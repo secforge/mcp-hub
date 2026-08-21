@@ -1,0 +1,6 @@
+bin/
+docs/
+*.log
+*.sock
+.git/
+README.adoc

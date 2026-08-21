@@ -1,0 +1,19 @@
+# Docker Compose for mcp-hub on staging3
+# Place this file at: /srv/docker/mcp-hub/compose.yaml
+#
+# Logs are bind-mounted to a host directory (not a named volume) so they
+# survive `docker compose down`/`docker rm` during the PoC period.
+
+services:
+  mcp-hub:
+    image: registry.staging2.secforge.de/mcp-hub:stable
+    container_name: mcp-hub
+    restart: unless-stopped
+    volumes:
+      - ./logs:/logs
+    networks:
+      - nginx
+
+networks:
+  nginx:
+    external: true

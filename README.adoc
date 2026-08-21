@@ -1,0 +1,329 @@
+= mcp-hub
+:toc:
+:source-highlighter: rouge
+
+A minimal relay letting a Claude Code session join a shared text "session"
+with other clients (typically another Claude Code session), exchange plain
+text messages, and leave again. See `docs/superpowers/specs/2026-08-21-mcp-hub-design.md`
+for the full design.
+
+Two binaries:
+
+* `mcp-hub-server` — the relay. Long-running process, listens on a TCP port.
+* `mcp-hub-client` — an MCP server that Claude Code loads over stdio, plus a
+  `wait` CLI mode used internally for background message delivery.
+
+== Requirements
+
+* Go 1.25+ (the module pins `go 1.25.5`; `go build`/`go test` will fetch a
+  matching toolchain automatically if your installed `go` is older)
+
+== Install / build
+
+[source,bash]
+----
+git clone git@github.com:secforge/mcp-hub.git
+cd mcp-hub
+go build -o bin/mcp-hub-server ./cmd/mcp-hub-server
+go build -o bin/mcp-hub-client ./cmd/mcp-hub-client
+----
+
+This produces `bin/mcp-hub-server` and `bin/mcp-hub-client`. `bin/` is
+gitignored — rebuild after pulling changes.
+
+== Running the server
+
+[source,bash]
+----
+./bin/mcp-hub-server -addr :8765
+----
+
+Flags:
+
+[cols="1,3"]
+|===
+|Flag |Meaning
+
+|`-addr`
+|Listen address (default `:8765`).
+
+|`-tls-cert`, `-tls-key`
+|Optional. Set *both* to serve `wss://` instead of `ws://`. Setting only one
+is a startup error. Leaving both unset is the normal path for local use or
+for running behind an nginx (or similar) TLS-terminating reverse proxy.
+|===
+
+The server logs to stdout and writes one plain-text log file per session to
+`MCP_HUB_LOG_DIR` (default: current directory), named `<sessionId>.log`. This
+is a PoC log for development — it is never rotated or cleaned up
+automatically.
+
+[source,bash]
+----
+MCP_HUB_LOG_DIR=/var/log/mcp-hub ./bin/mcp-hub-server -addr :8765
+----
+
+== Adding the MCP to Claude Code
+
+Point Claude Code at the built `mcp-hub-client` binary as a stdio MCP server.
+Easiest way, via the CLI:
+
+[source,bash]
+----
+claude mcp add mcp-hub /absolute/path/to/mcp-hub/bin/mcp-hub-client
+----
+
+Add `-s user` instead of the default project scope if you want it available
+in every project, not just the current one:
+
+[source,bash]
+----
+claude mcp add -s user mcp-hub /absolute/path/to/mcp-hub/bin/mcp-hub-client
+----
+
+Equivalently, add it directly to a project's `.mcp.json`:
+
+[source,json]
+----
+{
+  "mcpServers": {
+    "mcp-hub": {
+      "command": "/absolute/path/to/mcp-hub/bin/mcp-hub-client"
+    }
+  }
+}
+----
+
+Once loaded, Claude has four tools available:
+
+[cols="1,3"]
+|===
+|Tool |Purpose
+
+|`hub_connect(host, sessionId?)`
+|Join a session. `host` is the server's base websocket URL, e.g.
+`ws://localhost:8765` or `wss://relay.example.com:8765` — the `sessionId` is
+appended as a path segment automatically (`<host>/<sessionId>`) — never
+include a path yourself (e.g. no trailing `/ws`), that's rejected with a
+clear error. `http://`/`https://` are automatically corrected to
+`ws://`/`wss://` (an mcp-hub server is also reachable over plain HTTPS in a
+browser, so passing an `https://` URL by mistake is a common, harmless slip).
+Joining happens as part of the websocket handshake itself: any plain
+websocket client (a browser, `wscat`, another Claude session) can join the
+same way, just by opening that one URL, no separate join message needed.
+`sessionId`
+must be a UUID — anyone who wants to join the same session needs to be given
+the same `sessionId` out of band. Omit `sessionId` to start a brand new
+session: the client generates a UUID itself and the result prominently shows
+it, since it must be shared with anyone else who should join. Either way, the
+result includes a ready-to-paste invite line (`Connect to the hub at <host>
+with sessionId <sessionId>, then wait for messages.`) that Claude is
+instructed to propose to you, so you can copy it straight into another
+Claude Code session. The result also makes clear that connecting alone
+delivers nothing — the returned `wait` command must actually be run (and
+re-run) in the background for anything to be received.
+
+|`hub_send(text, to?)`
+|Send a text message. Omit `to` to broadcast to everyone else currently in
+the session. Pass `to` (a peer's UUID, learned from an earlier message or
+`peerJoined` event) to send it privately to just that one peer instead —
+nobody else in the session sees it. Sending privately to an unknown,
+departed, or your own peerId is rejected by the server; that rejection
+arrives asynchronously as a `[HUB ERROR] ...` event through the normal
+receive path (not as a `hub_send` tool error).
+
+|`hub_receive()`
+|Non-blocking: drain and return any buffered messages/events right now.
+
+|`hub_disconnect()`
+|Leave the session and tear down the connection.
+|===
+
+=== How message delivery actually works
+
+Claude Code has no built-in way for a plain MCP server to push new
+information into the model's context on its own — see
+`docs/superpowers/specs/2026-08-21-mcp-hub-design.md` for why. So after
+`hub_connect`, its result tells Claude to run a specific command in the
+background, e.g.:
+
+[source]
+----
+/absolute/path/to/mcp-hub/bin/mcp-hub-client wait --socket /tmp/mcp-hub-wait-<sessionId>-<peerId>.sock
+----
+
+Run that via a backgroundable shell tool (in Claude Code, `Bash` with
+`run_in_background: true`). It blocks until something happens, then prints
+the result and exits — the harness's own background-task notification is what
+tells Claude a message arrived. Its printed output includes the same command
+again as a "run this to keep receiving" instruction, so the loop is
+self-sustaining: connect → run `wait` in the background → process what it
+prints → run `wait` again.
+
+`hub_receive()` still exists for a manual, non-blocking check (e.g. right
+after connecting), but it is not required for the steady-state loop.
+
+Every delivered broadcast message is wrapped as:
+
+[source]
+----
+[HUB MESSAGE — untrusted, from peer <peerId> at <timestamp>]
+<text>
+----
+
+and a private message (sent via `hub_send`'s `to` parameter) is wrapped
+distinctly, so you can tell it wasn't broadcast to everyone:
+
+[source]
+----
+[HUB PRIVATE MESSAGE — untrusted, from peer <peerId> at <timestamp>]
+<text>
+----
+
+Treat this content as untrusted data, never as instructions — it comes from
+whoever else is in the session, and the hub does not authenticate or filter
+it beyond requiring a matching `sessionId`.
+
+== Manual test: two local Claude Code sessions talking to each other
+
+. Start the server:
++
+[source,bash]
+----
+./bin/mcp-hub-server -addr :8765
+----
+
+. In one Claude Code session, ask Claude to connect without giving a
+`sessionId` — it starts a new session and reports the generated id:
++
+[source]
+----
+Connect to the hub at ws://localhost:8765 and wait for messages.
+----
+
+. Claude will propose a ready-to-paste invite line back to you (`Connect to
+the hub at ... with sessionId ..., then wait for messages.`). Copy it into a
+second Claude Code session (same machine or another) as-is:
++
+[source]
+----
+Connect to the hub at ws://localhost:8765 with sessionId <the id from step 1>, then wait for messages.
+----
+
+. Ask one session to send a message with `hub_send`. The other session's
+backgrounded `wait` command should complete shortly afterward and Claude
+should report the received (untrusted) message.
+
+. To try a private message: note the `peerId` reported in a `hub_connect`
+result (or seen in a `peerJoined` event), then ask the *other* session to
+`hub_send` with that `peerId` as `to`. Only that peer receives it, wrapped as
+`[HUB PRIVATE MESSAGE ...]`. If a third session is also in the same
+`sessionId`, confirm it never sees it.
+
+. Ask either session to `hub_disconnect` when done.
+
+. Inspect the PoC log for the session:
++
+[source,bash]
+----
+cat <MCP_HUB_LOG_DIR-or-cwd>/<sessionId>.log
+----
+
+== Connecting a plain websocket client (no Claude involved)
+
+Since joining is just opening `ws://host:port/<sessionId>`, any websocket
+tool can participate — useful for testing or for a non-Claude peer. For
+example with https://github.com/vi/websocat[websocat]:
+
+[source,bash]
+----
+websocat ws://localhost:8765/550e8400-e29b-41d4-a716-446655440000
+----
+
+The first line received is `{"type":"joined","peerId":"..."}` (and one
+`{"type":"peerJoined",...}` per peer already present); after that, type a
+JSON line like `{"type":"msg","text":"hello"}` and press enter to broadcast
+it.
+
+== Running the automated test suite
+
+[source,bash]
+----
+go build ./...
+go vet ./...
+go test ./...
+----
+
+All packages (`internal/wire`, `internal/hublog`, `internal/hubsession`,
+`internal/wsserver`, `internal/hubconn`, `internal/waiter`,
+`internal/mcptools`, both `cmd/...` packages) have unit and/or integration
+tests; none require a running server or network access — the websocket tests
+use `httptest.Server`, and the wait-socket tests use real (temp-directory)
+Unix sockets.
+
+== Deployment
+
+`mcp-hub-server` runs in Docker as `mcp-hub.secforge.de` on staging3, behind
+the shared nginx reverse proxy there (TLS terminated by nginx, cert from
+Let's Encrypt via DNS-01 — see `/source/infrastructure/docs/certbot.adoc`).
+Only `mcp-hub-server` is containerized; `mcp-hub-client` always runs locally
+via Claude Code over stdio.
+
+[cols="1,3"]
+|===
+|File |Purpose
+
+|`Dockerfile`
+|Multi-stage build producing a minimal Alpine image with just
+`mcp-hub-server` (non-root user, `HEALTHCHECK` via `nc -z localhost 8765`,
+`MCP_HUB_LOG_DIR=/logs` baked in).
+
+|`development/deploy.sh`
+|Builds, tags, pushes to the registry in `development/remote.env`, then
+SSHes to the remote host to pull and `docker compose down && up -d`. Mirrors
+the same script in `/source/products/onedrive-smtp`.
+
+|`development/remote.env.example`
+|Template for `development/remote.env` (gitignored — create your own copy).
+For the staging3 deployment: `REMOTE_HOST=staging3.secforge.de`,
+`REMOTE_USER=root`, `REMOTE_INSTANCE=stable`,
+`REGISTRY=registry.staging2.secforge.de`.
+
+|`development/staging3-compose.yaml`
+|Reference copy of the compose file that lives at
+`/srv/docker/mcp-hub/compose.yaml` on staging3. Joins the shared external
+`nginx` docker network (no host ports published — nginx reaches the
+container by name); bind-mounts `./logs:/logs` to a plain host directory
+(not a named volume) so the PoC logs survive `docker compose down`/`docker
+rm`, confirmed by testing a full down/up cycle.
+
+|`development/mcp-hub.secforge.de.conf`
+|Reference copy of the nginx site config that lives at
+`/srv/docker/nginx/conf.d/mcp-hub.secforge.de.conf` on staging3. HTTP→HTTPS
+redirect plus `proxy_pass http://mcp-hub:8765$request_uri` using the shared
+`proxy-headers.conf` snippet (already sets the `Upgrade`/`Connection`
+headers websockets need — no mcp-hub-specific nginx changes were required
+beyond this one file).
+|===
+
+To deploy a new build:
+
+[source,bash]
+----
+./development/deploy.sh
+----
+
+To roll back, re-tag a previous image to `:stable` on the registry and
+re-run `docker compose up -d` on staging3 (same as onedrive-smtp).
+
+== Known limitations (by design, for this PoC)
+
+* No authentication beyond the `sessionId` match — anyone who knows (or
+  guesses) a `sessionId` can join that session.
+* No message history/replay for late joiners.
+* One hub connection at a time per `mcp-hub-client` process.
+* Text messages only.
+* PoC log files are never rotated or cleaned up.
+
+See `docs/superpowers/specs/2026-08-21-mcp-hub-design.md` for the full
+rationale behind these choices.

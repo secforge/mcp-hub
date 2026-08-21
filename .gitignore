@@ -1,0 +1,4 @@
+/bin/
+*.sock
+*.log
+development/remote.env
