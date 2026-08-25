@@ -71,6 +71,57 @@ func TestConnectSendReceiveDisconnect(t *testing.T) {
 	hubB.handleDisconnect(ctx, discReq)
 }
 
+func TestPeersToolReturnsRoster(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hubA.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	res, err := hubA.handlePeers(ctx, mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("peers failed: err=%v result=%+v", err, res)
+	}
+	if !strings.Contains(textOf(res), "no other peers") {
+		t.Fatalf("expected an empty-roster message, got: %s", textOf(res))
+	}
+
+	hubB := NewHub()
+	res, err = hubB.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	var peersText string
+	deadlinePoll(t, func() bool {
+		res, err := hubA.handlePeers(ctx, mcp.CallToolRequest{})
+		if err != nil {
+			t.Fatalf("peers failed: %v", err)
+		}
+		peersText = textOf(res)
+		return strings.Contains(peersText, hubB.conn.PeerID())
+	})
+	_ = peersText
+}
+
+func TestPeersToolErrorsWhenNotConnected(t *testing.T) {
+	hub := NewHub()
+	res, err := hub.handlePeers(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error when not connected")
+	}
+}
+
 func TestPrivateSendOnlyReachesTarget(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"

@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -57,6 +58,11 @@ func (h *Hub) Register(s *server.MCPServer) {
 		mcp.NewTool("hub_receive",
 			mcp.WithDescription("Drain and return currently buffered hub events without blocking")),
 		h.handleReceive,
+	)
+	s.AddTool(
+		mcp.NewTool("hub_peers",
+			mcp.WithDescription("List the peerIds of everyone else currently in the hub session")),
+		h.handlePeers,
 	)
 }
 
@@ -160,4 +166,15 @@ func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultText("no messages"), nil
 	}
 	return mcp.NewToolResultText(formatted), nil
+}
+
+func (h *Hub) handlePeers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if h.conn == nil {
+		return mcp.NewToolResultError("not connected"), nil
+	}
+	peers := h.conn.Peers()
+	if len(peers) == 0 {
+		return mcp.NewToolResultText("no other peers currently in the session"), nil
+	}
+	return mcp.NewToolResultText("Current peers: " + strings.Join(peers, ", ")), nil
 }

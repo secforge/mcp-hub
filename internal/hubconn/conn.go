@@ -3,6 +3,7 @@ package hubconn
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -26,6 +27,7 @@ type Conn struct {
 	buffer     []Event
 	closed     bool
 	onActivity func()
+	peers      map[string]struct{}
 }
 
 // Dial connects to host+"/"+sessionID (e.g. "ws://localhost:8765" joining
@@ -60,12 +62,29 @@ func Dial(host, sessionID string) (*Conn, error) {
 		return nil, fmt.Errorf("server returned malformed peerId %q", joined.PeerID)
 	}
 
-	c := &Conn{ws: ws, peerID: joined.PeerID}
+	c := &Conn{ws: ws, peerID: joined.PeerID, peers: make(map[string]struct{})}
 	go c.readLoop()
 	return c, nil
 }
 
 func (c *Conn) PeerID() string { return c.peerID }
+
+// Peers returns the peerIds of everyone else currently known to be in the
+// session, sorted for stable output. Built entirely from peerJoined/peerLeft
+// events seen so far — since a newly joined peer is told the full existing
+// roster on join (see the server's "roster on join" behavior), this is
+// complete from shortly after Dial returns, not just for peers who joined
+// after this connection did.
+func (c *Conn) Peers() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.peers))
+	for id := range c.peers {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // OnActivity registers a callback invoked (from the background read
 // goroutine) after every new buffered event and on disconnect.
@@ -93,6 +112,12 @@ func (c *Conn) readLoop() {
 			continue
 		}
 		c.mu.Lock()
+		switch ev.Kind {
+		case "peerJoined":
+			c.peers[ev.PeerID] = struct{}{}
+		case "peerLeft":
+			delete(c.peers, ev.PeerID)
+		}
 		c.buffer = append(c.buffer, ev)
 		f := c.onActivity
 		c.mu.Unlock()

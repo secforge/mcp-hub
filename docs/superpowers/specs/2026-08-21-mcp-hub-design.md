@@ -207,6 +207,14 @@ join/leave events.
   see below), or an empty result if none. Optional/manual use only (e.g. Claude
   wants to check without spinning up a background process) — it is not part of
   the required delivery loop.
+- **`hub_peers()`** — returns the peerIds of everyone else currently known to
+  be in the session (sorted, one list, or an explicit "no other peers"
+  message if empty). Built client-side from every `peerJoined`/`peerLeft`
+  event `hubconn.Conn` has seen — since a newly joined peer is told the full
+  existing roster on join (see "Roster on join" above), this is complete
+  shortly after `hub_connect` returns, not just for peers who joined
+  afterward. Errors clearly if not connected. Purely a local read of state
+  already being tracked — it does not talk to the server.
 
 Every delivered broadcast `msg` event is wrapped before being handed to Claude:
 

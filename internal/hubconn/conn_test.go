@@ -149,6 +149,54 @@ func TestSendToUnknownPeerSurfacesAsErrorEvent(t *testing.T) {
 	}
 }
 
+func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	a, err := Dial(url, sessionID)
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	activity := make(chan struct{}, 8)
+	a.OnActivity(func() { activity <- struct{}{} })
+
+	if peers := a.Peers(); len(peers) != 0 {
+		t.Fatalf("expected no peers before anyone else joins, got %v", peers)
+	}
+
+	b, err := Dial(url, sessionID)
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	waitForActivity(t, activity) // a sees b's peerJoined
+
+	peers := a.Peers()
+	if len(peers) != 1 || peers[0] != b.PeerID() {
+		t.Fatalf("expected [%s], got %v", b.PeerID(), peers)
+	}
+
+	c, err := Dial(url, sessionID)
+	if err != nil {
+		t.Fatalf("dial c: %v", err)
+	}
+	defer c.Close()
+	waitForActivity(t, activity) // a sees c's peerJoined
+
+	peers = a.Peers()
+	if len(peers) != 2 {
+		t.Fatalf("expected 2 peers, got %v", peers)
+	}
+
+	b.Close()
+	waitForActivity(t, activity) // a sees b's peerLeft
+
+	peers = a.Peers()
+	if len(peers) != 1 || peers[0] != c.PeerID() {
+		t.Fatalf("expected just [%s] after b left, got %v", c.PeerID(), peers)
+	}
+}
+
 func TestPeekAndDrainReflectDisconnect(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
