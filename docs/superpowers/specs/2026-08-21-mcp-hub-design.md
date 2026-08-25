@@ -136,10 +136,21 @@ and every successfully delivered *private* `msg` as:
 
 ```
 
-(blank line separates entries; wrapping breaks only on word boundaries, never
-mid-word). `peerJoined`/`peerLeft` events, and private sends that were
-rejected (unknown target), are not logged — only successfully delivered `msg`
-traffic.
+A peer joining or leaving the session (including a ping/pong keepalive
+timeout, which is treated as a leave) is appended as a single-line entry with
+no body:
+
+```
+<RFC3339 timestamp> <peerId> joined
+
+<RFC3339 timestamp> <peerId> left
+
+```
+
+(blank line separates all entries; message-text wrapping breaks only on word
+boundaries, never mid-word). Private sends that were rejected (unknown
+target) are not logged — only successfully delivered `msg` traffic, plus
+join/leave events.
 
 ## MCP client: tools
 

@@ -43,6 +43,20 @@ func (l *SessionLog) AppendDirected(peerID, targetPeerID, text, ts string) error
 	return err
 }
 
+func (l *SessionLog) AppendJoined(peerID, ts string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, err := l.file.WriteString(FormatJoinedEntry(ts, peerID))
+	return err
+}
+
+func (l *SessionLog) AppendLeft(peerID, ts string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, err := l.file.WriteString(FormatLeftEntry(ts, peerID))
+	return err
+}
+
 func (l *SessionLog) Close() error {
 	return l.file.Close()
 }

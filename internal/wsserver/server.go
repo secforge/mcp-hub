@@ -78,8 +78,14 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID string) {
 	if err := conn.WriteJSON(wire.NewJoined(peerID)); err != nil {
 		return
 	}
+	if logger != nil {
+		logger.AppendJoined(peerID, time.Now().UTC().Format(time.RFC3339))
+	}
 	session.Join(p)
 	defer func() {
+		if logger != nil {
+			logger.AppendLeft(peerID, time.Now().UTC().Format(time.RFC3339))
+		}
 		if session.Leave(p) {
 			h.manager.Remove(sessionID)
 		}

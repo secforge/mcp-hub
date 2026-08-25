@@ -87,6 +87,42 @@ func TestJoinRelayAndTeardown(t *testing.T) {
 	}
 }
 
+func TestJoinAndLeaveAreLogged(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MCP_HUB_LOG_DIR", dir)
+
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	a := dial(t, url, sessionID)
+	defer a.Close()
+	readTyped(t, a) // a: joined
+
+	b := dial(t, url, sessionID)
+	_, rawJoinedB := readTyped(t, b) // b: joined
+	var joinedB wire.Joined
+	decodeJSON(t, rawJoinedB, &joinedB)
+	readTyped(t, a) // a: peerJoined for b (broadcast) — by now b's join is logged
+
+	b.Close()
+	readTyped(t, a) // a: peerLeft for b — by now b's leave is logged
+
+	data, err := os.ReadFile(dir + "/" + sessionID + ".log")
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	log := string(data)
+	if !strings.Contains(log, joinedB.PeerID+" joined") {
+		t.Fatalf("log missing joined entry for b: %s", log)
+	}
+	if !strings.Contains(log, joinedB.PeerID+" left") {
+		t.Fatalf("log missing left entry for b: %s", log)
+	}
+}
+
 func TestJoinTellsNewPeerAboutExistingRoster(t *testing.T) {
 	srv := httptest.NewServer(NewHandler())
 	defer srv.Close()

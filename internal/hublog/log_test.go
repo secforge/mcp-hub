@@ -57,3 +57,32 @@ func TestAppendDirectedWritesTargetedEntry(t *testing.T) {
 		t.Fatalf("got %q, want %q", data, want)
 	}
 }
+
+func TestAppendJoinedAndLeftWriteExpectedEntries(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MCP_HUB_LOG_DIR", dir)
+
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	l, err := OpenSessionLog(sessionID)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := l.AppendJoined("peer-1", "2026-08-21T10:00:00Z"); err != nil {
+		t.Fatalf("append joined: %v", err)
+	}
+	if err := l.AppendLeft("peer-1", "2026-08-21T10:05:00Z"); err != nil {
+		t.Fatalf("append left: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, sessionID+".log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	want := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1") + FormatLeftEntry("2026-08-21T10:05:00Z", "peer-1")
+	if string(data) != want {
+		t.Fatalf("got %q, want %q", data, want)
+	}
+}
