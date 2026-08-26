@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/secforge/mcp-hub/internal/identitystore"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -26,10 +27,12 @@ type Session struct {
 	mu    sync.Mutex
 	peers map[string]Peer
 	// secretToPeerID remembers which peerID a reconnectSecret was last
-	// assigned, for the lifetime of this Session (i.e. only as long as the
-	// channel stays alive — a peer that reconnects after everyone else has
-	// left, tearing the session down, gets a fresh identity like anyone
-	// else, since a brand new Session has no memory of the old one).
+	// assigned, for the lifetime of this Session (i.e. as long as the
+	// channel stays alive across individual peer disconnects) *and* across
+	// a server restart — see identitystore. Only an intentional teardown
+	// (the last peer leaving, via Manager.Remove) forgets it. Keyed by
+	// identitystore.HashSecret(reconnectSecret), never the secret's own
+	// value, both here and on disk — see that package.
 	//
 	// Deliberately NOT keyed by agePublicKey: that value is broadcast to
 	// every other peer in the session (see Join below), so anyone who saw
@@ -41,7 +44,7 @@ type Session struct {
 }
 
 func newSession(id string) *Session {
-	return &Session{id: id, peers: make(map[string]Peer)}
+	return &Session{id: id, peers: make(map[string]Peer), secretToPeerID: identitystore.Load(id)}
 }
 
 // Join resolves the peerID to use (reusing the ID a previous, now-departed
@@ -86,7 +89,11 @@ func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer
 		if s.secretToPeerID == nil {
 			s.secretToPeerID = make(map[string]string)
 		}
-		s.secretToPeerID[reconnectSecret] = peerID
+		s.secretToPeerID[identitystore.HashSecret(reconnectSecret)] = peerID
+		// Best-effort: a persistence failure doesn't affect this Join's
+		// correctness, only whether the mapping happens to survive a
+		// future restart.
+		_ = identitystore.Save(s.id, s.secretToPeerID)
 	}
 
 	for _, ep := range existing {
@@ -102,7 +109,7 @@ func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer
 // s.mu already held.
 func (s *Session) resolvePeerIDLocked(reconnectSecret string) (peerID string, reused bool) {
 	if reconnectSecret != "" {
-		if id, ok := s.secretToPeerID[reconnectSecret]; ok {
+		if id, ok := s.secretToPeerID[identitystore.HashSecret(reconnectSecret)]; ok {
 			if _, stillConnected := s.peers[id]; !stillConnected {
 				return id, true
 			}
@@ -181,8 +188,14 @@ func (m *Manager) GetOrCreate(id string) *Session {
 	return s
 }
 
+// Remove tears a session down for good — called when its last peer leaves.
+// This is the one thing that forgets a session's reconnectSecret mapping
+// permanently (identitystore.Delete): unlike a server restart, an
+// intentional "everyone's gone" teardown is a deliberate end of the
+// channel, not just an interruption.
 func (m *Manager) Remove(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
 	m.mu.Unlock()
+	identitystore.Delete(id)
 }

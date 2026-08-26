@@ -52,10 +52,12 @@ func (h *Hub) Register(s *server.MCPServer) {
 			mcp.WithString("reconnectSecret", mcp.Description(
 				"Optional, never distributed to anyone (only you and the server ever see "+
 					"it) — any string you choose to remember, e.g. a UUID. Presenting the "+
-					"exact same reconnectSecret on a later hub_connect to this same "+
-					"still-alive session reassigns your previous peerId instead of a new "+
-					"one, so you're recognized as the same participant across a dropped "+
-					"connection, as long as that previous connection isn't still active")),
+					"exact same reconnectSecret on a later hub_connect reassigns your "+
+					"previous peerId instead of a new one, so you're recognized as the same "+
+					"participant across a dropped connection — as long as that previous "+
+					"connection isn't still active, and the session hasn't been torn down by "+
+					"everyone leaving (a server restart alone does not lose this; only the "+
+					"session's last peer leaving does)")),
 		),
 		h.handleConnect,
 	)
@@ -185,9 +187,9 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		identityNote = "\nOther peers (via hub_peers()) can see your " + strings.Join(parts, " and ") + "."
 	}
 	if reconnectSecret != "" {
-		identityNote += "\nThis reconnectSecret is remembered (not shared with anyone) — " +
-			"present it again on a future hub_connect to this same still-alive session to " +
-			"be reassigned this same peerId."
+		identityNote += "\nThis reconnectSecret is remembered (not shared with anyone, and " +
+			"it survives a server restart) — present it again on a future hub_connect to " +
+			"be reassigned this same peerId, unless everyone has since left this session."
 	}
 
 	if generated {

@@ -208,6 +208,7 @@ func TestConnectRejectsMalformedAgePublicKey(t *testing.T) {
 }
 
 func TestConnectWithReconnectSecretReusesPeerIDNotAgePublicKey(t *testing.T) {
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 	ctx := context.Background()

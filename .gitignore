@@ -1,4 +1,5 @@
 /bin/
 *.sock
 *.log
+*.secrets.json
 development/remote.env

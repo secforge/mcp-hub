@@ -130,6 +130,7 @@ func TestJoinReportsExistingCountViaBeforeVisibleCallback(t *testing.T) {
 }
 
 func TestJoinReusesPeerIDForSameReconnectSecretAfterLeaving(t *testing.T) {
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	secret := "super-secret-token"
@@ -145,6 +146,7 @@ func TestJoinReusesPeerIDForSameReconnectSecretAfterLeaving(t *testing.T) {
 }
 
 func TestJoinAssignsFreshPeerIDWhenSameReconnectSecretStillConnected(t *testing.T) {
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	secret := "super-secret-token"
@@ -160,6 +162,7 @@ func TestJoinAssignsFreshPeerIDWhenSameReconnectSecretStillConnected(t *testing.
 }
 
 func TestJoinReportsReusedAccurately(t *testing.T) {
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	secret := "super-secret-token"
@@ -185,6 +188,62 @@ func TestJoinReportsReusedAccurately(t *testing.T) {
 	_, reused = s.Join(secret, func(id string) Peer { return &fakePeer{id: id} }, nil)
 	if reused {
 		t.Fatal("expected reused=false when the secret's previous holder is still connected")
+	}
+}
+
+// TestReconnectSecretSurvivesSimulatedServerRestart proves the fix for the
+// gap the user found: reconnectSecret -> peerID mappings used to live only
+// in the in-memory Session, so any server restart silently reset every
+// peer's identity even if it presented the exact secret it always had. A
+// restart is simulated here by discarding the in-memory Session/Manager
+// entirely and constructing brand new ones — nothing in-process survives
+// that except whatever identitystore itself persisted to disk.
+func TestReconnectSecretSurvivesSimulatedServerRestart(t *testing.T) {
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
+	sessionID := "session-restart-test"
+	secret := "super-secret-token"
+
+	m1 := NewManager()
+	s1 := m1.GetOrCreate(sessionID)
+	first := joinFake(s1, "Alice", "", secret, nil)
+	firstID := first.ID()
+	s1.Leave(first)
+	// m1/s1 are now abandoned entirely, standing in for the old process's
+	// in-memory state being wiped by a restart — nothing below references
+	// them again.
+
+	m2 := NewManager()
+	s2 := m2.GetOrCreate(sessionID)
+	second := joinFake(s2, "Alice", "", secret, nil)
+	if second.ID() != firstID {
+		t.Fatalf("expected the reconnectSecret to survive the simulated restart and reuse peerID %q, got %q", firstID, second.ID())
+	}
+}
+
+// TestReconnectSecretDoesNotSurviveIntentionalTeardown proves the other
+// half of the design: unlike a restart, the last peer leaving (Remove) is
+// treated as a deliberate end of the channel, and does forget the mapping
+// — even across a subsequent simulated restart, since the persisted file
+// was deleted, not just the in-memory state.
+func TestReconnectSecretDoesNotSurviveIntentionalTeardown(t *testing.T) {
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
+	sessionID := "session-teardown-test"
+	secret := "super-secret-token"
+
+	m1 := NewManager()
+	s1 := m1.GetOrCreate(sessionID)
+	first := joinFake(s1, "Alice", "", secret, nil)
+	firstID := first.ID()
+	if empty := s1.Leave(first); !empty {
+		t.Fatal("expected the session to be empty after its only peer leaves")
+	}
+	m1.Remove(sessionID) // the real trigger for this, in wsserver, is exactly "session became empty"
+
+	m2 := NewManager()
+	s2 := m2.GetOrCreate(sessionID)
+	second := joinFake(s2, "Alice", "", secret, nil)
+	if second.ID() == firstID {
+		t.Fatal("expected a fresh peerID after an intentional teardown (Remove), even with the same reconnectSecret")
 	}
 }
 

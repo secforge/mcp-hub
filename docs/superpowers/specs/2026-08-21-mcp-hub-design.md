@@ -165,13 +165,13 @@ wire block above):
   is rejected with HTTP `400` before upgrade, the same way an invalid
   `agePublicKey` is.
 
-**Identity reuse.** `hubsession.Session` keeps an in-memory
+**Identity reuse.** `hubsession.Session` keeps a
 `secretToPeerID map[string]string`, populated whenever a peer connects with
-a non-empty `reconnectSecret`. On `Join`, if the given secret maps to a
-peerID that isn't a currently-active connection, that same peerID is reused
-instead of a fresh one — so a peer that drops and reconnects with the same
-secret is recognized as the same identity by anyone still watching the
-roster.
+a non-empty `reconnectSecret`, and durably persisted (see below). On
+`Join`, if the given secret maps to a peerID that isn't a currently-active
+connection, that same peerID is reused instead of a fresh one — so a peer
+that drops and reconnects with the same secret is recognized as the same
+identity by anyone still watching the roster.
 
 This is deliberately **not** keyed by `agePublicKey`, even though an
 earlier version of this feature did exactly that. `agePublicKey` is
@@ -188,16 +188,8 @@ never distributed at all — `TestJoinNeverReusesPeerIDBasedOnAgePublicKeyAlone`
 (`internal/hubsession`) and `TestObservingAgePublicKeyDoesNotAllowImpersonation`
 (`internal/wsserver`) are regression tests for exactly this.
 
-Two things bound the reuse itself, same as before:
+Two things bound the reuse itself:
 
-- The map lives inside the `Session` object itself, so it only persists for
-  as long as the channel does. Once the last peer leaves, `Manager.Remove`
-  tears the whole `Session` down (as always); a later connection with that
-  same secret — including after a server restart, which loses all in-memory
-  state — simply creates a brand new `Session` with no memory of the old
-  one and gets a fresh peerID, same as anyone else. This is intentional,
-  not a gap: identity is scoped to "the same still-alive channel," per the
-  original requirement, not to the secret itself indefinitely.
 - If the secret's previous peerID is *still* an active connection (e.g. two
   processes present the same secret into the same session concurrently),
   the new connection gets a fresh UUID instead of colliding with the live
@@ -205,6 +197,49 @@ Two things bound the reuse itself, same as before:
   it. Both the reuse and the collision-avoidance decision happen under
   `s.mu`, in the same locked section as the rest of `Join`, for the same
   atomicity reasons described above.
+- Identity is scoped to "the same still-alive channel" — not to the secret
+  indefinitely. See "Identity persistence across a server restart" below
+  for exactly what that means now that the mapping survives more than the
+  in-memory `Session` object.
+
+### Identity persistence across a server restart
+
+`secretToPeerID` used to live purely in the in-memory `Session`, so *any*
+server restart silently reset every peer's identity, even a peer that still
+held the exact `reconnectSecret` it always had — found from a real
+production incident where this was surprising in practice. Fixed by
+`internal/identitystore`: `Session` now durably persists (and, on
+`newSession`, reloads) that mapping to a small per-session file, so it
+survives a restart while still respecting the original "same still-alive
+channel" scoping for an *intentional* teardown:
+
+- **Restart** (the process dies and a new one starts): not a deliberate end
+  of the channel, just an interruption — `newSession(id)` calls
+  `identitystore.Load(id)`, so a fresh `Session` created for a `sessionId`
+  that was already in use picks up whatever mapping was last persisted for
+  it. A reconnecting peer presenting the same secret is recognized exactly
+  as if the server had never restarted.
+- **Intentional teardown** (the session's last peer leaves): still forgets
+  the mapping, same as before restart-persistence existed —
+  `Manager.Remove` (called exactly when a session becomes empty) now also
+  calls `identitystore.Delete(id)`, removing the persisted file. A later
+  connection with that same secret, even after this point, gets a fresh
+  peerId — the channel deliberately ended, so its identities end with it.
+
+The persisted file (`<sessionId>.secrets.json`, in the same
+`MCP_HUB_LOG_DIR` the session log uses) never contains a `reconnectSecret`'s
+own value — only `identitystore.HashSecret(reconnectSecret)` (SHA-256) as
+the map key, matched by re-hashing an incoming secret the same way. This
+means the file can't be replayed to impersonate anyone even if someone
+reads it directly off disk; `Save` writes are also `0600` (owner-only) and
+go through a write-to-temp-then-rename so a concurrent `Load` never
+observes a partially-written file. A `Save`/`Load` failure is logged but
+not fatal — restart-survival is a convenience layered on top of the
+in-memory mapping the session already works from correctly on its own,
+not something session correctness itself depends on.
+`TestReconnectSecretSurvivesSimulatedServerRestart` and
+`TestReconnectSecretDoesNotSurviveIntentionalTeardown` (`internal/hubsession`)
+are the regression tests for the two halves of this.
 
 ### Protocol versioning
 

@@ -140,14 +140,18 @@ cryptographically — it's purely distributed to other peers so they can
 +
 `reconnectSecret` is a *separate*, opaque string (any format — a UUID, a
 random token) that is never shared with anyone, unlike `name`/`agePublicKey`
-— not echoed back, not distributed to other peers, not logged. Presenting
-the same `reconnectSecret` on a later `hub_connect` to the same still-alive
-session reassigns your previous peerId instead of a new one (unless that
-previous connection is still active, in which case you get a fresh one to
-avoid a collision) — this is deliberately *not* tied to `agePublicKey`:
-since that key is broadcast to every other peer, using it for identity
-reuse would let anyone who merely observed it on the wire impersonate you
-by reconnecting with the same key.
+— not echoed back, not distributed to other peers, not logged (only whether
+one was involved, and whether it matched — see the session log format
+below). Presenting the same `reconnectSecret` on a later `hub_connect`
+reassigns your previous peerId instead of a new one (unless that previous
+connection is still active, in which case you get a fresh one to avoid a
+collision) — this is deliberately *not* tied to `agePublicKey`: since that
+key is broadcast to every other peer, using it for identity reuse would let
+anyone who merely observed it on the wire impersonate you by reconnecting
+with the same key. This mapping is durably persisted (hashed, never the
+secret itself — see `internal/identitystore`) and survives a server
+restart; only the session's last peer leaving forgets it, since that's a
+deliberate end of the channel rather than an interruption.
 +
 If `name`/`agePublicKey` was given, the result confirms what other peers
 can now see for you — including the sanitized name, if it differs from
