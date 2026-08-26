@@ -105,6 +105,15 @@ func (h *Handler) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, reconnectSecret string) {
 	defer conn.Close()
 
+	// Snapshot once, synchronously, before pingLoop is spawned — tests
+	// reassign these package vars, and an unsynchronized background
+	// goroutine reading them directly has no happens-before edge against a
+	// later test's write, which the race detector (correctly) flags even
+	// when this goroutine has logically already finished by then. Capturing
+	// here, before `go p.pingLoop()`, uses the goroutine-creation
+	// happens-before edge instead.
+	snapPingPeriod, snapPongWait, snapWriteWait := pingPeriod, pongWait, writeWait
+
 	var p *peer
 	var peerID string
 	done := make(chan struct{})
@@ -120,7 +129,7 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 	session.Join(reconnectSecret,
 		func(id string) hubsession.Peer {
 			peerID = id
-			p = &peer{id: id, conn: conn, done: done, name: name, agePublicKey: agePublicKey}
+			p = &peer{id: id, conn: conn, done: done, name: name, agePublicKey: agePublicKey, pingPeriod: snapPingPeriod, writeWait: snapWriteWait}
 			return p
 		},
 		func(existingCount int) {
@@ -142,9 +151,9 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 		}
 	}()
 
-	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetReadDeadline(time.Now().Add(snapPongWait))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetReadDeadline(time.Now().Add(snapPongWait))
 		return nil
 	})
 	go p.pingLoop()
@@ -184,6 +193,8 @@ type peer struct {
 	done         chan struct{}
 	name         string
 	agePublicKey string
+	pingPeriod   time.Duration
+	writeWait    time.Duration
 }
 
 func (p *peer) ID() string           { return p.id }
@@ -201,14 +212,14 @@ func (p *peer) Deliver(event any) {
 // missing pong is detected via the read deadline set in serve, which causes
 // the blocking ReadMessage call there to fail and return.
 func (p *peer) pingLoop() {
-	ticker := time.NewTicker(pingPeriod)
+	ticker := time.NewTicker(p.pingPeriod)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			// WriteControl may be called concurrently with the other Conn
 			// write methods per the gorilla/websocket concurrency contract.
-			if err := p.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+			if err := p.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(p.writeWait)); err != nil {
 				return
 			}
 		case <-p.done:

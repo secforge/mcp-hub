@@ -7,11 +7,25 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
 	"github.com/secforge/mcp-hub/internal/agekey"
 	"github.com/secforge/mcp-hub/internal/wire"
+)
+
+// pongWait mirrors wsserver's own pongWait: the server pings every 30s
+// (wsserver.pingPeriod), so if we haven't heard anything at all — data or a
+// ping — from it in pongWait, treat the connection as dead. Without this, a
+// silent drop (no TCP FIN/RST, e.g. a killed server process or a network
+// partition) would never surface: ws.ReadMessage blocks with no deadline,
+// so Peek/Drain would keep reporting connected forever and anything sent
+// into that dead socket in the meantime would be silently lost. writeWait
+// bounds writing our own pong reply.
+var (
+	pongWait  = 40 * time.Second
+	writeWait = 10 * time.Second
 )
 
 type Event struct {
@@ -38,6 +52,16 @@ type Conn struct {
 	agePublicKey  string
 	serverVersion int
 	expectedPeers int
+	// pongWait is snapshotted from the package-level var once, synchronously,
+	// in Dial — never read from the background readLoop goroutine directly.
+	// Reading the mutable package var from that goroutine on every loop
+	// iteration raced against tests reassigning it for a *different* Conn's
+	// Dial call: Go's race detector doesn't require actual timing overlap,
+	// only the absence of a happens-before edge, and an unsynchronized
+	// background goroutine has none with a later test's assignment.
+	// Capturing here, before `go c.readLoop()` is spawned, uses the
+	// goroutine-creation happens-before edge instead.
+	pongWait time.Duration
 
 	mu              sync.Mutex
 	buffer          []Event
@@ -84,6 +108,10 @@ type DialOptions struct {
 // path fails with a clear message instead of an opaque dial error. Starts a
 // background read loop on success.
 func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
+	// Snapshot once, synchronously, before any goroutine is spawned — see
+	// the pongWait field's doc comment on Conn for why.
+	snapPongWait, snapWriteWait := pongWait, writeWait
+
 	base, err := normalizeHost(host)
 	if err != nil {
 		return nil, err
@@ -120,6 +148,12 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 		return nil, fmt.Errorf("server returned malformed peerId %q", joined.PeerID)
 	}
 
+	ws.SetReadDeadline(time.Now().Add(snapPongWait))
+	ws.SetPingHandler(func(appData string) error {
+		ws.SetReadDeadline(time.Now().Add(snapPongWait))
+		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(snapWriteWait))
+	})
+
 	c := &Conn{
 		ws:            ws,
 		peerID:        joined.PeerID,
@@ -128,6 +162,7 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 		serverVersion: joined.ServerVersion,
 		expectedPeers: joined.PeerCount,
 		peers:         make(map[string]PeerInfo),
+		pongWait:      snapPongWait,
 	}
 	go c.readLoop()
 	return c, nil
@@ -191,6 +226,9 @@ func (c *Conn) OnActivity(f func()) {
 func (c *Conn) readLoop() {
 	for {
 		_, raw, err := c.ws.ReadMessage()
+		if err == nil {
+			c.ws.SetReadDeadline(time.Now().Add(c.pongWait))
+		}
 		if err != nil {
 			c.mu.Lock()
 			c.closed = true

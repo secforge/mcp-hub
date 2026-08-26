@@ -254,10 +254,41 @@ close — without it, such a connection would sit forever with neither side
 noticing, since a blocked `ReadMessage()` only returns on data or a real
 TCP-level error. Detection surfaces through the normal teardown path: the
 server's read loop errors out, which fires `peerLeft` to the rest of the
-session and tears the session down if that was the last peer. The client
-(`hubconn.Conn`) does not send its own pings — gorilla/websocket's default
-pong handler already answers the server's pings automatically, which is
-sufficient since the server is the side tracking liveness.
+session and tears the session down if that was the last peer.
+
+The client (`hubconn.Conn`) mirrors this in the other direction. An earlier
+version of this doc claimed the client didn't need its own liveness check
+since gorilla/websocket's default ping handler already answers the
+server's pings automatically — true, but incomplete: that only lets the
+*server* detect a dead *client*. The client itself never called
+`SetReadDeadline`, so `ws.ReadMessage()` blocked with no timeout; a silent
+drop from the client's point of view (server process killed without a
+clean close, a network partition — no TCP FIN/RST either) meant `readLoop`
+never errored, `Conn.closed` never flipped true, and `Peek()`/`Drain()`
+would report `connected: true` forever while anything sent into that dead
+socket in the meantime was silently lost. Fixed by giving the client its
+own read deadline (`pongWait`, same 40s value), reset both on every
+successfully-read data message and via a custom `SetPingHandler` that
+still answers the server's ping (as before) but *also* pushes the deadline
+out — using the server's own periodic pings as the client's liveness
+signal, rather than adding a second independent ping direction. If neither
+a message nor a ping arrives within `pongWait`, `ReadMessage` times out,
+`readLoop`'s existing error path fires exactly as it would for a real
+socket error, and the connection is correctly marked disconnected.
+`TestSilentDropIsDetectedViaReadDeadline` (`internal/hubconn`) is the
+regression test.
+
+Both `pongWait`/`writeWait` (client) and `pingPeriod`/`pongWait`/`writeWait`
+(server) are package-level vars so tests can shorten them, but are
+snapshotted into local variables synchronously — before the background
+`readLoop`/`pingLoop` goroutine is spawned — rather than read from that
+goroutine directly. Reading a mutable package var from an unsynchronized
+background goroutine races (under `-race`) against a *later, unrelated*
+test reassigning it for its own connection: Go's race detector flags the
+absence of a happens-before edge, not actual timing overlap, and a plain
+`go f()` spawn establishes that edge only up to the moment of the read
+that already happened inside `Dial`/`serve`, not for every subsequent read
+inside the goroutine.
 
 ## Logging (PoC)
 

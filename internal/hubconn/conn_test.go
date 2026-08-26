@@ -364,6 +364,51 @@ func TestPeekAndDrainReflectDisconnect(t *testing.T) {
 	}
 }
 
+// TestSilentDropIsDetectedViaReadDeadline proves the fix for a real gap: a
+// server that goes silent without ever closing the TCP connection (no data,
+// no ping, no FIN/RST — e.g. a killed process behind a still-open socket,
+// or a network partition) used to be invisible to the client forever, since
+// ws.ReadMessage blocked with no deadline. Peek/Drain would report
+// connected indefinitely and anything sent in that window was silently
+// lost. With a read deadline that only pongWait resets, a silent server
+// must be noticed once that deadline elapses.
+func TestSilentDropIsDetectedViaReadDeadline(t *testing.T) {
+	origPongWait, origWriteWait := pongWait, writeWait
+	pongWait = 60 * time.Millisecond
+	writeWait = 30 * time.Millisecond
+	defer func() { pongWait, writeWait = origPongWait, origWriteWait }()
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		// go silent forever — no more frames, no ping, no close.
+		select {}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, connected := c.Peek(); !connected {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected the silent server to eventually be detected as disconnected")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 const testAgePublicKey = "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"
 
 func TestDialRejectsMalformedAgePublicKey(t *testing.T) {
