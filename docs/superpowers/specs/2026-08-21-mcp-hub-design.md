@@ -628,6 +628,22 @@ multi-line message (only the `[HUB MESSAGE...]` header line matches the
 filter pattern) from what's shown, even though `tee` preserves everything
 in the log file untouched.
 
+`hub_connect` also detects a harness that has *no* such tool at all and
+adjusts instead of assuming Claude Code's own capabilities everywhere:
+`clientName(ctx)` reads the connecting MCP client's self-reported
+`clientInfo.name` from the standard MCP `initialize` handshake (exposed via
+`server.ClientSessionFromContext`), and `looksLikeCodex` matches it
+case-insensitively against `"codex"` (a loose substring match, not exact —
+OpenAI's own docs show `clientInfo.name` varying by integration, e.g.
+`"codex_vscode"`, and a false positive here is far cheaper than a false
+negative). As of writing, Codex CLI has no shipped equivalent to a
+`Monitor`-style per-line notification tool — it's an open, unshipped
+proposal (https://github.com/openai/codex/issues/29922) — so for a
+Codex-detected client, the generic "prefer `--follow` with a streaming
+tool" sentence is replaced with an explicit warning that `--follow` will
+not notify it and to use `ModeOnce`, re-run each time it completes,
+instead.
+
 Expected steady-state loop: `hub_connect` → run `wait --follow` (or
 `ModeOnce`, re-run each time) in the background → harness notifies on each
 delivery → Claude reads the message(s) directly from that command's stdout

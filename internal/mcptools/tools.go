@@ -90,6 +90,34 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 }
 
+// clientName reads the connecting MCP client's self-reported name from the
+// standard MCP `initialize` handshake (clientInfo.name) — empty if the
+// underlying transport/session doesn't expose it. This lets hub_connect's
+// result tailor its background-delivery guidance to what the connecting
+// harness actually supports, rather than assuming every harness behaves
+// like Claude Code.
+func clientName(ctx context.Context) string {
+	cs := server.ClientSessionFromContext(ctx)
+	if cs == nil {
+		return ""
+	}
+	withInfo, ok := cs.(server.SessionWithClientInfo)
+	if !ok {
+		return ""
+	}
+	return withInfo.GetClientInfo().Name
+}
+
+// looksLikeCodex is a loose, case-insensitive substring match rather than
+// an exact one, since OpenAI's own docs show clientInfo.name varying by
+// integration (e.g. "codex_vscode") and we'd rather over- than
+// under-detect here — the cost of a false positive (an accurate but
+// unnecessary warning) is much lower than a false negative (Codex silently
+// told to use --follow, which it cannot act on).
+func looksLikeCodex(name string) bool {
+	return strings.Contains(strings.ToLower(name), "codex")
+}
+
 func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if h.conn != nil {
 		return mcp.NewToolResultError("already connected; call hub_disconnect first"), nil
@@ -137,11 +165,22 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			"backgrounded via a tool that can stream a long-running process's output as it "+
 			"happens (e.g. a \"Monitor\"-style tool), if your harness has one; otherwise use "+
 			"once mode above:\n"+
-			"      %s\n"+
-			"When you connect to mcp-hub, use wait --follow with your Monitor/background-"+
-			"streaming tool directly — don't wrap it in a manual loop or a tee/grep pipeline.",
+			"      %s",
 		w.WaitCommand(), w.WaitFollowCommand(),
 	)
+	if looksLikeCodex(clientName(ctx)) {
+		waitBlock += "\nWARNING: detected Codex as the connecting client. As of writing, " +
+			"Codex CLI has no built-in way to be woken by new output from a still-running " +
+			"background process (this is an open, unshipped proposal — " +
+			"https://github.com/openai/codex/issues/29922); it relies on polling or " +
+			"blocking instead. --follow will NOT notify you here even though it's shown " +
+			"above for other harnesses. Use the once-mode command instead, and run it " +
+			"again every time it completes."
+	} else {
+		waitBlock += "\nWhen you connect to mcp-hub, use wait --follow with your Monitor/" +
+			"background-streaming tool directly — don't wrap it in a manual loop or a " +
+			"tee/grep pipeline."
+	}
 
 	invite := fmt.Sprintf(
 		"Propose this to the user so they can copy it to whoever else should join:\n"+

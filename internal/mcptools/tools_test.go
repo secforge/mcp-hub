@@ -10,6 +10,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/secforge/mcp-hub/internal/wire"
 	"github.com/secforge/mcp-hub/internal/wsserver"
@@ -20,6 +21,37 @@ func startTestServer(t *testing.T) string {
 	srv := httptest.NewServer(wsserver.NewHandler())
 	t.Cleanup(srv.Close)
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+// fakeClientSession is a minimal server.SessionWithClientInfo, used to put
+// a specific clientInfo.name into a handler's context the same way a real
+// MCP `initialize` handshake would, so tests can exercise Codex-detection
+// without a real client connection.
+type fakeClientSession struct {
+	id         string
+	clientInfo mcp.Implementation
+}
+
+func (f *fakeClientSession) SessionID() string                                   { return f.id }
+func (f *fakeClientSession) NotificationChannel() chan<- mcp.JSONRPCNotification { return nil }
+func (f *fakeClientSession) Initialize()                                         {}
+func (f *fakeClientSession) Initialized() bool                                   { return true }
+func (f *fakeClientSession) GetClientInfo() mcp.Implementation                   { return f.clientInfo }
+func (f *fakeClientSession) SetClientInfo(info mcp.Implementation)               { f.clientInfo = info }
+func (f *fakeClientSession) GetClientCapabilities() mcp.ClientCapabilities {
+	return mcp.ClientCapabilities{}
+}
+func (f *fakeClientSession) SetClientCapabilities(mcp.ClientCapabilities) {}
+
+// ctxWithClientName returns a context carrying a fake client session
+// reporting the given clientInfo.name, as server.ClientSessionFromContext
+// would see it for a real connection.
+func ctxWithClientName(name string) context.Context {
+	srv := server.NewMCPServer("test", "0.0.0")
+	return srv.WithContext(context.Background(), &fakeClientSession{
+		id:         "fake-session",
+		clientInfo: mcp.Implementation{Name: name},
+	})
 }
 
 func TestConnectResultMentionsFollowModeAndMonitorGuidance(t *testing.T) {
@@ -44,6 +76,50 @@ func TestConnectResultMentionsFollowModeAndMonitorGuidance(t *testing.T) {
 	}
 	if !strings.Contains(text, hub.waiter.WaitCommand()) || !strings.Contains(text, hub.waiter.WaitFollowCommand()) {
 		t.Fatalf("expected the result to include both the once and follow commands, got: %s", text)
+	}
+}
+
+func TestConnectResultWarnsCodexAgainstFollow(t *testing.T) {
+	url := startTestServer(t)
+	ctx := ctxWithClientName("codex")
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000"}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	text := textOf(res)
+	if !strings.Contains(text, "WARNING") || !strings.Contains(text, "Codex") {
+		t.Fatalf("expected a Codex-specific warning, got: %s", text)
+	}
+	if !strings.Contains(text, "will NOT notify you") {
+		t.Fatalf("expected the warning to say --follow won't notify Codex, got: %s", text)
+	}
+	if strings.Contains(text, "Monitor/background-streaming tool directly") {
+		t.Fatalf("expected the generic Monitor guidance to be replaced, not appended, got: %s", text)
+	}
+}
+
+func TestConnectResultDoesNotWarnNonCodexClients(t *testing.T) {
+	url := startTestServer(t)
+	ctx := ctxWithClientName("claude-code")
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000"}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	text := textOf(res)
+	if strings.Contains(text, "WARNING") {
+		t.Fatalf("expected no Codex warning for a non-Codex client, got: %s", text)
 	}
 }
 
