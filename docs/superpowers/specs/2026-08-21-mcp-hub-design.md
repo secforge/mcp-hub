@@ -197,34 +197,31 @@ Two things bound the reuse itself:
   it. Both the reuse and the collision-avoidance decision happen under
   `s.mu`, in the same locked section as the rest of `Join`, for the same
   atomicity reasons described above.
-- Identity is scoped to "the same still-alive channel" — not to the secret
-  indefinitely. See "Identity persistence across a server restart" below
-  for exactly what that means now that the mapping survives more than the
-  in-memory `Session` object.
+- Identity, once established for a `reconnectSecret`, persists
+  indefinitely — see "Identity persistence beyond the in-memory Session"
+  below.
 
-### Identity persistence across a server restart
+### Identity persistence beyond the in-memory Session
 
 `secretToPeerID` used to live purely in the in-memory `Session`, so *any*
 server restart silently reset every peer's identity, even a peer that still
 held the exact `reconnectSecret` it always had — found from a real
 production incident where this was surprising in practice. Fixed by
 `internal/identitystore`: `Session` now durably persists (and, on
-`newSession`, reloads) that mapping to a small per-session file, so it
-survives a restart while still respecting the original "same still-alive
-channel" scoping for an *intentional* teardown:
+`newSession`, reloads) that mapping to a small per-session file.
 
-- **Restart** (the process dies and a new one starts): not a deliberate end
-  of the channel, just an interruption — `newSession(id)` calls
-  `identitystore.Load(id)`, so a fresh `Session` created for a `sessionId`
-  that was already in use picks up whatever mapping was last persisted for
-  it. A reconnecting peer presenting the same secret is recognized exactly
-  as if the server had never restarted.
-- **Intentional teardown** (the session's last peer leaves): still forgets
-  the mapping, same as before restart-persistence existed —
-  `Manager.Remove` (called exactly when a session becomes empty) now also
-  calls `identitystore.Delete(id)`, removing the persisted file. A later
-  connection with that same secret, even after this point, gets a fresh
-  peerId — the channel deliberately ended, so its identities end with it.
+This survives more than just a restart. An earlier version of this design
+also had `Manager.Remove` (called exactly when a session becomes empty)
+delete the persisted mapping, on the reasoning that "the same still-alive
+channel" scoping should mean an intentional teardown forgets identity too.
+That was explicitly reversed: `reconnectSecret` identity is meant to work
+even if the session was fully torn down (everyone left) and only later
+reconstituted by a new connection reusing the same `sessionId` — so
+`Manager.Remove` no longer touches the persisted file at all, only the
+in-memory `Session`. There is currently no expiry or cleanup for these
+files, matching this project's existing PoC-log precedent (also never
+rotated/cleaned) — a mapping, once written, is recognized for as long as
+the file exists.
 
 The persisted file (`<sessionId>.secrets.json`, in the same
 `MCP_HUB_LOG_DIR` the session log uses) never contains a `reconnectSecret`'s
@@ -244,14 +241,15 @@ it as a well-formed UUID (`wire.IsValidID`) itself, independently of
 `wsserver` already rejecting a malformed `sessionId` before a session is
 ever created — defense in depth rather than trusting a single caller's
 validation to hold forever. `path()` returns an error for anything else;
-`Load`/`Delete` treat that the same as "nothing persisted"/"nothing to
-delete" rather than propagating it, since neither has a meaningful error
-path back to its caller. `TestPathTraversalSessionIDIsRejected`
-(`internal/identitystore`) is the regression test.
+`Load` treats that the same as "nothing persisted" rather than propagating
+it, since it has no meaningful error path back to its caller.
+`TestPathTraversalSessionIDIsRejected` (`internal/identitystore`) is the
+regression test.
 
 `TestReconnectSecretSurvivesSimulatedServerRestart` and
-`TestReconnectSecretDoesNotSurviveIntentionalTeardown` (`internal/hubsession`)
-are the regression tests for the two restart/teardown halves.
+`TestReconnectSecretSurvivesIntentionalTeardown` (`internal/hubsession`)
+are the regression tests for the restart and teardown halves respectively
+— both now prove the mapping *does* survive, matching the reversal above.
 
 ### Protocol versioning
 

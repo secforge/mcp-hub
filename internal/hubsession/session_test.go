@@ -220,12 +220,14 @@ func TestReconnectSecretSurvivesSimulatedServerRestart(t *testing.T) {
 	}
 }
 
-// TestReconnectSecretDoesNotSurviveIntentionalTeardown proves the other
-// half of the design: unlike a restart, the last peer leaving (Remove) is
-// treated as a deliberate end of the channel, and does forget the mapping
-// — even across a subsequent simulated restart, since the persisted file
-// was deleted, not just the in-memory state.
-func TestReconnectSecretDoesNotSurviveIntentionalTeardown(t *testing.T) {
+// TestReconnectSecretSurvivesIntentionalTeardown proves the mapping
+// survives even the session becoming fully empty and being torn down
+// (Manager.Remove) — not just a server restart. There's currently no
+// expiry/cleanup for persisted mappings at all (matching this project's
+// existing PoC-log precedent), so a peer reconnecting with the same secret
+// is recognized as the same identity no matter how long ago everyone else
+// left.
+func TestReconnectSecretSurvivesIntentionalTeardown(t *testing.T) {
 	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir())            // isolate persisted secretToPeerID from other tests
 	sessionID := "6ba7b810-9dad-11d1-80b4-00c04fd430c8" // must be a valid UUID - identitystore validates it
 	secret := "super-secret-token"
@@ -242,8 +244,8 @@ func TestReconnectSecretDoesNotSurviveIntentionalTeardown(t *testing.T) {
 	m2 := NewManager()
 	s2 := m2.GetOrCreate(sessionID)
 	second := joinFake(s2, "Alice", "", secret, nil)
-	if second.ID() == firstID {
-		t.Fatal("expected a fresh peerID after an intentional teardown (Remove), even with the same reconnectSecret")
+	if second.ID() != firstID {
+		t.Fatalf("expected the reconnectSecret to survive an intentional teardown (Remove) and reuse peerID %q, got %q", firstID, second.ID())
 	}
 }
 

@@ -188,14 +188,15 @@ func (m *Manager) GetOrCreate(id string) *Session {
 	return s
 }
 
-// Remove tears a session down for good — called when its last peer leaves.
-// This is the one thing that forgets a session's reconnectSecret mapping
-// permanently (identitystore.Delete): unlike a server restart, an
-// intentional "everyone's gone" teardown is a deliberate end of the
-// channel, not just an interruption.
+// Remove tears the in-memory Session down — called when its last peer
+// leaves. Its persisted reconnectSecret mapping (identitystore) is
+// deliberately left alone: a peer that reconnects later, even long after
+// everyone left and the session was fully torn down, still gets the same
+// peerID back for the same secret. There's currently no expiry or cleanup
+// for these files, matching this project's existing PoC-log precedent
+// (also never rotated/cleaned) — see identitystore's own doc comment.
 func (m *Manager) Remove(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
 	m.mu.Unlock()
-	identitystore.Delete(id)
 }

@@ -1,9 +1,13 @@
 // Package identitystore durably persists the mapping a
 // hubsession.Session uses to reassign a peerId when a reconnectSecret
-// matches a prior, now-departed connection's — so that mapping survives a
-// server restart, not just individual peer disconnects. It never persists
-// a reconnectSecret's own value, only a one-way hash of it, so the file at
-// rest can't be replayed to impersonate anyone even if read.
+// matches a prior connection's — so that mapping survives a server
+// restart and the session itself being fully torn down (its last peer
+// leaving), not just individual peer disconnects. There is currently no
+// expiry or cleanup: a mapping persists indefinitely once written,
+// matching this project's existing PoC-log precedent (also never
+// rotated/cleaned). It never persists a reconnectSecret's own value, only
+// a one-way hash of it, so the file at rest can't be replayed to
+// impersonate anyone even if read.
 package identitystore
 
 import (
@@ -87,17 +91,4 @@ func Save(sessionID string, mapping map[string]string) error {
 		return err
 	}
 	return os.Rename(tmp, target)
-}
-
-// Delete removes a session's persisted mapping, if any — called when a
-// session is deliberately torn down (its last peer left), as opposed to a
-// server restart: identity is scoped to "the same still-alive channel," so
-// an intentional end of that channel should end persisted identity too,
-// while an unplanned restart should not.
-func Delete(sessionID string) {
-	p, err := path(sessionID)
-	if err != nil {
-		return
-	}
-	_ = os.Remove(p)
 }

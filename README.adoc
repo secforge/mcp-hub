@@ -149,9 +149,9 @@ collision) — this is deliberately *not* tied to `agePublicKey`: since that
 key is broadcast to every other peer, using it for identity reuse would let
 anyone who merely observed it on the wire impersonate you by reconnecting
 with the same key. This mapping is durably persisted (hashed, never the
-secret itself — see `internal/identitystore`) and survives a server
-restart; only the session's last peer leaving forgets it, since that's a
-deliberate end of the channel rather than an interruption.
+secret itself — see `internal/identitystore`) and survives both a server
+restart and the session becoming fully empty — there's currently no expiry
+or cleanup for it, so it's recognized for as long as the file exists.
 +
 If `name`/`agePublicKey` was given, the result confirms what other peers
 can now see for you — including the sanitized name, if it differs from
