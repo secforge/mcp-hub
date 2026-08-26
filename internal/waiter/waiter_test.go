@@ -3,6 +3,7 @@ package waiter
 import (
 	"io"
 	"net"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -125,6 +126,48 @@ func TestNewWaiterSupersedesOld(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the new waiter's delivery")
+	}
+}
+
+func TestSocketPathStaysWithinUnixSocketPathLimit(t *testing.T) {
+	// Real sessionId/peerId are both 36-char UUIDs. Unix-domain sockets have a
+	// 108-byte sun_path limit on Linux, macOS, AND Windows' AF_UNIX - the
+	// filename portion alone must leave generous headroom for the OS temp
+	// directory (which on Windows can itself be 40-50+ chars).
+	src := &fakeSource{connected: true}
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	peerID := "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	w, err := Listen(sessionID, peerID, src)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer w.Close()
+
+	filename := filepath.Base(w.socketPath)
+	if len(filename) > 50 {
+		t.Fatalf("socket filename too long (%d bytes), leaves no headroom under the 108-byte "+
+			"sun_path limit once combined with a temp dir: %q", len(filename), filename)
+	}
+}
+
+func TestSocketPathDiffersForDifferentPeers(t *testing.T) {
+	src := &fakeSource{connected: true}
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	w1, err := Listen(sessionID, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", src)
+	if err != nil {
+		t.Fatalf("listen 1: %v", err)
+	}
+	defer w1.Close()
+
+	w2, err := Listen(sessionID, "6ba7b811-9dad-11d1-80b4-00c04fd430c8", src)
+	if err != nil {
+		t.Fatalf("listen 2: %v", err)
+	}
+	defer w2.Close()
+
+	if w1.socketPath == w2.socketPath {
+		t.Fatalf("expected distinct socket paths for distinct peerIds, both got %q", w1.socketPath)
 	}
 }
 

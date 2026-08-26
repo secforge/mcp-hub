@@ -156,7 +156,7 @@ background, e.g.:
 
 [source]
 ----
-/absolute/path/to/mcp-hub/bin/mcp-hub-client wait --socket /tmp/mcp-hub-wait-<sessionId>-<peerId>.sock
+/absolute/path/to/mcp-hub/bin/mcp-hub-client wait --socket /tmp/mcp-hub-wait-<hash>.sock
 ----
 
 Run that via a backgroundable shell tool (in Claude Code, `Bash` with

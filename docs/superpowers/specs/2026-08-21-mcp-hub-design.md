@@ -259,15 +259,25 @@ mcp-hub-client wait --socket <path>
 ```
 
 - On a successful `hub_connect`, the MCP process opens a Unix domain socket at
-  a path derived from both the `sessionId` and the `peerId` it was just
-  assigned: `<tmpdir>/mcp-hub-wait-<sessionId>-<peerId>.sock`. `peerId` is
-  included (not just `sessionId`) because two separate `mcp-hub-client`
+  `<tmpdir>/mcp-hub-wait-<hash>.sock`, where `<hash>` is 16 hex characters
+  from `SHA-256(sessionId + "-" + peerId)`. Both `sessionId` and `peerId` feed
+  the hash (not just `sessionId`) because two separate `mcp-hub-client`
   processes on the same host can join the same session — e.g. two local
   Claude Code instances talking to each other, the primary use case — and a
-  path keyed on `sessionId` alone would collide between them. This socket is
-  unrelated to the hub websocket connection itself — it's purely local IPC
-  between the MCP process and `wait` invocations of the same binary. It's torn
-  down on `hub_disconnect()` (after releasing any waiter).
+  path keyed on `sessionId` alone would collide between them. The hash (not
+  the raw UUIDs) keeps the filename short: Unix-domain sockets have a
+  108-byte `sun_path` limit on Linux, macOS, *and* Windows' AF_UNIX
+  implementation, and two 36-char UUIDs embedded directly would already
+  consume ~91 bytes before the OS temp directory is even joined in — on
+  Windows in particular, `%TEMP%` is often 40-50+ bytes on its own, so the
+  combined path silently exceeded the limit and `net.Listen` failed. When
+  that happened, `hub_connect` closed the connection it had just opened
+  (since the wait socket is required), producing a join immediately followed
+  by a leave in the same second — the actual failure mode this was fixed to
+  avoid. This socket is unrelated to the hub websocket connection itself —
+  it's purely local IPC between the MCP process and `wait` invocations of the
+  same binary. It's torn down on `hub_disconnect()` (after releasing any
+  waiter).
 - `wait` connects to that socket and blocks on a single-byte read, then acts on
   what it receives, prints a short result to stdout, and always exits 0 (a
   wake-up is a normal outcome, never a process error):

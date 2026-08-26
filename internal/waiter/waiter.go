@@ -1,6 +1,7 @@
 package waiter
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"os"
@@ -35,7 +36,7 @@ type Waiter struct {
 // connection to this socket may be pending at a time; a new connection
 // supersedes any previously registered one.
 func Listen(sessionID, peerID string, source Source) (*Waiter, error) {
-	path := filepath.Join(os.TempDir(), "mcp-hub-wait-"+sessionID+"-"+peerID+".sock")
+	path := socketPath(sessionID, peerID)
 	_ = os.Remove(path) // stale socket from a crashed prior run
 	ln, err := net.Listen("unix", path)
 	if err != nil {
@@ -44,6 +45,21 @@ func Listen(sessionID, peerID string, source Source) (*Waiter, error) {
 	w := &Waiter{source: source, ln: ln, socketPath: path}
 	go w.acceptLoop()
 	return w, nil
+}
+
+// socketPath derives a short, fixed-length wait-socket filename from
+// (sessionID, peerID) instead of embedding both raw UUIDs. Unix-domain
+// sockets have a 108-byte sun_path limit on Linux, macOS, and Windows'
+// AF_UNIX implementation; two 36-char UUIDs plus the surrounding literal
+// text alone already total ~91 bytes, leaving no headroom for the OS temp
+// directory once it's joined in (on Windows in particular, %TEMP% is often
+// 40-50+ bytes) — net.Listen then fails, and the caller closes the
+// connection it just opened, producing an immediate join-then-leave. A
+// truncated SHA-256 hash keeps collision risk negligible for this
+// short-lived, single-host use while staying well under the limit.
+func socketPath(sessionID, peerID string) string {
+	sum := sha256.Sum256([]byte(sessionID + "-" + peerID))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-hub-wait-%x.sock", sum[:8]))
 }
 
 // WaitCommand is the exact command Claude should run in the background to
