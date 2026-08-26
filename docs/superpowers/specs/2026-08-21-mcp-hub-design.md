@@ -535,26 +535,33 @@ the stream exactly as they would for a one-shot `wait`).
 
 This exists because the default `ModeOnce` flow assumes a harness whose
 background-task notification fires on process *completion* — which is what
-Claude Code's own backgroundable shell tool does, and is why `ModeOnce` is
-the default `hub_connect` instructs Claude to use. A harness observed
-wrapping the one-shot `wait` in its own `while true; do wait --socket ...;
-done` shell loop instead — which works, but means that harness's
-process-completion notification never fires (the loop never exits), so it
-must fall back to polling that background process's output some other way.
-For a harness with a tool that notifies per *line* of new output from a
-long-running background process (this project's own dev environment has
-`Monitor` for exactly that), `--follow` is a better fit than either the
-default `ModeOnce` loop or a hand-rolled shell wrapper: one long-lived
-connection, no per-message process-respawn, and a notification per delivered
-chunk. It is not the default specifically because Claude Code's own
-background-task notification — the mechanism this project is built around —
-only fires on completion, and `--follow`'s connection deliberately never
-completes.
+Claude Code's own backgroundable shell tool does. For a harness with a tool
+that notifies per *line* of new output from a long-running background
+process instead (this project's own dev environment has `Monitor` for
+exactly that), `--follow` is a better fit: one long-lived connection, no
+per-message process-respawn, and a notification per delivered chunk.
 
-Expected steady-state loop: `hub_connect` → run `wait` in the background →
-harness notifies on completion → Claude reads the message(s) directly from
-that command's stdout, processes them, and runs `wait` again. No additional
-tool call is required in the steady state.
+`hub_connect`'s result text gives Claude both commands up front and states
+the choice explicitly — see `mcptools.waitBlock` — rather than leaving
+Claude to default to `ModeOnce` and rediscover `--follow` on its own: prefer
+`--follow` backgrounded via a Monitor-style tool when the harness has one,
+falling back to the `ModeOnce` run-it-again loop otherwise. It also says
+explicitly: use the streaming tool *directly* on `--follow`, don't wrap it
+in a hand-rolled shell loop or a manual `tee`/`grep` filter pipeline — a
+harness with a real per-line notification tool was observed doing exactly
+that anyway (`while true; do wait --socket ...; done | tee -a <logfile> |
+grep -E "..."`), which works but is unnecessary in that case: it defeats
+`--follow`'s one-connection design (the loop keeps respawning `wait`) and
+`grep`'s per-line filtering can silently drop the body lines of a
+multi-line message (only the `[HUB MESSAGE...]` header line matches the
+filter pattern) from what's shown, even though `tee` preserves everything
+in the log file untouched.
+
+Expected steady-state loop: `hub_connect` → run `wait --follow` (or
+`ModeOnce`, re-run each time) in the background → harness notifies on each
+delivery → Claude reads the message(s) directly from that command's stdout
+and processes them. No additional tool call is required in the steady
+state.
 
 ## Error handling
 

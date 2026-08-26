@@ -220,8 +220,15 @@ default one-shot `wait` (run again each time it completes) fits a plain
 backgroundable shell tool best. `--follow` instead fits a harness with a
 way to get notified per line of new output from a still-running background
 process (this project's dev environment uses a `Monitor`-style tool for
-that) — Claude is told to prefer `--follow` there instead of wrapping the
-one-shot command in a hand-rolled polling loop.
+that) — Claude is told explicitly to prefer `--follow` there, run
+*directly* with that tool rather than wrapped in a hand-rolled shell loop
+or a manual `tee`/`grep` filter. That's not a hypothetical: a harness with
+a real per-line notification tool was observed doing exactly that anyway,
+which works but is redundant with what `--follow` and the streaming tool
+already provide, and `grep`'s per-line filtering can silently drop a
+multi-line message's body from what's shown (only the header line matches
+a keyword pattern) even though `tee` preserves the raw stream untouched in
+the log file.
 
 Every delivered broadcast message is wrapped as:
 

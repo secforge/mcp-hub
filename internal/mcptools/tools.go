@@ -135,7 +135,9 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			"backgrounded via a tool that can stream a long-running process's output as it "+
 			"happens (e.g. a \"Monitor\"-style tool), if your harness has one; otherwise use "+
 			"once mode above:\n"+
-			"      %s",
+			"      %s\n"+
+			"When you connect to mcp-hub, use wait --follow with your Monitor/background-"+
+			"streaming tool directly — don't wrap it in a manual loop or a tee/grep pipeline.",
 		w.WaitCommand(), w.WaitFollowCommand(),
 	)
 
