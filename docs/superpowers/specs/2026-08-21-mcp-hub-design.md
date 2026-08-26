@@ -283,9 +283,11 @@ mcp-hub-client wait --socket <path>
   it's purely local IPC between the MCP process and `wait` invocations of the
   same binary. It's torn down on `hub_disconnect()` (after releasing any
   waiter).
-- `wait` connects to that socket and blocks on a single-byte read, then acts on
-  what it receives, prints a short result to stdout, and always exits 0 (a
-  wake-up is a normal outcome, never a process error):
+- `wait` connects to that socket and, as the very first thing, sends one mode
+  byte: `0x00` (`ModeOnce`, the default) or `0x01` (`ModeFollow`, only with
+  `--follow` — see below). It then blocks on a read, acts on what it
+  receives, prints a short result to stdout, and always exits 0 (a wake-up is
+  a normal outcome, never a process error):
   - **`message` available** — the server drains the buffer, formats the
     event(s) exactly as `hub_receive()` would (including the untrusted
     wrapper), sends them down the socket, and `wait` prints them followed by a
@@ -306,6 +308,34 @@ mcp-hub-client wait --socket <path>
   pending waiter. This closes the gap between "nothing was buffered a moment
   ago" and "the `wait` process actually started" (including the moment right
   after `hub_connect` returns).
+
+### `wait --follow`: an alternative for harnesses with per-line notifications
+
+`mcp-hub-client wait --socket <path> --follow` sends `ModeFollow` instead of
+`ModeOnce`. In this mode the server does *not* close the connection after one
+delivery — it writes `<formatted events>\n\n` (no "run again" trailer, since
+none is needed) and keeps the same connection registered as the current
+waiter for the *next* event too, repeating indefinitely until the connection
+is superseded by a new `wait` or the hub disconnects (both of which still end
+the stream exactly as they would for a one-shot `wait`).
+
+This exists because the default `ModeOnce` flow assumes a harness whose
+background-task notification fires on process *completion* — which is what
+Claude Code's own backgroundable shell tool does, and is why `ModeOnce` is
+the default `hub_connect` instructs Claude to use. A harness observed
+wrapping the one-shot `wait` in its own `while true; do wait --socket ...;
+done` shell loop instead — which works, but means that harness's
+process-completion notification never fires (the loop never exits), so it
+must fall back to polling that background process's output some other way.
+For a harness with a tool that notifies per *line* of new output from a
+long-running background process (this project's own dev environment has
+`Monitor` for exactly that), `--follow` is a better fit than either the
+default `ModeOnce` loop or a hand-rolled shell wrapper: one long-lived
+connection, no per-message process-respawn, and a notification per delivered
+chunk. It is not the default specifically because Claude Code's own
+background-task notification — the mechanism this project is built around —
+only fires on completion, and `--follow`'s connection deliberately never
+completes.
 
 Expected steady-state loop: `hub_connect` → run `wait` in the background →
 harness notifies on completion → Claude reads the message(s) directly from

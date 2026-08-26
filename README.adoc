@@ -176,6 +176,20 @@ prints → run `wait` again.
 `hub_receive()` still exists for a manual, non-blocking check (e.g. right
 after connecting), but it is not required for the steady-state loop.
 
+==== `wait --follow`
+
+Add `--follow` to keep the same `wait` connection open across multiple
+deliveries instead of exiting after one — the server writes each new batch
+to it as it arrives (no "run again" trailer needed), until it's superseded
+by a newer `wait` or the hub disconnects. This is *not* what
+`hub_connect`'s instructions tell Claude to use by default: Claude Code's
+own background-task notification fires when a command *completes*, and a
+`--follow` connection deliberately never does. It exists for harnesses with
+a way to get notified per line of new output from a still-running
+background process instead (this project's dev environment uses a
+`Monitor`-style tool for that) — for those, `--follow` is a better fit than
+wrapping the default one-shot `wait` in a hand-rolled polling loop.
+
 Every delivered broadcast message is wrapped as:
 
 [source]

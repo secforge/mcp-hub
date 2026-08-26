@@ -20,21 +20,34 @@ type Source interface {
 	Drain() (formatted string, connected bool)
 }
 
+// Mode selector bytes a `wait` client sends as the first byte after
+// connecting, choosing how the server treats that connection.
+const (
+	ModeOnce   = 0x00 // deliver one event, then close (the default `wait` behavior)
+	ModeFollow = 0x01 // deliver events repeatedly over the same connection (`wait --follow`)
+)
+
+type registeredWaiter struct {
+	conn   net.Conn
+	follow bool
+}
+
 type Waiter struct {
 	source     Source
 	ln         net.Listener
 	socketPath string
 
 	mu      sync.Mutex
-	current net.Conn
+	current *registeredWaiter
 }
 
 // Listen opens the wait socket for this (sessionID, peerID) connection and
 // starts accepting connections. peerID is included in the path (not just
 // sessionID) so two separate mcp-hub-client processes joining the same
 // session on the same host don't collide on the same socket path. Only one
-// connection to this socket may be pending at a time; a new connection
-// supersedes any previously registered one.
+// connection to this socket may be registered at a time; a new connection
+// always supersedes any previously registered one, whether it was in "once"
+// or "follow" mode.
 func Listen(sessionID, peerID string, source Source) (*Waiter, error) {
 	path := socketPath(sessionID, peerID)
 	_ = os.Remove(path) // stale socket from a crashed prior run
@@ -63,7 +76,7 @@ func socketPath(sessionID, peerID string) string {
 }
 
 // WaitCommand is the exact command Claude should run in the background to
-// receive the next event.
+// receive the next event (the default, "once" mode).
 func (w *Waiter) WaitCommand() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -83,16 +96,23 @@ func (w *Waiter) acceptLoop() {
 }
 
 func (w *Waiter) handleAccept(conn net.Conn) {
+	mode := make([]byte, 1)
+	if n, err := conn.Read(mode); err != nil || n != 1 {
+		conn.Close()
+		return
+	}
+	rw := &registeredWaiter{conn: conn, follow: mode[0] == ModeFollow}
+
 	if hasEvents, connected := w.source.Peek(); hasEvents || !connected {
-		w.deliver(conn)
+		w.deliver(rw)
 		return
 	}
 	w.mu.Lock()
 	old := w.current
-	w.current = conn
+	w.current = rw
 	w.mu.Unlock()
 	if old != nil {
-		writeAndClose(old, "superseded by a newer wait\n")
+		writeAndClose(old.conn, "superseded by a newer wait\n")
 	}
 }
 
@@ -100,28 +120,53 @@ func (w *Waiter) handleAccept(conn net.Conn) {
 // the source currently has buffered.
 func (w *Waiter) Poke() {
 	w.mu.Lock()
-	conn := w.current
+	rw := w.current
 	w.current = nil
 	w.mu.Unlock()
-	if conn == nil {
+	if rw == nil {
 		return
 	}
-	w.deliver(conn)
+	w.deliver(rw)
 }
 
-func (w *Waiter) deliver(conn net.Conn) {
+func (w *Waiter) deliver(rw *registeredWaiter) {
 	formatted, connected := w.source.Drain()
 	if !connected {
-		writeAndClose(conn, "hub disconnected\n")
+		writeAndClose(rw.conn, "hub disconnected\n")
 		return
 	}
-	writeAndClose(conn, formatted+"\n\nRun this command again to keep receiving:\n"+w.WaitCommand()+"\n")
+	if !rw.follow {
+		writeAndClose(rw.conn, formatted+"\n\nRun this command again to keep receiving:\n"+w.WaitCommand()+"\n")
+		return
+	}
+
+	if _, err := rw.conn.Write([]byte(formatted + "\n\n")); err != nil {
+		rw.conn.Close()
+		return
+	}
+
+	// Re-register for the next event. If one is already pending (raced while
+	// we were writing), deliver it immediately instead of waiting for Poke.
+	if hasEvents, connected := w.source.Peek(); hasEvents || !connected {
+		w.deliver(rw)
+		return
+	}
+	w.mu.Lock()
+	if w.current != nil {
+		// A genuinely new connection claimed the slot while we were
+		// writing; it rightfully wins (see handleAccept) — we lose ours.
+		w.mu.Unlock()
+		writeAndClose(rw.conn, "superseded by a newer wait\n")
+		return
+	}
+	w.current = rw
+	w.mu.Unlock()
 }
 
 func (w *Waiter) Close() error {
 	w.mu.Lock()
 	if w.current != nil {
-		writeAndClose(w.current, "hub disconnected\n")
+		writeAndClose(w.current.conn, "hub disconnected\n")
 		w.current = nil
 	}
 	w.mu.Unlock()
