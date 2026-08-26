@@ -18,6 +18,8 @@ func FormatEvent(e Event) string {
 		return fmt.Sprintf("[peer %s left]", e.PeerID)
 	case "error":
 		return fmt.Sprintf("[HUB ERROR] %s", e.Text)
+	case "rosterComplete":
+		return "[hub: initial roster complete — you now know everyone who was already in the session]"
 	default:
 		return ""
 	}

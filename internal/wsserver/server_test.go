@@ -159,6 +159,70 @@ func TestJoinTellsNewPeerAboutExistingRoster(t *testing.T) {
 	}
 }
 
+func TestJoinedIncludesAccuratePeerCountAndServerVersion(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	a := dial(t, url, sessionID)
+	defer a.Close()
+	_, rawJoinedA := readTyped(t, a)
+	var joinedA wire.Joined
+	decodeJSON(t, rawJoinedA, &joinedA)
+	if joinedA.PeerCount != 0 {
+		t.Fatalf("a: expected peerCount 0 (first in session), got %d", joinedA.PeerCount)
+	}
+	if joinedA.ServerVersion != wire.ProtocolVersion {
+		t.Fatalf("a: expected serverVersion %d, got %d", wire.ProtocolVersion, joinedA.ServerVersion)
+	}
+
+	b := dial(t, url, sessionID)
+	defer b.Close()
+	_, rawJoinedB := readTyped(t, b)
+	var joinedB wire.Joined
+	decodeJSON(t, rawJoinedB, &joinedB)
+	if joinedB.PeerCount != 1 {
+		t.Fatalf("b: expected peerCount 1 (a already present), got %d", joinedB.PeerCount)
+	}
+}
+
+func TestConnectWithoutVersionQueryParamStillWorks(t *testing.T) {
+	// No "?v=" at all - simulates an older client, or any plain websocket
+	// client that doesn't know about version exchange. Must be treated as
+	// v1 and must not be rejected.
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	c, _, err := websocket.DefaultDialer.Dial(url+"/550e8400-e29b-41d4-a716-446655440000", nil)
+	if err != nil {
+		t.Fatalf("dial without version param should still succeed: %v", err)
+	}
+	defer c.Close()
+	typ, _ := readTyped(t, c)
+	if typ != wire.TypeJoined {
+		t.Fatalf("expected joined, got %s", typ)
+	}
+}
+
+func TestConnectWithVersionQueryParamAlsoWorks(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	c, _, err := websocket.DefaultDialer.Dial(url+"/550e8400-e29b-41d4-a716-446655440000?v=1", nil)
+	if err != nil {
+		t.Fatalf("dial with version param should succeed: %v", err)
+	}
+	defer c.Close()
+	typ, _ := readTyped(t, c)
+	if typ != wire.TypeJoined {
+		t.Fatalf("expected joined, got %s", typ)
+	}
+}
+
 func TestDirectedMessageGoesOnlyToTarget(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("MCP_HUB_LOG_DIR", dir)

@@ -65,6 +65,64 @@ func TestJoinNotifiesNewPeerAboutExistingPeers(t *testing.T) {
 	}
 }
 
+func TestRegisterReportsExistingCountBeforeVisible(t *testing.T) {
+	m := NewManager()
+	s := m.GetOrCreate("session-1")
+	a := &fakePeer{id: "a"}
+	b := &fakePeer{id: "b"}
+	s.Join(a)
+
+	var reportedCount int
+	c := &fakePeer{id: "c"}
+	existingIDs := s.Register(c, func(count int) { reportedCount = count })
+
+	if reportedCount != 1 {
+		t.Fatalf("expected beforeVisible to report 1 existing peer, got %d", reportedCount)
+	}
+	if len(existingIDs) != 1 || existingIDs[0] != "a" {
+		t.Fatalf("expected existingIDs [a], got %v", existingIDs)
+	}
+
+	// b joining now must not see c yet - AnnounceRoster hasn't run, so c
+	// isn't part of the roster b gets told about... but c IS already
+	// visible to broadcasts/DeliverTo, since Register alone makes it so.
+	s.Join(b)
+	sawC := false
+	for _, ev := range b.received {
+		if pe, ok := ev.(wire.PeerEvent); ok && pe.PeerID == "c" {
+			sawC = true
+		}
+	}
+	if !sawC {
+		t.Fatal("expected b to be told about c too, since c was registered (visible) before b joined")
+	}
+}
+
+func TestAnnounceRosterTellsNewPeerAndBroadcastsItsJoin(t *testing.T) {
+	m := NewManager()
+	s := m.GetOrCreate("session-1")
+	a := &fakePeer{id: "a"}
+	s.Join(a)
+	a.received = nil
+
+	c := &fakePeer{id: "c"}
+	existingIDs := s.Register(c, func(int) {})
+	s.AnnounceRoster(c, existingIDs)
+
+	if len(c.received) != 1 {
+		t.Fatalf("expected c to be told about a, got %d events: %+v", len(c.received), c.received)
+	}
+	if pe, ok := c.received[0].(wire.PeerEvent); !ok || pe.PeerID != "a" {
+		t.Fatalf("unexpected event for c: %+v", c.received[0])
+	}
+	if len(a.received) != 1 {
+		t.Fatalf("expected a to be told about c's join, got %d events: %+v", len(a.received), a.received)
+	}
+	if pe, ok := a.received[0].(wire.PeerEvent); !ok || pe.PeerID != "c" {
+		t.Fatalf("unexpected event for a: %+v", a.received[0])
+	}
+}
+
 func TestBroadcastExcludesSender(t *testing.T) {
 	m := NewManager()
 	s := m.GetOrCreate("session-1")

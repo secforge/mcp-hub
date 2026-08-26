@@ -6,12 +6,12 @@ import (
 )
 
 func TestJoinedRoundTrip(t *testing.T) {
-	j := NewJoined("550e8400-e29b-41d4-a716-446655440000")
+	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 3)
 	raw, err := json.Marshal(j)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000"}` {
+	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","peerCount":3,"serverVersion":1}` {
 		t.Fatalf("unexpected json: %s", got)
 	}
 	typ, err := DecodeType(raw)
@@ -20,6 +20,22 @@ func TestJoinedRoundTrip(t *testing.T) {
 	}
 	if typ != TypeJoined {
 		t.Fatalf("got type %q, want %q", typ, TypeJoined)
+	}
+}
+
+func TestNewJoinedStampsCurrentProtocolVersion(t *testing.T) {
+	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0)
+	if j.ServerVersion != ProtocolVersion {
+		t.Fatalf("got ServerVersion %d, want %d", j.ServerVersion, ProtocolVersion)
+	}
+}
+
+func TestProtocolVersionIsOne(t *testing.T) {
+	// The explicit baseline: everything shipped before version exchange
+	// existed is retroactively "v1", and absence of a client-sent version
+	// must be treated as v1 too (see wsserver's clientVersion parsing).
+	if ProtocolVersion != 1 {
+		t.Fatalf("got ProtocolVersion %d, want 1", ProtocolVersion)
 	}
 }
 

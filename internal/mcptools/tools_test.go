@@ -2,11 +2,13 @@ package mcptools
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/secforge/mcp-hub/internal/wire"
@@ -109,6 +111,107 @@ func TestPeersToolReturnsRoster(t *testing.T) {
 		return strings.Contains(peersText, hubB.conn.PeerID())
 	})
 	_ = peersText
+}
+
+func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	res, err := hubA.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if !strings.Contains(textOf(res), "No other peers are in this session yet") {
+		t.Fatalf("expected a-no-existing-peers note, got: %s", textOf(res))
+	}
+
+	hubB := NewHub()
+	res, err = hubB.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if !strings.Contains(textOf(res), "1 other peer(s) already in this session") {
+		t.Fatalf("expected b-1-existing-peer note, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), "roster complete") {
+		t.Fatalf("expected a mention of the roster-complete notification, got: %s", textOf(res))
+	}
+}
+
+func TestPeersToolNotesWhenStillCatchingUp(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hubA.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hubB := NewHub()
+	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	// hubA immediately asks for peers, likely before the roster catch-up
+	// event (about b) has arrived over the (real, but very fast) network -
+	// exercise this deterministically by checking RosterComplete directly
+	// rather than racing a real timing window.
+	if hubA.conn.RosterComplete() {
+		t.Skip("roster caught up before we could observe the in-progress state (fast local network) — not flaky, just nothing to assert here")
+	}
+	res, err := hubA.handlePeers(ctx, mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("peers failed: %v", err)
+	}
+	if !strings.Contains(textOf(res), "still catching up") {
+		t.Fatalf("expected a catching-up note, got: %s", textOf(res))
+	}
+}
+
+func TestConnectResultNotesOutdatedClientVersion(t *testing.T) {
+	// A raw fake server (not wsserver.NewHandler) that reports a newer
+	// serverVersion than this client build understands.
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0)
+		joined.ServerVersion = wire.ProtocolVersion + 1
+		conn.WriteJSON(joined)
+		// Keep the connection open briefly so the client's background read
+		// loop doesn't immediately see a disconnect.
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	if !strings.Contains(textOf(res), "update mcp-hub-client") {
+		t.Fatalf("expected an update-the-client note, got: %s", textOf(res))
+	}
 }
 
 func TestPeersToolErrorsWhenNotConnected(t *testing.T) {

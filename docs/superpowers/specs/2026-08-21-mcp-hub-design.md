@@ -36,8 +36,8 @@ an explicit `{"type":"join",...}` first message; that has been fully
 replaced by this URL-based form.
 
 ```
-GET /<sessionId>  (upgrade to websocket)
-← {"type":"joined","peerId":"<uuid>"}          // sent immediately, no join message needed
+GET /<sessionId>?v=<protocolVersion>  (upgrade to websocket; ?v= optional, see "Protocol versioning")
+← {"type":"joined","peerId":"<uuid>","peerCount":<int>,"serverVersion":<int>}   // sent immediately
 ← {"type":"peerJoined","peerId":"<uuid>"}      // one per peer already in the session (see "Roster on join" below)
 ← {"type":"error","message":"..."}
 
@@ -87,10 +87,65 @@ Rules:
 A newly joined peer is told about every peer already in the session, using
 the same `peerJoined` event they'd have seen had they been connected at the
 time — one event per existing peer, sent right after `joined` and before
-anything else. This means a client never has to guess who else might already
-be present: after reading `joined` and draining the immediately-following
-`peerJoined` events, it has the complete current roster. Existing peers are,
-as before, told about the *new* peer via a single broadcast `peerJoined`.
+anything else. `joined.peerCount` tells the client exactly how many
+`peerJoined` events to expect for this initial catch-up, so it has a
+concrete, *notifiable* signal for "the roster is now complete" — see
+`hubconn.Conn`'s synthetic `rosterComplete` event below, and
+`docs`/README for how that surfaces to the model. Existing peers are, as
+before, told about the *new* peer via a single broadcast `peerJoined`.
+
+`peerCount` is computed and the peer registered into the session
+*atomically*, under the same lock (`hubsession.Session.Register`), and only
+`beforeVisible` (used by the server to send `joined` itself) runs before the
+peer becomes visible to any other peer's broadcast/DeliverTo. This
+guarantees two things: the reported count can never drift from what the
+roster events that follow will actually deliver (no race), and this peer
+can never receive anything else on the wire before its own `joined`
+confirmation.
+
+Client-side (`hubconn.Conn`), once exactly `peerCount` `peerJoined` events
+have been seen (or immediately, if `peerCount` is `0`), a synthetic local
+`rosterComplete` event is appended to the same buffer `wait`/`hub_receive`
+already drain — so it's a real notification through the existing delivery
+path, not something requiring a separate poll. Rendered to the model as:
+`[hub: initial roster complete — you now know everyone who was already in
+the session]`. `Conn.RosterComplete() bool` is also available for an
+on-demand check. Note: if another peer joins the session concurrently while
+this catch-up is still in progress, its `peerJoined` broadcast is
+wire-identical to a genuine roster-catchup event and may be counted toward
+the threshold slightly early — an accepted, self-healing imprecision (the
+real roster event that got "delayed" by this still arrives moments later via
+the normal background read loop; `Peers()` is unaffected either way, since
+it just accumulates every `peerJoined` it's ever seen regardless of phase).
+
+### Protocol versioning
+
+`wire.ProtocolVersion` (currently `1`) identifies the wire protocol's
+schema. It only needs to be bumped for a genuinely *breaking* change —
+purely additive changes (new optional fields, new event kinds) don't need
+it, because both ends already tolerate those without any version check:
+`encoding/json` silently ignores unknown fields in either direction, and
+`hubconn.decodeEvent`'s `default` case silently drops any message with an
+unrecognized `"type"`. Today's version-exchange feature and the
+`rosterComplete` addition are themselves additive — the version stays `1`
+now that this is in place; it exists for the next time a *breaking* change
+is needed.
+
+The client appends `?v=<wire.ProtocolVersion>` to the connect URL. The
+server parses it (`wsserver`), defaulting to `1` if it's absent or
+unparseable — **this is the permanent backward-compatible baseline, not a
+temporary fallback**: any client that doesn't send a version at all
+(including every plain non-`mcp-hub-client` websocket client) is assumed to
+speak v1, forever. The parsed value is currently only logged
+(`clientVersion`, reserved for future server-side compatibility decisions);
+the server never rejects a connection over it.
+
+The server always reports its own version back as `joined.serverVersion`.
+`hubconn.Conn.ServerVersion()` exposes it; `mcptools.handleConnect` compares
+it against this build's `wire.ProtocolVersion` and, on a mismatch, appends a
+note to the `hub_connect` result telling Claude to prompt the user to update
+`mcp-hub-client` (if the server is ahead) or that the server may need
+updating (if this client is ahead).
 
 ## Transport / TLS
 
@@ -194,7 +249,14 @@ join/leave events.
   - always states plainly that connecting alone delivers nothing — receiving
     messages requires the returned wait command to actually be run (and
     re-run) in the background; skipping it silently means no message is ever
-    noticed, so this is called out as a hard requirement, not a suggestion.
+    noticed, so this is called out as a hard requirement, not a suggestion;
+  - states how many peers were already in the session (`Conn.ExpectedPeerCount()`)
+    and that a `rosterComplete` notification will follow once caught up (see
+    "Roster on join"), or that there are none yet;
+  - if the server's `serverVersion` doesn't match this build's
+    `wire.ProtocolVersion`, appends a note telling Claude to prompt the user
+    to update `mcp-hub-client` (server ahead) or that the server may need
+    updating (client ahead) — see "Protocol versioning" above.
 - **`hub_send(text, to?)`** — sends `{"type":"msg","text":...}` (broadcast) or,
   if `to` (a peerId) is given, `{"type":"msg","text":...,"to":...}` (private)
   on the active connection. Errors clearly if not connected, or if `to` is
@@ -215,11 +277,12 @@ join/leave events.
 - **`hub_peers()`** — returns the peerIds of everyone else currently known to
   be in the session (sorted, one list, or an explicit "no other peers"
   message if empty). Built client-side from every `peerJoined`/`peerLeft`
-  event `hubconn.Conn` has seen — since a newly joined peer is told the full
-  existing roster on join (see "Roster on join" above), this is complete
-  shortly after `hub_connect` returns, not just for peers who joined
-  afterward. Errors clearly if not connected. Purely a local read of state
-  already being tracked — it does not talk to the server.
+  event `hubconn.Conn` has seen. If called before `Conn.RosterComplete()` is
+  true (i.e. before the `rosterComplete` event has arrived — see "Roster on
+  join"), the result is suffixed with a note that the list may still be
+  incomplete, rather than silently presenting a partial roster as final.
+  Errors clearly if not connected. Purely a local read of state already
+  being tracked — it does not talk to the server.
 
 Every delivered broadcast `msg` event is wrapped before being handed to Claude:
 

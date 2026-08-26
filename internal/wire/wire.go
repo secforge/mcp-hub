@@ -29,6 +29,17 @@ const (
 	TypePeerLeft   Type = "peerLeft"
 )
 
+// ProtocolVersion identifies the wire protocol's schema. Bump it only for a
+// genuinely breaking change — additive changes (new optional fields, new
+// event kinds) don't need it, since both the server and hubconn already
+// tolerate those: unknown JSON fields are silently ignored by
+// encoding/json, and decodeEvent's default case silently drops any message
+// with an unrecognized "type". A client that doesn't send a version at all
+// (e.g. the "?v=" query param is absent) is treated as version 1 — that is
+// the deliberate, permanent backward-compatible baseline, not a fallback
+// that will later change meaning.
+const ProtocolVersion = 1
+
 type envelope struct {
 	Type Type `json:"type"`
 }
@@ -45,10 +56,18 @@ func DecodeType(raw []byte) (Type, error) {
 type Joined struct {
 	Type   Type   `json:"type"`
 	PeerID string `json:"peerId"`
+	// PeerCount is how many other peers were already in the session at the
+	// moment this peer joined — i.e. how many peerJoined events (the
+	// "roster") will follow. Computed atomically server-side so it can never
+	// drift from what's actually delivered.
+	PeerCount int `json:"peerCount"`
+	// ServerVersion is this server's ProtocolVersion, so the client can tell
+	// if it's behind and surface that to the model.
+	ServerVersion int `json:"serverVersion"`
 }
 
-func NewJoined(peerID string) Joined {
-	return Joined{Type: TypeJoined, PeerID: peerID}
+func NewJoined(peerID string, peerCount int) Joined {
+	return Joined{Type: TypeJoined, PeerID: peerID, PeerCount: peerCount, ServerVersion: ProtocolVersion}
 }
 
 type Error struct {

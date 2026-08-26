@@ -1,11 +1,16 @@
 package hubconn
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
+	"github.com/secforge/mcp-hub/internal/wire"
 	"github.com/secforge/mcp-hub/internal/wsserver"
 )
 
@@ -41,6 +46,124 @@ func TestDialRejectsInvalidSessionID(t *testing.T) {
 	url := startTestServer(t)
 	if _, err := Dial(url, "not-a-uuid"); err == nil {
 		t.Fatal("expected an error for an invalid sessionId")
+	}
+}
+
+func TestDialSendsCurrentProtocolVersionAsQueryParam(t *testing.T) {
+	var gotQuery string
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0))
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	want := "v=" + strconv.Itoa(wire.ProtocolVersion)
+	if gotQuery != want {
+		t.Fatalf("got query %q, want %q", gotQuery, want)
+	}
+}
+
+func TestDialCapturesServerVersion(t *testing.T) {
+	url := startTestServer(t)
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if c.ServerVersion() != wire.ProtocolVersion {
+		t.Fatalf("got ServerVersion %d, want %d", c.ServerVersion(), wire.ProtocolVersion)
+	}
+}
+
+func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	a, err := Dial(url, sessionID)
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	if a.ExpectedPeerCount() != 0 {
+		t.Fatalf("a: expected 0, got %d", a.ExpectedPeerCount())
+	}
+
+	b, err := Dial(url, sessionID)
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	if b.ExpectedPeerCount() != 1 {
+		t.Fatalf("b: expected 1, got %d", b.ExpectedPeerCount())
+	}
+}
+
+func TestRosterCompleteImmediatelyWhenNoExistingPeers(t *testing.T) {
+	url := startTestServer(t)
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if !c.RosterComplete() {
+		t.Fatal("expected RosterComplete to be true immediately when there were no existing peers")
+	}
+
+	formatted, connected := c.Drain()
+	if !connected {
+		t.Fatal("expected still connected")
+	}
+	if !strings.Contains(formatted, "roster complete") {
+		t.Fatalf("expected a rosterComplete notification already buffered, got: %q", formatted)
+	}
+}
+
+func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	a, err := Dial(url, sessionID)
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+
+	b, err := Dial(url, sessionID)
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+
+	activity := make(chan struct{}, 8)
+	b.OnActivity(func() { activity <- struct{}{} })
+
+	if b.RosterComplete() {
+		t.Fatal("expected RosterComplete to be false before the roster catch-up event arrives")
+	}
+	waitForActivity(t, activity) // b catches up on the roster (a)
+
+	if !b.RosterComplete() {
+		t.Fatal("expected RosterComplete to be true after catching up on the existing roster")
+	}
+	formatted, connected := b.Drain()
+	if !connected {
+		t.Fatal("expected still connected")
+	}
+	if !strings.Contains(formatted, "roster complete") {
+		t.Fatalf("expected a rosterComplete notification in the drained events, got: %q", formatted)
 	}
 }
 

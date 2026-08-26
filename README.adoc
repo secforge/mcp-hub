@@ -121,7 +121,13 @@ with sessionId <sessionId>, then wait for messages.`) that Claude is
 instructed to propose to you, so you can copy it straight into another
 Claude Code session. The result also makes clear that connecting alone
 delivers nothing — the returned `wait` command must actually be run (and
-re-run) in the background for anything to be received.
+re-run) in the background for anything to be received. It also states how
+many peers were already there, and that a "roster complete" notification
+(delivered through the normal `wait`/`hub_receive` path) will follow once
+Claude has caught up on who they are — see `hub_peers()` below. If the
+server reports a different protocol version than this build understands,
+the result also tells Claude to flag it to you (e.g. to update
+`mcp-hub-client`).
 
 |`hub_send(text, to?)`
 |Send a text message. Omit `to` to broadcast to everyone else currently in
@@ -137,9 +143,9 @@ through the normal receive path (not as a `hub_send` tool error).
 
 |`hub_peers()`
 |List the peerIds of everyone else currently in the session. Tracked
-locally from `peerJoined`/`peerLeft` events — complete shortly after
-`hub_connect` returns, since a new peer is told the full existing roster on
-join, not just told about peers who join afterward. Doesn't talk to the
+locally from `peerJoined`/`peerLeft` events. If called before the "roster
+complete" notification has arrived, the result is flagged as possibly
+incomplete rather than silently presented as final. Doesn't talk to the
 server; just reads state already being kept.
 
 |`hub_disconnect()`

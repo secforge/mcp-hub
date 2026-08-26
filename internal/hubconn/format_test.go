@@ -35,6 +35,14 @@ func TestFormatEventPeerJoinedIsPlain(t *testing.T) {
 	}
 }
 
+func TestFormatEventRosterCompleteIsPlain(t *testing.T) {
+	got := FormatEvent(Event{Kind: "rosterComplete"})
+	want := "[hub: initial roster complete — you now know everyone who was already in the session]"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestFormatEventsJoinsMultiple(t *testing.T) {
 	got := FormatEvents([]Event{
 		{Kind: "peerJoined", PeerID: "a"},

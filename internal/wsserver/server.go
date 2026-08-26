@@ -2,7 +2,9 @@ package wsserver
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -55,6 +57,22 @@ func (h *Handler) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid sessionId", http.StatusBadRequest)
 		return
 	}
+	// clientVersion is currently only logged (reserved for future
+	// server-side compatibility decisions); a missing or unparseable "v" is
+	// treated as version 1 — the permanent backward-compatible default for
+	// any client (including plain websocket clients) that doesn't send one
+	// at all.
+	clientVersion := 1
+	if v := r.URL.Query().Get("v"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			clientVersion = parsed
+		}
+	}
+	if clientVersion != wire.ProtocolVersion {
+		log.Printf("client for session %s connected with protocol version %d (server is %d)",
+			sessionID, clientVersion, wire.ProtocolVersion)
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -75,13 +93,17 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID string) {
 	}
 
 	session := h.manager.GetOrCreate(sessionID)
-	if err := conn.WriteJSON(wire.NewJoined(peerID)); err != nil {
+	var writeErr error
+	existingIDs := session.Register(p, func(existingCount int) {
+		writeErr = conn.WriteJSON(wire.NewJoined(peerID, existingCount))
+	})
+	if writeErr != nil {
 		return
 	}
 	if logger != nil {
 		logger.AppendJoined(peerID, time.Now().UTC().Format(time.RFC3339))
 	}
-	session.Join(p)
+	session.AnnounceRoster(p, existingIDs)
 	defer func() {
 		if logger != nil {
 			logger.AppendLeft(peerID, time.Now().UTC().Format(time.RFC3339))

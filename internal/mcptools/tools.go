@@ -104,18 +104,40 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		host, sessionID,
 	)
 
+	var rosterNote string
+	if n := conn.ExpectedPeerCount(); n == 0 {
+		rosterNote = "No other peers are in this session yet."
+	} else {
+		rosterNote = fmt.Sprintf(
+			"%d other peer(s) already in this session — you'll get a \"roster complete\" "+
+				"notification (via wait/hub_receive) once you've caught up on who they are; "+
+				"call hub_peers() after that to see the list.", n)
+	}
+
+	versionNote := ""
+	if sv := conn.ServerVersion(); sv > wire.ProtocolVersion {
+		versionNote = fmt.Sprintf(
+			"\nNOTE: this mcp-hub-client speaks protocol v%d, but the server recommends v%d — "+
+				"tell the user to update mcp-hub-client (see "+
+				"https://github.com/secforge/mcp-hub/releases).", wire.ProtocolVersion, sv)
+	} else if sv := conn.ServerVersion(); sv < wire.ProtocolVersion {
+		versionNote = fmt.Sprintf(
+			"\nNOTE: this mcp-hub-client speaks protocol v%d, ahead of the server's v%d — "+
+				"the server may need updating.", wire.ProtocolVersion, sv)
+	}
+
 	if generated {
 		return mcp.NewToolResultText(fmt.Sprintf(
 			"Connected as peer %s in a new session: %s\n"+
 				"Share this sessionId with whoever else should join — they need it to connect.\n"+
-				"%s\n"+
-				"%s\n%s",
-			conn.PeerID(), sessionID, invite, waitRequirement, w.WaitCommand(),
+				"%s\n%s\n"+
+				"%s\n%s%s",
+			conn.PeerID(), sessionID, invite, rosterNote, waitRequirement, w.WaitCommand(), versionNote,
 		)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf(
-		"Connected as peer %s.\n%s\n%s\n%s",
-		conn.PeerID(), invite, waitRequirement, w.WaitCommand(),
+		"Connected as peer %s.\n%s\n%s\n%s\n%s%s",
+		conn.PeerID(), invite, rosterNote, waitRequirement, w.WaitCommand(), versionNote,
 	)), nil
 }
 
@@ -172,9 +194,13 @@ func (h *Hub) handlePeers(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	if h.conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
+	catchingUp := ""
+	if !h.conn.RosterComplete() {
+		catchingUp = " (still catching up on the initial roster — this list may be incomplete)"
+	}
 	peers := h.conn.Peers()
 	if len(peers) == 0 {
-		return mcp.NewToolResultText("no other peers currently in the session"), nil
+		return mcp.NewToolResultText("no other peers currently in the session" + catchingUp), nil
 	}
-	return mcp.NewToolResultText("Current peers: " + strings.Join(peers, ", ")), nil
+	return mcp.NewToolResultText("Current peers: " + strings.Join(peers, ", ") + catchingUp), nil
 }

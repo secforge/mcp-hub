@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -20,14 +21,18 @@ type Event struct {
 }
 
 type Conn struct {
-	ws     *websocket.Conn
-	peerID string
+	ws            *websocket.Conn
+	peerID        string
+	serverVersion int
+	expectedPeers int
 
-	mu         sync.Mutex
-	buffer     []Event
-	closed     bool
-	onActivity func()
-	peers      map[string]struct{}
+	mu              sync.Mutex
+	buffer          []Event
+	closed          bool
+	onActivity      func()
+	peers           map[string]struct{}
+	rosterSeen      int
+	rosterAnnounced bool
 }
 
 // Dial connects to host+"/"+sessionID (e.g. "ws://localhost:8765" joining
@@ -42,7 +47,7 @@ func Dial(host, sessionID string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	target := base + "/" + sessionID
+	target := base + "/" + sessionID + "?v=" + strconv.Itoa(wire.ProtocolVersion)
 	ws, _, err := websocket.DefaultDialer.Dial(target, nil)
 	if err != nil {
 		return nil, err
@@ -62,12 +67,45 @@ func Dial(host, sessionID string) (*Conn, error) {
 		return nil, fmt.Errorf("server returned malformed peerId %q", joined.PeerID)
 	}
 
-	c := &Conn{ws: ws, peerID: joined.PeerID, peers: make(map[string]struct{})}
+	c := &Conn{
+		ws:            ws,
+		peerID:        joined.PeerID,
+		serverVersion: joined.ServerVersion,
+		expectedPeers: joined.PeerCount,
+		peers:         make(map[string]struct{}),
+	}
+	if c.expectedPeers == 0 {
+		// Nothing to catch up on - the roster is complete right away, so
+		// synthesize the notification immediately rather than waiting for
+		// an event that will never arrive to trigger it.
+		c.rosterAnnounced = true
+		c.buffer = append(c.buffer, Event{Kind: "rosterComplete"})
+	}
 	go c.readLoop()
 	return c, nil
 }
 
 func (c *Conn) PeerID() string { return c.peerID }
+
+// ServerVersion is the wire.ProtocolVersion the server reported in "joined".
+// Compare against wire.ProtocolVersion to tell if this client is behind.
+func (c *Conn) ServerVersion() int { return c.serverVersion }
+
+// ExpectedPeerCount is how many peers were already in the session at join
+// time, as reported by the server's "joined" message — i.e. how many
+// peerJoined events make up the initial roster catch-up.
+func (c *Conn) ExpectedPeerCount() int { return c.expectedPeers }
+
+// RosterComplete reports whether this connection has now seen every
+// peerJoined event the server promised (via "joined"'s peerCount) for the
+// roster that existed at join time. Once true, a "rosterComplete" event has
+// also been buffered (see Drain/Peek) — this method is for an on-demand
+// check; the buffered event is the actual notification.
+func (c *Conn) RosterComplete() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rosterAnnounced
+}
 
 // Peers returns the peerIds of everyone else currently known to be in the
 // session, sorted for stable output. Built entirely from peerJoined/peerLeft
@@ -112,13 +150,18 @@ func (c *Conn) readLoop() {
 			continue
 		}
 		c.mu.Lock()
+		c.buffer = append(c.buffer, ev)
 		switch ev.Kind {
 		case "peerJoined":
 			c.peers[ev.PeerID] = struct{}{}
+			c.rosterSeen++
+			if !c.rosterAnnounced && c.rosterSeen >= c.expectedPeers {
+				c.rosterAnnounced = true
+				c.buffer = append(c.buffer, Event{Kind: "rosterComplete"})
+			}
 		case "peerLeft":
 			delete(c.peers, ev.PeerID)
 		}
-		c.buffer = append(c.buffer, ev)
 		f := c.onActivity
 		c.mu.Unlock()
 		if f != nil {
