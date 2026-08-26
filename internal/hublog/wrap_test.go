@@ -52,6 +52,43 @@ func TestFormatEntryWrapsOnWordBoundary(t *testing.T) {
 	}
 }
 
+func TestFormatEntryPreservesOriginalLineBreaks(t *testing.T) {
+	got := FormatEntry("ts", "p1", "first line\nsecond line")
+	want := "ts p1\n  first line\n  second line\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestFormatEntryPreservesBlankLinesWithinMessage(t *testing.T) {
+	got := FormatEntry("ts", "p1", "first\n\nthird")
+	want := "ts p1\n  first\n  \n  third\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestFormatEntryStillWrapsAnOverlongLineWithinPreservedBreaks(t *testing.T) {
+	word := "abcdefghij" // 10 chars
+	longLine := ""
+	for i := 0; i < 12; i++ { // 131 chars, must still wrap at 100
+		if i > 0 {
+			longLine += " "
+		}
+		longLine += word
+	}
+	got := FormatEntry("ts", "p1", "short line\n"+longLine)
+	lines := splitLines(got)
+	if lines[1] != "  short line" {
+		t.Fatalf("expected the short line to stay on its own line, got %q", lines[1])
+	}
+	for _, l := range lines {
+		if len(l) > 102 { // 100 + 2-space indent
+			t.Fatalf("line too long (%d): %q", len(l), l)
+		}
+	}
+}
+
 func TestFormatEntryNeverSplitsAWord(t *testing.T) {
 	longWord := ""
 	for i := 0; i < 150; i++ {

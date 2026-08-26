@@ -124,7 +124,8 @@ rotation/cleanup in this PoC). Every broadcast `msg` is appended as:
 
 ```
 <RFC3339 timestamp> <peerId>
-  <message text, word-wrapped at <=100 chars/line, continuation lines indented 2 spaces>
+  <message text, original line breaks preserved, each line further
+   word-wrapped only if still >100 chars, every output line indented 2 spaces>
 
 ```
 
@@ -147,9 +148,13 @@ no body:
 
 ```
 
-(blank line separates all entries; message-text wrapping breaks only on word
-boundaries, never mid-word). Private sends that were rejected (unknown
-target) are not logged — only successfully delivered `msg` traffic, plus
+(blank line separates all entries; a message's own line breaks are kept as
+written — each source line is only further wrapped if it's still over 100
+chars, and that wrapping breaks only on word boundaries, never mid-word — so
+a blank line inside a message becomes an indented empty line, distinct from
+the unindented blank line that separates entries). Private sends that were
+rejected (unknown target) are not logged — only successfully delivered `msg`
+traffic, plus
 join/leave events.
 
 ## MCP client: tools

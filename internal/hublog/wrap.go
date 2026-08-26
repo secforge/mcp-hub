@@ -5,8 +5,9 @@ import "strings"
 const wrapWidth = 100
 
 // FormatEntry renders one log entry: "<ts> <peerId>" then the message text
-// word-wrapped at wrapWidth columns, each line indented by two spaces, then a
-// blank line.
+// with its original line breaks preserved (each further word-wrapped at
+// wrapWidth columns only if it's still too long), each output line indented
+// by two spaces, then a blank line.
 func FormatEntry(ts, peerID, text string) string {
 	return formatEntry(ts+" "+peerID, text)
 }
@@ -43,8 +44,21 @@ func formatEntry(header, text string) string {
 	return b.String()
 }
 
+// wrapText preserves the text's original line breaks — each source line is
+// wrapped independently (and only split further if it doesn't fit width),
+// so a message's own formatting survives instead of being flattened into
+// one paragraph.
 func wrapText(text string, width int) []string {
-	words := strings.Fields(text)
+	srcLines := strings.Split(text, "\n")
+	out := make([]string, 0, len(srcLines))
+	for _, srcLine := range srcLines {
+		out = append(out, wrapLine(srcLine, width)...)
+	}
+	return out
+}
+
+func wrapLine(line string, width int) []string {
+	words := strings.Fields(line)
 	if len(words) == 0 {
 		return []string{""}
 	}
