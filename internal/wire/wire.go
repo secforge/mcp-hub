@@ -22,11 +22,12 @@ func IsValidID(s string) bool {
 type Type string
 
 const (
-	TypeJoined     Type = "joined"
-	TypeError      Type = "error"
-	TypeMsg        Type = "msg"
-	TypePeerJoined Type = "peerJoined"
-	TypePeerLeft   Type = "peerLeft"
+	TypeJoined         Type = "joined"
+	TypeError          Type = "error"
+	TypeMsg            Type = "msg"
+	TypePeerJoined     Type = "peerJoined"
+	TypePeerLeft       Type = "peerLeft"
+	TypeRosterComplete Type = "rosterComplete"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -122,4 +123,17 @@ func NewPeerJoined(peerID string) PeerEvent {
 
 func NewPeerLeft(peerID string) PeerEvent {
 	return PeerEvent{Type: TypePeerLeft, PeerID: peerID}
+}
+
+// RosterComplete is sent by the server to a newly joined peer once it has
+// finished delivering that peer's initial roster (one peerJoined per
+// existing peer) — it is always the last message from that delivery,
+// emitted under the same lock as the roster itself, so it can never race
+// ahead of or behind the events it's promising are complete.
+type RosterComplete struct {
+	Type Type `json:"type"`
+}
+
+func NewRosterComplete() RosterComplete {
+	return RosterComplete{Type: TypeRosterComplete}
 }

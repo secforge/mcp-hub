@@ -53,6 +53,9 @@ func TestJoinRelayAndTeardown(t *testing.T) {
 	if typ, _ := readTyped(t, a); typ != wire.TypeJoined {
 		t.Fatalf("a: expected joined, got %s", typ)
 	}
+	if typ, _ := readTyped(t, a); typ != wire.TypeRosterComplete {
+		t.Fatalf("a: expected rosterComplete, got %s", typ)
+	}
 
 	b := dial(t, url, sessionID)
 	if typ, _ := readTyped(t, b); typ != wire.TypeJoined {
@@ -100,6 +103,7 @@ func TestJoinAndLeaveAreLogged(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
+	readTyped(t, a) // a: rosterComplete
 
 	b := dial(t, url, sessionID)
 	_, rawJoinedB := readTyped(t, b) // b: joined
@@ -133,11 +137,12 @@ func TestJoinTellsNewPeerAboutExistingRoster(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
+	readTyped(t, a) // a: rosterComplete
 
 	b := dial(t, url, sessionID)
 	defer b.Close()
-	readTyped(t, b)   // b: joined
-	readTyped(t, a)   // a: peerJoined for b
+	readTyped(t, b) // b: joined
+	readTyped(t, a) // a: peerJoined for b
 
 	c := dial(t, url, sessionID)
 	defer c.Close()
@@ -236,6 +241,7 @@ func TestDirectedMessageGoesOnlyToTarget(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
+	readTyped(t, a) // a: rosterComplete
 
 	b := dial(t, url, sessionID)
 	defer b.Close()
@@ -243,6 +249,7 @@ func TestDirectedMessageGoesOnlyToTarget(t *testing.T) {
 	var joinedB wire.Joined
 	decodeJSON(t, rawJoinedB, &joinedB)
 	readTyped(t, b) // b: peerJoined for a (roster notification)
+	readTyped(t, b) // b: rosterComplete
 	readTyped(t, a) // a: peerJoined for b
 
 	c := dial(t, url, sessionID)
@@ -250,6 +257,7 @@ func TestDirectedMessageGoesOnlyToTarget(t *testing.T) {
 	readTyped(t, c) // c: joined
 	readTyped(t, c) // c: peerJoined for a
 	readTyped(t, c) // c: peerJoined for b
+	readTyped(t, c) // c: rosterComplete
 	readTyped(t, a) // a: peerJoined for c
 	readTyped(t, b) // b: peerJoined for c
 
@@ -298,6 +306,7 @@ func TestDirectedMessageToUnknownPeerReturnsErrorToSender(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
+	readTyped(t, a) // a: rosterComplete
 
 	a.WriteJSON(wire.NewOutgoingDirectedMsg("hello?", "00000000-0000-0000-0000-000000000000"))
 	typ, _ := readTyped(t, a)
@@ -322,6 +331,7 @@ func TestDeadPeerIsDroppedViaPingPongTimeout(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
+	readTyped(t, a) // a: rosterComplete
 
 	b := dial(t, url, sessionID)
 	defer b.Close()

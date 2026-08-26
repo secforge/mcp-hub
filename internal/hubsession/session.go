@@ -23,44 +23,35 @@ func newSession(id string) *Session {
 	return &Session{id: id, peers: make(map[string]Peer)}
 }
 
-// Register adds p to the session and returns the peerIds of everyone
-// already present at that moment. The session lock is held for the whole
-// call, including beforeVisible — so beforeVisible (e.g. writing a "joined"
-// confirmation with an accurate existing-peer count) is guaranteed to run
-// before p becomes visible to any other peer's Broadcast/DeliverTo/Register.
-// That guarantees two things: p can never receive anything else before
-// whatever beforeVisible sends it, and any count beforeVisible reports can
-// never drift from the roster AnnounceRoster goes on to actually deliver
-// (both come from the same snapshot, under the same lock).
-func (s *Session) Register(p Peer, beforeVisible func(existingCount int)) (existingIDs []string) {
+// Join registers p, delivers it the current roster (one peerJoined per
+// existing peer, terminated by a RosterComplete), and announces p's own join
+// to everyone else — all while holding the session lock for the entire
+// sequence. That atomicity is what makes this safe: no other peer can Join
+// or Leave in the middle of it, so the roster p receives is exactly the set
+// of peers still present when RosterComplete is sent, with no gap in which
+// a peer from the snapshot could vanish (a phantom peerJoined with no way to
+// correct it) or a concurrent joiner could be missed.
+//
+// beforeVisible, if non-nil, runs under the same lock before p becomes
+// visible to anyone else — e.g. to write a "joined" confirmation with an
+// existing-peer count that's guaranteed consistent with the roster that
+// follows.
+func (s *Session) Join(p Peer, beforeVisible func(existingCount int)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existingIDs = make([]string, 0, len(s.peers))
+	existingIDs := make([]string, 0, len(s.peers))
 	for id := range s.peers {
 		existingIDs = append(existingIDs, id)
 	}
-	beforeVisible(len(existingIDs))
+	if beforeVisible != nil {
+		beforeVisible(len(existingIDs))
+	}
 	s.peers[p.ID()] = p
-	return existingIDs
-}
-
-// AnnounceRoster tells p about each peer in existingIDs (as if it just
-// joined) and broadcasts p's own join to everyone else. Call once, after
-// Register.
-func (s *Session) AnnounceRoster(p Peer, existingIDs []string) {
 	for _, id := range existingIDs {
 		p.Deliver(wire.NewPeerJoined(id))
 	}
-	s.broadcastExcept(p.ID(), wire.NewPeerJoined(p.ID()))
-}
-
-// Join registers p and immediately announces the roster — a convenience for
-// callers that don't need to inject anything between the two steps (mainly
-// tests; wsserver uses Register/AnnounceRoster directly so it can send an
-// accurate peerCount in the "joined" confirmation first).
-func (s *Session) Join(p Peer) {
-	existingIDs := s.Register(p, func(int) {})
-	s.AnnounceRoster(p, existingIDs)
+	p.Deliver(wire.NewRosterComplete())
+	s.broadcastExceptLocked(p.ID(), wire.NewPeerJoined(p.ID()))
 }
 
 // Leave removes p from the session and reports whether the session is now
@@ -99,6 +90,12 @@ func (s *Session) DeliverTo(from Peer, targetID string, event any) error {
 func (s *Session) broadcastExcept(exceptID string, event any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.broadcastExceptLocked(exceptID, event)
+}
+
+// broadcastExceptLocked is broadcastExcept for callers that already hold
+// s.mu (namely Join, which can't re-lock a non-reentrant mutex).
+func (s *Session) broadcastExceptLocked(exceptID string, event any) {
 	for id, p := range s.peers {
 		if id == exceptID {
 			continue

@@ -94,7 +94,7 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID string) {
 
 	session := h.manager.GetOrCreate(sessionID)
 	var writeErr error
-	existingIDs := session.Register(p, func(existingCount int) {
+	session.Join(p, func(existingCount int) {
 		writeErr = conn.WriteJSON(wire.NewJoined(peerID, existingCount))
 	})
 	if writeErr != nil {
@@ -103,7 +103,6 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID string) {
 	if logger != nil {
 		logger.AppendJoined(peerID, time.Now().UTC().Format(time.RFC3339))
 	}
-	session.AnnounceRoster(p, existingIDs)
 	defer func() {
 		if logger != nil {
 			logger.AppendLeft(peerID, time.Now().UTC().Format(time.RFC3339))

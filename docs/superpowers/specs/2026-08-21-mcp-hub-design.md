@@ -39,6 +39,7 @@ replaced by this URL-based form.
 GET /<sessionId>?v=<protocolVersion>  (upgrade to websocket; ?v= optional, see "Protocol versioning")
 ← {"type":"joined","peerId":"<uuid>","peerCount":<int>,"serverVersion":<int>}   // sent immediately
 ← {"type":"peerJoined","peerId":"<uuid>"}      // one per peer already in the session (see "Roster on join" below)
+← {"type":"rosterComplete"}                    // marks the end of the initial roster catch-up above
 ← {"type":"error","message":"..."}
 
 → {"type":"msg","text":"..."}                                       // broadcast to everyone else
@@ -86,37 +87,36 @@ Rules:
 
 A newly joined peer is told about every peer already in the session, using
 the same `peerJoined` event they'd have seen had they been connected at the
-time — one event per existing peer, sent right after `joined` and before
-anything else. `joined.peerCount` tells the client exactly how many
-`peerJoined` events to expect for this initial catch-up, so it has a
-concrete, *notifiable* signal for "the roster is now complete" — see
-`hubconn.Conn`'s synthetic `rosterComplete` event below, and
-`docs`/README for how that surfaces to the model. Existing peers are, as
-before, told about the *new* peer via a single broadcast `peerJoined`.
+time — one event per existing peer, sent right after `joined`, followed by a
+dedicated `{"type":"rosterComplete"}` event that marks the end of that
+catch-up. Existing peers are, as before, told about the *new* peer via a
+single broadcast `peerJoined`.
 
-`peerCount` is computed and the peer registered into the session
-*atomically*, under the same lock (`hubsession.Session.Register`), and only
-`beforeVisible` (used by the server to send `joined` itself) runs before the
-peer becomes visible to any other peer's broadcast/DeliverTo. This
-guarantees two things: the reported count can never drift from what the
-roster events that follow will actually deliver (no race), and this peer
-can never receive anything else on the wire before its own `joined`
-confirmation.
+The whole sequence — snapshotting the existing peers, running
+`beforeVisible` (used by the server to send `joined` with an accurate
+`peerCount`), registering the new peer, delivering its roster, sending
+`rosterComplete`, and broadcasting its own `peerJoined` to everyone else —
+happens in one call, `hubsession.Session.Join`, which holds the session lock
+for the entire sequence. This was originally split across two calls
+(`Register` then `AnnounceRoster`) with the lock released in between; that
+allowed a peer included in the roster snapshot to `Leave` in the gap,
+producing a phantom `peerJoined` for someone already gone with no way to
+correct it. Collapsing it into one atomic, lock-held `Join` removes that
+race entirely: since `Leave` also takes the session lock, it cannot
+interleave with an in-progress `Join` — the roster a peer receives is always
+exactly the set of peers still present at the moment `rosterComplete` is
+sent. (`broadcastExceptLocked` is `broadcastExcept`'s lock-free body, used
+by `Join` since it already holds the lock and can't re-lock a non-reentrant
+mutex.)
 
-Client-side (`hubconn.Conn`), once exactly `peerCount` `peerJoined` events
-have been seen (or immediately, if `peerCount` is `0`), a synthetic local
-`rosterComplete` event is appended to the same buffer `wait`/`hub_receive`
-already drain — so it's a real notification through the existing delivery
-path, not something requiring a separate poll. Rendered to the model as:
-`[hub: initial roster complete — you now know everyone who was already in
-the session]`. `Conn.RosterComplete() bool` is also available for an
-on-demand check. Note: if another peer joins the session concurrently while
-this catch-up is still in progress, its `peerJoined` broadcast is
-wire-identical to a genuine roster-catchup event and may be counted toward
-the threshold slightly early — an accepted, self-healing imprecision (the
-real roster event that got "delayed" by this still arrives moments later via
-the normal background read loop; `Peers()` is unaffected either way, since
-it just accumulates every `peerJoined` it's ever seen regardless of phase).
+Client-side (`hubconn.Conn`), `rosterComplete` is passed straight through as
+a real event into the same buffer `wait`/`hub_receive` already drain — no
+counting or synthesis needed. Rendered to the model as: `[hub: initial
+roster complete — you now know everyone who was already in the session]`.
+`Conn.RosterComplete() bool` is also available for an on-demand check.
+`joined.peerCount` is still reported (informational — lets a client show
+"N other peers" before the roster catch-up arrives) but the client no longer
+needs it for correctness.
 
 ### Protocol versioning
 

@@ -118,8 +118,12 @@ func TestRosterCompleteImmediatelyWhenNoExistingPeers(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
+	activity := make(chan struct{}, 8)
+	c.OnActivity(func() { activity <- struct{}{} })
+
+	waitForActivity(t, activity) // the server's rosterComplete for an empty roster
 	if !c.RosterComplete() {
-		t.Fatal("expected RosterComplete to be true immediately when there were no existing peers")
+		t.Fatal("expected RosterComplete to be true once the server's rosterComplete event arrives")
 	}
 
 	formatted, connected := c.Drain()
@@ -153,7 +157,8 @@ func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
 	if b.RosterComplete() {
 		t.Fatal("expected RosterComplete to be false before the roster catch-up event arrives")
 	}
-	waitForActivity(t, activity) // b catches up on the roster (a)
+	waitForActivity(t, activity) // b is told about a (roster entry)
+	waitForActivity(t, activity) // b's rosterComplete
 
 	if !b.RosterComplete() {
 		t.Fatal("expected RosterComplete to be true after catching up on the existing roster")
@@ -186,6 +191,7 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 
 	activity := make(chan struct{}, 8)
 	a.OnActivity(func() { activity <- struct{}{} })
+	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
 
 	b, err := Dial(url, sessionID)
 	if err != nil {
@@ -220,6 +226,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	defer a.Close()
 	activityA := make(chan struct{}, 8)
 	a.OnActivity(func() { activityA <- struct{}{} })
+	waitForActivity(t, activityA) // a's own rosterComplete (no peers yet)
 
 	b, err := Dial(url, sessionID)
 	if err != nil {
@@ -257,6 +264,7 @@ func TestSendToUnknownPeerSurfacesAsErrorEvent(t *testing.T) {
 	defer a.Close()
 	activity := make(chan struct{}, 8)
 	a.OnActivity(func() { activity <- struct{}{} })
+	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
 
 	if err := a.SendTo("hello?", "00000000-0000-0000-0000-000000000000"); err != nil {
 		t.Fatalf("sendTo: %v", err)
@@ -283,6 +291,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 	defer a.Close()
 	activity := make(chan struct{}, 8)
 	a.OnActivity(func() { activity <- struct{}{} })
+	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
 
 	if peers := a.Peers(); len(peers) != 0 {
 		t.Fatalf("expected no peers before anyone else joins, got %v", peers)

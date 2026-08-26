@@ -31,7 +31,6 @@ type Conn struct {
 	closed          bool
 	onActivity      func()
 	peers           map[string]struct{}
-	rosterSeen      int
 	rosterAnnounced bool
 }
 
@@ -74,13 +73,6 @@ func Dial(host, sessionID string) (*Conn, error) {
 		expectedPeers: joined.PeerCount,
 		peers:         make(map[string]struct{}),
 	}
-	if c.expectedPeers == 0 {
-		// Nothing to catch up on - the roster is complete right away, so
-		// synthesize the notification immediately rather than waiting for
-		// an event that will never arrive to trigger it.
-		c.rosterAnnounced = true
-		c.buffer = append(c.buffer, Event{Kind: "rosterComplete"})
-	}
 	go c.readLoop()
 	return c, nil
 }
@@ -96,11 +88,11 @@ func (c *Conn) ServerVersion() int { return c.serverVersion }
 // peerJoined events make up the initial roster catch-up.
 func (c *Conn) ExpectedPeerCount() int { return c.expectedPeers }
 
-// RosterComplete reports whether this connection has now seen every
-// peerJoined event the server promised (via "joined"'s peerCount) for the
-// roster that existed at join time. Once true, a "rosterComplete" event has
-// also been buffered (see Drain/Peek) — this method is for an on-demand
-// check; the buffered event is the actual notification.
+// RosterComplete reports whether the server's "rosterComplete" event — sent
+// once it has finished delivering this peer's initial roster — has been
+// seen yet. Once true, that event has also been buffered (see Drain/Peek) —
+// this method is for an on-demand check; the buffered event is the actual
+// notification.
 func (c *Conn) RosterComplete() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -154,13 +146,10 @@ func (c *Conn) readLoop() {
 		switch ev.Kind {
 		case "peerJoined":
 			c.peers[ev.PeerID] = struct{}{}
-			c.rosterSeen++
-			if !c.rosterAnnounced && c.rosterSeen >= c.expectedPeers {
-				c.rosterAnnounced = true
-				c.buffer = append(c.buffer, Event{Kind: "rosterComplete"})
-			}
 		case "peerLeft":
 			delete(c.peers, ev.PeerID)
+		case "rosterComplete":
+			c.rosterAnnounced = true
 		}
 		f := c.onActivity
 		c.mu.Unlock()
@@ -200,6 +189,8 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "peerLeft", PeerID: p.PeerID}, true
+	case wire.TypeRosterComplete:
+		return Event{Kind: "rosterComplete"}, true
 	default:
 		return Event{}, false
 	}

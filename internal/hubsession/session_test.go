@@ -1,7 +1,9 @@
 package hubsession
 
 import (
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/secforge/mcp-hub/internal/wire"
 )
@@ -20,20 +22,28 @@ func TestJoinNeverTellsAPeerAboutItself(t *testing.T) {
 	a := &fakePeer{id: "a"}
 	b := &fakePeer{id: "b"}
 
-	s.Join(a)
-	s.Join(b)
+	s.Join(a, nil)
+	s.Join(b, nil)
 
-	if len(a.received) != 1 {
-		t.Fatalf("a should have received b's join event, got %d events", len(a.received))
+	// a: rosterComplete (immediately, empty roster of its own), then told
+	// about b's later join.
+	if len(a.received) != 2 {
+		t.Fatalf("a should have received its own rosterComplete plus b's join event, got %d events: %+v", len(a.received), a.received)
 	}
-	if ev, ok := a.received[0].(wire.PeerEvent); !ok || ev.PeerID != "b" {
-		t.Fatalf("unexpected event for a: %+v", a.received[0])
+	if _, ok := a.received[0].(wire.RosterComplete); !ok {
+		t.Fatalf("expected a's first event to be rosterComplete, got %+v", a.received[0])
 	}
-	if len(b.received) != 1 {
-		t.Fatalf("b should be told about the one existing peer (a), got %d events: %+v", len(b.received), b.received)
+	if ev, ok := a.received[1].(wire.PeerEvent); !ok || ev.PeerID != "b" {
+		t.Fatalf("unexpected second event for a: %+v", a.received[1])
+	}
+	if len(b.received) != 2 {
+		t.Fatalf("b should be told about the one existing peer (a) then rosterComplete, got %d events: %+v", len(b.received), b.received)
 	}
 	if ev, ok := b.received[0].(wire.PeerEvent); !ok || ev.PeerID != "a" {
-		t.Fatalf("unexpected event for b: %+v", b.received[0])
+		t.Fatalf("unexpected first event for b: %+v", b.received[0])
+	}
+	if _, ok := b.received[1].(wire.RosterComplete); !ok {
+		t.Fatalf("expected b's second event to be rosterComplete, got %+v", b.received[1])
 	}
 }
 
@@ -44,16 +54,16 @@ func TestJoinNotifiesNewPeerAboutExistingPeers(t *testing.T) {
 	b := &fakePeer{id: "b"}
 	c := &fakePeer{id: "c"}
 
-	s.Join(a)
-	s.Join(b)
+	s.Join(a, nil)
+	s.Join(b, nil)
 	c.received = nil
-	s.Join(c)
+	s.Join(c, nil)
 
-	if len(c.received) != 2 {
-		t.Fatalf("c should be told about both existing peers, got %d events: %+v", len(c.received), c.received)
+	if len(c.received) != 3 {
+		t.Fatalf("c should be told about both existing peers plus rosterComplete, got %d events: %+v", len(c.received), c.received)
 	}
 	seen := map[string]bool{}
-	for _, ev := range c.received {
+	for _, ev := range c.received[:2] {
 		pe, ok := ev.(wire.PeerEvent)
 		if !ok || pe.Type != wire.TypePeerJoined {
 			t.Fatalf("expected a peerJoined event, got %+v", ev)
@@ -63,63 +73,106 @@ func TestJoinNotifiesNewPeerAboutExistingPeers(t *testing.T) {
 	if !seen["a"] || !seen["b"] {
 		t.Fatalf("expected to be told about both a and b, got %+v", c.received)
 	}
+	if _, ok := c.received[2].(wire.RosterComplete); !ok {
+		t.Fatalf("expected c's last event to be rosterComplete, got %+v", c.received[2])
+	}
 }
 
-func TestRegisterReportsExistingCountBeforeVisible(t *testing.T) {
+func TestJoinReportsExistingCountViaBeforeVisibleCallback(t *testing.T) {
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	a := &fakePeer{id: "a"}
-	b := &fakePeer{id: "b"}
-	s.Join(a)
+	s.Join(a, nil)
 
 	var reportedCount int
 	c := &fakePeer{id: "c"}
-	existingIDs := s.Register(c, func(count int) { reportedCount = count })
+	s.Join(c, func(count int) { reportedCount = count })
 
 	if reportedCount != 1 {
 		t.Fatalf("expected beforeVisible to report 1 existing peer, got %d", reportedCount)
 	}
-	if len(existingIDs) != 1 || existingIDs[0] != "a" {
-		t.Fatalf("expected existingIDs [a], got %v", existingIDs)
-	}
-
-	// b joining now must not see c yet - AnnounceRoster hasn't run, so c
-	// isn't part of the roster b gets told about... but c IS already
-	// visible to broadcasts/DeliverTo, since Register alone makes it so.
-	s.Join(b)
-	sawC := false
-	for _, ev := range b.received {
-		if pe, ok := ev.(wire.PeerEvent); ok && pe.PeerID == "c" {
-			sawC = true
-		}
-	}
-	if !sawC {
-		t.Fatal("expected b to be told about c too, since c was registered (visible) before b joined")
-	}
 }
 
-func TestAnnounceRosterTellsNewPeerAndBroadcastsItsJoin(t *testing.T) {
+// blockingPeer's Deliver signals started, then blocks on unblock — used to
+// hold Join's internal lock open long enough to prove a concurrent Leave
+// (for a peer already included in the roster snapshot) cannot proceed until
+// Join has fully finished delivering that snapshot.
+type blockingPeer struct {
+	id         string
+	started    chan struct{}
+	startedOne sync.Once
+	unblock    chan struct{}
+	received   []any
+}
+
+func (b *blockingPeer) ID() string { return b.id }
+func (b *blockingPeer) Deliver(event any) {
+	b.received = append(b.received, event)
+	b.startedOne.Do(func() { close(b.started) })
+	<-b.unblock
+}
+
+func TestJoinIsAtomicAgainstConcurrentLeave(t *testing.T) {
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	a := &fakePeer{id: "a"}
-	s.Join(a)
-	a.received = nil
+	s.Join(a, nil)
 
-	c := &fakePeer{id: "c"}
-	existingIDs := s.Register(c, func(int) {})
-	s.AnnounceRoster(c, existingIDs)
+	c := &blockingPeer{id: "c", started: make(chan struct{}), unblock: make(chan struct{})}
+	joinDone := make(chan struct{})
+	go func() {
+		s.Join(c, nil) // delivering peerJoined("a") to c blocks inside c.Deliver
+		close(joinDone)
+	}()
 
-	if len(c.received) != 1 {
-		t.Fatalf("expected c to be told about a, got %d events: %+v", len(c.received), c.received)
+	select {
+	case <-c.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Join never started delivering to c")
 	}
-	if pe, ok := c.received[0].(wire.PeerEvent); !ok || pe.PeerID != "a" {
-		t.Fatalf("unexpected event for c: %+v", c.received[0])
+
+	leaveDone := make(chan struct{})
+	go func() {
+		s.Leave(a) // a was in c's roster snapshot — must wait for Join to finish
+		close(leaveDone)
+	}()
+
+	select {
+	case <-leaveDone:
+		t.Fatal("Leave(a) completed while Join(c) still held the session lock mid-delivery — not atomic")
+	case <-time.After(100 * time.Millisecond):
+		// expected: still blocked, since Join(c) hasn't released the lock yet
 	}
-	if len(a.received) != 1 {
-		t.Fatalf("expected a to be told about c's join, got %d events: %+v", len(a.received), a.received)
+
+	close(c.unblock) // let Join(c) finish delivering and release the lock
+
+	select {
+	case <-joinDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Join(c) never completed")
 	}
-	if pe, ok := a.received[0].(wire.PeerEvent); !ok || pe.PeerID != "c" {
-		t.Fatalf("unexpected event for a: %+v", a.received[0])
+	select {
+	case <-leaveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Leave(a) never completed after Join(c) released the lock")
+	}
+
+	// c's roster snapshot correctly included a (a was still present at
+	// snapshot time) — a's later departure is a's own concern, not
+	// something that should have erased it from c's already-delivered
+	// roster event. c then separately gets told about a's departure too,
+	// since c is a member of the session by then.
+	if len(c.received) != 3 {
+		t.Fatalf("expected c to have received 1 roster event, rosterComplete, then a's departure, got %d: %+v", len(c.received), c.received)
+	}
+	if pe, ok := c.received[0].(wire.PeerEvent); !ok || pe.PeerID != "a" || pe.Type != wire.TypePeerJoined {
+		t.Fatalf("unexpected first event for c: %+v", c.received[0])
+	}
+	if _, ok := c.received[1].(wire.RosterComplete); !ok {
+		t.Fatalf("expected c's second event to be rosterComplete, got %+v", c.received[1])
+	}
+	if pe, ok := c.received[2].(wire.PeerEvent); !ok || pe.PeerID != "a" || pe.Type != wire.TypePeerLeft {
+		t.Fatalf("expected c's third event to be a's departure, got %+v", c.received[2])
 	}
 }
 
@@ -128,8 +181,8 @@ func TestBroadcastExcludesSender(t *testing.T) {
 	s := m.GetOrCreate("session-1")
 	a := &fakePeer{id: "a"}
 	b := &fakePeer{id: "b"}
-	s.Join(a)
-	s.Join(b)
+	s.Join(a, nil)
+	s.Join(b, nil)
 	a.received = nil
 	b.received = nil
 
@@ -149,9 +202,9 @@ func TestDeliverToSendsOnlyToTarget(t *testing.T) {
 	a := &fakePeer{id: "a"}
 	b := &fakePeer{id: "b"}
 	c := &fakePeer{id: "c"}
-	s.Join(a)
-	s.Join(b)
-	s.Join(c)
+	s.Join(a, nil)
+	s.Join(b, nil)
+	s.Join(c, nil)
 	a.received, b.received, c.received = nil, nil, nil
 
 	if err := s.DeliverTo(a, "b", wire.NewDirectedMsg("a", "psst", "ts")); err != nil {
@@ -173,7 +226,7 @@ func TestDeliverToUnknownPeerErrors(t *testing.T) {
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	a := &fakePeer{id: "a"}
-	s.Join(a)
+	s.Join(a, nil)
 
 	err := s.DeliverTo(a, "does-not-exist", wire.NewDirectedMsg("a", "hi", "ts"))
 	if err == nil {
@@ -185,7 +238,8 @@ func TestDeliverToSelfErrors(t *testing.T) {
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	a := &fakePeer{id: "a"}
-	s.Join(a)
+	s.Join(a, nil)
+	a.received = nil
 
 	err := s.DeliverTo(a, "a", wire.NewDirectedMsg("a", "hi", "ts"))
 	if err == nil {
@@ -201,8 +255,8 @@ func TestLeaveReportsEmptyWhenLastPeerLeaves(t *testing.T) {
 	s := m.GetOrCreate("session-1")
 	a := &fakePeer{id: "a"}
 	b := &fakePeer{id: "b"}
-	s.Join(a)
-	s.Join(b)
+	s.Join(a, nil)
+	s.Join(b, nil)
 
 	if empty := s.Leave(a); empty {
 		t.Fatal("session should not be empty after only one of two peers leaves")
