@@ -516,12 +516,36 @@ mcp-hub-client wait --socket <path>
     which would immediately supersede whatever legitimately still-active
     wait was already running, and so on: exactly one wait should ever be
     kept running at a time.
-- **Race fix**: when a `wait` connection is accepted, the server checks
-  immediately whether the buffer already has unread events. If so, it responds
-  with `message` right away instead of registering the connection as a
-  pending waiter. This closes the gap between "nothing was buffered a moment
-  ago" and "the `wait` process actually started" (including the moment right
-  after `hub_connect` returns).
+- **Race fix (initial registration)**: when a `wait` connection is accepted,
+  the server checks immediately whether the buffer already has unread
+  events. If so, it responds with `message` right away instead of
+  registering the connection as a pending waiter. This closes the gap
+  between "nothing was buffered a moment ago" and "the `wait` process
+  actually started" (including the moment right after `hub_connect`
+  returns).
+- **Race fix (re-registration, `--follow`)**: a second, subtler version of
+  the same problem existed in `deliver`'s re-registration for the *next*
+  event after a `--follow` delivery — found from a real production incident
+  where a message was sent and successfully buffered, but the receiving
+  side's `wait --follow` process never printed it and just sat there,
+  looking like a healthy listener indefinitely. `deliver`'s tail used to
+  call `source.Peek()` *before* acquiring `w.mu`, then separately lock to
+  set `w.current`. `Poke()` (triggered by `hubconn.Conn.OnActivity` when a
+  new event lands) reads and clears `w.current` under that same lock — so
+  a `Poke()` landing in the gap between the unlocked `Peek()` and the
+  locked registration would find `w.current` still `nil` (from the
+  *delivery in progress*, which hadn't re-registered yet), silently no-op
+  (`Poke` does nothing when nothing is registered), and the event that had
+  in fact already arrived would never be delivered: `deliver` would go on
+  to register based on its now-stale `Peek()` result, and nothing would
+  ever call `Poke()` again for that connection. Fixed by moving `Peek()`
+  inside the same lock hold used to set `w.current` (in both `deliver`'s
+  re-registration and `handleAccept`'s initial registration), so the two
+  operations can no longer be interleaved: whichever of `Poke()` or
+  registration acquires `w.mu` first, the other is guaranteed to observe
+  accurate state once it's their turn — no window remains in which an
+  event can land unnoticed. `TestFollowNeverLosesAnEventToRegistrationRace`
+  is the regression test.
 
 ### `wait --follow`: an alternative for harnesses with per-line notifications
 

@@ -1,9 +1,11 @@
 package waiter
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,10 +33,17 @@ func (f *fakeSource) Drain() (string, bool) {
 	return formatted, f.connected
 }
 
+// push appends text to whatever's already buffered (joined by a space),
+// mirroring hubconn.Conn's real buffer — which accumulates every event
+// until drained — rather than overwriting, so concurrent pushes before a
+// Drain aren't lost at the fake's own level.
 func (f *fakeSource) push(text string) {
 	f.mu.Lock()
 	f.hasEvents = true
-	f.formatted = text
+	if f.formatted != "" {
+		f.formatted += " "
+	}
+	f.formatted += text
 	f.mu.Unlock()
 }
 
@@ -302,6 +311,84 @@ func TestWaitFollowCommandAppendsFollowFlag(t *testing.T) {
 
 	if got, want := w.WaitFollowCommand(), w.WaitCommand()+" --follow"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// TestFollowNeverLosesAnEventToRegistrationRace is a regression test for a
+// real production incident: deliver()'s re-registration used to check
+// source.Peek() *before* acquiring w.mu, then separately lock to set
+// w.current. A Poke() landing in that gap (triggered by an event that had,
+// in fact, already arrived) would find w.current still nil, silently no-op
+// (Poke does nothing when nothing is registered), and the event that
+// arrived in the gap would then never be delivered — deliver() would go on
+// to register based on its earlier, now-stale Peek() result, and nothing
+// would ever poke that registration again. The connection stayed alive,
+// looking like a healthy listener, forever waiting for a notification that
+// had already happened and was missed. Checking Peek() and setting
+// w.current under the same uninterrupted lock hold (what Poke() also uses)
+// closes the gap. This test hammers Poke() concurrently with pushes to
+// prove no event is ever silently dropped.
+func TestFollowNeverLosesAnEventToRegistrationRace(t *testing.T) {
+	src := &fakeSource{connected: true}
+	w, err := Listen("session-i", "peer-i", src)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer w.Close()
+
+	conn := dialFollow(t, w.socketPath)
+	defer conn.Close()
+
+	const n = 200
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			src.push(fmt.Sprintf("msg-%d", i))
+			w.Poke()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		// Extra, redundant pokes maximize the chance of landing exactly in
+		// the vulnerable window on the old, buggy code.
+		for i := 0; i < n; i++ {
+			w.Poke()
+		}
+	}()
+	wg.Wait()
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var all strings.Builder
+	buf := make([]byte, 4096)
+	want := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		want[fmt.Sprintf("msg-%d", i)] = false
+	}
+	remaining := n
+	deadline := time.Now().Add(5 * time.Second)
+	for remaining > 0 && time.Now().Before(deadline) {
+		nRead, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
+		all.Write(buf[:nRead])
+		for k, seen := range want {
+			if !seen && strings.Contains(all.String(), k) {
+				want[k] = true
+				remaining--
+			}
+		}
+	}
+	if remaining > 0 {
+		missing := make([]string, 0, remaining)
+		for k, seen := range want {
+			if !seen {
+				missing = append(missing, k)
+			}
+		}
+		t.Fatalf("lost %d/%d events to the registration race, e.g. %v", remaining, n, missing[:min(5, len(missing))])
 	}
 }
 

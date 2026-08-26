@@ -116,11 +116,16 @@ func (w *Waiter) handleAccept(conn net.Conn) {
 	}
 	rw := &registeredWaiter{conn: conn, follow: mode[0] == ModeFollow}
 
+	// The source's Peek() and the w.current registration below are checked
+	// under one uninterrupted lock hold — see the comment on deliver's tail
+	// for why the two must never be split, on pain of a permanently
+	// undelivered event.
+	w.mu.Lock()
 	if hasEvents, connected := w.source.Peek(); hasEvents || !connected {
+		w.mu.Unlock()
 		w.deliver(rw)
 		return
 	}
-	w.mu.Lock()
 	old := w.current
 	w.current = rw
 	w.mu.Unlock()
@@ -158,18 +163,32 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 		return
 	}
 
-	// Re-register for the next event. If one is already pending (raced while
-	// we were writing), deliver it immediately instead of waiting for Poke.
-	if hasEvents, connected := w.source.Peek(); hasEvents || !connected {
-		w.deliver(rw)
-		return
-	}
+	// Re-register for the next event — checking w.source.Peek() and setting
+	// w.current in the same uninterrupted lock hold that Poke() uses to
+	// read/clear w.current, not as two separate steps. Splitting them (an
+	// unlocked Peek() first, then a separate lock to register) leaves a gap
+	// in which a concurrent Poke() — triggered by an event landing in
+	// exactly that window — finds w.current still nil from the *previous*
+	// delivery, silently no-ops (Poke does nothing when nothing is
+	// registered), and then this call goes on to register anyway, based on
+	// a Peek() taken *before* that event existed. The result: an event that
+	// genuinely arrived sits in the buffer with nothing left to ever poke
+	// it again — the connection stays registered, technically alive,
+	// forever waiting for a notification that already happened and was
+	// missed. Checking Peek() fresh inside the same lock Poke() uses
+	// closes the gap: whichever of the two acquires w.mu first, the other
+	// is guaranteed to observe accurate state once it's their turn.
 	w.mu.Lock()
 	if w.current != nil {
 		// A genuinely new connection claimed the slot while we were
 		// writing; it rightfully wins (see handleAccept) — we lose ours.
 		w.mu.Unlock()
 		writeAndClose(rw.conn, w.supersededMessage())
+		return
+	}
+	if hasEvents, connected := w.source.Peek(); hasEvents || !connected {
+		w.mu.Unlock()
+		w.deliver(rw)
 		return
 	}
 	w.current = rw
