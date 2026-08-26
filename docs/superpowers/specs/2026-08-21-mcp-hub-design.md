@@ -658,6 +658,16 @@ nothing, whereas `exec_command`'s background-plus-poll path would need
 Codex to actively decide when to re-check, with no guarantee of
 promptness.
 
+One more caveat the message spells out explicitly: Codex's own shell-exec
+tool has its own execution timeout, independent of `wait` itself (recent
+Codex versions default to around 300s) — a real risk for a genuinely
+blocking call, unlike the backgrounded case where a tool-call timeout only
+bounds how long the *call* takes to return control, not the backgrounded
+process's lifetime. If `wait` gets killed with no output because nothing
+happened yet, that's normal, not an error — Codex is told to just run it
+again the same way, and to pass a longer `timeout_ms` on the call if its
+tool supports one, to cut down how often that happens.
+
 Expected steady-state loop: `hub_connect` → run `wait --follow` (or
 `ModeOnce`, re-run each time) in the background → harness notifies on each
 delivery → Claude reads the message(s) directly from that command's stdout

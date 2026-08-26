@@ -112,6 +112,9 @@ func TestConnectResultTellsCodexToRunBlockingInForeground(t *testing.T) {
 	if strings.Contains(text, "Monitor/background-streaming tool directly") {
 		t.Fatalf("expected the generic Monitor guidance to be replaced, not appended, got: %s", text)
 	}
+	if !strings.Contains(text, "timeout") || !strings.Contains(text, "NOT an error") {
+		t.Fatalf("expected a note that a shell-exec timeout with no output is not an error, got: %s", text)
+	}
 }
 
 func TestConnectResultDoesNotWarnNonCodexClients(t *testing.T) {

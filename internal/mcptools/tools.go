@@ -172,7 +172,11 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			"It blocks until a message arrives (or the hub disconnects), then exits — " +
 			"process what it printed, then run it again, still blocking, to keep waiting. " +
 			"This ties up your turn while waiting; that's expected, it's the only " +
-			"delivery mechanism available to you."
+			"delivery mechanism available to you. Your own shell-exec tool has its own " +
+			"timeout (recent Codex versions default to around 300s) that is independent of " +
+			"this command — if it gets killed with no output because nothing happened yet, " +
+			"that is NOT an error, just run it again the same way; pass a longer timeout_ms " +
+			"on the call if your tool supports it, to reduce how often that happens."
 	} else {
 		waitBlock = fmt.Sprintf(
 			"IMPORTANT: connecting alone does not deliver anything — you will never see a "+
