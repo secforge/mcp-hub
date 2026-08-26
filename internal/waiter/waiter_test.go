@@ -293,6 +293,19 @@ func TestNewWaiterSupersedesFollowConnection(t *testing.T) {
 	}
 }
 
+func TestWaitFollowCommandAppendsFollowFlag(t *testing.T) {
+	src := &fakeSource{connected: true}
+	w, err := Listen("session-e", "peer-e", src)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer w.Close()
+
+	if got, want := w.WaitFollowCommand(), w.WaitCommand()+" --follow"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestDisconnectedSourceReportedImmediately(t *testing.T) {
 	src := &fakeSource{connected: false}
 	w, err := Listen("session-d", "peer-d", src)

@@ -60,11 +60,20 @@ type DialOptions struct {
 	// and again server-side — but never parsed, decoded, or used
 	// cryptographically by the hub in any way; it is only distributed to
 	// other peers so they can encrypt to this one, entirely outside the
-	// hub's involvement. If a peer previously connected to this same
-	// session with this exact key, it is reassigned the same peerId (see
-	// hubsession.Session.Join), as long as that previous connection isn't
-	// still active.
+	// hub's involvement. It does NOT affect peerId reuse — see
+	// ReconnectSecret — because it's broadcast to every other peer in the
+	// session, so keying identity off it would let anyone who saw it
+	// impersonate that peer on reconnect.
 	AgePublicKey string
+	// ReconnectSecret, if given, is never distributed to anyone — only this
+	// client and the server ever see it. If a peer previously connected to
+	// this same still-alive session with this exact secret, it is
+	// reassigned that same peerId (see hubsession.Session.Join), as long as
+	// that previous connection isn't still active; otherwise it's simply
+	// remembered for a future reconnect. Any string works — a UUID, a
+	// random token, whatever the caller wants to remember and present again
+	// later.
+	ReconnectSecret string
 }
 
 // Dial connects to host+"/"+sessionID (e.g. "ws://localhost:8765" joining
@@ -88,6 +97,9 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 	}
 	if opts.AgePublicKey != "" {
 		target += "&agePublicKey=" + url.QueryEscape(opts.AgePublicKey)
+	}
+	if opts.ReconnectSecret != "" {
+		target += "&reconnectSecret=" + url.QueryEscape(opts.ReconnectSecret)
 	}
 	ws, _, err := websocket.DefaultDialer.Dial(target, nil)
 	if err != nil {

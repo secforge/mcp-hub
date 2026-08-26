@@ -21,6 +21,11 @@ import (
 // reasonable name, short enough to keep it from bloating logs/events.
 const maxNameRunes = 64
 
+// maxReconnectSecretRunes bounds a reconnectSecret — generous for any
+// reasonable client-generated token, but bounded so a client can't bloat
+// Session.secretToPeerID with arbitrarily large values.
+const maxReconnectSecretRunes = 256
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
@@ -84,15 +89,20 @@ func (h *Handler) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid agePublicKey", http.StatusBadRequest)
 		return
 	}
+	reconnectSecret := r.URL.Query().Get("reconnectSecret")
+	if len(reconnectSecret) > maxReconnectSecretRunes {
+		http.Error(w, "reconnectSecret too long", http.StatusBadRequest)
+		return
+	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	h.serve(conn, sessionID, name, agePublicKey)
+	h.serve(conn, sessionID, name, agePublicKey, reconnectSecret)
 }
 
-func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey string) {
+func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, reconnectSecret string) {
 	defer conn.Close()
 
 	var p *peer
@@ -107,7 +117,7 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey stri
 
 	session := h.manager.GetOrCreate(sessionID)
 	var writeErr error
-	session.Join(agePublicKey,
+	session.Join(reconnectSecret,
 		func(id string) hubsession.Peer {
 			peerID = id
 			p = &peer{id: id, conn: conn, done: done, name: name, agePublicKey: agePublicKey}

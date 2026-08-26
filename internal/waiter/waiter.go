@@ -78,11 +78,24 @@ func socketPath(sessionID, peerID string) string {
 // WaitCommand is the exact command Claude should run in the background to
 // receive the next event (the default, "once" mode).
 func (w *Waiter) WaitCommand() string {
+	return w.waitCommand("")
+}
+
+// WaitFollowCommand is the same command in "follow" mode: it stays running
+// and prints each event as it arrives instead of exiting after one, which
+// fits a harness with a way to stream a long-running background process's
+// output (e.g. a "Monitor"-style tool) better than the once-mode
+// run-it-again loop WaitCommand is meant for.
+func (w *Waiter) WaitFollowCommand() string {
+	return w.waitCommand(" --follow")
+}
+
+func (w *Waiter) waitCommand(flags string) string {
 	exe, err := os.Executable()
 	if err != nil {
 		exe = "mcp-hub-client"
 	}
-	return fmt.Sprintf("%s wait --socket %s", exe, w.socketPath)
+	return fmt.Sprintf("%s wait --socket %s%s", exe, w.socketPath, flags)
 }
 
 func (w *Waiter) acceptLoop() {

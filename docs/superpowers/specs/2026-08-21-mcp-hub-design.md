@@ -36,9 +36,10 @@ an explicit `{"type":"join",...}` first message; that has been fully
 replaced by this URL-based form.
 
 ```
-GET /<sessionId>?v=<protocolVersion>&name=<untrusted>&agePublicKey=<age1...>
-    (upgrade to websocket; v/name/agePublicKey all optional — see "Protocol
-    versioning" and "Peer identity: name and age public key")
+GET /<sessionId>?v=<protocolVersion>&name=<untrusted>&agePublicKey=<age1...>&reconnectSecret=<opaque>
+    (upgrade to websocket; v/name/agePublicKey/reconnectSecret all optional
+    — see "Protocol versioning" and "Peer identity: name, age public key,
+    and reconnect secret")
 ← {"type":"joined","peerId":"<uuid>","peerCount":<int>,"serverVersion":<int>,"name":"<sanitized>","agePublicKey":"<age1...>"}   // sent immediately
 ← {"type":"peerJoined","peerId":"<uuid>","name":"<sanitized>","agePublicKey":"<age1...>"}   // one per peer already in the session (see "Roster on join" below)
 ← {"type":"rosterComplete"}                    // marks the end of the initial roster catch-up above
@@ -64,9 +65,10 @@ Rules:
   Anything else → plain HTTP `400 Bad Request`, rejected *before* any
   websocket upgrade is attempted — no connection is ever opened for a
   malformed sessionId.
-- `peerId` is a random UUID assigned at join (or, if an `agePublicKey` was
-  given, possibly reused from that same key's previous connection in this
-  same still-alive session — see "Peer identity" below). Stable for that
+- `peerId` is a random UUID assigned at join (or, if a `reconnectSecret` was
+  given, possibly reused from that same secret's previous connection in
+  this same still-alive session — see "Peer identity" below; note this is
+  *not* driven by `agePublicKey`, deliberately). Stable for that
   connection's lifetime. It only lets recipients tell "this message came
   from the same peer as that earlier one" — an optional, untrusted
   human-readable `name` can additionally be given at connect time (see
@@ -125,7 +127,7 @@ roster complete — you now know everyone who was already in the session]`.
 "N other peers" before the roster catch-up arrives) but the client no longer
 needs it for correctness.
 
-### Peer identity: name and age public key
+### Peer identity: name, age public key, and reconnect secret
 
 A client may optionally supply, at connect time (as query params — see the
 wire block above):
@@ -144,40 +146,65 @@ wire block above):
   their models learn it — always still framed as untrusted, never as an
   instruction.
 - `agePublicKey`: an [age](https://age-encryption.org) recipient string
-  (`age1...`). The hub validates its *format* only — `internal/agekey.Valid`
-  checks it's a syntactically well-formed bech32 string with human-readable
-  part `age` and a correct checksum — and never parses, decodes, or uses it
-  for any cryptographic purpose. A syntactically invalid key is rejected
-  with a plain HTTP `400` before the websocket upgrade, exactly like an
-  invalid `sessionId`. Once accepted, it's distributed to every other peer
-  exactly like `name` (echoed in `joined`, included on `peerJoined`), so
-  they can encrypt messages to this peer with `age` themselves, entirely
-  outside the hub's involvement — the hub remains a dumb relay for message
-  content either way.
+  (`age1...`), for encryption only. The hub validates its *format* only —
+  `internal/agekey.Valid` checks it's a syntactically well-formed bech32
+  string with human-readable part `age` and a correct checksum — and never
+  parses, decodes, or uses it for any cryptographic purpose. A
+  syntactically invalid key is rejected with a plain HTTP `400` before the
+  websocket upgrade, exactly like an invalid `sessionId`. Once accepted,
+  it's distributed to every other peer exactly like `name` (echoed in
+  `joined`, included on `peerJoined`), so they can encrypt messages to this
+  peer with `age` themselves, entirely outside the hub's involvement — the
+  hub remains a dumb relay for message content either way. **It plays no
+  role in peerId reuse** — see below for why.
+- `reconnectSecret`: an opaque, client-chosen string (any format — a UUID,
+  a random token, whatever) used *purely* to reclaim a previous peerId on
+  reconnect. Unlike `name`/`agePublicKey`, it is **never distributed to
+  anyone** — not echoed in `joined`, not included in any `peerJoined` event,
+  never logged. Capped at `maxReconnectSecretRunes` (256); an overlong one
+  is rejected with HTTP `400` before upgrade, the same way an invalid
+  `agePublicKey` is.
 
 **Identity reuse.** `hubsession.Session` keeps an in-memory
-`pubkeyToPeerID map[string]string`, populated whenever a peer connects with
-a non-empty `agePublicKey`. On `Join`, if the given key maps to a peerID
-that isn't a currently-active connection, that same peerID is reused
+`secretToPeerID map[string]string`, populated whenever a peer connects with
+a non-empty `reconnectSecret`. On `Join`, if the given secret maps to a
+peerID that isn't a currently-active connection, that same peerID is reused
 instead of a fresh one — so a peer that drops and reconnects with the same
-key is recognized as the same identity by anyone still watching the roster.
-Two things bound this deliberately:
+secret is recognized as the same identity by anyone still watching the
+roster.
+
+This is deliberately **not** keyed by `agePublicKey`, even though an
+earlier version of this feature did exactly that. `agePublicKey` is
+broadcast to every other peer in the session (that's the whole point — so
+they can encrypt to it); keying reuse off it would mean anyone who merely
+*observed* a peer's public key on the wire could reconnect presenting that
+same key and be handed that peer's peerId — a straightforward impersonation
+vector, since a public key by definition proves nothing about possessing
+the matching private key, and the hub never asks for or verifies any proof
+of that (no signing, no challenge/response — this iteration is explicitly
+just "does the string match", which is why it has to be a value nobody else
+ever sees). `reconnectSecret` fixes this by being a separate value that's
+never distributed at all — `TestJoinNeverReusesPeerIDBasedOnAgePublicKeyAlone`
+(`internal/hubsession`) and `TestObservingAgePublicKeyDoesNotAllowImpersonation`
+(`internal/wsserver`) are regression tests for exactly this.
+
+Two things bound the reuse itself, same as before:
 
 - The map lives inside the `Session` object itself, so it only persists for
   as long as the channel does. Once the last peer leaves, `Manager.Remove`
   tears the whole `Session` down (as always); a later connection with that
-  same key — including after a server restart, which loses all in-memory
+  same secret — including after a server restart, which loses all in-memory
   state — simply creates a brand new `Session` with no memory of the old
   one and gets a fresh peerID, same as anyone else. This is intentional,
   not a gap: identity is scoped to "the same still-alive channel," per the
-  original requirement, not to the key itself indefinitely.
-- If the key's previous peerID is *still* an active connection (e.g. two
-  processes present the same key into the same session concurrently), the
-  new connection gets a fresh UUID instead of colliding with the live one —
-  `resolvePeerIDLocked` checks `s.peers` for that ID before reusing it. Both
-  the reuse and the collision-avoidance decision happen under `s.mu`, in the
-  same locked section as the rest of `Join`, for the same atomicity reasons
-  described above.
+  original requirement, not to the secret itself indefinitely.
+- If the secret's previous peerID is *still* an active connection (e.g. two
+  processes present the same secret into the same session concurrently),
+  the new connection gets a fresh UUID instead of colliding with the live
+  one — `resolvePeerIDLocked` checks `s.peers` for that ID before reusing
+  it. Both the reuse and the collision-avoidance decision happen under
+  `s.mu`, in the same locked section as the rest of `Join`, for the same
+  atomicity reasons described above.
 
 ### Protocol versioning
 
@@ -276,7 +303,7 @@ join/leave events.
 
 ## MCP client: tools
 
-- **`hub_connect(host, sessionId?, name?, agePublicKey?)`** — dials `host` + `/` + `sessionId` (e.g.
+- **`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret?)`** — dials `host` + `/` + `sessionId` (e.g.
   `host="wss://relay.example.com:8765"` and `sessionId="550e8400-..."` dials
   `wss://relay.example.com:8765/550e8400-...`), which auto-joins as part of
   the websocket handshake, and on success spawns a background goroutine that
@@ -320,14 +347,16 @@ join/leave events.
     to update `mcp-hub-client` (server ahead) or that the server may need
     updating (client ahead) — see "Protocol versioning" above.
 
-  `name` and `agePublicKey` are both optional (see "Peer identity" above).
-  `agePublicKey` is format-validated client-side (`agekey.Valid`) before
-  even dialing, so a malformed key fails fast with a clear tool error
-  instead of a round trip to the server (which validates it again anyway).
-  If either was given, the result text confirms what other peers can now
-  see via `hub_peers()` — including the sanitized name, called out
-  explicitly if it differs from what was passed in, so Claude never
-  silently assumes an unsanitized value took effect.
+  `name`, `agePublicKey`, and `reconnectSecret` are all optional (see "Peer
+  identity" above). `agePublicKey` is format-validated client-side
+  (`agekey.Valid`) before even dialing, so a malformed key fails fast with
+  a clear tool error instead of a round trip to the server (which validates
+  it again anyway). If `name`/`agePublicKey` was given, the result text
+  confirms what other peers can now see via `hub_peers()` — including the
+  sanitized name, called out explicitly if it differs from what was passed
+  in, so Claude never silently assumes an unsanitized value took effect. If
+  `reconnectSecret` was given, the result confirms it's remembered (and
+  never shared) for a future reconnect.
 - **`hub_send(text, to?)`** — sends `{"type":"msg","text":...}` (broadcast) or,
   if `to` (a peerId) is given, `{"type":"msg","text":...,"to":...}` (private)
   on the active connection. Errors clearly if not connected, or if `to` is

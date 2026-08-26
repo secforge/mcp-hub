@@ -43,11 +43,19 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"stripped, length capped)")),
 			mcp.WithString("agePublicKey", mcp.Description(
 				"Optional age (https://age-encryption.org) public key ('age1...'), "+
-					"format-validated but otherwise untouched — distributed to other "+
-					"peers so they can encrypt to you; the hub never uses it "+
-					"cryptographically. Reconnecting with the same key in the same "+
-					"session reassigns your previous peerId, as long as that previous "+
-					"connection isn't still active")),
+					"format-validated but otherwise untouched by the hub — it's distributed "+
+					"to other peers (via hub_peers()) so they can encrypt to you; the hub "+
+					"itself never uses it cryptographically. This is DIFFERENT from "+
+					"reconnectSecret: agePublicKey is visible to every other peer in the "+
+					"session, so it must never be used to grant identity/peerId reuse — "+
+					"anyone who saw it could then impersonate you. Use reconnectSecret for that")),
+			mcp.WithString("reconnectSecret", mcp.Description(
+				"Optional, never distributed to anyone (only you and the server ever see "+
+					"it) — any string you choose to remember, e.g. a UUID. Presenting the "+
+					"exact same reconnectSecret on a later hub_connect to this same "+
+					"still-alive session reassigns your previous peerId instead of a new "+
+					"one, so you're recognized as the same participant across a dropped "+
+					"connection, as long as that previous connection isn't still active")),
 		),
 		h.handleConnect,
 	)
@@ -100,7 +108,10 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if agePublicKey != "" && !agekey.Valid(agePublicKey) {
 		return mcp.NewToolResultError("agePublicKey is not a validly formatted age public key"), nil
 	}
-	conn, err := hubconn.Dial(host, sessionID, hubconn.DialOptions{Name: name, AgePublicKey: agePublicKey})
+	reconnectSecret := req.GetString("reconnectSecret", "")
+	conn, err := hubconn.Dial(host, sessionID, hubconn.DialOptions{
+		Name: name, AgePublicKey: agePublicKey, ReconnectSecret: reconnectSecret,
+	})
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %v", err)), nil
 	}
@@ -113,9 +124,20 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	h.conn = conn
 	h.waiter = w
 
-	const waitRequirement = "IMPORTANT: connecting alone does not deliver anything — " +
-		"you will never see a message unless this wait command is actually running in the " +
-		"background. Run it now, and again every time it completes, to keep receiving:"
+	waitBlock := fmt.Sprintf(
+		"IMPORTANT: connecting alone does not deliver anything — you will never see a "+
+			"message unless one of these is actually running in the background. Two modes, "+
+			"pick based on what your harness offers:\n"+
+			"  - once (default): exits after the next event, so it must be run again every "+
+			"time it completes — run it now:\n"+
+			"      %s\n"+
+			"  - follow: stays running and prints each event as it arrives — prefer this, "+
+			"backgrounded via a tool that can stream a long-running process's output as it "+
+			"happens (e.g. a \"Monitor\"-style tool), if your harness has one; otherwise use "+
+			"once mode above:\n"+
+			"      %s",
+		w.WaitCommand(), w.WaitFollowCommand(),
+	)
 
 	invite := fmt.Sprintf(
 		"Propose this to the user so they can copy it to whoever else should join:\n"+
@@ -160,19 +182,24 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		}
 		identityNote = "\nOther peers (via hub_peers()) can see your " + strings.Join(parts, " and ") + "."
 	}
+	if reconnectSecret != "" {
+		identityNote += "\nThis reconnectSecret is remembered (not shared with anyone) — " +
+			"present it again on a future hub_connect to this same still-alive session to " +
+			"be reassigned this same peerId."
+	}
 
 	if generated {
 		return mcp.NewToolResultText(fmt.Sprintf(
 			"Connected as peer %s in a new session: %s\n"+
 				"Share this sessionId with whoever else should join — they need it to connect.\n"+
 				"%s\n%s\n"+
-				"%s\n%s%s%s",
-			conn.PeerID(), sessionID, invite, rosterNote, waitRequirement, w.WaitCommand(), versionNote, identityNote,
+				"%s%s%s",
+			conn.PeerID(), sessionID, invite, rosterNote, waitBlock, versionNote, identityNote,
 		)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf(
-		"Connected as peer %s.\n%s\n%s\n%s\n%s%s%s",
-		conn.PeerID(), invite, rosterNote, waitRequirement, w.WaitCommand(), versionNote, identityNote,
+		"Connected as peer %s.\n%s\n%s\n%s%s%s",
+		conn.PeerID(), invite, rosterNote, waitBlock, versionNote, identityNote,
 	)), nil
 }
 

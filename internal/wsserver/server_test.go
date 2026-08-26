@@ -385,6 +385,25 @@ func TestInvalidAgePublicKeyRejectedBeforeUpgrade(t *testing.T) {
 	}
 }
 
+func TestOverlongReconnectSecretRejectedBeforeUpgrade(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	_, resp, err := websocket.DefaultDialer.Dial(
+		url+"/550e8400-e29b-41d4-a716-446655440000?reconnectSecret="+strings.Repeat("x", maxReconnectSecretRunes+1), nil)
+	if err == nil {
+		t.Fatal("expected the handshake to fail for an overlong reconnectSecret")
+	}
+	if resp == nil || resp.StatusCode != http.StatusBadRequest {
+		status := "<nil response>"
+		if resp != nil {
+			status = resp.Status
+		}
+		t.Fatalf("expected HTTP 400 before any websocket upgrade, got: %s", status)
+	}
+}
+
 func TestJoinedEchoesSanitizedNameAndValidAgePublicKey(t *testing.T) {
 	srv := httptest.NewServer(NewHandler())
 	defer srv.Close()
@@ -435,7 +454,7 @@ func TestPeerJoinedCarriesNameAndAgePublicKeyToOtherPeers(t *testing.T) {
 	}
 }
 
-func TestReconnectingWithSameAgePublicKeyReusesPeerID(t *testing.T) {
+func TestReconnectingWithSameReconnectSecretReusesPeerID(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("MCP_HUB_LOG_DIR", dir)
 
@@ -443,9 +462,55 @@ func TestReconnectingWithSameAgePublicKeyReusesPeerID(t *testing.T) {
 	defer srv.Close()
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	const secret = "super-secret-reconnect-token"
 
 	// another peer stays connected throughout, so the session (and its
-	// pubkey memory) survives first's departure instead of being torn down.
+	// secret memory) survives first's departure instead of being torn down.
+	other := dial(t, url, sessionID)
+	defer other.Close()
+	readTyped(t, other) // other: joined
+	readTyped(t, other) // other: rosterComplete
+
+	first, _, err := websocket.DefaultDialer.Dial(
+		url+"/"+sessionID+"?reconnectSecret="+secret, nil)
+	if err != nil {
+		t.Fatalf("dial first: %v", err)
+	}
+	_, raw := readTyped(t, first)
+	var joinedFirst wire.Joined
+	decodeJSON(t, raw, &joinedFirst)
+	readTyped(t, other) // other: peerJoined for first
+	first.Close()
+	readTyped(t, other) // other: peerLeft for first — by now first is fully deregistered
+
+	second, _, err := websocket.DefaultDialer.Dial(
+		url+"/"+sessionID+"?reconnectSecret="+secret, nil)
+	if err != nil {
+		t.Fatalf("dial second: %v", err)
+	}
+	defer second.Close()
+	_, raw = readTyped(t, second)
+	var joinedSecond wire.Joined
+	decodeJSON(t, raw, &joinedSecond)
+
+	if joinedSecond.PeerID != joinedFirst.PeerID {
+		t.Fatalf("expected reconnecting with the same reconnectSecret to reuse peerID %q, got %q",
+			joinedFirst.PeerID, joinedSecond.PeerID)
+	}
+}
+
+// TestObservingAgePublicKeyDoesNotAllowImpersonation is a security
+// regression test at the HTTP/websocket layer: agePublicKey is broadcast to
+// every other peer (see TestPeerJoinedCarriesNameAndAgePublicKeyToOtherPeers),
+// so an "impersonator" who merely saw it on the wire — without knowing
+// first's reconnectSecret — must not be able to reclaim first's peerId by
+// presenting that same agePublicKey.
+func TestObservingAgePublicKeyDoesNotAllowImpersonation(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
 	other := dial(t, url, sessionID)
 	defer other.Close()
 	readTyped(t, other) // other: joined
@@ -459,23 +524,22 @@ func TestReconnectingWithSameAgePublicKeyReusesPeerID(t *testing.T) {
 	_, raw := readTyped(t, first)
 	var joinedFirst wire.Joined
 	decodeJSON(t, raw, &joinedFirst)
-	readTyped(t, other) // other: peerJoined for first
+	readTyped(t, other) // other: peerJoined for first (this is what "leaks" the key)
 	first.Close()
-	readTyped(t, other) // other: peerLeft for first — by now first is fully deregistered
+	readTyped(t, other) // other: peerLeft for first
 
-	second, _, err := websocket.DefaultDialer.Dial(
+	impersonator, _, err := websocket.DefaultDialer.Dial(
 		url+"/"+sessionID+"?agePublicKey="+testAgePublicKey, nil)
 	if err != nil {
-		t.Fatalf("dial second: %v", err)
+		t.Fatalf("dial impersonator: %v", err)
 	}
-	defer second.Close()
-	_, raw = readTyped(t, second)
-	var joinedSecond wire.Joined
-	decodeJSON(t, raw, &joinedSecond)
+	defer impersonator.Close()
+	_, raw = readTyped(t, impersonator)
+	var joinedImpersonator wire.Joined
+	decodeJSON(t, raw, &joinedImpersonator)
 
-	if joinedSecond.PeerID != joinedFirst.PeerID {
-		t.Fatalf("expected reconnecting with the same agePublicKey to reuse peerID %q, got %q",
-			joinedFirst.PeerID, joinedSecond.PeerID)
+	if joinedImpersonator.PeerID == joinedFirst.PeerID {
+		t.Fatal("agePublicKey alone must never grant peerId reuse — it's broadcast to every peer, so this would allow impersonation")
 	}
 }
 

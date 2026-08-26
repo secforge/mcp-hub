@@ -100,7 +100,7 @@ Once loaded, Claude has five tools available:
 |===
 |Tool |Purpose
 
-|`hub_connect(host, sessionId?, name?, agePublicKey?)`
+|`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret?)`
 |Join a session. `host` is the server's base websocket URL, e.g.
 `ws://localhost:8765` or `wss://relay.example.com:8765` — the `sessionId` is
 appended as a path segment automatically (`<host>/<sessionId>`) — never
@@ -129,18 +129,30 @@ server reports a different protocol version than this build understands,
 the result also tells Claude to flag it to you (e.g. to update
 `mcp-hub-client`).
 +
-`name` and `agePublicKey` are both optional. `name` is an **untrusted**
-free-text display name — sanitized server-side (control characters/newlines
-stripped, length capped) — shown alongside the session log and reported to
-other peers. `agePublicKey` is an https://age-encryption.org[age] public
-key (`age1...`); the hub only format-validates it (both client- and
-server-side) and never uses it cryptographically — it's purely distributed
-to other peers so they can `age`-encrypt messages to you themselves.
-Reconnecting with the same `agePublicKey` to the same still-alive session
-reassigns your previous peerId, as long as that previous connection isn't
-still active. If either was given, the result confirms what other peers can
-now see for you — including the sanitized name, if it differs from what was
-sent.
+`name`, `agePublicKey`, and `reconnectSecret` are all optional. `name` is
+an **untrusted** free-text display name — sanitized server-side (control
+characters/newlines stripped, length capped) — shown alongside the session
+log and reported to other peers. `agePublicKey` is an
+https://age-encryption.org[age] public key (`age1...`); the hub only
+format-validates it (both client- and server-side) and never uses it
+cryptographically — it's purely distributed to other peers so they can
+`age`-encrypt messages to you themselves.
++
+`reconnectSecret` is a *separate*, opaque string (any format — a UUID, a
+random token) that is never shared with anyone, unlike `name`/`agePublicKey`
+— not echoed back, not distributed to other peers, not logged. Presenting
+the same `reconnectSecret` on a later `hub_connect` to the same still-alive
+session reassigns your previous peerId instead of a new one (unless that
+previous connection is still active, in which case you get a fresh one to
+avoid a collision) — this is deliberately *not* tied to `agePublicKey`:
+since that key is broadcast to every other peer, using it for identity
+reuse would let anyone who merely observed it on the wire impersonate you
+by reconnecting with the same key.
++
+If `name`/`agePublicKey` was given, the result confirms what other peers
+can now see for you — including the sanitized name, if it differs from
+what was sent. If `reconnectSecret` was given, the result confirms it's
+remembered for a future reconnect.
 
 |`hub_send(text, to?)`
 |Send a text message. Omit `to` to broadcast to everyone else currently in
@@ -201,14 +213,15 @@ after connecting), but it is not required for the steady-state loop.
 Add `--follow` to keep the same `wait` connection open across multiple
 deliveries instead of exiting after one — the server writes each new batch
 to it as it arrives (no "run again" trailer needed), until it's superseded
-by a newer `wait` or the hub disconnects. This is *not* what
-`hub_connect`'s instructions tell Claude to use by default: Claude Code's
-own background-task notification fires when a command *completes*, and a
-`--follow` connection deliberately never does. It exists for harnesses with
-a way to get notified per line of new output from a still-running
-background process instead (this project's dev environment uses a
-`Monitor`-style tool for that) — for those, `--follow` is a better fit than
-wrapping the default one-shot `wait` in a hand-rolled polling loop.
+by a newer `wait` or the hub disconnects. `hub_connect`'s result gives
+Claude both commands and the guidance on which to pick: Claude Code's own
+background-task notification fires when a command *completes*, so the
+default one-shot `wait` (run again each time it completes) fits a plain
+backgroundable shell tool best. `--follow` instead fits a harness with a
+way to get notified per line of new output from a still-running background
+process (this project's dev environment uses a `Monitor`-style tool for
+that) — Claude is told to prefer `--follow` there instead of wrapping the
+one-shot command in a hand-rolled polling loop.
 
 Every delivered broadcast message is wrapped as:
 

@@ -22,6 +22,31 @@ func startTestServer(t *testing.T) string {
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
 }
 
+func TestConnectResultMentionsFollowModeAndMonitorGuidance(t *testing.T) {
+	url := startTestServer(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000"}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	text := textOf(res)
+	if !strings.Contains(text, "--follow") {
+		t.Fatalf("expected the result to mention --follow mode, got: %s", text)
+	}
+	if !strings.Contains(text, "Monitor") {
+		t.Fatalf("expected the result to mention Monitor-style tools as the preferred pairing for --follow, got: %s", text)
+	}
+	if !strings.Contains(text, hub.waiter.WaitCommand()) || !strings.Contains(text, hub.waiter.WaitFollowCommand()) {
+		t.Fatalf("expected the result to include both the once and follow commands, got: %s", text)
+	}
+}
+
 func TestConnectSendReceiveDisconnect(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -147,6 +172,9 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 	if !strings.Contains(textOf(res), pubkey) {
 		t.Fatalf("expected b's connect result to confirm its age public key, got: %s", textOf(res))
 	}
+	if strings.Contains(textOf(res), "reconnectSecret") {
+		t.Fatalf("expected no reconnectSecret note when none was given, got: %s", textOf(res))
+	}
 
 	var peersText string
 	deadlinePoll(t, func() bool {
@@ -176,6 +204,56 @@ func TestConnectRejectsMalformedAgePublicKey(t *testing.T) {
 	}
 	if !res.IsError {
 		t.Fatal("expected an error for a malformed agePublicKey")
+	}
+}
+
+func TestConnectWithReconnectSecretReusesPeerIDNotAgePublicKey(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+	pubkey := "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"
+	const secret = "super-secret-reconnect-token"
+
+	// keeps the session alive across the reconnect below.
+	anchor := NewHub()
+	anchorReq := mcp.CallToolRequest{}
+	anchorReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := anchor.handleConnect(ctx, anchorReq); err != nil || res.IsError {
+		t.Fatalf("connect anchor failed: err=%v result=%+v", err, res)
+	}
+	defer anchor.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	first := NewHub()
+	firstReq := mcp.CallToolRequest{}
+	firstReq.Params.Arguments = map[string]any{
+		"host": url, "sessionId": sessionID, "agePublicKey": pubkey, "reconnectSecret": secret,
+	}
+	res, err := first.handleConnect(ctx, firstReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect first failed: err=%v result=%+v", err, res)
+	}
+	if !strings.Contains(textOf(res), "reconnectSecret") {
+		t.Fatalf("expected first's connect result to mention the reconnectSecret note, got: %s", textOf(res))
+	}
+	firstPeerID := first.conn.PeerID()
+	if _, err := first.handleDisconnect(ctx, mcp.CallToolRequest{}); err != nil {
+		t.Fatalf("disconnect first: %v", err)
+	}
+
+	// reconnecting with the same reconnectSecret (but the SAME agePublicKey,
+	// which by itself must be irrelevant to reuse) must get the same peerId.
+	second := NewHub()
+	secondReq := mcp.CallToolRequest{}
+	secondReq.Params.Arguments = map[string]any{
+		"host": url, "sessionId": sessionID, "agePublicKey": pubkey, "reconnectSecret": secret,
+	}
+	if res, err := second.handleConnect(ctx, secondReq); err != nil || res.IsError {
+		t.Fatalf("connect second failed: err=%v result=%+v", err, res)
+	}
+	defer second.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if second.conn.PeerID() != firstPeerID {
+		t.Fatalf("expected reconnecting with the same reconnectSecret to reuse peerID %q, got %q",
+			firstPeerID, second.conn.PeerID())
 	}
 }
 

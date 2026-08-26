@@ -25,12 +25,19 @@ type Session struct {
 	id    string
 	mu    sync.Mutex
 	peers map[string]Peer
-	// pubkeyToPeerID remembers which peerID an age public key was last
+	// secretToPeerID remembers which peerID a reconnectSecret was last
 	// assigned, for the lifetime of this Session (i.e. only as long as the
 	// channel stays alive — a peer that reconnects after everyone else has
 	// left, tearing the session down, gets a fresh identity like anyone
 	// else, since a brand new Session has no memory of the old one).
-	pubkeyToPeerID map[string]string
+	//
+	// Deliberately NOT keyed by agePublicKey: that value is broadcast to
+	// every other peer in the session (see Join below), so anyone who saw
+	// it could replay it to steal a peer's identity on reconnect. A
+	// reconnectSecret is never distributed to anyone — only the connecting
+	// client and the server ever see it — so only whoever actually holds it
+	// can reclaim the identity it maps to.
+	secretToPeerID map[string]string
 }
 
 func newSession(id string) *Session {
@@ -38,8 +45,8 @@ func newSession(id string) *Session {
 }
 
 // Join resolves the peerID to use (reusing the ID a previous, now-departed
-// connection with the same agePublicKey used, if any — see
-// pubkeyToPeerID — otherwise a fresh UUID), constructs the peer via
+// connection that presented the same reconnectSecret, if any — see
+// secretToPeerID — otherwise a fresh UUID), constructs the peer via
 // makePeer, registers it, delivers it the current roster (one peerJoined
 // per existing peer, terminated by a RosterComplete), and announces its own
 // join to everyone else — all while holding the session lock for the
@@ -56,11 +63,11 @@ func newSession(id string) *Session {
 // anyone else — e.g. to write a "joined" confirmation with an
 // existing-peer count that's guaranteed consistent with the roster that
 // follows.
-func (s *Session) Join(agePublicKey string, makePeer func(peerID string) Peer, beforeVisible func(existingCount int)) Peer {
+func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer, beforeVisible func(existingCount int)) Peer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	peerID := s.resolvePeerIDLocked(agePublicKey)
+	peerID := s.resolvePeerIDLocked(reconnectSecret)
 	existing := make([]Peer, 0, len(s.peers))
 	for _, ep := range s.peers {
 		existing = append(existing, ep)
@@ -70,11 +77,11 @@ func (s *Session) Join(agePublicKey string, makePeer func(peerID string) Peer, b
 		beforeVisible(len(existing))
 	}
 	s.peers[peerID] = p
-	if agePublicKey != "" {
-		if s.pubkeyToPeerID == nil {
-			s.pubkeyToPeerID = make(map[string]string)
+	if reconnectSecret != "" {
+		if s.secretToPeerID == nil {
+			s.secretToPeerID = make(map[string]string)
 		}
-		s.pubkeyToPeerID[agePublicKey] = peerID
+		s.secretToPeerID[reconnectSecret] = peerID
 	}
 
 	for _, ep := range existing {
@@ -87,9 +94,9 @@ func (s *Session) Join(agePublicKey string, makePeer func(peerID string) Peer, b
 
 // resolvePeerIDLocked returns the peerID a joining connection should use.
 // Called with s.mu already held.
-func (s *Session) resolvePeerIDLocked(agePublicKey string) string {
-	if agePublicKey != "" {
-		if id, ok := s.pubkeyToPeerID[agePublicKey]; ok {
+func (s *Session) resolvePeerIDLocked(reconnectSecret string) string {
+	if reconnectSecret != "" {
+		if id, ok := s.secretToPeerID[reconnectSecret]; ok {
 			if _, stillConnected := s.peers[id]; !stillConnected {
 				return id
 			}
