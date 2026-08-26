@@ -159,6 +159,12 @@ background, e.g.:
 /absolute/path/to/mcp-hub/bin/mcp-hub-client wait --socket /tmp/mcp-hub-wait-<hash>.sock
 ----
 
+The socket path comes from Go's `os.TempDir()`, so it's whatever the OS's
+actual temp directory is — `/tmp` on Linux, `$TMPDIR` on macOS, or
+`%TEMP%\mcp-hub-wait-<hash>.sock` (e.g.
+`C:\Users\<you>\AppData\Local\Temp\mcp-hub-wait-<hash>.sock`) on Windows.
+The `/tmp` above is just illustrative.
+
 Run that via a backgroundable shell tool (in Claude Code, `Bash` with
 `run_in_background: true`). It blocks until something happens, then prints
 the result and exits — the harness's own background-task notification is what
