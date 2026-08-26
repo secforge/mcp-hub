@@ -324,6 +324,10 @@ join/leave events.
   `agePublicKey` is format-validated client-side (`agekey.Valid`) before
   even dialing, so a malformed key fails fast with a clear tool error
   instead of a round trip to the server (which validates it again anyway).
+  If either was given, the result text confirms what other peers can now
+  see via `hub_peers()` — including the sanitized name, called out
+  explicitly if it differs from what was passed in, so Claude never
+  silently assumes an unsanitized value took effect.
 - **`hub_send(text, to?)`** — sends `{"type":"msg","text":...}` (broadcast) or,
   if `to` (a peerId) is given, `{"type":"msg","text":...,"to":...}` (private)
   on the active connection. Errors clearly if not connected, or if `to` is

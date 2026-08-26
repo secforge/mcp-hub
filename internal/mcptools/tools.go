@@ -73,7 +73,9 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	s.AddTool(
 		mcp.NewTool("hub_peers",
-			mcp.WithDescription("List the peerIds of everyone else currently in the hub session")),
+			mcp.WithDescription("List everyone else currently in the hub session, including each "+
+				"peer's peerId and — if they supplied one on connect — their display name and age "+
+				"public key (e.g. for encrypting a message to them before sending)")),
 		h.handlePeers,
 	)
 }
@@ -143,18 +145,34 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				"the server may need updating.", wire.ProtocolVersion, sv)
 	}
 
+	identityNote := ""
+	if name != "" || agePublicKey != "" {
+		var parts []string
+		if conn.Name() != "" {
+			if conn.Name() != name {
+				parts = append(parts, fmt.Sprintf("display name %q (sanitized from what was given)", conn.Name()))
+			} else {
+				parts = append(parts, fmt.Sprintf("display name %q", conn.Name()))
+			}
+		}
+		if conn.AgePublicKey() != "" {
+			parts = append(parts, "age public key "+conn.AgePublicKey())
+		}
+		identityNote = "\nOther peers (via hub_peers()) can see your " + strings.Join(parts, " and ") + "."
+	}
+
 	if generated {
 		return mcp.NewToolResultText(fmt.Sprintf(
 			"Connected as peer %s in a new session: %s\n"+
 				"Share this sessionId with whoever else should join — they need it to connect.\n"+
 				"%s\n%s\n"+
-				"%s\n%s%s",
-			conn.PeerID(), sessionID, invite, rosterNote, waitRequirement, w.WaitCommand(), versionNote,
+				"%s\n%s%s%s",
+			conn.PeerID(), sessionID, invite, rosterNote, waitRequirement, w.WaitCommand(), versionNote, identityNote,
 		)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf(
-		"Connected as peer %s.\n%s\n%s\n%s\n%s%s",
-		conn.PeerID(), invite, rosterNote, waitRequirement, w.WaitCommand(), versionNote,
+		"Connected as peer %s.\n%s\n%s\n%s\n%s%s%s",
+		conn.PeerID(), invite, rosterNote, waitRequirement, w.WaitCommand(), versionNote, identityNote,
 	)), nil
 }
 

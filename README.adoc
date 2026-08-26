@@ -138,7 +138,9 @@ server-side) and never uses it cryptographically — it's purely distributed
 to other peers so they can `age`-encrypt messages to you themselves.
 Reconnecting with the same `agePublicKey` to the same still-alive session
 reassigns your previous peerId, as long as that previous connection isn't
-still active.
+still active. If either was given, the result confirms what other peers can
+now see for you — including the sanitized name, if it differs from what was
+sent.
 
 |`hub_send(text, to?)`
 |Send a text message. Omit `to` to broadcast to everyone else currently in

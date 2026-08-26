@@ -136,8 +136,16 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 	if err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
-	if strings.Contains(textOf(res), "\n") && strings.Contains(textOf(res), "fake log line") {
-		t.Fatalf("expected the newline in the raw name to be stripped (no log-line injection), got: %s", textOf(res))
+	for _, line := range strings.Split(textOf(res), "\n") {
+		if strings.TrimSpace(line) == "fake log line" {
+			t.Fatalf("expected the newline in the raw name to be stripped (no line injection), got line %q in: %s", line, textOf(res))
+		}
+	}
+	if !strings.Contains(textOf(res), "sanitized") || !strings.Contains(textOf(res), "Steffenfake log line") {
+		t.Fatalf("expected b's connect result to confirm its sanitized display name, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), pubkey) {
+		t.Fatalf("expected b's connect result to confirm its age public key, got: %s", textOf(res))
 	}
 
 	var peersText string
@@ -186,6 +194,9 @@ func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T)
 	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
 	if !strings.Contains(textOf(res), "No other peers are in this session yet") {
 		t.Fatalf("expected a-no-existing-peers note, got: %s", textOf(res))
+	}
+	if strings.Contains(textOf(res), "display name") || strings.Contains(textOf(res), "age public key") {
+		t.Fatalf("expected no identity note when neither name nor agePublicKey was given, got: %s", textOf(res))
 	}
 
 	hubB := NewHub()
