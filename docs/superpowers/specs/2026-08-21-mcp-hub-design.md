@@ -496,9 +496,15 @@ mcp-hub-client wait --socket <path>
   - **`superseded`** — the server allows only one registered waiter at a time.
     If a new `wait` connects while one is already registered, the server
     immediately sends `superseded` to the *old* one and closes it, then
-    registers the new connection as the current waiter. `wait` prints
-    `superseded by a newer wait` with no re-run instruction — this output
-    should just be discarded, since a newer wait is already in flight.
+    registers the new connection as the current waiter. `wait` prints an
+    explicit "do NOT run this command again" message (with the `--follow`
+    command as the suggested replacement) rather than the usual re-run
+    trailer — `Waiter.supersededMessage()` — specifically so a model that
+    otherwise follows `hub_connect`'s generic "run it again on completion"
+    instruction too literally doesn't spawn a replacement for the loser,
+    which would immediately supersede whatever legitimately still-active
+    wait was already running, and so on: exactly one wait should ever be
+    kept running at a time.
 - **Race fix**: when a `wait` connection is accepted, the server checks
   immediately whether the buffer already has unread events. If so, it responds
   with `message` right away instead of registering the connection as a

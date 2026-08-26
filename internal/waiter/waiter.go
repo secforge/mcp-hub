@@ -125,7 +125,7 @@ func (w *Waiter) handleAccept(conn net.Conn) {
 	w.current = rw
 	w.mu.Unlock()
 	if old != nil {
-		writeAndClose(old.conn, "superseded by a newer wait\n")
+		writeAndClose(old.conn, w.supersededMessage())
 	}
 }
 
@@ -169,7 +169,7 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 		// A genuinely new connection claimed the slot while we were
 		// writing; it rightfully wins (see handleAccept) — we lose ours.
 		w.mu.Unlock()
-		writeAndClose(rw.conn, "superseded by a newer wait\n")
+		writeAndClose(rw.conn, w.supersededMessage())
 		return
 	}
 	w.current = rw
@@ -186,6 +186,19 @@ func (w *Waiter) Close() error {
 	err := w.ln.Close()
 	_ = os.Remove(w.socketPath)
 	return err
+}
+
+// supersededMessage tells the losing wait's process not to restart itself —
+// without this, a model that follows hub_connect's generic "run it again
+// every time it completes" instruction too literally could spawn a
+// replacement for the one that just lost, which immediately supersedes
+// whatever legitimately still-active wait was already running, and so on
+// indefinitely: only one wait should ever be kept running at a time.
+func (w *Waiter) supersededMessage() string {
+	return "superseded by a newer wait — do NOT run this command again. " +
+		"Keep exactly ONE wait running at a time; the newer one is already " +
+		"active and receiving for you. Prefer --follow for that one going " +
+		"forward:\n" + w.WaitFollowCommand() + "\n"
 }
 
 func writeAndClose(conn net.Conn, msg string) {

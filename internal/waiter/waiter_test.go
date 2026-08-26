@@ -151,7 +151,7 @@ func TestNewWaiterSupersedesOld(t *testing.T) {
 
 	select {
 	case got := <-oldDone:
-		if got != "superseded by a newer wait\n" {
+		if got != w.supersededMessage() {
 			t.Fatalf("expected the old waiter to be superseded, got: %q", got)
 		}
 	case <-time.After(2 * time.Second):
@@ -162,7 +162,7 @@ func TestNewWaiterSupersedesOld(t *testing.T) {
 	w.Poke()
 	select {
 	case got := <-newDone:
-		if got == "" || got == "superseded by a newer wait\n" {
+		if got == "" || got == w.supersededMessage() {
 			t.Fatalf("expected the new waiter to receive the message, got: %q", got)
 		}
 	case <-time.After(2 * time.Second):
@@ -272,12 +272,11 @@ func TestNewWaiterSupersedesFollowConnection(t *testing.T) {
 	newDone := make(chan string, 1)
 	go func() { newDone <- dialAndRead(t, w.socketPath) }()
 
-	buf := make([]byte, 64)
-	n, err := oldConn.Read(buf)
+	got, err := io.ReadAll(oldConn)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if got := string(buf[:n]); got != "superseded by a newer wait\n" {
+	if string(got) != w.supersededMessage() {
 		t.Fatalf("expected the follow connection to be superseded, got %q", got)
 	}
 
@@ -285,7 +284,7 @@ func TestNewWaiterSupersedesFollowConnection(t *testing.T) {
 	w.Poke()
 	select {
 	case got := <-newDone:
-		if got == "" || got == "superseded by a newer wait\n" {
+		if got == "" || got == w.supersededMessage() {
 			t.Fatalf("expected the new waiter to receive the message, got: %q", got)
 		}
 	case <-time.After(2 * time.Second):
