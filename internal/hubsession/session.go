@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/google/uuid"
+
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -11,47 +13,89 @@ import (
 type Peer interface {
 	ID() string
 	Deliver(event any)
+	// Name and AgePublicKey are this peer's own sanitized/validated,
+	// already-immutable values from when it connected — used to populate
+	// the peerJoined events other peers (and this peer's own roster
+	// catch-up) receive about it.
+	Name() string
+	AgePublicKey() string
 }
 
 type Session struct {
 	id    string
 	mu    sync.Mutex
 	peers map[string]Peer
+	// pubkeyToPeerID remembers which peerID an age public key was last
+	// assigned, for the lifetime of this Session (i.e. only as long as the
+	// channel stays alive — a peer that reconnects after everyone else has
+	// left, tearing the session down, gets a fresh identity like anyone
+	// else, since a brand new Session has no memory of the old one).
+	pubkeyToPeerID map[string]string
 }
 
 func newSession(id string) *Session {
 	return &Session{id: id, peers: make(map[string]Peer)}
 }
 
-// Join registers p, delivers it the current roster (one peerJoined per
-// existing peer, terminated by a RosterComplete), and announces p's own join
-// to everyone else — all while holding the session lock for the entire
-// sequence. That atomicity is what makes this safe: no other peer can Join
-// or Leave in the middle of it, so the roster p receives is exactly the set
-// of peers still present when RosterComplete is sent, with no gap in which
-// a peer from the snapshot could vanish (a phantom peerJoined with no way to
-// correct it) or a concurrent joiner could be missed.
+// Join resolves the peerID to use (reusing the ID a previous, now-departed
+// connection with the same agePublicKey used, if any — see
+// pubkeyToPeerID — otherwise a fresh UUID), constructs the peer via
+// makePeer, registers it, delivers it the current roster (one peerJoined
+// per existing peer, terminated by a RosterComplete), and announces its own
+// join to everyone else — all while holding the session lock for the
+// entire sequence. That atomicity is what makes this safe: no other peer
+// can Join or Leave in the middle of it, so the roster the new peer
+// receives is exactly the set of peers still present when RosterComplete is
+// sent, with no gap in which a peer from the snapshot could vanish (a
+// phantom peerJoined with no way to correct it) or a concurrent joiner
+// could be missed.
 //
-// beforeVisible, if non-nil, runs under the same lock before p becomes
-// visible to anyone else — e.g. to write a "joined" confirmation with an
+// makePeer runs first (so beforeVisible, wsserver's own code, and this
+// method can all refer to the resolved peerID), then beforeVisible, if
+// non-nil, runs under the same lock before the peer becomes visible to
+// anyone else — e.g. to write a "joined" confirmation with an
 // existing-peer count that's guaranteed consistent with the roster that
 // follows.
-func (s *Session) Join(p Peer, beforeVisible func(existingCount int)) {
+func (s *Session) Join(agePublicKey string, makePeer func(peerID string) Peer, beforeVisible func(existingCount int)) Peer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existingIDs := make([]string, 0, len(s.peers))
-	for id := range s.peers {
-		existingIDs = append(existingIDs, id)
+
+	peerID := s.resolvePeerIDLocked(agePublicKey)
+	existing := make([]Peer, 0, len(s.peers))
+	for _, ep := range s.peers {
+		existing = append(existing, ep)
 	}
+	p := makePeer(peerID)
 	if beforeVisible != nil {
-		beforeVisible(len(existingIDs))
+		beforeVisible(len(existing))
 	}
-	s.peers[p.ID()] = p
-	for _, id := range existingIDs {
-		p.Deliver(wire.NewPeerJoined(id))
+	s.peers[peerID] = p
+	if agePublicKey != "" {
+		if s.pubkeyToPeerID == nil {
+			s.pubkeyToPeerID = make(map[string]string)
+		}
+		s.pubkeyToPeerID[agePublicKey] = peerID
+	}
+
+	for _, ep := range existing {
+		p.Deliver(wire.NewPeerJoined(ep.ID(), ep.Name(), ep.AgePublicKey()))
 	}
 	p.Deliver(wire.NewRosterComplete())
-	s.broadcastExceptLocked(p.ID(), wire.NewPeerJoined(p.ID()))
+	s.broadcastExceptLocked(peerID, wire.NewPeerJoined(peerID, p.Name(), p.AgePublicKey()))
+	return p
+}
+
+// resolvePeerIDLocked returns the peerID a joining connection should use.
+// Called with s.mu already held.
+func (s *Session) resolvePeerIDLocked(agePublicKey string) string {
+	if agePublicKey != "" {
+		if id, ok := s.pubkeyToPeerID[agePublicKey]; ok {
+			if _, stillConnected := s.peers[id]; !stillConnected {
+				return id
+			}
+		}
+	}
+	return uuid.NewString()
 }
 
 // Leave removes p from the session and reports whether the session is now

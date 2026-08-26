@@ -20,9 +20,15 @@ func FormatDirectedEntry(ts, peerID, targetPeerID, text string) string {
 }
 
 // FormatJoinedEntry renders a peer-joined log entry: "<ts> <peerId> joined"
-// followed by a blank line. No message body — peerJoined events carry none.
-func FormatJoinedEntry(ts, peerID string) string {
-	return ts + " " + peerID + " joined\n\n"
+// (or "<ts> <peerId> (<name>) joined" if a display name was given — already
+// sanitized of control characters/newlines by the caller, so it's always
+// safe to embed on this one line) followed by a blank line. No message
+// body — peerJoined events carry none.
+func FormatJoinedEntry(ts, peerID, name string) string {
+	if name == "" {
+		return ts + " " + peerID + " joined\n\n"
+	}
+	return ts + " " + peerID + " (" + name + ") joined\n\n"
 }
 
 // FormatLeftEntry renders a peer-left log entry: "<ts> <peerId> left"

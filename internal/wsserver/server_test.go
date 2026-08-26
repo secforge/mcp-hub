@@ -364,6 +364,121 @@ func TestInvalidSessionIDRejectedBeforeUpgrade(t *testing.T) {
 	}
 }
 
+const testAgePublicKey = "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"
+
+func TestInvalidAgePublicKeyRejectedBeforeUpgrade(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	_, resp, err := websocket.DefaultDialer.Dial(
+		url+"/550e8400-e29b-41d4-a716-446655440000?agePublicKey=not-a-key", nil)
+	if err == nil {
+		t.Fatal("expected the handshake to fail for a malformed agePublicKey")
+	}
+	if resp == nil || resp.StatusCode != http.StatusBadRequest {
+		status := "<nil response>"
+		if resp != nil {
+			status = resp.Status
+		}
+		t.Fatalf("expected HTTP 400 before any websocket upgrade, got: %s", status)
+	}
+}
+
+func TestJoinedEchoesSanitizedNameAndValidAgePublicKey(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	c, _, err := websocket.DefaultDialer.Dial(
+		url+"/550e8400-e29b-41d4-a716-446655440000?name=Steffen%0Afake+line&agePublicKey="+testAgePublicKey, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	_, raw := readTyped(t, c)
+	var joined wire.Joined
+	decodeJSON(t, raw, &joined)
+	if joined.Name != "Steffenfake line" {
+		t.Fatalf("expected the newline stripped from the name, got %q", joined.Name)
+	}
+	if joined.AgePublicKey != testAgePublicKey {
+		t.Fatalf("got AgePublicKey %q, want %q", joined.AgePublicKey, testAgePublicKey)
+	}
+}
+
+func TestPeerJoinedCarriesNameAndAgePublicKeyToOtherPeers(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	a := dial(t, url, sessionID)
+	defer a.Close()
+	readTyped(t, a) // a: joined
+	readTyped(t, a) // a: rosterComplete
+
+	b, _, err := websocket.DefaultDialer.Dial(
+		url+"/"+sessionID+"?name=Steffen&agePublicKey="+testAgePublicKey, nil)
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	readTyped(t, b) // b: joined
+
+	_, raw := readTyped(t, a) // a: peerJoined for b
+	var pe wire.PeerEvent
+	decodeJSON(t, raw, &pe)
+	if pe.Name != "Steffen" || pe.AgePublicKey != testAgePublicKey {
+		t.Fatalf("expected a to be told b's name/agePublicKey, got %+v", pe)
+	}
+}
+
+func TestReconnectingWithSameAgePublicKeyReusesPeerID(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MCP_HUB_LOG_DIR", dir)
+
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	// another peer stays connected throughout, so the session (and its
+	// pubkey memory) survives first's departure instead of being torn down.
+	other := dial(t, url, sessionID)
+	defer other.Close()
+	readTyped(t, other) // other: joined
+	readTyped(t, other) // other: rosterComplete
+
+	first, _, err := websocket.DefaultDialer.Dial(
+		url+"/"+sessionID+"?agePublicKey="+testAgePublicKey, nil)
+	if err != nil {
+		t.Fatalf("dial first: %v", err)
+	}
+	_, raw := readTyped(t, first)
+	var joinedFirst wire.Joined
+	decodeJSON(t, raw, &joinedFirst)
+	readTyped(t, other) // other: peerJoined for first
+	first.Close()
+	readTyped(t, other) // other: peerLeft for first — by now first is fully deregistered
+
+	second, _, err := websocket.DefaultDialer.Dial(
+		url+"/"+sessionID+"?agePublicKey="+testAgePublicKey, nil)
+	if err != nil {
+		t.Fatalf("dial second: %v", err)
+	}
+	defer second.Close()
+	_, raw = readTyped(t, second)
+	var joinedSecond wire.Joined
+	decodeJSON(t, raw, &joinedSecond)
+
+	if joinedSecond.PeerID != joinedFirst.PeerID {
+		t.Fatalf("expected reconnecting with the same agePublicKey to reuse peerID %q, got %q",
+			joinedFirst.PeerID, joinedSecond.PeerID)
+	}
+}
+
 func decodeJSON(t *testing.T, raw []byte, v any) {
 	t.Helper()
 	if err := jsonUnmarshal(raw, v); err != nil {

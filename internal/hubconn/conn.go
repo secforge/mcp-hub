@@ -3,26 +3,39 @@ package hubconn
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
 	"sync"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/secforge/mcp-hub/internal/agekey"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
 type Event struct {
-	Kind    string
-	PeerID  string
-	Text    string
-	TS      string
-	Private bool
+	Kind         string
+	PeerID       string
+	Text         string
+	TS           string
+	Private      bool
+	Name         string
+	AgePublicKey string
+}
+
+// PeerInfo is what's known about one other peer in the session.
+type PeerInfo struct {
+	ID           string
+	Name         string
+	AgePublicKey string
 }
 
 type Conn struct {
 	ws            *websocket.Conn
 	peerID        string
+	name          string
+	agePublicKey  string
 	serverVersion int
 	expectedPeers int
 
@@ -30,8 +43,28 @@ type Conn struct {
 	buffer          []Event
 	closed          bool
 	onActivity      func()
-	peers           map[string]struct{}
+	peers           map[string]PeerInfo
 	rosterAnnounced bool
+}
+
+// DialOptions carries the optional, untrusted-to-everyone-else identity a
+// client presents on connect.
+type DialOptions struct {
+	// Name is a free-text display name shown alongside logs and reported to
+	// other peers. The server sanitizes it (control characters stripped,
+	// length capped) before relaying it or writing it to the log — treat
+	// whatever comes back in Conn.Name() as the authoritative value.
+	Name string
+	// AgePublicKey is an age (https://age-encryption.org) recipient string.
+	// It is validated for correct bech32 format (agekey.Valid) — both here
+	// and again server-side — but never parsed, decoded, or used
+	// cryptographically by the hub in any way; it is only distributed to
+	// other peers so they can encrypt to this one, entirely outside the
+	// hub's involvement. If a peer previously connected to this same
+	// session with this exact key, it is reassigned the same peerId (see
+	// hubsession.Session.Join), as long as that previous connection isn't
+	// still active.
+	AgePublicKey string
 }
 
 // Dial connects to host+"/"+sessionID (e.g. "ws://localhost:8765" joining
@@ -41,12 +74,21 @@ type Conn struct {
 // normalizeHost) so a common mistake like using https:// or including a
 // path fails with a clear message instead of an opaque dial error. Starts a
 // background read loop on success.
-func Dial(host, sessionID string) (*Conn, error) {
+func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 	base, err := normalizeHost(host)
 	if err != nil {
 		return nil, err
 	}
+	if opts.AgePublicKey != "" && !agekey.Valid(opts.AgePublicKey) {
+		return nil, fmt.Errorf("agePublicKey is not a validly formatted age public key")
+	}
 	target := base + "/" + sessionID + "?v=" + strconv.Itoa(wire.ProtocolVersion)
+	if opts.Name != "" {
+		target += "&name=" + url.QueryEscape(opts.Name)
+	}
+	if opts.AgePublicKey != "" {
+		target += "&agePublicKey=" + url.QueryEscape(opts.AgePublicKey)
+	}
 	ws, _, err := websocket.DefaultDialer.Dial(target, nil)
 	if err != nil {
 		return nil, err
@@ -69,15 +111,25 @@ func Dial(host, sessionID string) (*Conn, error) {
 	c := &Conn{
 		ws:            ws,
 		peerID:        joined.PeerID,
+		name:          joined.Name,
+		agePublicKey:  joined.AgePublicKey,
 		serverVersion: joined.ServerVersion,
 		expectedPeers: joined.PeerCount,
-		peers:         make(map[string]struct{}),
+		peers:         make(map[string]PeerInfo),
 	}
 	go c.readLoop()
 	return c, nil
 }
 
 func (c *Conn) PeerID() string { return c.peerID }
+
+// Name is this connection's own display name, after server-side
+// sanitization — empty if none was supplied.
+func (c *Conn) Name() string { return c.name }
+
+// AgePublicKey is this connection's own age public key, echoed back by the
+// server — empty if none was supplied.
+func (c *Conn) AgePublicKey() string { return c.agePublicKey }
 
 // ServerVersion is the wire.ProtocolVersion the server reported in "joined".
 // Compare against wire.ProtocolVersion to tell if this client is behind.
@@ -99,20 +151,20 @@ func (c *Conn) RosterComplete() bool {
 	return c.rosterAnnounced
 }
 
-// Peers returns the peerIds of everyone else currently known to be in the
-// session, sorted for stable output. Built entirely from peerJoined/peerLeft
+// Peers returns everyone else currently known to be in the session, sorted
+// by peerId for stable output. Built entirely from peerJoined/peerLeft
 // events seen so far — since a newly joined peer is told the full existing
 // roster on join (see the server's "roster on join" behavior), this is
 // complete from shortly after Dial returns, not just for peers who joined
 // after this connection did.
-func (c *Conn) Peers() []string {
+func (c *Conn) Peers() []PeerInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	out := make([]string, 0, len(c.peers))
-	for id := range c.peers {
-		out = append(out, id)
+	out := make([]PeerInfo, 0, len(c.peers))
+	for _, info := range c.peers {
+		out = append(out, info)
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -145,7 +197,7 @@ func (c *Conn) readLoop() {
 		c.buffer = append(c.buffer, ev)
 		switch ev.Kind {
 		case "peerJoined":
-			c.peers[ev.PeerID] = struct{}{}
+			c.peers[ev.PeerID] = PeerInfo{ID: ev.PeerID, Name: ev.Name, AgePublicKey: ev.AgePublicKey}
 		case "peerLeft":
 			delete(c.peers, ev.PeerID)
 		case "rosterComplete":
@@ -182,7 +234,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &p); err != nil || !wire.IsValidID(p.PeerID) {
 			return Event{}, false
 		}
-		return Event{Kind: "peerJoined", PeerID: p.PeerID}, true
+		return Event{Kind: "peerJoined", PeerID: p.PeerID, Name: p.Name, AgePublicKey: p.AgePublicKey}, true
 	case wire.TypePeerLeft:
 		var p wire.PeerEvent
 		if err := json.Unmarshal(raw, &p); err != nil || !wire.IsValidID(p.PeerID) {

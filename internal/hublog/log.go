@@ -43,10 +43,10 @@ func (l *SessionLog) AppendDirected(peerID, targetPeerID, text, ts string) error
 	return err
 }
 
-func (l *SessionLog) AppendJoined(peerID, ts string) error {
+func (l *SessionLog) AppendJoined(peerID, name, ts string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, err := l.file.WriteString(FormatJoinedEntry(ts, peerID))
+	_, err := l.file.WriteString(FormatJoinedEntry(ts, peerID, name))
 	return err
 }
 

@@ -8,13 +8,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/secforge/mcp-hub/internal/agekey"
 	"github.com/secforge/mcp-hub/internal/hublog"
 	"github.com/secforge/mcp-hub/internal/hubsession"
+	"github.com/secforge/mcp-hub/internal/sanitize"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
+
+// maxNameRunes bounds a peer's untrusted display name — long enough for any
+// reasonable name, short enough to keep it from bloating logs/events.
+const maxNameRunes = 64
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
@@ -73,19 +78,27 @@ func (h *Handler) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 			sessionID, clientVersion, wire.ProtocolVersion)
 	}
 
+	name := sanitize.Text(r.URL.Query().Get("name"), maxNameRunes)
+	agePublicKey := r.URL.Query().Get("agePublicKey")
+	if agePublicKey != "" && !agekey.Valid(agePublicKey) {
+		http.Error(w, "invalid agePublicKey", http.StatusBadRequest)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	h.serve(conn, sessionID)
+	h.serve(conn, sessionID, name, agePublicKey)
 }
 
-func (h *Handler) serve(conn *websocket.Conn, sessionID string) {
+func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey string) {
 	defer conn.Close()
 
-	peerID := uuid.NewString()
-	p := &peer{id: peerID, conn: conn, done: make(chan struct{})}
-	defer close(p.done)
+	var p *peer
+	var peerID string
+	done := make(chan struct{})
+	defer close(done)
 
 	logger, logErr := hublog.OpenSessionLog(sessionID)
 	if logErr == nil {
@@ -94,14 +107,21 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID string) {
 
 	session := h.manager.GetOrCreate(sessionID)
 	var writeErr error
-	session.Join(p, func(existingCount int) {
-		writeErr = conn.WriteJSON(wire.NewJoined(peerID, existingCount))
-	})
+	session.Join(agePublicKey,
+		func(id string) hubsession.Peer {
+			peerID = id
+			p = &peer{id: id, conn: conn, done: done, name: name, agePublicKey: agePublicKey}
+			return p
+		},
+		func(existingCount int) {
+			writeErr = conn.WriteJSON(wire.NewJoined(peerID, existingCount, name, agePublicKey))
+		},
+	)
 	if writeErr != nil {
 		return
 	}
 	if logger != nil {
-		logger.AppendJoined(peerID, time.Now().UTC().Format(time.RFC3339))
+		logger.AppendJoined(peerID, name, time.Now().UTC().Format(time.RFC3339))
 	}
 	defer func() {
 		if logger != nil {
@@ -148,13 +168,17 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID string) {
 }
 
 type peer struct {
-	id   string
-	mu   sync.Mutex
-	conn *websocket.Conn
-	done chan struct{}
+	id           string
+	mu           sync.Mutex
+	conn         *websocket.Conn
+	done         chan struct{}
+	name         string
+	agePublicKey string
 }
 
-func (p *peer) ID() string { return p.id }
+func (p *peer) ID() string           { return p.id }
+func (p *peer) Name() string         { return p.name }
+func (p *peer) AgePublicKey() string { return p.agePublicKey }
 
 func (p *peer) Deliver(event any) {
 	p.mu.Lock()

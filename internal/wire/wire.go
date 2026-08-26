@@ -65,10 +65,21 @@ type Joined struct {
 	// ServerVersion is this server's ProtocolVersion, so the client can tell
 	// if it's behind and surface that to the model.
 	ServerVersion int `json:"serverVersion"`
+	// Name echoes back this peer's own display name after sanitization, so
+	// the client can tell if anything was stripped/truncated from what it
+	// requested. Empty if none was supplied.
+	Name string `json:"name,omitempty"`
+	// AgePublicKey echoes back this peer's own age public key. Always
+	// exactly what was supplied (already format-validated pre-upgrade) or
+	// empty if none was supplied.
+	AgePublicKey string `json:"agePublicKey,omitempty"`
 }
 
-func NewJoined(peerID string, peerCount int) Joined {
-	return Joined{Type: TypeJoined, PeerID: peerID, PeerCount: peerCount, ServerVersion: ProtocolVersion}
+func NewJoined(peerID string, peerCount int, name, agePublicKey string) Joined {
+	return Joined{
+		Type: TypeJoined, PeerID: peerID, PeerCount: peerCount, ServerVersion: ProtocolVersion,
+		Name: name, AgePublicKey: agePublicKey,
+	}
 }
 
 type Error struct {
@@ -115,10 +126,15 @@ func NewDirectedMsg(peerID, text, ts string) Msg {
 type PeerEvent struct {
 	Type   Type   `json:"type"`
 	PeerID string `json:"peerId"`
+	// Name and AgePublicKey are that peer's own sanitized/validated values
+	// from when it connected (see Joined). Both are empty if that peer
+	// didn't supply them.
+	Name         string `json:"name,omitempty"`
+	AgePublicKey string `json:"agePublicKey,omitempty"`
 }
 
-func NewPeerJoined(peerID string) PeerEvent {
-	return PeerEvent{Type: TypePeerJoined, PeerID: peerID}
+func NewPeerJoined(peerID, name, agePublicKey string) PeerEvent {
+	return PeerEvent{Type: TypePeerJoined, PeerID: peerID, Name: name, AgePublicKey: agePublicKey}
 }
 
 func NewPeerLeft(peerID string) PeerEvent {

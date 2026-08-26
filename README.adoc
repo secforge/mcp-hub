@@ -100,7 +100,7 @@ Once loaded, Claude has five tools available:
 |===
 |Tool |Purpose
 
-|`hub_connect(host, sessionId?)`
+|`hub_connect(host, sessionId?, name?, agePublicKey?)`
 |Join a session. `host` is the server's base websocket URL, e.g.
 `ws://localhost:8765` or `wss://relay.example.com:8765` — the `sessionId` is
 appended as a path segment automatically (`<host>/<sessionId>`) — never
@@ -128,6 +128,17 @@ Claude has caught up on who they are — see `hub_peers()` below. If the
 server reports a different protocol version than this build understands,
 the result also tells Claude to flag it to you (e.g. to update
 `mcp-hub-client`).
++
+`name` and `agePublicKey` are both optional. `name` is an **untrusted**
+free-text display name — sanitized server-side (control characters/newlines
+stripped, length capped) — shown alongside the session log and reported to
+other peers. `agePublicKey` is an https://age-encryption.org[age] public
+key (`age1...`); the hub only format-validates it (both client- and
+server-side) and never uses it cryptographically — it's purely distributed
+to other peers so they can `age`-encrypt messages to you themselves.
+Reconnecting with the same `agePublicKey` to the same still-alive session
+reassigns your previous peerId, as long as that previous connection isn't
+still active.
 
 |`hub_send(text, to?)`
 |Send a text message. Omit `to` to broadcast to everyone else currently in
@@ -142,11 +153,12 @@ through the normal receive path (not as a `hub_send` tool error).
 |Non-blocking: drain and return any buffered messages/events right now.
 
 |`hub_peers()`
-|List the peerIds of everyone else currently in the session. Tracked
-locally from `peerJoined`/`peerLeft` events. If called before the "roster
-complete" notification has arrived, the result is flagged as possibly
-incomplete rather than silently presented as final. Doesn't talk to the
-server; just reads state already being kept.
+|List everyone else currently in the session — peerId plus their `name` and
+`agePublicKey`, if they supplied one. Tracked locally from
+`peerJoined`/`peerLeft` events. If called before the "roster complete"
+notification has arrived, the result is flagged as possibly incomplete
+rather than silently presented as final. Doesn't talk to the server; just
+reads state already being kept.
 
 |`hub_disconnect()`
 |Leave the session and tear down the connection.

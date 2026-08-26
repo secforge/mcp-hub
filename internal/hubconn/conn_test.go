@@ -32,7 +32,7 @@ func waitForActivity(t *testing.T, ch <-chan struct{}) {
 
 func TestDialJoinsAndAssignsPeerID(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000")
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestDialJoinsAndAssignsPeerID(t *testing.T) {
 
 func TestDialRejectsInvalidSessionID(t *testing.T) {
 	url := startTestServer(t)
-	if _, err := Dial(url, "not-a-uuid"); err == nil {
+	if _, err := Dial(url, "not-a-uuid", DialOptions{}); err == nil {
 		t.Fatal("expected an error for an invalid sessionId")
 	}
 }
@@ -59,12 +59,12 @@ func TestDialSendsCurrentProtocolVersionAsQueryParam(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
 	}))
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestDialSendsCurrentProtocolVersionAsQueryParam(t *testing.T) {
 
 func TestDialCapturesServerVersion(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000")
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID)
+	a, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
 		t.Fatalf("a: expected 0, got %d", a.ExpectedPeerCount())
 	}
 
-	b, err := Dial(url, sessionID)
+	b, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
 
 func TestRosterCompleteImmediatelyWhenNoExistingPeers(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000")
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -139,13 +139,13 @@ func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID)
+	a, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
 	defer a.Close()
 
-	b, err := Dial(url, sessionID)
+	b, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
 
 func TestDialRejectsHostWithPath(t *testing.T) {
 	url := startTestServer(t)
-	if _, err := Dial(url+"/extra-path", "550e8400-e29b-41d4-a716-446655440000"); err == nil {
+	if _, err := Dial(url+"/extra-path", "550e8400-e29b-41d4-a716-446655440000", DialOptions{}); err == nil {
 		t.Fatal("expected Dial to reject a host containing a path")
 	}
 }
@@ -183,7 +183,7 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID)
+	a, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 	a.OnActivity(func() { activity <- struct{}{} })
 	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
 
-	b, err := Dial(url, sessionID)
+	b, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID)
+	a, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	a.OnActivity(func() { activityA <- struct{}{} })
 	waitForActivity(t, activityA) // a's own rosterComplete (no peers yet)
 
-	b, err := Dial(url, sessionID)
+	b, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestSendToUnknownPeerSurfacesAsErrorEvent(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID)
+	a, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID)
+	a, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -297,18 +297,18 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 		t.Fatalf("expected no peers before anyone else joins, got %v", peers)
 	}
 
-	b, err := Dial(url, sessionID)
+	b, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
 	waitForActivity(t, activity) // a sees b's peerJoined
 
 	peers := a.Peers()
-	if len(peers) != 1 || peers[0] != b.PeerID() {
+	if len(peers) != 1 || peers[0].ID != b.PeerID() {
 		t.Fatalf("expected [%s], got %v", b.PeerID(), peers)
 	}
 
-	c, err := Dial(url, sessionID)
+	c, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial c: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 	waitForActivity(t, activity) // a sees b's peerLeft
 
 	peers = a.Peers()
-	if len(peers) != 1 || peers[0] != c.PeerID() {
+	if len(peers) != 1 || peers[0].ID != c.PeerID() {
 		t.Fatalf("expected just [%s] after b left, got %v", c.PeerID(), peers)
 	}
 }
@@ -333,25 +333,85 @@ func TestPeekAndDrainReflectDisconnect(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID)
+	a, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	activity := make(chan struct{}, 8)
-	a.OnActivity(func() { activity <- struct{}{} })
 
-	b, err := Dial(url, sessionID)
+	b, err := Dial(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
-	waitForActivity(t, activity) // a sees b's peerJoined
 	b.Close()
 	// server closing the connection propagates as a peerLeft to a, then
 	// (separately) a's own socket must be closed by the test to observe its
 	// own disconnect:
 	a.Close()
 
-	if _, connected := a.Peek(); connected {
-		t.Fatal("expected Peek to report disconnected after Close")
+	// a's readLoop goroutine notices the close asynchronously (it's still
+	// mid-flight on whatever roster/peerJoined/peerLeft traffic arrived
+	// before the close), so poll briefly instead of checking Peek()
+	// immediately.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, connected := a.Peek(); !connected {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected Peek to eventually report disconnected after Close")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+const testAgePublicKey = "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"
+
+func TestDialRejectsMalformedAgePublicKey(t *testing.T) {
+	url := startTestServer(t)
+	_, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{AgePublicKey: "not-a-key"})
+	if err == nil {
+		t.Fatal("expected an error for a malformed agePublicKey")
+	}
+}
+
+func TestDialEchoesBackSanitizedNameAndAgePublicKey(t *testing.T) {
+	url := startTestServer(t)
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000",
+		DialOptions{Name: "Steffen\n\x1b[31m", AgePublicKey: testAgePublicKey})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if c.Name() != "Steffen[31m" {
+		t.Fatalf("expected control chars/newlines stripped from name, got %q", c.Name())
+	}
+	if c.AgePublicKey() != testAgePublicKey {
+		t.Fatalf("got AgePublicKey %q, want %q", c.AgePublicKey(), testAgePublicKey)
+	}
+}
+
+func TestPeersReportsNameAndAgePublicKeyOfOthers(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	a, err := Dial(url, sessionID, DialOptions{})
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	activity := make(chan struct{}, 8)
+	a.OnActivity(func() { activity <- struct{}{} })
+	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
+
+	b, err := Dial(url, sessionID, DialOptions{Name: "Steffen", AgePublicKey: testAgePublicKey})
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	waitForActivity(t, activity) // a sees b's peerJoined
+
+	peers := a.Peers()
+	if len(peers) != 1 || peers[0].Name != "Steffen" || peers[0].AgePublicKey != testAgePublicKey {
+		t.Fatalf("expected b's name/agePublicKey to be reported, got %+v", peers)
 	}
 }

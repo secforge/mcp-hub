@@ -19,8 +19,16 @@ func TestFormatDirectedEntryIncludesTarget(t *testing.T) {
 }
 
 func TestFormatJoinedEntry(t *testing.T) {
-	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1")
+	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "")
 	want := "2026-08-21T10:00:00Z peer-1 joined\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestFormatJoinedEntryIncludesName(t *testing.T) {
+	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "Steffen")
+	want := "2026-08-21T10:00:00Z peer-1 (Steffen) joined\n\n"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

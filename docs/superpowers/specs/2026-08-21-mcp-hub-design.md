@@ -36,9 +36,11 @@ an explicit `{"type":"join",...}` first message; that has been fully
 replaced by this URL-based form.
 
 ```
-GET /<sessionId>?v=<protocolVersion>  (upgrade to websocket; ?v= optional, see "Protocol versioning")
-← {"type":"joined","peerId":"<uuid>","peerCount":<int>,"serverVersion":<int>}   // sent immediately
-← {"type":"peerJoined","peerId":"<uuid>"}      // one per peer already in the session (see "Roster on join" below)
+GET /<sessionId>?v=<protocolVersion>&name=<untrusted>&agePublicKey=<age1...>
+    (upgrade to websocket; v/name/agePublicKey all optional — see "Protocol
+    versioning" and "Peer identity: name and age public key")
+← {"type":"joined","peerId":"<uuid>","peerCount":<int>,"serverVersion":<int>,"name":"<sanitized>","agePublicKey":"<age1...>"}   // sent immediately
+← {"type":"peerJoined","peerId":"<uuid>","name":"<sanitized>","agePublicKey":"<age1...>"}   // one per peer already in the session (see "Roster on join" below)
 ← {"type":"rosterComplete"}                    // marks the end of the initial roster catch-up above
 ← {"type":"error","message":"..."}
 
@@ -47,9 +49,12 @@ GET /<sessionId>?v=<protocolVersion>  (upgrade to websocket; ?v= optional, see "
 ← {"type":"msg","peerId":"<uuid>","text":"...","ts":"<RFC3339>"}                       // broadcast delivery
 ← {"type":"msg","peerId":"<uuid>","text":"...","ts":"<RFC3339>","private":true}        // private delivery
 
-← {"type":"peerJoined","peerId":"<uuid>"}      // another peer joined after you did
+← {"type":"peerJoined","peerId":"<uuid>","name":"<sanitized>","agePublicKey":"<age1...>"}   // another peer joined after you did
 ← {"type":"peerLeft","peerId":"<uuid>"}
 ```
+
+`name` and `agePublicKey` are both `omitempty` on the wire — present only
+when that peer actually supplied one.
 
 Rules:
 
@@ -59,11 +64,13 @@ Rules:
   Anything else → plain HTTP `400 Bad Request`, rejected *before* any
   websocket upgrade is attempted — no connection is ever opened for a
   malformed sessionId.
-- `peerId` is a random UUID assigned at join. Stable for that connection's
-  lifetime, carries no identity information. It only lets recipients tell "this
-  message came from the same peer as that earlier one" — any human-readable name
-  is left to be exchanged as ordinary message content, by agreement between the
-  clients.
+- `peerId` is a random UUID assigned at join (or, if an `agePublicKey` was
+  given, possibly reused from that same key's previous connection in this
+  same still-alive session — see "Peer identity" below). Stable for that
+  connection's lifetime. It only lets recipients tell "this message came
+  from the same peer as that earlier one" — an optional, untrusted
+  human-readable `name` can additionally be given at connect time (see
+  below).
 - A session is keyed by `sessionId` and exists only in server memory. The first
   successful connection for a given `sessionId` creates the session; when the
   last connection in a session closes (cleanly or via read error), the session
@@ -117,6 +124,60 @@ roster complete — you now know everyone who was already in the session]`.
 `joined.peerCount` is still reported (informational — lets a client show
 "N other peers" before the roster catch-up arrives) but the client no longer
 needs it for correctness.
+
+### Peer identity: name and age public key
+
+A client may optionally supply, at connect time (as query params — see the
+wire block above):
+
+- `name`: a free-text display name. **Untrusted** — it's peer-controlled
+  content, exactly like message text. The server sanitizes it
+  (`internal/sanitize.Text`) before doing anything else with it: every
+  control character (including newlines/tabs) is stripped and it's capped
+  at `maxNameRunes` (64) runes, so it can never inject a fake extra line
+  into the session log or smuggle control sequences into a delivered event.
+  `joined.name` echoes back the sanitized value actually in use — a client
+  that cares should read that back rather than assume its input survived
+  unchanged. It's written into the log's `joined` line
+  (`hublog.FormatJoinedEntry`) and included on every `peerJoined` event this
+  peer generates (see the wire block above), which is how other peers and
+  their models learn it — always still framed as untrusted, never as an
+  instruction.
+- `agePublicKey`: an [age](https://age-encryption.org) recipient string
+  (`age1...`). The hub validates its *format* only — `internal/agekey.Valid`
+  checks it's a syntactically well-formed bech32 string with human-readable
+  part `age` and a correct checksum — and never parses, decodes, or uses it
+  for any cryptographic purpose. A syntactically invalid key is rejected
+  with a plain HTTP `400` before the websocket upgrade, exactly like an
+  invalid `sessionId`. Once accepted, it's distributed to every other peer
+  exactly like `name` (echoed in `joined`, included on `peerJoined`), so
+  they can encrypt messages to this peer with `age` themselves, entirely
+  outside the hub's involvement — the hub remains a dumb relay for message
+  content either way.
+
+**Identity reuse.** `hubsession.Session` keeps an in-memory
+`pubkeyToPeerID map[string]string`, populated whenever a peer connects with
+a non-empty `agePublicKey`. On `Join`, if the given key maps to a peerID
+that isn't a currently-active connection, that same peerID is reused
+instead of a fresh one — so a peer that drops and reconnects with the same
+key is recognized as the same identity by anyone still watching the roster.
+Two things bound this deliberately:
+
+- The map lives inside the `Session` object itself, so it only persists for
+  as long as the channel does. Once the last peer leaves, `Manager.Remove`
+  tears the whole `Session` down (as always); a later connection with that
+  same key — including after a server restart, which loses all in-memory
+  state — simply creates a brand new `Session` with no memory of the old
+  one and gets a fresh peerID, same as anyone else. This is intentional,
+  not a gap: identity is scoped to "the same still-alive channel," per the
+  original requirement, not to the key itself indefinitely.
+- If the key's previous peerID is *still* an active connection (e.g. two
+  processes present the same key into the same session concurrently), the
+  new connection gets a fresh UUID instead of colliding with the live one —
+  `resolvePeerIDLocked` checks `s.peers` for that ID before reusing it. Both
+  the reuse and the collision-avoidance decision happen under `s.mu`, in the
+  same locked section as the rest of `Join`, for the same atomicity reasons
+  described above.
 
 ### Protocol versioning
 
@@ -198,6 +259,7 @@ no body:
 
 ```
 <RFC3339 timestamp> <peerId> joined
+<RFC3339 timestamp> <peerId> (<name>) joined   // when a sanitized name was given
 
 <RFC3339 timestamp> <peerId> left
 
@@ -214,7 +276,7 @@ join/leave events.
 
 ## MCP client: tools
 
-- **`hub_connect(host, sessionId?)`** — dials `host` + `/` + `sessionId` (e.g.
+- **`hub_connect(host, sessionId?, name?, agePublicKey?)`** — dials `host` + `/` + `sessionId` (e.g.
   `host="wss://relay.example.com:8765"` and `sessionId="550e8400-..."` dials
   `wss://relay.example.com:8765/550e8400-...`), which auto-joins as part of
   the websocket handshake, and on success spawns a background goroutine that
@@ -257,6 +319,11 @@ join/leave events.
     `wire.ProtocolVersion`, appends a note telling Claude to prompt the user
     to update `mcp-hub-client` (server ahead) or that the server may need
     updating (client ahead) — see "Protocol versioning" above.
+
+  `name` and `agePublicKey` are both optional (see "Peer identity" above).
+  `agePublicKey` is format-validated client-side (`agekey.Valid`) before
+  even dialing, so a malformed key fails fast with a clear tool error
+  instead of a round trip to the server (which validates it again anyway).
 - **`hub_send(text, to?)`** — sends `{"type":"msg","text":...}` (broadcast) or,
   if `to` (a peerId) is given, `{"type":"msg","text":...,"to":...}` (private)
   on the active connection. Errors clearly if not connected, or if `to` is
@@ -274,15 +341,18 @@ join/leave events.
   see below), or an empty result if none. Optional/manual use only (e.g. Claude
   wants to check without spinning up a background process) — it is not part of
   the required delivery loop.
-- **`hub_peers()`** — returns the peerIds of everyone else currently known to
-  be in the session (sorted, one list, or an explicit "no other peers"
-  message if empty). Built client-side from every `peerJoined`/`peerLeft`
-  event `hubconn.Conn` has seen. If called before `Conn.RosterComplete()` is
-  true (i.e. before the `rosterComplete` event has arrived — see "Roster on
-  join"), the result is suffixed with a note that the list may still be
-  incomplete, rather than silently presenting a partial roster as final.
-  Errors clearly if not connected. Purely a local read of state already
-  being tracked — it does not talk to the server.
+- **`hub_peers()`** — returns everyone else currently known to be in the
+  session (sorted by peerId, one per line, or an explicit "no other peers"
+  message if empty), including each peer's `name` and `agePublicKey` when
+  they supplied one — so Claude can, for instance, `age`-encrypt a message
+  to a specific peer before sending it as ordinary (still hub-opaque) text.
+  Built client-side from every `peerJoined`/`peerLeft` event `hubconn.Conn`
+  has seen. If called before `Conn.RosterComplete()` is true (i.e. before
+  the `rosterComplete` event has arrived — see "Roster on join"), the
+  result is suffixed with a note that the list may still be incomplete,
+  rather than silently presenting a partial roster as final. Errors clearly
+  if not connected. Purely a local read of state already being tracked — it
+  does not talk to the server.
 
 Every delivered broadcast `msg` event is wrapped before being handed to Claude:
 

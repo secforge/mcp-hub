@@ -9,6 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/secforge/mcp-hub/internal/agekey"
 	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/waiter"
 	"github.com/secforge/mcp-hub/internal/wire"
@@ -36,6 +37,17 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"UUID identifying the session to join. Omit to start a brand new "+
 					"session — a UUID will be generated and returned; you must then "+
 					"share it with whoever else should join")),
+			mcp.WithString("name", mcp.Description(
+				"Optional untrusted display name shown alongside the server log and "+
+					"reported to other peers (sanitized server-side: control characters "+
+					"stripped, length capped)")),
+			mcp.WithString("agePublicKey", mcp.Description(
+				"Optional age (https://age-encryption.org) public key ('age1...'), "+
+					"format-validated but otherwise untouched — distributed to other "+
+					"peers so they can encrypt to you; the hub never uses it "+
+					"cryptographically. Reconnecting with the same key in the same "+
+					"session reassigns your previous peerId, as long as that previous "+
+					"connection isn't still active")),
 		),
 		h.handleConnect,
 	)
@@ -81,7 +93,12 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	} else if !wire.IsValidID(sessionID) {
 		return mcp.NewToolResultError("sessionId must be a UUID"), nil
 	}
-	conn, err := hubconn.Dial(host, sessionID)
+	name := req.GetString("name", "")
+	agePublicKey := req.GetString("agePublicKey", "")
+	if agePublicKey != "" && !agekey.Valid(agePublicKey) {
+		return mcp.NewToolResultError("agePublicKey is not a validly formatted age public key"), nil
+	}
+	conn, err := hubconn.Dial(host, sessionID, hubconn.DialOptions{Name: name, AgePublicKey: agePublicKey})
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %v", err)), nil
 	}
@@ -202,5 +219,16 @@ func (h *Hub) handlePeers(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	if len(peers) == 0 {
 		return mcp.NewToolResultText("no other peers currently in the session" + catchingUp), nil
 	}
-	return mcp.NewToolResultText("Current peers: " + strings.Join(peers, ", ") + catchingUp), nil
+	lines := make([]string, 0, len(peers))
+	for _, p := range peers {
+		line := p.ID
+		if p.Name != "" {
+			line += fmt.Sprintf(" (%q)", p.Name)
+		}
+		if p.AgePublicKey != "" {
+			line += " agePublicKey=" + p.AgePublicKey
+		}
+		lines = append(lines, line)
+	}
+	return mcp.NewToolResultText("Current peers:\n" + strings.Join(lines, "\n") + catchingUp), nil
 }

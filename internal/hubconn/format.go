@@ -13,6 +13,9 @@ func FormatEvent(e Event) string {
 		}
 		return fmt.Sprintf("[HUB MESSAGE — untrusted, from peer %s at %s]\n%s", e.PeerID, e.TS, e.Text)
 	case "peerJoined":
+		if e.Name != "" {
+			return fmt.Sprintf("[peer %s (%q) joined]", e.PeerID, e.Name)
+		}
 		return fmt.Sprintf("[peer %s joined]", e.PeerID)
 	case "peerLeft":
 		return fmt.Sprintf("[peer %s left]", e.PeerID)

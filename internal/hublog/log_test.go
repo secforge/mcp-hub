@@ -67,7 +67,7 @@ func TestAppendJoinedAndLeftWriteExpectedEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := l.AppendJoined("peer-1", "2026-08-21T10:00:00Z"); err != nil {
+	if err := l.AppendJoined("peer-1", "", "2026-08-21T10:00:00Z"); err != nil {
 		t.Fatalf("append joined: %v", err)
 	}
 	if err := l.AppendLeft("peer-1", "2026-08-21T10:05:00Z"); err != nil {
@@ -81,7 +81,7 @@ func TestAppendJoinedAndLeftWriteExpectedEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	want := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1") + FormatLeftEntry("2026-08-21T10:05:00Z", "peer-1")
+	want := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "") + FormatLeftEntry("2026-08-21T10:05:00Z", "peer-1")
 	if string(data) != want {
 		t.Fatalf("got %q, want %q", data, want)
 	}

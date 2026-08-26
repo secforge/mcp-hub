@@ -113,6 +113,64 @@ func TestPeersToolReturnsRoster(t *testing.T) {
 	_ = peersText
 }
 
+func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+	pubkey := "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"
+
+	hubA := NewHub()
+	connReqA := mcp.CallToolRequest{}
+	connReqA.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hubA.handleConnect(ctx, connReqA); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hubB := NewHub()
+	connReqB := mcp.CallToolRequest{}
+	connReqB.Params.Arguments = map[string]any{
+		"host": url, "sessionId": sessionID, "name": "Steffen\nfake log line", "agePublicKey": pubkey,
+	}
+	res, err := hubB.handleConnect(ctx, connReqB)
+	if err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	if strings.Contains(textOf(res), "\n") && strings.Contains(textOf(res), "fake log line") {
+		t.Fatalf("expected the newline in the raw name to be stripped (no log-line injection), got: %s", textOf(res))
+	}
+
+	var peersText string
+	deadlinePoll(t, func() bool {
+		res, err := hubA.handlePeers(ctx, mcp.CallToolRequest{})
+		if err != nil {
+			t.Fatalf("peers failed: %v", err)
+		}
+		peersText = textOf(res)
+		return strings.Contains(peersText, hubB.conn.PeerID())
+	})
+	if !strings.Contains(peersText, "Steffenfake log line") || !strings.Contains(peersText, pubkey) {
+		t.Fatalf("expected a's peer listing to include b's (newline-stripped) name and agePublicKey, got: %s", peersText)
+	}
+}
+
+func TestConnectRejectsMalformedAgePublicKey(t *testing.T) {
+	url := startTestServer(t)
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{
+		"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000", "agePublicKey": "not-a-key",
+	}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error for a malformed agePublicKey")
+	}
+}
+
 func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -189,7 +247,7 @@ func TestConnectResultNotesOutdatedClientVersion(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0)
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
 		joined.ServerVersion = wire.ProtocolVersion + 1
 		conn.WriteJSON(joined)
 		// Keep the connection open briefly so the client's background read
