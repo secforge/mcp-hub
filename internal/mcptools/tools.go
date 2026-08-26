@@ -174,22 +174,30 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// confusing, not just redundant.
 	var waitBlock string
 	if looksLikeCodex(clientName(ctx)) {
-		waitBlock = "IMPORTANT: connecting alone does not deliver anything — you will " +
-			"never see a message until you call this. Codex cannot run a command in the " +
-			"background or be woken by a still-running process's output (no per-line " +
-			"notification tool exists yet — https://github.com/openai/codex/issues/29865 " +
-			"and #29922 are both open, unshipped), so use the hub_wait() MCP tool directly " +
-			"instead of a shell command — call it now:\n" +
-			"      hub_wait()\n" +
-			"It blocks until a message arrives (or the hub disconnects), then returns it — " +
-			"process what it returned, then call hub_wait() again to keep waiting. This " +
-			"ties up your turn while waiting; that's expected, it's the delivery mechanism " +
-			"available to you. Prefer this over running the wait CLI binary yourself: your " +
-			"shell-exec tool's own timeout (recent Codex versions default to around 30s) is " +
-			"much shorter than your MCP tool-call timeout (recent Codex versions default to " +
-			"around 300s), so hub_wait() needs roughly 10x fewer round trips when nothing is " +
-			"happening yet. If a hub_wait() call is cancelled or times out with nothing " +
-			"having arrived, that is NOT an error — just call it again."
+		waitBlock = "Persistent monitoring is active for this session.\n\n" +
+			"After connecting, immediately call the foreground hub_wait tool.\n\n" +
+			"When hub_wait returns for any reason—event, timeout, cancellation, or " +
+			"disconnect—do the following before ending the current turn:\n\n" +
+			"1. Process and acknowledge every returned event.\n" +
+			"2. If disconnected, reconnect with the same sessionId and reconnectSecret.\n" +
+			"3. Immediately call hub_wait again.\n" +
+			"4. Never return a final response merely because one waiter call ended.\n" +
+			"5. If the user sends a message while monitoring, answer it, then immediately " +
+			"call hub_wait again.\n" +
+			"6. Continue this cycle indefinitely while monitoring is requested.\n" +
+			"7. Only stop after the user explicitly says to stop monitoring or the " +
+			"platform forcibly ends the turn.\n" +
+			"8. If the platform forcibly ends the turn, report that monitoring was " +
+			"interrupted and resume with hub_wait at the start of the next turn.\n\n" +
+			"A timeout with no event is normal and must result in another hub_wait call."
+		if reconnectSecret == "" {
+			waitBlock += "\n\nNote: no reconnectSecret was given on this connect, so step 2 " +
+				"above has nothing to reconnect with yet — a reconnect after a disconnect " +
+				"would get a new peerId instead of resuming this one. If continuity across a " +
+				"disconnect matters, disconnect and reconnect once more now, this time " +
+				"passing a reconnectSecret you'll remember and reuse for every future " +
+				"reconnect in this monitoring cycle."
+		}
 	} else {
 		waitBlock = fmt.Sprintf(
 			"IMPORTANT: connecting alone does not deliver anything — you will never see a "+

@@ -93,14 +93,17 @@ func TestConnectResultTellsCodexToUseHubWait(t *testing.T) {
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
 
 	text := textOf(res)
-	if !strings.Contains(text, "Codex") {
-		t.Fatalf("expected Codex-specific guidance, got: %s", text)
+	if !strings.Contains(text, "Persistent monitoring is active") {
+		t.Fatalf("expected the persistent-monitoring checklist, got: %s", text)
 	}
-	if !strings.Contains(text, "cannot run a command in the background") {
-		t.Fatalf("expected the message to say Codex cannot background anything, got: %s", text)
+	if !strings.Contains(text, "call the foreground hub_wait tool") {
+		t.Fatalf("expected instructions to call hub_wait, got: %s", text)
 	}
-	if !strings.Contains(text, "hub_wait()") {
-		t.Fatalf("expected instructions to call hub_wait(), got: %s", text)
+	if !strings.Contains(text, "Never return a final response merely because one waiter call ended") {
+		t.Fatalf("expected the never-stop-early instruction, got: %s", text)
+	}
+	if !strings.Contains(text, "reconnect with the same sessionId and reconnectSecret") {
+		t.Fatalf("expected the reconnect-on-disconnect instruction, got: %s", text)
 	}
 	// The generic "background one of these two modes" framing, and the CLI
 	// wait-binary guidance meant for backgroundable harnesses, must never
@@ -113,11 +116,34 @@ func TestConnectResultTellsCodexToUseHubWait(t *testing.T) {
 	if strings.Contains(text, "Monitor/background-streaming tool directly") {
 		t.Fatalf("expected the generic Monitor guidance to be replaced, not appended, got: %s", text)
 	}
-	if !strings.Contains(text, "10x fewer") {
-		t.Fatalf("expected the round-trip-savings reasoning for preferring hub_wait(), got: %s", text)
+	if !strings.Contains(text, "A timeout with no event is normal") {
+		t.Fatalf("expected the timeout-is-normal note, got: %s", text)
 	}
-	if !strings.Contains(text, "NOT an error") {
-		t.Fatalf("expected a note that a cancelled/timed-out hub_wait() call is not an error, got: %s", text)
+	// No reconnectSecret was passed in this test, so step 2's prerequisite
+	// is missing — the result should flag that explicitly.
+	if !strings.Contains(text, "no reconnectSecret was given") {
+		t.Fatalf("expected a note that reconnectSecret is missing, got: %s", text)
+	}
+}
+
+func TestConnectResultOmitsMissingReconnectSecretNoteWhenOneWasGiven(t *testing.T) {
+	url := startTestServer(t)
+	ctx := ctxWithClientName("codex")
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{
+		"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000", "reconnectSecret": "keep-me",
+	}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	text := textOf(res)
+	if strings.Contains(text, "no reconnectSecret was given") {
+		t.Fatalf("expected no missing-reconnectSecret note when one was given, got: %s", text)
 	}
 }
 

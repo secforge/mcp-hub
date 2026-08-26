@@ -668,26 +668,35 @@ notify you") are false for it.
 Rather than presenting that generic framing and then walking it back with
 a correction — confusing on its own, tried and explicitly rejected — a
 Codex-detected client gets a **wholly separate, self-contained** message
-built from scratch, never the shared one: call the `hub_wait()` MCP tool
-directly (see above), not the `wait` CLI binary at all — process what it
-returned, then call it again to keep waiting. This is also the
-*objectively better* choice for Codex even setting the "cannot background"
-constraint aside: a blocking call returns exactly when a message arrives,
-with no polling logic and no wasted turns checking for nothing, whereas
-`exec_command`'s background-plus-poll path would need Codex to actively
-decide when to re-check, with no guarantee of promptness.
+built from scratch, never the shared one. Its exact wording (verbatim, as
+reported by a live Codex session as what it actually needs, not something
+authored speculatively on this project's side) is an explicit numbered
+operational checklist rather than prose — "persistent monitoring", call
+`hub_wait` immediately, and on every return (event, timeout, cancellation,
+*or* disconnect) alike: process what came back, reconnect with the same
+`sessionId`/`reconnectSecret` if disconnected, call `hub_wait` again, and
+critically — **never end the turn just because one `hub_wait` call
+ended**, including on a bare timeout with nothing delivered, only stopping
+when the user explicitly says so or the platform forcibly ends the turn
+(and even then, resume at the start of the next one). This checklist form,
+not prose explaining the reasoning, is what a Codex session reported
+actually working for it — Codex's own turn-ending behavior was observed to
+be a distinct failure mode from anything ordinary reasoning-style guidance
+addressed: without an explicit "never stop early" instruction, it would
+end its turn after a single `hub_wait` call rather than looping.
 
-The message also spells out *why* `hub_wait()` specifically, not the CLI
-binary run blocking via `exec_command` (an earlier version of this
-guidance did exactly that, before `hub_wait` existed): Codex's own
-shell-exec tool has a much shorter execution timeout than its MCP
-tool-call timeout — a live Codex session reported its `exec_command`
-foreground timeout as 30s, against an MCP tool-call timeout around 300s
-for recent versions — so blocking on the CLI binary via `exec_command`
+If `hub_connect` wasn't given a `reconnectSecret`, the message adds one
+more note: step 2 (reconnect using the same secret) has nothing to work
+with in that case, and recommends disconnecting and reconnecting once more
+with one before starting the monitoring loop, so a later disconnect can
+actually be recovered from with the same identity.
+
+`hub_wait` itself is still the right *tool* for the reasons already
+covered: Codex's shell-exec timeout (~30s, confirmed directly from a live
+session) is roughly 10x shorter than its MCP tool-call timeout (~300s for
+recent versions), so blocking on the CLI `wait` binary via `exec_command`
 would need roughly 10x as many round trips as blocking on `hub_wait()`
-directly to cover the same idle time. If a `hub_wait()` call is cancelled
-or times out with nothing having arrived, that's normal, not an error —
-Codex is told to just call it again.
+directly covers the same idle time.
 
 Expected steady-state loop: `hub_connect` → run `wait --follow` (or
 `ModeOnce`, re-run each time) in the background → harness notifies on each
