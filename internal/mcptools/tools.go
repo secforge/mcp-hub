@@ -154,37 +154,43 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	h.conn = conn
 	h.waiter = w
 
-	waitBlock := fmt.Sprintf(
-		"IMPORTANT: connecting alone does not deliver anything — you will never see a "+
-			"message unless one of these is actually running in the background. Two modes, "+
-			"pick based on what your harness offers:\n"+
-			"  - once (default): exits after the next event, so it must be run again every "+
-			"time it completes — run it now:\n"+
-			"      %s\n"+
-			"  - follow: stays running and prints each event as it arrives — prefer this, "+
-			"backgrounded via a tool that can stream a long-running process's output as it "+
-			"happens (e.g. a \"Monitor\"-style tool), if your harness has one; otherwise use "+
-			"once mode above:\n"+
-			"      %s",
-		w.WaitCommand(), w.WaitFollowCommand(),
-	)
+	// Codex gets its own, self-contained block from the start — never the
+	// generic "background one of these two" framing followed by a
+	// contradicting correction. Codex cannot background a command at all
+	// (confirmed directly from a live Codex session), so presenting that
+	// framing first and only then saying "ignore that" is actively
+	// confusing, not just redundant.
+	var waitBlock string
 	if looksLikeCodex(clientName(ctx)) {
-		waitBlock += "\nWARNING: detected Codex as the connecting client. Ignore both " +
-			"options above — Codex cannot run a command in the background at all, so " +
-			"neither \"backgrounded once mode\" nor --follow (which additionally needs a " +
-			"per-line notification tool Codex also doesn't have — this is an open, " +
-			"unshipped proposal, https://github.com/openai/codex/issues/29922) applies to " +
-			"you. Instead, run the once-mode command directly, blocking, in the " +
-			"foreground:\n" +
+		waitBlock = "IMPORTANT: connecting alone does not deliver anything — you will " +
+			"never see a message until you run this. Codex cannot run a command in the " +
+			"background or be woken by a still-running process's output (no per-line " +
+			"notification tool exists yet — https://github.com/openai/codex/issues/29865 " +
+			"and #29922 are both open, unshipped), so run this directly, blocking, in the " +
+			"foreground — do not background it:\n" +
 			"      " + w.WaitCommand() + "\n" +
-			"It will block until a message arrives (or the hub disconnects), then exit — " +
+			"It blocks until a message arrives (or the hub disconnects), then exits — " +
 			"process what it printed, then run it again, still blocking, to keep waiting. " +
-			"This ties up your turn while waiting, which is expected: it's the only " +
+			"This ties up your turn while waiting; that's expected, it's the only " +
 			"delivery mechanism available to you."
 	} else {
-		waitBlock += "\nWhen you connect to mcp-hub, use wait --follow with your Monitor/" +
-			"background-streaming tool directly — don't wrap it in a manual loop or a " +
-			"tee/grep pipeline."
+		waitBlock = fmt.Sprintf(
+			"IMPORTANT: connecting alone does not deliver anything — you will never see a "+
+				"message unless one of these is actually running in the background. Two "+
+				"modes, pick based on what your harness offers:\n"+
+				"  - once (default): exits after the next event, so it must be run again "+
+				"every time it completes — run it now:\n"+
+				"      %s\n"+
+				"  - follow: stays running and prints each event as it arrives — prefer "+
+				"this, backgrounded via a tool that can stream a long-running process's "+
+				"output as it happens (e.g. a \"Monitor\"-style tool), if your harness has "+
+				"one; otherwise use once mode above:\n"+
+				"      %s\n"+
+				"When you connect to mcp-hub, use wait --follow with your Monitor/"+
+				"background-streaming tool directly — don't wrap it in a manual loop or a "+
+				"tee/grep pipeline.",
+			w.WaitCommand(), w.WaitFollowCommand(),
+		)
 	}
 
 	invite := fmt.Sprintf(

@@ -636,18 +636,29 @@ adjusts instead of assuming Claude Code's own capabilities everywhere:
 case-insensitively against `"codex"` (a loose substring match, not exact —
 OpenAI's own docs show `clientInfo.name` varying by integration, e.g.
 `"codex_vscode"`, and a false positive here is far cheaper than a false
-negative). As of writing, Codex CLI has neither a `Monitor`-style per-line
-notification tool (it's an open, unshipped proposal —
-https://github.com/openai/codex/issues/29922) *nor* any way to run a
-command in the background at all — confirmed directly from a live Codex
-session's own report. Both assumptions the generic guidance rests on
-("background one of these two commands") are false for it, so for a
-Codex-detected client the *entire* two-option block is superseded, not
-just the `--follow` sentence: the result tells Codex to ignore both
-options above and instead run the `ModeOnce` command directly, blocking,
-in the foreground — process what it printed, then run it again, still
-blocking, to keep waiting. This deliberately ties up Codex's turn while
-waiting, since that's the only delivery mechanism available to it.
+negative). As of writing, Codex's own `exec_command` tool can leave a
+process running in the background and hand back a `session_id`, but Codex
+only sees new output from it by actively polling (`write_stdin`) — there's
+no passive wake-on-output (an open, unshipped proposal —
+https://github.com/openai/codex/issues/29865), and no `Monitor`-style
+per-line notification tool either (also open/unshipped —
+https://github.com/openai/codex/issues/29922) — confirmed directly from a
+live Codex session's own report. Both assumptions the generic two-option
+guidance rests on ("background one of these two commands, something will
+notify you") are false for it.
+
+Rather than presenting that generic framing and then walking it back with
+a correction — confusing on its own, tried and explicitly rejected — a
+Codex-detected client gets a **wholly separate, self-contained** message
+built from scratch, never the shared one: run the `ModeOnce` command
+directly, blocking, in the foreground (not backgrounded at all) — process
+what it printed, then run it again, still blocking, to keep waiting. This
+is also the *objectively better* choice for Codex even setting the "cannot
+background" constraint aside: a blocking call returns exactly when a
+message arrives, with no polling logic and no wasted turns checking for
+nothing, whereas `exec_command`'s background-plus-poll path would need
+Codex to actively decide when to re-check, with no guarantee of
+promptness.
 
 Expected steady-state loop: `hub_connect` → run `wait --follow` (or
 `ModeOnce`, re-run each time) in the background → harness notifies on each

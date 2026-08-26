@@ -93,14 +93,21 @@ func TestConnectResultTellsCodexToRunBlockingInForeground(t *testing.T) {
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
 
 	text := textOf(res)
-	if !strings.Contains(text, "WARNING") || !strings.Contains(text, "Codex") {
-		t.Fatalf("expected a Codex-specific warning, got: %s", text)
+	if !strings.Contains(text, "Codex") {
+		t.Fatalf("expected Codex-specific guidance, got: %s", text)
 	}
 	if !strings.Contains(text, "cannot run a command in the background") {
-		t.Fatalf("expected the warning to say Codex cannot background anything, got: %s", text)
+		t.Fatalf("expected the message to say Codex cannot background anything, got: %s", text)
 	}
 	if !strings.Contains(text, "blocking, in the") || !strings.Contains(text, "foreground") {
 		t.Fatalf("expected instructions to run wait blocking in the foreground, got: %s", text)
+	}
+	// The generic "background one of these two modes" framing must never
+	// appear at all for Codex — not even followed by a correction — since
+	// presenting it and then walking it back is exactly the confusing
+	// sequence this is meant to avoid.
+	if strings.Contains(text, "Two modes") || strings.Contains(text, "backgrounded via a tool") {
+		t.Fatalf("expected the generic two-mode framing to be entirely absent for Codex, got: %s", text)
 	}
 	if strings.Contains(text, "Monitor/background-streaming tool directly") {
 		t.Fatalf("expected the generic Monitor guidance to be replaced, not appended, got: %s", text)
