@@ -20,15 +20,40 @@ func FormatDirectedEntry(ts, peerID, targetPeerID, text string) string {
 }
 
 // FormatJoinedEntry renders a peer-joined log entry: "<ts> <peerId> joined"
-// (or "<ts> <peerId> (<name>) joined" if a display name was given — already
-// sanitized of control characters/newlines by the caller, so it's always
-// safe to embed on this one line) followed by a blank line. No message
-// body — peerJoined events carry none.
-func FormatJoinedEntry(ts, peerID, name string) string {
-	if name == "" {
-		return ts + " " + peerID + " joined\n\n"
+// at minimum, plus optional pieces for whatever that peer supplied — name
+// (already sanitized of control characters/newlines by the caller, so
+// always safe to embed on this one line), agePublicKey, and a
+// reconnectSecret status marker — followed by a blank line. No message
+// body — peerJoined events carry none. reconnectSecret's own value is
+// never logged (see AppendJoined); only whether one was involved, and how.
+//
+// reused and secretGiven distinguish reconnectSecret's three possible
+// states for this join, each surfaced explicitly rather than left to be
+// inferred from a repeated peerId elsewhere in the log:
+//   - reused: this connection presented a reconnectSecret that matched a
+//     prior, now-departed connection's — peerId was reclaimed. Logged as
+//     "(reconnected)".
+//   - !reused && secretGiven: a reconnectSecret was given but didn't (yet)
+//     match anything — either the first time it's been used, or its
+//     previous holder is still connected. Registered for a future
+//     reconnect. Logged as "(reconnectSecret set)".
+//   - neither: no reconnectSecret was involved. No marker.
+func FormatJoinedEntry(ts, peerID, name, agePublicKey string, reused, secretGiven bool) string {
+	suffix := ""
+	switch {
+	case reused:
+		suffix = " (reconnected)"
+	case secretGiven:
+		suffix = " (reconnectSecret set)"
 	}
-	return ts + " " + peerID + " (" + name + ") joined\n\n"
+	line := ts + " " + peerID
+	if name != "" {
+		line += " (" + name + ")"
+	}
+	if agePublicKey != "" {
+		line += " agePublicKey=" + agePublicKey
+	}
+	return line + " joined" + suffix + "\n\n"
 }
 
 // FormatLeftEntry renders a peer-left log entry: "<ts> <peerId> left"

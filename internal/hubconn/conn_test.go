@@ -422,12 +422,12 @@ func TestDialRejectsMalformedAgePublicKey(t *testing.T) {
 func TestDialEchoesBackSanitizedNameAndAgePublicKey(t *testing.T) {
 	url := startTestServer(t)
 	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000",
-		DialOptions{Name: "Steffen\n\x1b[31m", AgePublicKey: testAgePublicKey})
+		DialOptions{Name: "Alice\n\x1b[31m", AgePublicKey: testAgePublicKey})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
-	if c.Name() != "Steffen[31m" {
+	if c.Name() != "Alice[31m" {
 		t.Fatalf("expected control chars/newlines stripped from name, got %q", c.Name())
 	}
 	if c.AgePublicKey() != testAgePublicKey {
@@ -448,7 +448,7 @@ func TestPeersReportsNameAndAgePublicKeyOfOthers(t *testing.T) {
 	a.OnActivity(func() { activity <- struct{}{} })
 	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
 
-	b, err := Dial(url, sessionID, DialOptions{Name: "Steffen", AgePublicKey: testAgePublicKey})
+	b, err := Dial(url, sessionID, DialOptions{Name: "Alice", AgePublicKey: testAgePublicKey})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestPeersReportsNameAndAgePublicKeyOfOthers(t *testing.T) {
 	waitForActivity(t, activity) // a sees b's peerJoined
 
 	peers := a.Peers()
-	if len(peers) != 1 || peers[0].Name != "Steffen" || peers[0].AgePublicKey != testAgePublicKey {
+	if len(peers) != 1 || peers[0].Name != "Alice" || peers[0].AgePublicKey != testAgePublicKey {
 		t.Fatalf("expected b's name/agePublicKey to be reported, got %+v", peers)
 	}
 }

@@ -317,11 +317,22 @@ no body:
 
 ```
 <RFC3339 timestamp> <peerId> joined
-<RFC3339 timestamp> <peerId> (<name>) joined   // when a sanitized name was given
+<RFC3339 timestamp> <peerId> (<name>) joined                       // sanitized name given
+<RFC3339 timestamp> <peerId> agePublicKey=<age1...> joined         // agePublicKey given
+<RFC3339 timestamp> <peerId> (<name>) joined (reconnectSecret set) // a secret was given, not yet reused
+<RFC3339 timestamp> <peerId> (<name>) joined (reconnected)         // a secret matched a departed peer's
 
 <RFC3339 timestamp> <peerId> left
 
 ```
+
+`reconnectSecret`'s own value is never written to the log (nor anywhere
+else — see "Peer identity" below) — only whether one was involved for this
+join, and whether it actually matched a prior identity. Since peerIds are
+otherwise always fresh random UUIDs, seeing the same peerId reappear in a
+later `joined` line is itself indirect evidence of a `reconnected` reuse,
+but `FormatJoinedEntry` makes it explicit rather than something that has to
+be inferred by comparing entries.
 
 (blank line separates all entries; a message's own line breaks are kept as
 written — each source line is only further wrapped if it's still over 100

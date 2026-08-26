@@ -24,13 +24,13 @@ func TestJoinedRoundTrip(t *testing.T) {
 }
 
 func TestJoinedIncludesNameAndAgePublicKey(t *testing.T) {
-	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "Steffen", "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk")
+	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "Alice", "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk")
 	raw, _ := json.Marshal(j)
 	var decoded Joined
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if decoded.Name != "Steffen" || decoded.AgePublicKey != "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk" {
+	if decoded.Name != "Alice" || decoded.AgePublicKey != "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk" {
 		t.Fatalf("unexpected round trip: %+v", decoded)
 	}
 }
@@ -102,13 +102,13 @@ func TestBroadcastMsgIsNotPrivate(t *testing.T) {
 }
 
 func TestPeerJoinedIncludesNameAndAgePublicKey(t *testing.T) {
-	pe := NewPeerJoined("peer-1", "Steffen", "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk")
+	pe := NewPeerJoined("peer-1", "Alice", "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk")
 	raw, _ := json.Marshal(pe)
 	var decoded PeerEvent
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if decoded.Name != "Steffen" || decoded.AgePublicKey != "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk" {
+	if decoded.Name != "Alice" || decoded.AgePublicKey != "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk" {
 		t.Fatalf("unexpected round trip: %+v", decoded)
 	}
 }

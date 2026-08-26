@@ -93,7 +93,7 @@ func TestJoinIncludesNameAndAgePublicKeyInPeerEvents(t *testing.T) {
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	pubkeyA := "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"
-	a := joinFake(s, "Steffen", pubkeyA, "", nil)
+	a := joinFake(s, "Alice", pubkeyA, "", nil)
 	b := joinFake(s, "", "", "", nil)
 
 	// b's roster catch-up must include a's name/pubkey.
@@ -101,7 +101,7 @@ func TestJoinIncludesNameAndAgePublicKeyInPeerEvents(t *testing.T) {
 		t.Fatalf("expected b to receive at least one event, got %+v", b.received)
 	}
 	pe, ok := b.received[0].(wire.PeerEvent)
-	if !ok || pe.PeerID != a.ID() || pe.Name != "Steffen" || pe.AgePublicKey != pubkeyA {
+	if !ok || pe.PeerID != a.ID() || pe.Name != "Alice" || pe.AgePublicKey != pubkeyA {
 		t.Fatalf("expected b's roster entry for a to carry name/pubkey, got %+v", b.received[0])
 	}
 
@@ -134,11 +134,11 @@ func TestJoinReusesPeerIDForSameReconnectSecretAfterLeaving(t *testing.T) {
 	s := m.GetOrCreate("session-1")
 	secret := "super-secret-token"
 
-	first := joinFake(s, "Steffen", "", secret, nil)
+	first := joinFake(s, "Alice", "", secret, nil)
 	firstID := first.ID()
 	s.Leave(first)
 
-	second := joinFake(s, "Steffen", "", secret, nil)
+	second := joinFake(s, "Alice", "", secret, nil)
 	if second.ID() != firstID {
 		t.Fatalf("expected reconnecting with the same reconnectSecret to reuse peerID %q, got %q", firstID, second.ID())
 	}
@@ -149,13 +149,42 @@ func TestJoinAssignsFreshPeerIDWhenSameReconnectSecretStillConnected(t *testing.
 	s := m.GetOrCreate("session-1")
 	secret := "super-secret-token"
 
-	first := joinFake(s, "Steffen", "", secret, nil)
+	first := joinFake(s, "Alice", "", secret, nil)
 	// first never leaves - a second connection presenting the same secret
 	// concurrently must not collide with it.
-	second := joinFake(s, "Steffen", "", secret, nil)
+	second := joinFake(s, "Alice", "", secret, nil)
 
 	if second.ID() == first.ID() {
 		t.Fatal("expected a fresh peerID when the previous holder of this reconnectSecret is still connected")
+	}
+}
+
+func TestJoinReportsReusedAccurately(t *testing.T) {
+	m := NewManager()
+	s := m.GetOrCreate("session-1")
+	secret := "super-secret-token"
+
+	var firstID string
+	_, reused := s.Join(secret, func(id string) Peer { firstID = id; return &fakePeer{id: id} }, nil)
+	if reused {
+		t.Fatal("first join with a never-before-seen secret must report reused=false")
+	}
+	s.Leave(&fakePeer{id: firstID})
+
+	var secondID string
+	p2, reused := s.Join(secret, func(id string) Peer { secondID = id; return &fakePeer{id: id} }, nil)
+	if !reused {
+		t.Fatal("reconnecting with a matching secret to a now-departed peer must report reused=true")
+	}
+	if secondID != firstID {
+		t.Fatalf("expected reused peerID %q, got %q", firstID, secondID)
+	}
+	_ = p2
+
+	// same secret, but its holder is still connected: fresh ID, reused=false.
+	_, reused = s.Join(secret, func(id string) Peer { return &fakePeer{id: id} }, nil)
+	if reused {
+		t.Fatal("expected reused=false when the secret's previous holder is still connected")
 	}
 }
 
@@ -184,13 +213,13 @@ func TestJoinNeverReusesPeerIDBasedOnAgePublicKeyAlone(t *testing.T) {
 	s := m.GetOrCreate("session-1")
 	pubkey := "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"
 
-	first := joinFake(s, "Steffen", pubkey, "", nil)
+	first := joinFake(s, "Alice", pubkey, "", nil)
 	firstID := first.ID()
 	s.Leave(first)
 
 	// an "impersonator" who merely observed first's public agePublicKey
 	// (no secret) must not be able to reclaim first's peerId.
-	impersonator := joinFake(s, "Steffen", pubkey, "", nil)
+	impersonator := joinFake(s, "Alice", pubkey, "", nil)
 	if impersonator.ID() == firstID {
 		t.Fatal("agePublicKey alone must never grant peerId reuse — it's public, so this would allow impersonation")
 	}

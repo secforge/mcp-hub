@@ -19,7 +19,7 @@ func TestFormatDirectedEntryIncludesTarget(t *testing.T) {
 }
 
 func TestFormatJoinedEntry(t *testing.T) {
-	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "")
+	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "", "", false, false)
 	want := "2026-08-21T10:00:00Z peer-1 joined\n\n"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -27,8 +27,40 @@ func TestFormatJoinedEntry(t *testing.T) {
 }
 
 func TestFormatJoinedEntryIncludesName(t *testing.T) {
-	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "Steffen")
-	want := "2026-08-21T10:00:00Z peer-1 (Steffen) joined\n\n"
+	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "Alice", "", false, false)
+	want := "2026-08-21T10:00:00Z peer-1 (Alice) joined\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestFormatJoinedEntryIncludesAgePublicKey(t *testing.T) {
+	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "", "age1abc", false, false)
+	want := "2026-08-21T10:00:00Z peer-1 agePublicKey=age1abc joined\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestFormatJoinedEntryIncludesNameAndAgePublicKey(t *testing.T) {
+	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "Alice", "age1abc", false, false)
+	want := "2026-08-21T10:00:00Z peer-1 (Alice) agePublicKey=age1abc joined\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestFormatJoinedEntryMarksReconnected(t *testing.T) {
+	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "Alice", "", true, true)
+	want := "2026-08-21T10:00:00Z peer-1 (Alice) joined (reconnected)\n\n"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestFormatJoinedEntryMarksReconnectSecretSetWhenNotYetReused(t *testing.T) {
+	got := FormatJoinedEntry("2026-08-21T10:00:00Z", "peer-1", "Alice", "", false, true)
+	want := "2026-08-21T10:00:00Z peer-1 (Alice) joined (reconnectSecret set)\n\n"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

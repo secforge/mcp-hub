@@ -126,7 +126,7 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 
 	session := h.manager.GetOrCreate(sessionID)
 	var writeErr error
-	session.Join(reconnectSecret,
+	_, reused := session.Join(reconnectSecret,
 		func(id string) hubsession.Peer {
 			peerID = id
 			p = &peer{id: id, conn: conn, done: done, name: name, agePublicKey: agePublicKey, pingPeriod: snapPingPeriod, writeWait: snapWriteWait}
@@ -140,7 +140,7 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 		return
 	}
 	if logger != nil {
-		logger.AppendJoined(peerID, name, time.Now().UTC().Format(time.RFC3339))
+		logger.AppendJoined(peerID, name, agePublicKey, reused, reconnectSecret != "", time.Now().UTC().Format(time.RFC3339))
 	}
 	defer func() {
 		if logger != nil {

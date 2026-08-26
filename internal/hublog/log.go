@@ -43,10 +43,14 @@ func (l *SessionLog) AppendDirected(peerID, targetPeerID, text, ts string) error
 	return err
 }
 
-func (l *SessionLog) AppendJoined(peerID, name, ts string) error {
+// AppendJoined logs a peer's join. Note what's deliberately absent:
+// reconnectSecret's own value is never passed in or logged, only whether
+// one was involved and whether it matched (reused/secretGiven) — logging
+// the secret itself would defeat its purpose (see hubsession.Session).
+func (l *SessionLog) AppendJoined(peerID, name, agePublicKey string, reused, secretGiven bool, ts string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, err := l.file.WriteString(FormatJoinedEntry(ts, peerID, name))
+	_, err := l.file.WriteString(FormatJoinedEntry(ts, peerID, name, agePublicKey, reused, secretGiven))
 	return err
 }
 

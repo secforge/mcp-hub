@@ -63,16 +63,21 @@ func newSession(id string) *Session {
 // anyone else — e.g. to write a "joined" confirmation with an
 // existing-peer count that's guaranteed consistent with the roster that
 // follows.
-func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer, beforeVisible func(existingCount int)) Peer {
+// Join's second return value, reused, reports whether peerID was reclaimed
+// from a matching reconnectSecret (true) or freshly generated (false) — the
+// caller (wsserver) surfaces this in the session log so a reconnect with a
+// valid secret is visible there without having to infer it from a repeated
+// peerId across entries.
+func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer, beforeVisible func(existingCount int)) (p Peer, reused bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	peerID := s.resolvePeerIDLocked(reconnectSecret)
+	peerID, reused := s.resolvePeerIDLocked(reconnectSecret)
 	existing := make([]Peer, 0, len(s.peers))
 	for _, ep := range s.peers {
 		existing = append(existing, ep)
 	}
-	p := makePeer(peerID)
+	p = makePeer(peerID)
 	if beforeVisible != nil {
 		beforeVisible(len(existing))
 	}
@@ -89,20 +94,21 @@ func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer
 	}
 	p.Deliver(wire.NewRosterComplete())
 	s.broadcastExceptLocked(peerID, wire.NewPeerJoined(peerID, p.Name(), p.AgePublicKey()))
-	return p
+	return p, reused
 }
 
-// resolvePeerIDLocked returns the peerID a joining connection should use.
-// Called with s.mu already held.
-func (s *Session) resolvePeerIDLocked(reconnectSecret string) string {
+// resolvePeerIDLocked returns the peerID a joining connection should use,
+// and whether it was reclaimed from a matching reconnectSecret. Called with
+// s.mu already held.
+func (s *Session) resolvePeerIDLocked(reconnectSecret string) (peerID string, reused bool) {
 	if reconnectSecret != "" {
 		if id, ok := s.secretToPeerID[reconnectSecret]; ok {
 			if _, stillConnected := s.peers[id]; !stillConnected {
-				return id
+				return id, true
 			}
 		}
 	}
-	return uuid.NewString()
+	return uuid.NewString(), false
 }
 
 // Leave removes p from the session and reports whether the session is now

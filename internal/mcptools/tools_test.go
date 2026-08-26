@@ -155,7 +155,7 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 	hubB := NewHub()
 	connReqB := mcp.CallToolRequest{}
 	connReqB.Params.Arguments = map[string]any{
-		"host": url, "sessionId": sessionID, "name": "Steffen\nfake log line", "agePublicKey": pubkey,
+		"host": url, "sessionId": sessionID, "name": "Alice\nfake log line", "agePublicKey": pubkey,
 	}
 	res, err := hubB.handleConnect(ctx, connReqB)
 	if err != nil || res.IsError {
@@ -166,7 +166,7 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 			t.Fatalf("expected the newline in the raw name to be stripped (no line injection), got line %q in: %s", line, textOf(res))
 		}
 	}
-	if !strings.Contains(textOf(res), "sanitized") || !strings.Contains(textOf(res), "Steffenfake log line") {
+	if !strings.Contains(textOf(res), "sanitized") || !strings.Contains(textOf(res), "Alicefake log line") {
 		t.Fatalf("expected b's connect result to confirm its sanitized display name, got: %s", textOf(res))
 	}
 	if !strings.Contains(textOf(res), pubkey) {
@@ -185,7 +185,7 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 		peersText = textOf(res)
 		return strings.Contains(peersText, hubB.conn.PeerID())
 	})
-	if !strings.Contains(peersText, "Steffenfake log line") || !strings.Contains(peersText, pubkey) {
+	if !strings.Contains(peersText, "Alicefake log line") || !strings.Contains(peersText, pubkey) {
 		t.Fatalf("expected a's peer listing to include b's (newline-stripped) name and agePublicKey, got: %s", peersText)
 	}
 }

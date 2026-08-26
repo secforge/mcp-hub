@@ -3,8 +3,8 @@ package sanitize
 import "testing"
 
 func TestTextStripsControlCharsAndNewlines(t *testing.T) {
-	got := Text("Steffen\n2026-01-01T00:00:00Z fake-peer joined\x00\x1b[31m", 64)
-	want := "Steffen2026-01-01T00:00:00Z fake-peer joined[31m"
+	got := Text("Alice\n2026-01-01T00:00:00Z fake-peer joined\x00\x1b[31m", 64)
+	want := "Alice2026-01-01T00:00:00Z fake-peer joined[31m"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -18,8 +18,8 @@ func TestTextTruncatesToMaxRunes(t *testing.T) {
 }
 
 func TestTextTrimsSurroundingWhitespace(t *testing.T) {
-	got := Text("  Steffen  ", 64)
-	if got != "Steffen" {
+	got := Text("  Alice  ", 64)
+	if got != "Alice" {
 		t.Fatalf("got %q", got)
 	}
 }
