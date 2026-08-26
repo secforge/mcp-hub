@@ -199,8 +199,8 @@ func TestJoinReportsReusedAccurately(t *testing.T) {
 // entirely and constructing brand new ones — nothing in-process survives
 // that except whatever identitystore itself persisted to disk.
 func TestReconnectSecretSurvivesSimulatedServerRestart(t *testing.T) {
-	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
-	sessionID := "session-restart-test"
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir())            // isolate persisted secretToPeerID from other tests
+	sessionID := "6ba7b810-9dad-11d1-80b4-00c04fd430c8" // must be a valid UUID - identitystore validates it
 	secret := "super-secret-token"
 
 	m1 := NewManager()
@@ -226,8 +226,8 @@ func TestReconnectSecretSurvivesSimulatedServerRestart(t *testing.T) {
 // — even across a subsequent simulated restart, since the persisted file
 // was deleted, not just the in-memory state.
 func TestReconnectSecretDoesNotSurviveIntentionalTeardown(t *testing.T) {
-	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
-	sessionID := "session-teardown-test"
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir())            // isolate persisted secretToPeerID from other tests
+	sessionID := "6ba7b810-9dad-11d1-80b4-00c04fd430c8" // must be a valid UUID - identitystore validates it
 	secret := "super-secret-token"
 
 	m1 := NewManager()

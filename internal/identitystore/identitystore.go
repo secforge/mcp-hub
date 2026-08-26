@@ -10,8 +10,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/secforge/mcp-hub/internal/wire"
 )
 
 func dir() string {
@@ -21,8 +24,20 @@ func dir() string {
 	return "."
 }
 
-func path(sessionID string) string {
-	return filepath.Join(dir(), sessionID+".secrets.json")
+// path builds the persistence file path for sessionID, which by the time
+// it reaches this package should already be a validated UUID (wsserver
+// rejects anything else before a session is ever created — see
+// wire.IsValidID). Re-validating here anyway, rather than trusting the
+// caller, is deliberate defense in depth: sessionID becomes part of a
+// filesystem path, and this package has no other way to guarantee a future
+// caller won't pass through something attacker-controlled and unvalidated
+// (e.g. "../../etc/cron.d/x") that could otherwise write or read outside
+// dir() entirely.
+func path(sessionID string) (string, error) {
+	if !wire.IsValidID(sessionID) {
+		return "", fmt.Errorf("identitystore: invalid sessionID %q", sessionID)
+	}
+	return filepath.Join(dir(), sessionID+".secrets.json"), nil
 }
 
 // HashSecret returns the lookup key a reconnectSecret is stored/matched
@@ -33,11 +48,15 @@ func HashSecret(secret string) string {
 }
 
 // Load reads the persisted secretHash->peerID mapping for a session. A
-// missing or unreadable file is not an error — it just means nothing has
-// been persisted for this session yet (or ever) — so Load always returns a
-// usable (possibly empty) map.
+// missing or unreadable file, or an invalid sessionID, is not an error —
+// either just means nothing usable has been persisted for this session —
+// so Load always returns a usable (possibly empty) map.
 func Load(sessionID string) map[string]string {
-	data, err := os.ReadFile(path(sessionID))
+	p, err := path(sessionID)
+	if err != nil {
+		return map[string]string{}
+	}
+	data, err := os.ReadFile(p)
 	if err != nil {
 		return map[string]string{}
 	}
@@ -55,11 +74,14 @@ func Load(sessionID string) map[string]string {
 // in-memory mapping the session already works from, not something session
 // correctness itself depends on.
 func Save(sessionID string, mapping map[string]string) error {
+	target, err := path(sessionID)
+	if err != nil {
+		return err
+	}
 	data, err := json.Marshal(mapping)
 	if err != nil {
 		return err
 	}
-	target := path(sessionID)
 	tmp := target + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
@@ -73,5 +95,9 @@ func Save(sessionID string, mapping map[string]string) error {
 // an intentional end of that channel should end persisted identity too,
 // while an unplanned restart should not.
 func Delete(sessionID string) {
-	_ = os.Remove(path(sessionID))
+	p, err := path(sessionID)
+	if err != nil {
+		return
+	}
+	_ = os.Remove(p)
 }

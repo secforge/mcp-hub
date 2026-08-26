@@ -79,6 +79,45 @@ func TestDeleteOfNonexistentSessionIsHarmless(t *testing.T) {
 	Delete("never-existed") // must not panic
 }
 
+// TestPathTraversalSessionIDIsRejected is a security regression test:
+// sessionID becomes part of a filesystem path, so an unvalidated caller
+// passing something like "../../etc/cron.d/x" must never be able to read,
+// write, or delete outside dir(). wsserver already rejects any non-UUID
+// sessionId before a session is ever created, but this package validates
+// independently rather than trusting that as its only line of defense.
+func TestPathTraversalSessionIDIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MCP_HUB_LOG_DIR", dir)
+
+	malicious := []string{
+		"../../../../etc/cron.d/evil",
+		"../escape",
+		"..",
+		"/etc/passwd",
+		"a/b",
+		"a\\b",
+		"not-a-uuid",
+		"",
+	}
+	for _, id := range malicious {
+		if got := Load(id); len(got) != 0 {
+			t.Errorf("Load(%q): expected an empty map, got %+v", id, got)
+		}
+		if err := Save(id, map[string]string{"h": "peer-a"}); err == nil {
+			t.Errorf("Save(%q): expected an error, got nil", id)
+		}
+		Delete(id) // must not panic or touch anything outside dir
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no files written for any malicious sessionID, got %+v", entries)
+	}
+}
+
 func TestHashSecretIsDeterministicAndDistinct(t *testing.T) {
 	if HashSecret("a") != HashSecret("a") {
 		t.Fatal("expected the same secret to hash the same way every time")

@@ -233,13 +233,25 @@ the map key, matched by re-hashing an incoming secret the same way. This
 means the file can't be replayed to impersonate anyone even if someone
 reads it directly off disk; `Save` writes are also `0600` (owner-only) and
 go through a write-to-temp-then-rename so a concurrent `Load` never
-observes a partially-written file. A `Save`/`Load` failure is logged but
-not fatal — restart-survival is a convenience layered on top of the
-in-memory mapping the session already works from correctly on its own,
-not something session correctness itself depends on.
+observes a partially-written file. A `Save`/`Load` failure is silently
+discarded by the caller (`Session`), not fatal — restart-survival is a
+convenience layered on top of the in-memory mapping the session already
+works from correctly on its own, not something session correctness itself
+depends on.
+
+`sessionID` becomes part of that file's path, so `identitystore` validates
+it as a well-formed UUID (`wire.IsValidID`) itself, independently of
+`wsserver` already rejecting a malformed `sessionId` before a session is
+ever created — defense in depth rather than trusting a single caller's
+validation to hold forever. `path()` returns an error for anything else;
+`Load`/`Delete` treat that the same as "nothing persisted"/"nothing to
+delete" rather than propagating it, since neither has a meaningful error
+path back to its caller. `TestPathTraversalSessionIDIsRejected`
+(`internal/identitystore`) is the regression test.
+
 `TestReconnectSecretSurvivesSimulatedServerRestart` and
 `TestReconnectSecretDoesNotSurviveIntentionalTeardown` (`internal/hubsession`)
-are the regression tests for the two halves of this.
+are the regression tests for the two restart/teardown halves.
 
 ### Protocol versioning
 
