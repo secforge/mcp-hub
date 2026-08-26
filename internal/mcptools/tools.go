@@ -169,13 +169,18 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		w.WaitCommand(), w.WaitFollowCommand(),
 	)
 	if looksLikeCodex(clientName(ctx)) {
-		waitBlock += "\nWARNING: detected Codex as the connecting client. As of writing, " +
-			"Codex CLI has no built-in way to be woken by new output from a still-running " +
-			"background process (this is an open, unshipped proposal — " +
-			"https://github.com/openai/codex/issues/29922); it relies on polling or " +
-			"blocking instead. --follow will NOT notify you here even though it's shown " +
-			"above for other harnesses. Use the once-mode command instead, and run it " +
-			"again every time it completes."
+		waitBlock += "\nWARNING: detected Codex as the connecting client. Ignore both " +
+			"options above — Codex cannot run a command in the background at all, so " +
+			"neither \"backgrounded once mode\" nor --follow (which additionally needs a " +
+			"per-line notification tool Codex also doesn't have — this is an open, " +
+			"unshipped proposal, https://github.com/openai/codex/issues/29922) applies to " +
+			"you. Instead, run the once-mode command directly, blocking, in the " +
+			"foreground:\n" +
+			"      " + w.WaitCommand() + "\n" +
+			"It will block until a message arrives (or the hub disconnects), then exit — " +
+			"process what it printed, then run it again, still blocking, to keep waiting. " +
+			"This ties up your turn while waiting, which is expected: it's the only " +
+			"delivery mechanism available to you."
 	} else {
 		waitBlock += "\nWhen you connect to mcp-hub, use wait --follow with your Monitor/" +
 			"background-streaming tool directly — don't wrap it in a manual loop or a " +

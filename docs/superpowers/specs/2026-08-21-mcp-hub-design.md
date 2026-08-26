@@ -636,13 +636,18 @@ adjusts instead of assuming Claude Code's own capabilities everywhere:
 case-insensitively against `"codex"` (a loose substring match, not exact —
 OpenAI's own docs show `clientInfo.name` varying by integration, e.g.
 `"codex_vscode"`, and a false positive here is far cheaper than a false
-negative). As of writing, Codex CLI has no shipped equivalent to a
-`Monitor`-style per-line notification tool — it's an open, unshipped
-proposal (https://github.com/openai/codex/issues/29922) — so for a
-Codex-detected client, the generic "prefer `--follow` with a streaming
-tool" sentence is replaced with an explicit warning that `--follow` will
-not notify it and to use `ModeOnce`, re-run each time it completes,
-instead.
+negative). As of writing, Codex CLI has neither a `Monitor`-style per-line
+notification tool (it's an open, unshipped proposal —
+https://github.com/openai/codex/issues/29922) *nor* any way to run a
+command in the background at all — confirmed directly from a live Codex
+session's own report. Both assumptions the generic guidance rests on
+("background one of these two commands") are false for it, so for a
+Codex-detected client the *entire* two-option block is superseded, not
+just the `--follow` sentence: the result tells Codex to ignore both
+options above and instead run the `ModeOnce` command directly, blocking,
+in the foreground — process what it printed, then run it again, still
+blocking, to keep waiting. This deliberately ties up Codex's turn while
+waiting, since that's the only delivery mechanism available to it.
 
 Expected steady-state loop: `hub_connect` → run `wait --follow` (or
 `ModeOnce`, re-run each time) in the background → harness notifies on each

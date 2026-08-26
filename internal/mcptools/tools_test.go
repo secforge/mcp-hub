@@ -79,7 +79,7 @@ func TestConnectResultMentionsFollowModeAndMonitorGuidance(t *testing.T) {
 	}
 }
 
-func TestConnectResultWarnsCodexAgainstFollow(t *testing.T) {
+func TestConnectResultTellsCodexToRunBlockingInForeground(t *testing.T) {
 	url := startTestServer(t)
 	ctx := ctxWithClientName("codex")
 
@@ -96,8 +96,11 @@ func TestConnectResultWarnsCodexAgainstFollow(t *testing.T) {
 	if !strings.Contains(text, "WARNING") || !strings.Contains(text, "Codex") {
 		t.Fatalf("expected a Codex-specific warning, got: %s", text)
 	}
-	if !strings.Contains(text, "will NOT notify you") {
-		t.Fatalf("expected the warning to say --follow won't notify Codex, got: %s", text)
+	if !strings.Contains(text, "cannot run a command in the background") {
+		t.Fatalf("expected the warning to say Codex cannot background anything, got: %s", text)
+	}
+	if !strings.Contains(text, "blocking, in the") || !strings.Contains(text, "foreground") {
+		t.Fatalf("expected instructions to run wait blocking in the foreground, got: %s", text)
 	}
 	if strings.Contains(text, "Monitor/background-streaming tool directly") {
 		t.Fatalf("expected the generic Monitor guidance to be replaced, not appended, got: %s", text)
