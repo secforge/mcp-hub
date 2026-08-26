@@ -478,9 +478,27 @@ join/leave events.
   depends on the *client* sending that notification when its own
   tool-call timeout elapses, which the MCP spec makes optional, not
   guaranteed — a client that silently abandons the call instead leaves the
-  blocked goroutine polling until the underlying transport itself closes
-  (harmless individually, since it's just idling, but unbounded across
-  many abandoned retries in a single long session).
+  blocked goroutine polling until something else intervenes.
+
+  That "something else" is deliberate: a new `hub_wait` call always
+  supersedes one already in flight, mirroring `waiter.Waiter`'s single-
+  registered-waiter design for the CLI wait socket, for the identical
+  reason. Without this, two genuinely concurrent calls (most plausibly the
+  abandoned-retry case above, but nothing prevents it otherwise) would
+  independently poll the same buffer and race for whichever event arrives
+  first via `Drain` — destructive, so only one caller ever sees it — and
+  the loser would sit blocked waiting for a *different* event that might
+  never come, with no indication anything was "stolen." `Hub` tracks the
+  in-flight call's own `context.CancelFunc` (`waitCancel`, guarded by
+  `waitMu`) plus a generation counter (`waitGen`) so a completing call only
+  clears the field if it's still the current one, not a stale write from a
+  call that's already been superseded. The superseded call's `innerCtx`
+  (derived from the caller's own `ctx` via `context.WithCancel`) fires
+  either way; `handleWait` distinguishes a real cancellation from being
+  superseded by checking whether the *outer* `ctx.Err()` is non-nil —
+  superseded returns a plain `"superseded by a newer hub_wait call"` text
+  result, not an error, since nothing about the request itself failed.
+  `TestHubWaitNewCallSupersedesInFlightOne` is the regression test.
 - **`hub_peers()`** — returns everyone else currently known to be in the
   session (sorted by peerId, one per line, or an explicit "no other peers"
   message if empty), including each peer's `name` and `agePublicKey` when

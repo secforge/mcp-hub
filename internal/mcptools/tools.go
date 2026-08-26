@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +22,13 @@ import (
 type Hub struct {
 	conn   *hubconn.Conn
 	waiter *waiter.Waiter
+
+	// waitMu, waitCancel, and waitGen let a new handleWait call supersede
+	// one already in flight, mirroring waiter.Waiter's single-registered-
+	// waiter design for the CLI wait socket — see handleWait.
+	waitMu     sync.Mutex
+	waitCancel context.CancelFunc
+	waitGen    uint64
 }
 
 func NewHub() *Hub {
@@ -90,7 +98,9 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"process at all (e.g. Codex): this call is bounded by your own MCP client's tool-"+
 				"call timeout instead of a much shorter shell-exec timeout, so it needs far fewer "+
 				"round trips. If the call is cancelled or times out with nothing having arrived "+
-				"yet, that's normal, not an error — just call hub_wait() again")),
+				"yet, that's normal, not an error — just call hub_wait() again. Calling hub_wait() "+
+				"again while a previous call is still outstanding immediately supersedes it (the "+
+				"old call returns right away); only ever have one in flight at a time")),
 		h.handleWait,
 	)
 	s.AddTool(
@@ -348,10 +358,40 @@ const waitPollInterval = 100 * time.Millisecond
 // than leaking a goroutine blocked forever; note this depends on the
 // client actually sending that notification, which the MCP spec makes
 // optional, not guaranteed.
+//
+// A new call always supersedes one already in flight — mirroring
+// waiter.Waiter's single-registered-waiter design for the CLI wait
+// socket, for the same reason: without this, two concurrent calls would
+// independently poll the same buffer and just race for whichever event
+// arrives first via Drain (destructive), leaving the loser blocked
+// waiting for a *different* event that might never come, with no
+// indication anything was "stolen." This matters most for exactly the
+// case handleWait's own doc above already flags: a client that silently
+// abandons a call on its own timeout (no cancellation sent) and then
+// retries, leaving the old call still running server-side.
 func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if h.conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
+
+	innerCtx, cancel := context.WithCancel(ctx)
+	h.waitMu.Lock()
+	if h.waitCancel != nil {
+		h.waitCancel() // supersede whatever hub_wait call was already in flight
+	}
+	h.waitGen++
+	myGen := h.waitGen
+	h.waitCancel = cancel
+	h.waitMu.Unlock()
+	defer func() {
+		h.waitMu.Lock()
+		if h.waitGen == myGen {
+			h.waitCancel = nil
+		}
+		h.waitMu.Unlock()
+		cancel()
+	}()
+
 	ticker := time.NewTicker(waitPollInterval)
 	defer ticker.Stop()
 	for {
@@ -363,8 +403,13 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 			return mcp.NewToolResultText(formatted), nil
 		}
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-innerCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return nil, err // the caller's own context was cancelled/timed out
+			}
+			// innerCtx was cancelled independently of ctx: a newer hub_wait
+			// call superseded this one.
+			return mcp.NewToolResultText("superseded by a newer hub_wait call"), nil
 		case <-ticker.C:
 		}
 	}

@@ -335,6 +335,78 @@ func TestHubWaitBlocksUntilMessageArrives(t *testing.T) {
 	}
 }
 
+func TestHubWaitNewCallSupersedesInFlightOne(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	deadlinePoll(t, func() bool { return hub.conn.RosterComplete() })
+	hub.handleReceive(ctx, mcp.CallToolRequest{}) // drain hub's own rosterComplete
+
+	// b connects up front (not during the supersede dance below), so its
+	// roster-join event is drained out of the way before either hub_wait
+	// call starts — otherwise whichever call is actively polling would
+	// devour that roster event instead of the real message sent later.
+	hubB := NewHub()
+	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+	deadlinePoll(t, func() bool { hasEvents, _ := hub.conn.Peek(); return hasEvents })
+	hub.handleReceive(ctx, mcp.CallToolRequest{}) // drain hub's peerJoined-for-b
+
+	firstResultCh := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, _ := hub.handleWait(ctx, mcp.CallToolRequest{})
+		firstResultCh <- res
+	}()
+
+	// give the first call a moment to actually start blocking (and
+	// register itself as h.waitCancel) before the second one supersedes it.
+	time.Sleep(50 * time.Millisecond)
+
+	secondResultCh := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, _ := hub.handleWait(ctx, mcp.CallToolRequest{})
+		secondResultCh <- res
+	}()
+
+	select {
+	case res := <-firstResultCh:
+		if !strings.Contains(textOf(res), "superseded by a newer hub_wait call") {
+			t.Fatalf("expected the first call to report being superseded, got: %s", textOf(res))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the superseded hub_wait call never returned")
+	}
+
+	// the second (superseding) call must still be the one actually
+	// listening — it should get the next real event, not sit forever
+	// having "won" nothing.
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "for the surviving call"}
+	deadlinePoll(t, func() bool {
+		res, err := hubB.handleSend(ctx, sendReq)
+		return err == nil && !res.IsError
+	})
+
+	select {
+	case res := <-secondResultCh:
+		if !strings.Contains(textOf(res), "for the surviving call") {
+			t.Fatalf("expected the surviving call to receive the next real event, got: %s", textOf(res))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the surviving hub_wait call never returned")
+	}
+}
+
 func TestHubWaitReturnsOnDisconnect(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
