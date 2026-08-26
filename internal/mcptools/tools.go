@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -80,6 +81,17 @@ func (h *Hub) Register(s *server.MCPServer) {
 		mcp.NewTool("hub_receive",
 			mcp.WithDescription("Drain and return currently buffered hub events without blocking")),
 		h.handleReceive,
+	)
+	s.AddTool(
+		mcp.NewTool("hub_wait",
+			mcp.WithDescription("Block until the next hub event arrives (or the hub disconnects), "+
+				"then return it — the direct MCP-tool alternative to running the wait CLI binary "+
+				"as a background/foreground process. Best for a harness that cannot background a "+
+				"process at all (e.g. Codex): this call is bounded by your own MCP client's tool-"+
+				"call timeout instead of a much shorter shell-exec timeout, so it needs far fewer "+
+				"round trips. If the call is cancelled or times out with nothing having arrived "+
+				"yet, that's normal, not an error — just call hub_wait() again")),
+		h.handleWait,
 	)
 	s.AddTool(
 		mcp.NewTool("hub_peers",
@@ -163,20 +175,21 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	var waitBlock string
 	if looksLikeCodex(clientName(ctx)) {
 		waitBlock = "IMPORTANT: connecting alone does not deliver anything — you will " +
-			"never see a message until you run this. Codex cannot run a command in the " +
+			"never see a message until you call this. Codex cannot run a command in the " +
 			"background or be woken by a still-running process's output (no per-line " +
 			"notification tool exists yet — https://github.com/openai/codex/issues/29865 " +
-			"and #29922 are both open, unshipped), so run this directly, blocking, in the " +
-			"foreground — do not background it:\n" +
-			"      " + w.WaitCommand() + "\n" +
-			"It blocks until a message arrives (or the hub disconnects), then exits — " +
-			"process what it printed, then run it again, still blocking, to keep waiting. " +
-			"This ties up your turn while waiting; that's expected, it's the only " +
-			"delivery mechanism available to you. Your own shell-exec tool has its own " +
-			"timeout (recent Codex versions default to around 300s) that is independent of " +
-			"this command — if it gets killed with no output because nothing happened yet, " +
-			"that is NOT an error, just run it again the same way; pass a longer timeout_ms " +
-			"on the call if your tool supports it, to reduce how often that happens."
+			"and #29922 are both open, unshipped), so use the hub_wait() MCP tool directly " +
+			"instead of a shell command — call it now:\n" +
+			"      hub_wait()\n" +
+			"It blocks until a message arrives (or the hub disconnects), then returns it — " +
+			"process what it returned, then call hub_wait() again to keep waiting. This " +
+			"ties up your turn while waiting; that's expected, it's the delivery mechanism " +
+			"available to you. Prefer this over running the wait CLI binary yourself: your " +
+			"shell-exec tool's own timeout (recent Codex versions default to around 30s) is " +
+			"much shorter than your MCP tool-call timeout (recent Codex versions default to " +
+			"around 300s), so hub_wait() needs roughly 10x fewer round trips when nothing is " +
+			"happening yet. If a hub_wait() call is cancelled or times out with nothing " +
+			"having arrived, that is NOT an error — just call it again."
 	} else {
 		waitBlock = fmt.Sprintf(
 			"IMPORTANT: connecting alone does not deliver anything — you will never see a "+
@@ -308,6 +321,45 @@ func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultText("no messages"), nil
 	}
 	return mcp.NewToolResultText(formatted), nil
+}
+
+// waitPollInterval is how often handleWait re-checks the buffer while
+// blocked. Deliberately not event-driven (unlike the CLI wait/waiter path,
+// which registers for a Poke callback): hubconn.Conn.OnActivity holds only
+// a single callback, already claimed by the waiter socket for the CLI
+// wait command, and polling this rarely is cheap enough not to warrant
+// extending that to a multi-listener design just for this.
+const waitPollInterval = 100 * time.Millisecond
+
+// handleWait blocks until an event is buffered or the hub disconnects,
+// then returns it — the direct MCP-tool equivalent of running the wait
+// CLI binary, for a harness that can't background/persist a process at
+// all. Returns promptly if the caller's context is cancelled (e.g. the
+// client's own tool-call timeout elapsed and it sent notifications/
+// cancelled — mark3labs/mcp-go wires that into ctx per request), rather
+// than leaking a goroutine blocked forever; note this depends on the
+// client actually sending that notification, which the MCP spec makes
+// optional, not guaranteed.
+func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if h.conn == nil {
+		return mcp.NewToolResultError("not connected"), nil
+	}
+	ticker := time.NewTicker(waitPollInterval)
+	defer ticker.Stop()
+	for {
+		if hasEvents, connected := h.conn.Peek(); hasEvents || !connected {
+			formatted, connected := h.conn.Drain()
+			if !connected && formatted == "" {
+				return mcp.NewToolResultText("hub disconnected"), nil
+			}
+			return mcp.NewToolResultText(formatted), nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (h *Hub) handlePeers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

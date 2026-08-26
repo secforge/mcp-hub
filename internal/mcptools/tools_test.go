@@ -79,7 +79,7 @@ func TestConnectResultMentionsFollowModeAndMonitorGuidance(t *testing.T) {
 	}
 }
 
-func TestConnectResultTellsCodexToRunBlockingInForeground(t *testing.T) {
+func TestConnectResultTellsCodexToUseHubWait(t *testing.T) {
 	url := startTestServer(t)
 	ctx := ctxWithClientName("codex")
 
@@ -99,10 +99,11 @@ func TestConnectResultTellsCodexToRunBlockingInForeground(t *testing.T) {
 	if !strings.Contains(text, "cannot run a command in the background") {
 		t.Fatalf("expected the message to say Codex cannot background anything, got: %s", text)
 	}
-	if !strings.Contains(text, "blocking, in the") || !strings.Contains(text, "foreground") {
-		t.Fatalf("expected instructions to run wait blocking in the foreground, got: %s", text)
+	if !strings.Contains(text, "hub_wait()") {
+		t.Fatalf("expected instructions to call hub_wait(), got: %s", text)
 	}
-	// The generic "background one of these two modes" framing must never
+	// The generic "background one of these two modes" framing, and the CLI
+	// wait-binary guidance meant for backgroundable harnesses, must never
 	// appear at all for Codex — not even followed by a correction — since
 	// presenting it and then walking it back is exactly the confusing
 	// sequence this is meant to avoid.
@@ -112,8 +113,11 @@ func TestConnectResultTellsCodexToRunBlockingInForeground(t *testing.T) {
 	if strings.Contains(text, "Monitor/background-streaming tool directly") {
 		t.Fatalf("expected the generic Monitor guidance to be replaced, not appended, got: %s", text)
 	}
-	if !strings.Contains(text, "timeout") || !strings.Contains(text, "NOT an error") {
-		t.Fatalf("expected a note that a shell-exec timeout with no output is not an error, got: %s", text)
+	if !strings.Contains(text, "10x fewer") {
+		t.Fatalf("expected the round-trip-savings reasoning for preferring hub_wait(), got: %s", text)
+	}
+	if !strings.Contains(text, "NOT an error") {
+		t.Fatalf("expected a note that a cancelled/timed-out hub_wait() call is not an error, got: %s", text)
 	}
 }
 
@@ -185,6 +189,192 @@ func TestConnectSendReceiveDisconnect(t *testing.T) {
 	}
 
 	hubB.handleDisconnect(ctx, discReq)
+}
+
+func TestHubWaitErrorsWhenNotConnected(t *testing.T) {
+	hub := NewHub()
+	res, err := hub.handleWait(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error when not connected")
+	}
+}
+
+func TestHubWaitReturnsImmediatelyWhenAlreadyBuffered(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hubA.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hubB := NewHub()
+	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	// drain a's own roster catch-up (its rosterComplete/peerJoined-for-b)
+	// before exercising hub_wait's actual target behavior below.
+	deadlinePoll(t, func() bool { return hubA.conn.RosterComplete() })
+	hubA.handleReceive(ctx, mcp.CallToolRequest{})
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "already there by the time we wait"}
+	deadlinePoll(t, func() bool {
+		res, err := hubB.handleSend(ctx, sendReq)
+		return err == nil && !res.IsError
+	})
+	// give it a moment to actually land in hubA's buffer before we call
+	// hub_wait, so this genuinely exercises the "already buffered" path
+	// rather than racing the real wait-for-arrival path below.
+	deadlinePoll(t, func() bool {
+		hasEvents, _ := hubA.conn.Peek()
+		return hasEvents
+	})
+
+	start := time.Now()
+	res, err := hubA.handleWait(ctx, mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("wait failed: err=%v result=%+v", err, res)
+	}
+	if elapsed := time.Since(start); elapsed > waitPollInterval {
+		t.Fatalf("expected an already-buffered event to return near-instantly, took %v", elapsed)
+	}
+	if !strings.Contains(textOf(res), "already there by the time we wait") {
+		t.Fatalf("expected the buffered message, got: %s", textOf(res))
+	}
+}
+
+func TestHubWaitBlocksUntilMessageArrives(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hubA.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hubB := NewHub()
+	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	// drain a's own roster catch-up before exercising the wait-for-arrival
+	// path below.
+	deadlinePoll(t, func() bool { return hubA.conn.RosterComplete() })
+	hubA.handleReceive(ctx, mcp.CallToolRequest{})
+
+	resultCh := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, err := hubA.handleWait(ctx, mcp.CallToolRequest{})
+		if err != nil {
+			t.Errorf("wait failed: %v", err)
+			return
+		}
+		resultCh <- res
+	}()
+
+	// give handleWait a moment to actually start blocking before the
+	// message is sent, so this exercises the wait-for-arrival path rather
+	// than the already-buffered one covered above.
+	time.Sleep(50 * time.Millisecond)
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "arrives while waiting"}
+	deadlinePoll(t, func() bool {
+		res, err := hubB.handleSend(ctx, sendReq)
+		return err == nil && !res.IsError
+	})
+
+	select {
+	case res := <-resultCh:
+		if !strings.Contains(textOf(res), "arrives while waiting") {
+			t.Fatalf("expected the message that arrived, got: %s", textOf(res))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hub_wait never returned after a message arrived")
+	}
+}
+
+func TestHubWaitReturnsOnDisconnect(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+
+	// drain this peer's own rosterComplete (sent even with no existing
+	// peers) before exercising the disconnect path below.
+	deadlinePoll(t, func() bool { return hub.conn.RosterComplete() })
+	hub.handleReceive(ctx, mcp.CallToolRequest{})
+
+	resultCh := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, _ := hub.handleWait(ctx, mcp.CallToolRequest{})
+		resultCh <- res
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	hub.conn.Close()
+
+	select {
+	case res := <-resultCh:
+		if !strings.Contains(textOf(res), "disconnected") {
+			t.Fatalf("expected a disconnected result, got: %s", textOf(res))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hub_wait never returned after the hub disconnected")
+	}
+}
+
+func TestHubWaitRespectsContextCancellation(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	// drain this peer's own rosterComplete (sent even with no existing
+	// peers) before exercising the cancellation path below.
+	deadlinePoll(t, func() bool { return hub.conn.RosterComplete() })
+	hub.handleReceive(ctx, mcp.CallToolRequest{})
+
+	waitCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := hub.handleWait(waitCtx, mcp.CallToolRequest{})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected an error when the context is cancelled with nothing to deliver")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("expected handleWait to return promptly on cancellation, took %v", elapsed)
+	}
 }
 
 func TestPeersToolReturnsRoster(t *testing.T) {

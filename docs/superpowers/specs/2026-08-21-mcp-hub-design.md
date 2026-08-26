@@ -461,6 +461,26 @@ join/leave events.
   see below), or an empty result if none. Optional/manual use only (e.g. Claude
   wants to check without spinning up a background process) — it is not part of
   the required delivery loop.
+- **`hub_wait()`** — blocks until an event is buffered or the hub
+  disconnects, then returns it: the direct MCP-tool equivalent of running
+  the `wait` CLI binary, for a harness that can't background or persist a
+  process at all (Codex — see "`wait --follow`" below for why
+  `hub_connect` recommends this specifically to it, and by how much).
+  Internally polls `Conn.Peek()` every `waitPollInterval` (100ms) rather
+  than being event-driven like the CLI path — `hubconn.Conn.OnActivity`
+  holds only a single callback, already claimed by the waiter socket for
+  the CLI `wait` command, and polling this rarely is cheap enough not to
+  warrant a multi-listener redesign just for this. Respects context
+  cancellation: if the caller's `ctx` is cancelled (`mark3labs/mcp-go`
+  wires MCP's `notifications/cancelled` into the per-request context — see
+  below), `hub_wait` returns promptly instead of polling forever with
+  nothing left listening for the result. Whether that actually happens
+  depends on the *client* sending that notification when its own
+  tool-call timeout elapses, which the MCP spec makes optional, not
+  guaranteed — a client that silently abandons the call instead leaves the
+  blocked goroutine polling until the underlying transport itself closes
+  (harmless individually, since it's just idling, but unbounded across
+  many abandoned retries in a single long session).
 - **`hub_peers()`** — returns everyone else currently known to be in the
   session (sorted by peerId, one per line, or an explicit "no other peers"
   message if empty), including each peer's `name` and `agePublicKey` when
@@ -648,25 +668,26 @@ notify you") are false for it.
 Rather than presenting that generic framing and then walking it back with
 a correction — confusing on its own, tried and explicitly rejected — a
 Codex-detected client gets a **wholly separate, self-contained** message
-built from scratch, never the shared one: run the `ModeOnce` command
-directly, blocking, in the foreground (not backgrounded at all) — process
-what it printed, then run it again, still blocking, to keep waiting. This
-is also the *objectively better* choice for Codex even setting the "cannot
-background" constraint aside: a blocking call returns exactly when a
-message arrives, with no polling logic and no wasted turns checking for
-nothing, whereas `exec_command`'s background-plus-poll path would need
-Codex to actively decide when to re-check, with no guarantee of
-promptness.
+built from scratch, never the shared one: call the `hub_wait()` MCP tool
+directly (see above), not the `wait` CLI binary at all — process what it
+returned, then call it again to keep waiting. This is also the
+*objectively better* choice for Codex even setting the "cannot background"
+constraint aside: a blocking call returns exactly when a message arrives,
+with no polling logic and no wasted turns checking for nothing, whereas
+`exec_command`'s background-plus-poll path would need Codex to actively
+decide when to re-check, with no guarantee of promptness.
 
-One more caveat the message spells out explicitly: Codex's own shell-exec
-tool has its own execution timeout, independent of `wait` itself (recent
-Codex versions default to around 300s) — a real risk for a genuinely
-blocking call, unlike the backgrounded case where a tool-call timeout only
-bounds how long the *call* takes to return control, not the backgrounded
-process's lifetime. If `wait` gets killed with no output because nothing
-happened yet, that's normal, not an error — Codex is told to just run it
-again the same way, and to pass a longer `timeout_ms` on the call if its
-tool supports one, to cut down how often that happens.
+The message also spells out *why* `hub_wait()` specifically, not the CLI
+binary run blocking via `exec_command` (an earlier version of this
+guidance did exactly that, before `hub_wait` existed): Codex's own
+shell-exec tool has a much shorter execution timeout than its MCP
+tool-call timeout — a live Codex session reported its `exec_command`
+foreground timeout as 30s, against an MCP tool-call timeout around 300s
+for recent versions — so blocking on the CLI binary via `exec_command`
+would need roughly 10x as many round trips as blocking on `hub_wait()`
+directly to cover the same idle time. If a `hub_wait()` call is cancelled
+or times out with nothing having arrived, that's normal, not an error —
+Codex is told to just call it again.
 
 Expected steady-state loop: `hub_connect` → run `wait --follow` (or
 `ModeOnce`, re-run each time) in the background → harness notifies on each

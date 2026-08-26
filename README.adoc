@@ -94,7 +94,7 @@ Equivalently, add it directly to a project's `.mcp.json`:
 }
 ----
 
-Once loaded, Claude has five tools available:
+Once loaded, Claude has six tools available:
 
 [cols="1,3"]
 |===
@@ -169,6 +169,14 @@ through the normal receive path (not as a `hub_send` tool error).
 
 |`hub_receive()`
 |Non-blocking: drain and return any buffered messages/events right now.
+
+|`hub_wait()`
+|Blocking: waits until the next event arrives (or the hub disconnects),
+then returns it — the direct MCP-tool alternative to running the `wait`
+CLI binary, for a harness that can't background or persist a process at
+all (Codex — `hub_connect`'s result tells it to use this instead of the
+CLI binary, and why). If the call is cancelled or times out with nothing
+having arrived, that's not an error — just call it again.
 
 |`hub_peers()`
 |List everyone else currently in the session — peerId plus their `name` and
