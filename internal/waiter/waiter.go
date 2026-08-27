@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Source is the buffered-event side of a hub connection (satisfied by
@@ -41,6 +42,28 @@ type Waiter struct {
 	current *registeredWaiter
 }
 
+// socketDir is where wait sockets live — a package var (not a plain
+// os.TempDir() call inline) so tests can point it at an isolated temp dir
+// instead of sweeping/polluting the real OS temp dir. Both socketPath and
+// sweepStaleSockets must use this same var; letting them diverge (e.g. one
+// hardcoding os.TempDir() while the other reads an env var) would silently
+// break the sweep in production, where MCP_HUB_LOG_DIR — a *different*,
+// unrelated directory used by hublog/identitystore — is commonly set.
+var socketDir = os.TempDir()
+
+// SocketDirForTesting overrides the directory wait sockets are created in
+// (and swept from), returning a restore function. For use by *other*
+// packages' tests that exercise a real Listen() call indirectly (e.g.
+// mcptools.Hub.handleConnect) — without this, such a test would sweep the
+// real OS temp dir, which on a dev machine is where other live processes'
+// real wait sockets actually live. internal/waiter's own tests set
+// socketDir directly (same package, no need for this).
+func SocketDirForTesting(dir string) (restore func()) {
+	orig := socketDir
+	socketDir = dir
+	return func() { socketDir = orig }
+}
+
 // Listen opens the wait socket for this (sessionID, peerID) connection and
 // starts accepting connections. peerID is included in the path (not just
 // sessionID) so two separate mcp-hub-client processes joining the same
@@ -57,7 +80,49 @@ func Listen(sessionID, peerID string, source Source) (*Waiter, error) {
 	}
 	w := &Waiter{source: source, ln: ln, socketPath: path}
 	go w.acceptLoop()
+	sweepStaleSockets(path)
 	return w, nil
+}
+
+// sweepStaleSockets removes every mcp-hub-wait-*.sock file in the same
+// directory that has no listener behind it — self-healing cleanup for
+// sockets left behind by a process that ended without running Close
+// (crash, kill -9, a harness just terminating it — none of which run a
+// defer). Never touches excludePath (this Waiter's own, just-created
+// socket) or anything with a live listener.
+//
+// Staleness is determined the only way that's actually reliable for a
+// Unix domain socket: briefly connecting to it. This is provably harmless
+// to a real, still-active Waiter on the other end — handleAccept requires
+// reading one mode byte before it does anything stateful (registering as
+// current, superseding a prior connection), and this probe closes without
+// ever writing one, so at worst it's indistinguishable from a client that
+// connected and immediately hung up before identifying itself.
+func sweepStaleSockets(excludePath string) {
+	matches, err := filepath.Glob(filepath.Join(socketDir, "mcp-hub-wait-*.sock"))
+	if err != nil {
+		return
+	}
+	for _, p := range matches {
+		if p == excludePath {
+			continue
+		}
+		if isStaleSocket(p) {
+			_ = os.Remove(p)
+		}
+	}
+}
+
+// isStaleSocket reports whether path has no listener behind it, by
+// attempting (and immediately abandoning) a connection — see
+// sweepStaleSockets for why this is safe against a live listener.
+func isStaleSocket(path string) bool {
+	conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+	if err != nil {
+		return true
+	}
+	conn.Close()
+	return false
 }
 
 // socketPath derives a short, fixed-length wait-socket filename from
@@ -72,7 +137,7 @@ func Listen(sessionID, peerID string, source Source) (*Waiter, error) {
 // short-lived, single-host use while staying well under the limit.
 func socketPath(sessionID, peerID string) string {
 	sum := sha256.Sum256([]byte(sessionID + "-" + peerID))
-	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-hub-wait-%x.sock", sum[:8]))
+	return filepath.Join(socketDir, fmt.Sprintf("mcp-hub-wait-%x.sock", sum[:8]))
 }
 
 // WaitCommand is the exact command Claude should run in the background to

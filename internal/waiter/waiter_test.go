@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -403,5 +404,73 @@ func TestDisconnectedSourceReportedImmediately(t *testing.T) {
 	got := dialAndRead(t, w.socketPath)
 	if got != "hub disconnected\n" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// TestListenSweepsStaleSocketsButNeverTouchesALiveOne is the core safety
+// test for the janitor sweep: it plants both a genuinely stale socket file
+// (from a listener that's already closed) and a real, still-active one,
+// then confirms a fresh Listen() call removes only the stale one — the
+// live listener's file, its ability to accept connections, and its
+// internal state must all survive completely untouched.
+func TestListenSweepsStaleSocketsButNeverTouchesALiveOne(t *testing.T) {
+	// a socket *file* with no listener behind it at all — net.Listener's
+	// own Close() would unlink it, which isn't what actually happens: a
+	// killed/crashed process never runs Close() (or any defer) in the
+	// first place, so the file is simply left behind with nothing ever
+	// having cleaned it up. A plain regular file reproduces that end state
+	// well enough for isStaleSocket's purposes — dialing it fails
+	// (ENOTSOCK rather than ECONNREFUSED, but isStaleSocket only checks
+	// for any dial error) exactly as dialing a truly-orphaned socket file
+	// would.
+	stalePath := filepath.Join(socketDir, "mcp-hub-wait-0000000000000000.sock")
+	if err := os.WriteFile(stalePath, nil, 0o600); err != nil {
+		t.Fatalf("create stale socket file: %v", err)
+	}
+
+	// a real, still-active listener that must survive the sweep untouched.
+	liveSrc := &fakeSource{connected: true}
+	liveWaiter, err := Listen("session-live", "peer-live", liveSrc)
+	if err != nil {
+		t.Fatalf("listen (live): %v", err)
+	}
+	defer liveWaiter.Close()
+
+	// register a real waiter on the live one, so we can also prove its
+	// internal state (w.current) wasn't disturbed by the sweep.
+	liveConn := dialFollow(t, liveWaiter.socketPath)
+	defer liveConn.Close()
+	time.Sleep(50 * time.Millisecond) // let it register as current
+
+	// a fresh Listen() call — the thing that actually triggers a sweep.
+	triggerSrc := &fakeSource{connected: true}
+	triggerWaiter, err := Listen("session-trigger", "peer-trigger", triggerSrc)
+	if err != nil {
+		t.Fatalf("listen (sweep trigger): %v", err)
+	}
+	defer triggerWaiter.Close()
+
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("expected the stale socket file to be swept away, stat err: %v", err)
+	}
+	if _, err := os.Stat(liveWaiter.socketPath); err != nil {
+		t.Fatalf("expected the live socket file to survive the sweep, stat err: %v", err)
+	}
+
+	// the live listener must still actually work: push an event and
+	// confirm the already-registered connection still receives it,
+	// proving the sweep's probe-connect-and-abandon didn't supersede or
+	// otherwise disturb its registration.
+	liveSrc.push("still alive after the sweep")
+	liveWaiter.Poke()
+	got := readChunk(t, liveConn)
+	if got != "still alive after the sweep\n\n" {
+		t.Fatalf("expected the live waiter to still deliver normally after the sweep, got %q", got)
+	}
+}
+
+func TestIsStaleSocketDetectsAbsentAndDeadSockets(t *testing.T) {
+	if !isStaleSocket(filepath.Join(socketDir, "does-not-exist.sock")) {
+		t.Fatal("expected a nonexistent path to be reported stale")
 	}
 }

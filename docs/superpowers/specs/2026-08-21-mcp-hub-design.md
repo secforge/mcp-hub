@@ -574,6 +574,38 @@ mcp-hub-client wait --socket <path>
   it's purely local IPC between the MCP process and `wait` invocations of the
   same binary. It's torn down on `hub_disconnect()` (after releasing any
   waiter).
+- **Stale-socket janitor sweep.** A `wait` socket is only ever removed by a
+  clean `hub_disconnect()`; a process that ends without running that (crash,
+  `kill -9`, a harness that just terminates it) leaves its socket file behind
+  forever. Left unchecked this accumulates without bound — observed on a
+  real dev machine as ~130 stale files after normal day-to-day use. Every
+  `Listen()` call now also sweeps the socket directory: it globs
+  `mcp-hub-wait-*.sock`, and for every match other than the socket it just
+  created, dials it with a short timeout and deletes it if the dial fails
+  (no listener behind it). This is deliberately opportunistic, not
+  scheduled — it piggybacks on the natural cadence of new connections
+  joining, so no separate timer or background goroutine is needed.
+  - **Safety property (required — must never disturb a live session):**
+    `handleAccept` only does anything stateful (registering as the current
+    waiter, superseding a prior one) *after* reading one mode byte from the
+    new connection. The sweep's probe connects and immediately closes
+    without ever writing that byte, so to a real, live `Waiter` on the other
+    end it's indistinguishable from a client that connected and hung up
+    before identifying itself — provably a no-op against live state.
+    `TestListenSweepsStaleSocketsButNeverTouchesALiveOne` proves this
+    directly: it plants a stale file next to a real live listener with an
+    already-registered `--follow` connection, triggers a sweep via a third
+    `Listen()` call, and confirms the live socket file, its registration,
+    and delivery through it all survive untouched.
+  - The socket directory is a package var (`socketDir`, defaulting to
+    `os.TempDir()`) rather than an inline call, specifically so tests can
+    redirect it — `SocketDirForTesting` — instead of sweeping the real OS
+    temp dir. `internal/mcptools` is the only other package that drives a
+    real `Listen()` (via `Hub.handleConnect`), and its tests wire this up
+    too; without it, running `go test ./...` on a dev machine measurably
+    swept real, live-adjacent stale sockets out of `/tmp` as a side effect
+    of the test suite — the exact category of thing this feature otherwise
+    prevents.
 - `wait` connects to that socket and, as the very first thing, sends one mode
   byte: `0x00` (`ModeOnce`, the default) or `0x01` (`ModeFollow`, only with
   `--follow` — see below). It then blocks on a read, acts on what it
@@ -755,4 +787,14 @@ state.
 - No multi-connection-per-client-process support (one hub connection at a time
   per mcp-hub-client instance).
 - No binary/file transfer — text only.
-- No persistence beyond the plain-text PoC log files.
+- No persistence beyond the plain-text PoC log files and the
+  `reconnectSecret` mapping (`internal/identitystore`).
+- **No maximum message size.** Neither the websocket layer (no
+  `SetReadLimit` on either end — gorilla/websocket's default is
+  unlimited) nor the wire protocol (`wire.Msg.Text` is a plain `string`,
+  no length validation anywhere in `wsserver`/`hubconn`) enforces a cap.
+  A message of any size is fully buffered in memory by every connected
+  peer and written in full to the session log, with no truncation —
+  a real resource-exhaustion vector against a malicious or buggy peer,
+  explicitly left unfixed for now (asked directly, declined) rather than
+  an oversight.
