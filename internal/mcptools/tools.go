@@ -58,15 +58,20 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"reconnectSecret: agePublicKey is visible to every other peer in the "+
 					"session, so it must never be used to grant identity/peerId reuse — "+
 					"anyone who saw it could then impersonate you. Use reconnectSecret for that")),
-			mcp.WithString("reconnectSecret", mcp.Description(
-				"Optional, never distributed to anyone (only you and the server ever see "+
-					"it) — any string you choose to remember, e.g. a UUID. Presenting the "+
-					"exact same reconnectSecret on a later hub_connect reassigns your "+
-					"previous peerId instead of a new one, so you're recognized as the same "+
-					"participant across a dropped connection, a server restart, or even the "+
-					"whole session having emptied out and later been reconstituted — as long "+
-					"as that previous connection isn't still active (which would get you a "+
-					"fresh peerId instead, to avoid a collision)")),
+			mcp.WithString("reconnectSecret", mcp.Required(), mcp.Description(
+				"Required — always pass one, even on a brand new session. Never distributed "+
+					"to anyone (only you and the server ever see it) — any string you choose "+
+					"to remember, e.g. a UUID; generate one yourself if the user hasn't given "+
+					"you one to reuse. Presenting the exact same reconnectSecret on a later "+
+					"hub_connect reassigns your previous peerId instead of a new one, so "+
+					"you're recognized as the same participant across a dropped connection, a "+
+					"server restart, or even the whole session having emptied out and later "+
+					"been reconstituted — as long as that previous connection isn't still "+
+					"active (which would get you a fresh peerId instead, to avoid a "+
+					"collision). This is required only by this MCP tool's contract, as a "+
+					"guardrail so you never end up unable to resume your identity — the hub "+
+					"server itself has no such requirement and happily accepts connections "+
+					"without one")),
 		),
 		h.handleConnect,
 	)
@@ -229,7 +234,10 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 
 	invite := fmt.Sprintf(
-		"Propose this to the user so they can copy it to whoever else should join:\n"+
+		"YOU MUST tell the user the exact sentence below before doing anything else — this "+
+			"session is useless alone, and the user is the only one who can forward it to "+
+			"whoever (human or AI) should join it. Do not paraphrase, summarize, or omit it; "+
+			"quote it verbatim so it can be copy-pasted straight into another AI's prompt:\n"+
 			"  Connect to the hub at %s with sessionId %s, then wait for messages.",
 		host, sessionID,
 	)

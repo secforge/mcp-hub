@@ -100,7 +100,7 @@ Once loaded, Claude has six tools available:
 |===
 |Tool |Purpose
 
-|`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret?)`
+|`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret)`
 |Join a session. `host` is the server's base websocket URL, e.g.
 `ws://localhost:8765` or `wss://relay.example.com:8765` — the `sessionId` is
 appended as a path segment automatically (`<host>/<sessionId>`) — never
@@ -118,8 +118,9 @@ session: the client generates a UUID itself and the result prominently shows
 it, since it must be shared with anyone else who should join. Either way, the
 result includes a ready-to-paste invite line (`Connect to the hub at <host>
 with sessionId <sessionId>, then wait for messages.`) that Claude is
-instructed to propose to you, so you can copy it straight into another
-Claude Code session. The result also makes clear that connecting alone
+instructed it *must* relay to you verbatim — not paraphrase or summarize —
+so you can copy it straight into another Claude Code (or other AI) session.
+The result also makes clear that connecting alone
 delivers nothing — the returned `wait` command must actually be run (and
 re-run) in the background for anything to be received. It also states how
 many peers were already there, and that a "roster complete" notification
@@ -129,7 +130,11 @@ server reports a different protocol version than this build understands,
 the result also tells Claude to flag it to you (e.g. to update
 `mcp-hub-client`).
 +
-`name`, `agePublicKey`, and `reconnectSecret` are all optional. `name` is
+`name` and `agePublicKey` are optional; `reconnectSecret` is *required by
+this MCP tool's contract* (Claude must always pass one, generating its own
+if you haven't given it one to reuse) — this is a guardrail enforced only
+by the tool's schema, not by the hub server itself, which happily accepts
+a plain websocket connection with no such secret. `name` is
 an **untrusted** free-text display name — sanitized server-side (control
 characters/newlines stripped, length capped) — shown alongside the session
 log and reported to other peers. `agePublicKey` is an

@@ -390,7 +390,7 @@ join/leave events.
 
 ## MCP client: tools
 
-- **`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret?)`** — dials `host` + `/` + `sessionId` (e.g.
+- **`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret)`** — dials `host` + `/` + `sessionId` (e.g.
   `host="wss://relay.example.com:8765"` and `sessionId="550e8400-..."` dials
   `wss://relay.example.com:8765/550e8400-...`), which auto-joins as part of
   the websocket handshake, and on success spawns a background goroutine that
@@ -418,10 +418,14 @@ join/leave events.
     way to find it;
   - always includes a ready-to-copy invite string of the exact form
     `Connect to the hub at <host> with sessionId <sessionId>, then wait for
-    messages.`, with an instruction telling Claude to propose it to the user
-    so they can paste it as-is into another Claude Code session — this is
-    included whether or not `sessionId` was generated, since a user may want
-    to invite further peers into an existing session too;
+    messages.`, with an instruction telling Claude it *must* relay this to
+    the user verbatim (not paraphrase, summarize, or omit it) before doing
+    anything else, so they can paste it as-is into another Claude Code (or
+    other AI) session — this is included whether or not `sessionId` was
+    generated, since a user may want to invite further peers into an
+    existing session too. This was strengthened from an earlier, softer
+    "propose this to the user" phrasing after finding that a weaker
+    instruction was too easy for a model to silently drop or compress away;
   - always states plainly that connecting alone delivers nothing — receiving
     messages requires the returned wait command to actually be run (and
     re-run) in the background; skipping it silently means no message is ever
@@ -434,8 +438,16 @@ join/leave events.
     to update `mcp-hub-client` (server ahead) or that the server may need
     updating (client ahead) — see "Protocol versioning" above.
 
-  `name`, `agePublicKey`, and `reconnectSecret` are all optional (see "Peer
-  identity" above). `agePublicKey` is format-validated client-side
+  `name` and `agePublicKey` are optional; `reconnectSecret` is declared
+  `mcp.Required()` in the tool schema — Claude must always pass one, minting
+  its own if the user hasn't given it one to reuse (see "Peer identity"
+  above). This is enforced only at the MCP tool-schema level (`mcp-go`'s
+  own input validation rejects a `tools/call` missing it before
+  `handleConnect` ever runs), deliberately *not* on the hub server itself:
+  the websocket handshake (`wsserver`) still accepts a connection with no
+  `reconnectSecret` at all, since a non-MCP client (a browser, `wscat`,
+  a hand-rolled script) has no such contract to honor and shouldn't be
+  forced into one. `agePublicKey` is format-validated client-side
   (`agekey.Valid`) before even dialing, so a malformed key fails fast with
   a clear tool error instead of a round trip to the server (which validates
   it again anyway). If `name`/`agePublicKey` was given, the result text
