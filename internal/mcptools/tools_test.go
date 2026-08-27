@@ -74,7 +74,8 @@ func TestConnectResultMentionsFollowModeAndMonitorGuidance(t *testing.T) {
 	if !strings.Contains(text, "Monitor") {
 		t.Fatalf("expected the result to mention Monitor-style tools as the preferred pairing for --follow, got: %s", text)
 	}
-	if !strings.Contains(text, hub.waiter.WaitCommand()) || !strings.Contains(text, hub.waiter.WaitFollowCommand()) {
+	_, w := hub.activeConn()
+	if !strings.Contains(text, w.WaitCommand()) || !strings.Contains(text, w.WaitFollowCommand()) {
 		t.Fatalf("expected the result to include both the once and follow commands, got: %s", text)
 	}
 }
@@ -969,7 +970,8 @@ func textOf(res *mcp.CallToolResult) string {
 // whether the underlying connection was still alive, so a silent
 // disconnect (server restart, network drop — anything short of a clean
 // hub_disconnect()) left it confidently returning a roster from before the
-// drop, with no indication anything was wrong.
+// drop, with no indication anything was wrong. A second peer joins first
+// so there's an actual roster to go stale if that bug were still present.
 func TestPeersToolReportsDisconnectInsteadOfStaleRoster(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -982,18 +984,32 @@ func TestPeersToolReportsDisconnectInsteadOfStaleRoster(t *testing.T) {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
-	hub.conn.Close() // simulate a silent drop, not a clean hub_disconnect()
-	deadlinePoll(t, func() bool { return !hub.conn.Connected() })
+	hubB := NewHub()
+	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+	deadlinePoll(t, func() bool {
+		res, _ := hub.handlePeers(ctx, mcp.CallToolRequest{})
+		return res != nil && strings.Contains(textOf(res), "Current peers")
+	})
+
+	conn, _ := hub.activeConn()
+	conn.Close() // simulate a silent drop, not a clean hub_disconnect()
+	deadlinePoll(t, func() bool { c, _ := hub.activeConn(); return c == nil })
 
 	res, err := hub.handlePeers(ctx, mcp.CallToolRequest{})
 	if err != nil {
 		t.Fatalf("handlePeers returned an error: %v", err)
 	}
-	if !strings.Contains(textOf(res), "disconnected") {
-		t.Fatalf("expected a disconnected result instead of a stale roster, got: %s", textOf(res))
+	if strings.Contains(textOf(res), "Current peers") {
+		t.Fatalf("expected no stale roster after disconnect, got: %s", textOf(res))
 	}
-	if hub.conn != nil || hub.waiter != nil {
-		t.Fatalf("expected the dead connection to be torn down, got conn=%v waiter=%v", hub.conn, hub.waiter)
+	if !strings.Contains(textOf(res), "not connected") {
+		t.Fatalf("expected a clear not-connected result, got: %s", textOf(res))
+	}
+	if c, w := hub.activeConn(); c != nil || w != nil {
+		t.Fatalf("expected the dead connection to be torn down, got conn=%v waiter=%v", c, w)
 	}
 }
 
@@ -1011,8 +1027,9 @@ func TestSendToolReportsDisconnectInsteadOfAttemptingASend(t *testing.T) {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
-	hub.conn.Close()
-	deadlinePoll(t, func() bool { return !hub.conn.Connected() })
+	conn, _ := hub.activeConn()
+	conn.Close()
+	deadlinePoll(t, func() bool { c, _ := hub.activeConn(); return c == nil })
 
 	sendReq := mcp.CallToolRequest{}
 	sendReq.Params.Arguments = map[string]any{"text": "hello"}
@@ -1020,11 +1037,8 @@ func TestSendToolReportsDisconnectInsteadOfAttemptingASend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleSend returned an error: %v", err)
 	}
-	if !strings.Contains(textOf(res), "disconnected") {
-		t.Fatalf("expected a disconnected result, got: %s", textOf(res))
-	}
-	if hub.conn != nil || hub.waiter != nil {
-		t.Fatalf("expected the dead connection to be torn down, got conn=%v waiter=%v", hub.conn, hub.waiter)
+	if !strings.Contains(textOf(res), "not connected") {
+		t.Fatalf("expected a clear not-connected result, got: %s", textOf(res))
 	}
 }
 
@@ -1044,12 +1058,39 @@ func TestConnectAfterSilentDisconnectDoesNotRequireExplicitDisconnect(t *testing
 		t.Fatalf("first connect failed: err=%v result=%+v", err, res)
 	}
 
-	hub.conn.Close()
-	deadlinePoll(t, func() bool { return !hub.conn.Connected() })
+	conn, _ := hub.activeConn()
+	conn.Close()
+	deadlinePoll(t, func() bool { c, _ := hub.activeConn(); return c == nil })
 
 	res, err := hub.handleConnect(ctx, connReq)
 	if err != nil || res.IsError {
 		t.Fatalf("reconnect after a silent disconnect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+}
+
+// TestDisconnectDetectedAutomaticallyWithoutAnyToolCall proves the hub
+// tears itself down the moment its connection dies — closing the wait
+// socket and forgetting the connection — even with nothing actively
+// blocked on it and no further tool call happening at all, rather than
+// only reactively the next time some handler happens to check.
+func TestDisconnectDetectedAutomaticallyWithoutAnyToolCall(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+
+	conn, _ := hub.activeConn()
+	conn.Close()
+
+	deadlinePoll(t, func() bool {
+		c, w := hub.activeConn()
+		return c == nil && w == nil
+	})
 }

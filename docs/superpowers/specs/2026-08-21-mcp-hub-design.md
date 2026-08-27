@@ -539,30 +539,46 @@ join/leave events.
   `Conn.Connected()` up front (`hub_send`, `hub_peers`) or, where it
   already naturally observes the connection's state as a side effect
   (`hub_receive`'s `Drain`, `hub_wait`'s `Peek`/`Drain` loop), reports
-  `"hub disconnected"` uniformly and — new — calls
-  `Hub.teardownDeadConnection()`, which closes the wait socket and clears
-  `h.conn`/`h.waiter` so:
-  - a blocked `hub_wait` call (or a registered CLI `wait --follow`, via the
-    existing `Poke`-on-disconnect path in `hubconn.Conn.OnActivity` →
-    `waiter.Waiter.Poke` → `deliver`) terminates immediately instead of
-    polling a dead connection forever;
-  - the wait socket itself stops accepting new connections and its file is
-    removed, instead of lingering indefinitely just to tell each new
-    connection "hub disconnected";
-  - a subsequent `hub_connect` can proceed directly instead of being
-    permanently refused with `"already connected; call hub_disconnect
-    first"` for a connection that, in every observable sense, is already
-    gone — `handleConnect` runs the same teardown itself, on entry, if it
-    finds a dead connection.
+  `"hub disconnected"` uniformly.
   `hub_receive`/`hub_wait` still prefer surfacing any final buffered
   content over a bare disconnect note (e.g. a message that arrived right
   before the read loop errored out) — appending `"\n\nhub disconnected"`
   rather than discarding it, which `hub_receive` used to do unconditionally
   whenever `Drain` reported `connected=false`, silently dropping real
-  content. Regression tests:
-  `TestPeersToolReportsDisconnectInsteadOfStaleRoster`,
+  content.
+
+- **Teardown of a dead connection is automatic, not just reactive.**
+  `Hub.conn`/`Hub.waiter` are guarded by `Hub.mu` and only ever mutated
+  through `activeConn`/`setActiveConn`/`clearActiveConn`/`teardownIfCurrent`
+  — needed because, beyond the per-call checks above, `handleConnect` now
+  wires `conn.OnActivity` to do more than just `waiter.Waiter.Poke()`: it
+  also checks `conn.Connected()` after every activity callback (which
+  `readLoop` invokes once more, with `closed` already set, as the very
+  last thing it does before returning) and, the moment it sees the
+  connection has died, calls `Hub.teardownIfCurrent(conn)` right there from
+  the `Conn`'s own background read goroutine — no tool call needs to
+  happen first. `teardownIfCurrent` only clears `Hub.conn`/`Hub.waiter` if
+  they still point at exactly the `Conn` that died (compare-and-clear under
+  `Hub.mu`), so a notification about a connection that's already been
+  superseded by a fresh `hub_connect`, or already cleared by an explicit
+  `hub_disconnect`, can never wrongly tear down whatever replaced it. This
+  means:
+  - a blocked `hub_wait` call (or a registered CLI `wait --follow`, via the
+    same `OnActivity` → `Poke` → `deliver` path) terminates immediately
+    instead of polling a dead connection forever;
+  - the wait socket itself stops accepting new connections and its file is
+    removed within moments of the drop, instead of lingering indefinitely
+    just to tell each new connection "hub disconnected";
+  - a subsequent `hub_connect` almost always finds `Hub.conn` already `nil`
+    and proceeds directly — the "already connected; call hub_disconnect
+    first" error only fires for a connection that's genuinely still alive.
+    `handleConnect` also runs the same `teardownIfCurrent` itself, on
+    entry, as a fallback for the rare window where a caller gets there
+    before the automatic teardown above has run.
+  Regression tests: `TestPeersToolReportsDisconnectInsteadOfStaleRoster`,
   `TestSendToolReportsDisconnectInsteadOfAttemptingASend`,
-  `TestConnectAfterSilentDisconnectDoesNotRequireExplicitDisconnect`.
+  `TestConnectAfterSilentDisconnectDoesNotRequireExplicitDisconnect`,
+  `TestDisconnectDetectedAutomaticallyWithoutAnyToolCall`.
 
 Every delivered broadcast `msg` event is wrapped before being handed to Claude:
 

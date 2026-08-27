@@ -20,6 +20,13 @@ import (
 // Hub bundles the single active hub connection + wait socket for one
 // mcp-hub-client process.
 type Hub struct {
+	// mu guards conn/waiter. Needed because, unlike every other mutation of
+	// these fields (which happens synchronously inside a tool call),
+	// conn.OnActivity's disconnect callback (see handleConnect) can clear
+	// them from the Conn's own background read goroutine at any moment —
+	// automatic detection of a dead connection, not just the reactive
+	// per-call check a tool handler does.
+	mu     sync.Mutex
 	conn   *hubconn.Conn
 	waiter *waiter.Waiter
 
@@ -33,6 +40,54 @@ type Hub struct {
 
 func NewHub() *Hub {
 	return &Hub{}
+}
+
+// activeConn returns the current connection and its wait socket, or (nil,
+// nil) if not connected.
+func (h *Hub) activeConn() (*hubconn.Conn, *waiter.Waiter) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.conn, h.waiter
+}
+
+// setActiveConn records a newly established connection as the active one.
+func (h *Hub) setActiveConn(conn *hubconn.Conn, w *waiter.Waiter) {
+	h.mu.Lock()
+	h.conn, h.waiter = conn, w
+	h.mu.Unlock()
+}
+
+// clearActiveConn unconditionally forgets whatever connection is currently
+// active and returns it, for an explicit hub_disconnect — which should
+// tear down whatever is active right now, regardless of which Conn
+// instance a caller happens to be holding a reference to.
+func (h *Hub) clearActiveConn() (*hubconn.Conn, *waiter.Waiter) {
+	h.mu.Lock()
+	conn, w := h.conn, h.waiter
+	h.conn, h.waiter = nil, nil
+	h.mu.Unlock()
+	return conn, w
+}
+
+// teardownIfCurrent tears down the active connection, but only if it's
+// still exactly the Conn passed in. A caller that noticed conn had died —
+// including conn's own background read goroutine, via conn.OnActivity — is
+// racing against a fresh hub_connect (or an explicit hub_disconnect) that
+// may have already replaced or cleared it; without this check, a stale
+// notification about a connection nobody cares about anymore could wrongly
+// tear down whatever legitimately replaced it.
+func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
+	h.mu.Lock()
+	if h.conn != conn {
+		h.mu.Unlock()
+		return
+	}
+	w := h.waiter
+	h.conn, h.waiter = nil, nil
+	h.mu.Unlock()
+	if w != nil {
+		w.Close()
+	}
 }
 
 func (h *Hub) Register(s *server.MCPServer) {
@@ -146,15 +201,18 @@ func looksLikeCodex(name string) bool {
 }
 
 func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if h.conn != nil && !h.conn.Connected() {
-		// The previous connection died on its own (server restart, network
-		// drop, kill -9) without a clean hub_disconnect() ever running to
-		// clear it — don't make the caller issue that call itself just to
-		// unstick a connection that's already gone.
-		h.teardownDeadConnection()
-	}
-	if h.conn != nil {
-		return mcp.NewToolResultError("already connected; call hub_disconnect first"), nil
+	if prev, _ := h.activeConn(); prev != nil {
+		if !prev.Connected() {
+			// The previous connection died on its own (server restart,
+			// network drop, kill -9) without a clean hub_disconnect() ever
+			// running to clear it — normally this has already been torn
+			// down automatically (see the OnActivity wiring below) well
+			// before a caller gets here, but don't make the caller issue
+			// hub_disconnect itself in the rare case it hasn't yet.
+			h.teardownIfCurrent(prev)
+		} else {
+			return mcp.NewToolResultError("already connected; call hub_disconnect first"), nil
+		}
 	}
 	host, err := req.RequireString("host")
 	if err != nil {
@@ -184,9 +242,19 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		conn.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("could not start wait socket: %v", err)), nil
 	}
-	conn.OnActivity(w.Poke)
-	h.conn = conn
-	h.waiter = w
+	conn.OnActivity(func() {
+		w.Poke()
+		if !conn.Connected() {
+			// The read loop that just invoked us is the one that detected
+			// this — a silent drop, a server-side close, anything short of
+			// our own hub_disconnect(). Tear down proactively instead of
+			// leaving a dead-but-not-yet-noticed connection sitting around
+			// (and its wait socket still listening) until whatever tool
+			// call happens to come next.
+			h.teardownIfCurrent(conn)
+		}
+	})
+	h.setActiveConn(conn, w)
 
 	// Codex gets its own, self-contained block from the start — never the
 	// generic "background one of these two" framing followed by a
@@ -307,29 +375,13 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	)), nil
 }
 
-// teardownDeadConnection releases the wait socket and forgets the
-// connection, called once a call notices the underlying hub connection died
-// on its own (server restart, network drop, kill -9 — anything short of a
-// clean hub_disconnect()). Without this, h.conn stays a non-nil but
-// permanently dead handle: hub_connect would keep refusing to reconnect
-// ("already connected; call hub_disconnect first") even though there's
-// nothing left to disconnect from in any meaningful sense, and the wait
-// socket would keep accepting new connections forever just to tell each one
-// "hub disconnected" instead of actually going away.
-func (h *Hub) teardownDeadConnection() {
-	if h.waiter != nil {
-		h.waiter.Close()
-	}
-	h.conn = nil
-	h.waiter = nil
-}
-
 func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if h.conn == nil {
+	conn, _ := h.activeConn()
+	if conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
-	if !h.conn.Connected() {
-		h.teardownDeadConnection()
+	if !conn.Connected() {
+		h.teardownIfCurrent(conn)
 		return mcp.NewToolResultText("hub disconnected"), nil
 	}
 	text, err := req.RequireString("text")
@@ -338,7 +390,7 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	}
 	to := req.GetString("to", "")
 	if to == "" {
-		if err := h.conn.Send(text); err != nil {
+		if err := conn.Send(text); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("send failed: %v", err)), nil
 		}
 		return mcp.NewToolResultText("sent"), nil
@@ -346,30 +398,32 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if !wire.IsValidID(to) {
 		return mcp.NewToolResultError("to must be a UUID"), nil
 	}
-	if err := h.conn.SendTo(text, to); err != nil {
+	if err := conn.SendTo(text, to); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("send failed: %v", err)), nil
 	}
 	return mcp.NewToolResultText("sent (private)"), nil
 }
 
 func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if h.conn == nil {
+	conn, w := h.clearActiveConn()
+	if conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
-	h.waiter.Close()
-	h.conn.Close()
-	h.conn = nil
-	h.waiter = nil
+	if w != nil {
+		w.Close()
+	}
+	conn.Close()
 	return mcp.NewToolResultText("disconnected"), nil
 }
 
 func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if h.conn == nil {
+	conn, _ := h.activeConn()
+	if conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
-	formatted, connected := h.conn.Drain()
+	formatted, connected := conn.Drain()
 	if !connected {
-		h.teardownDeadConnection()
+		h.teardownIfCurrent(conn)
 		// Still surface anything that arrived right before the disconnect
 		// (e.g. a final message buffered just ahead of the read loop
 		// erroring out) instead of silently discarding it in favor of a
@@ -415,7 +469,8 @@ const waitPollInterval = 100 * time.Millisecond
 // abandons a call on its own timeout (no cancellation sent) and then
 // retries, leaving the old call still running server-side.
 func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if h.conn == nil {
+	conn, _ := h.activeConn()
+	if conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
 
@@ -440,10 +495,10 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	ticker := time.NewTicker(waitPollInterval)
 	defer ticker.Stop()
 	for {
-		if hasEvents, connected := h.conn.Peek(); hasEvents || !connected {
-			formatted, connected := h.conn.Drain()
+		if hasEvents, connected := conn.Peek(); hasEvents || !connected {
+			formatted, connected := conn.Drain()
 			if !connected {
-				h.teardownDeadConnection()
+				h.teardownIfCurrent(conn)
 				if formatted == "" {
 					return mcp.NewToolResultText("hub disconnected"), nil
 				}
@@ -465,18 +520,19 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func (h *Hub) handlePeers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	if h.conn == nil {
+	conn, _ := h.activeConn()
+	if conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
-	if !h.conn.Connected() {
-		h.teardownDeadConnection()
+	if !conn.Connected() {
+		h.teardownIfCurrent(conn)
 		return mcp.NewToolResultText("hub disconnected"), nil
 	}
 	catchingUp := ""
-	if !h.conn.RosterComplete() {
+	if !conn.RosterComplete() {
 		catchingUp = " (still catching up on the initial roster — this list may be incomplete)"
 	}
-	peers := h.conn.Peers()
+	peers := conn.Peers()
 	if len(peers) == 0 {
 		return mcp.NewToolResultText("no other peers currently in the session" + catchingUp), nil
 	}
