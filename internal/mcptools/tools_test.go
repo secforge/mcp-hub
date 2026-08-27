@@ -963,3 +963,93 @@ func textOf(res *mcp.CallToolResult) string {
 	}
 	return b.String()
 }
+
+// TestPeersToolReportsDisconnectInsteadOfStaleRoster is a regression test:
+// hub_peers used to read straight from Conn.Peers() with no check on
+// whether the underlying connection was still alive, so a silent
+// disconnect (server restart, network drop — anything short of a clean
+// hub_disconnect()) left it confidently returning a roster from before the
+// drop, with no indication anything was wrong.
+func TestPeersToolReportsDisconnectInsteadOfStaleRoster(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+
+	hub.conn.Close() // simulate a silent drop, not a clean hub_disconnect()
+	deadlinePoll(t, func() bool { return !hub.conn.Connected() })
+
+	res, err := hub.handlePeers(ctx, mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("handlePeers returned an error: %v", err)
+	}
+	if !strings.Contains(textOf(res), "disconnected") {
+		t.Fatalf("expected a disconnected result instead of a stale roster, got: %s", textOf(res))
+	}
+	if hub.conn != nil || hub.waiter != nil {
+		t.Fatalf("expected the dead connection to be torn down, got conn=%v waiter=%v", hub.conn, hub.waiter)
+	}
+}
+
+// TestSendToolReportsDisconnectInsteadOfAttemptingASend is the hub_send
+// analog of TestPeersToolReportsDisconnectInsteadOfStaleRoster.
+func TestSendToolReportsDisconnectInsteadOfAttemptingASend(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+
+	hub.conn.Close()
+	deadlinePoll(t, func() bool { return !hub.conn.Connected() })
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "hello"}
+	res, err := hub.handleSend(ctx, sendReq)
+	if err != nil {
+		t.Fatalf("handleSend returned an error: %v", err)
+	}
+	if !strings.Contains(textOf(res), "disconnected") {
+		t.Fatalf("expected a disconnected result, got: %s", textOf(res))
+	}
+	if hub.conn != nil || hub.waiter != nil {
+		t.Fatalf("expected the dead connection to be torn down, got conn=%v waiter=%v", hub.conn, hub.waiter)
+	}
+}
+
+// TestConnectAfterSilentDisconnectDoesNotRequireExplicitDisconnect proves
+// hub_connect self-heals from a stale, silently-dead connection instead of
+// permanently refusing to reconnect until hub_disconnect is called on a
+// connection that, in every observable sense, is already gone.
+func TestConnectAfterSilentDisconnectDoesNotRequireExplicitDisconnect(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("first connect failed: err=%v result=%+v", err, res)
+	}
+
+	hub.conn.Close()
+	deadlinePoll(t, func() bool { return !hub.conn.Connected() })
+
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("reconnect after a silent disconnect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+}

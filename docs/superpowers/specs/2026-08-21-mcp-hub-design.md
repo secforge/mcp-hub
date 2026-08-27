@@ -524,6 +524,46 @@ join/leave events.
   if not connected. Purely a local read of state already being tracked — it
   does not talk to the server.
 
+- **Disconnect detection is uniform across every tool, not just
+  `hub_receive`/`hub_wait`.** `hubconn.Conn` tracks `closed` (flipped by the
+  read loop once `ws.ReadMessage` errors — a server restart, a network
+  drop, `kill -9` on the server, anything short of a clean local
+  `hub_disconnect()`) and exposes it via `Conn.Connected()`. Before this,
+  only `hub_receive`/`hub_wait` actually checked it (via `Peek`/`Drain`'s
+  own `connected` return value); `hub_send` and `hub_peers` did not,
+  so — the concrete bug this fixed — `hub_peers` kept confidently
+  returning the last-known roster from before a silent drop, with nothing
+  telling Claude it was stale, and `hub_send` would just attempt (and fail
+  with a raw websocket error, not a clear "disconnected") a write into a
+  socket already known to be dead. Every tool now either checks
+  `Conn.Connected()` up front (`hub_send`, `hub_peers`) or, where it
+  already naturally observes the connection's state as a side effect
+  (`hub_receive`'s `Drain`, `hub_wait`'s `Peek`/`Drain` loop), reports
+  `"hub disconnected"` uniformly and — new — calls
+  `Hub.teardownDeadConnection()`, which closes the wait socket and clears
+  `h.conn`/`h.waiter` so:
+  - a blocked `hub_wait` call (or a registered CLI `wait --follow`, via the
+    existing `Poke`-on-disconnect path in `hubconn.Conn.OnActivity` →
+    `waiter.Waiter.Poke` → `deliver`) terminates immediately instead of
+    polling a dead connection forever;
+  - the wait socket itself stops accepting new connections and its file is
+    removed, instead of lingering indefinitely just to tell each new
+    connection "hub disconnected";
+  - a subsequent `hub_connect` can proceed directly instead of being
+    permanently refused with `"already connected; call hub_disconnect
+    first"` for a connection that, in every observable sense, is already
+    gone — `handleConnect` runs the same teardown itself, on entry, if it
+    finds a dead connection.
+  `hub_receive`/`hub_wait` still prefer surfacing any final buffered
+  content over a bare disconnect note (e.g. a message that arrived right
+  before the read loop errored out) — appending `"\n\nhub disconnected"`
+  rather than discarding it, which `hub_receive` used to do unconditionally
+  whenever `Drain` reported `connected=false`, silently dropping real
+  content. Regression tests:
+  `TestPeersToolReportsDisconnectInsteadOfStaleRoster`,
+  `TestSendToolReportsDisconnectInsteadOfAttemptingASend`,
+  `TestConnectAfterSilentDisconnectDoesNotRequireExplicitDisconnect`.
+
 Every delivered broadcast `msg` event is wrapped before being handed to Claude:
 
 ```

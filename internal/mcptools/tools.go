@@ -146,6 +146,13 @@ func looksLikeCodex(name string) bool {
 }
 
 func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if h.conn != nil && !h.conn.Connected() {
+		// The previous connection died on its own (server restart, network
+		// drop, kill -9) without a clean hub_disconnect() ever running to
+		// clear it — don't make the caller issue that call itself just to
+		// unstick a connection that's already gone.
+		h.teardownDeadConnection()
+	}
 	if h.conn != nil {
 		return mcp.NewToolResultError("already connected; call hub_disconnect first"), nil
 	}
@@ -300,9 +307,30 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	)), nil
 }
 
+// teardownDeadConnection releases the wait socket and forgets the
+// connection, called once a call notices the underlying hub connection died
+// on its own (server restart, network drop, kill -9 — anything short of a
+// clean hub_disconnect()). Without this, h.conn stays a non-nil but
+// permanently dead handle: hub_connect would keep refusing to reconnect
+// ("already connected; call hub_disconnect first") even though there's
+// nothing left to disconnect from in any meaningful sense, and the wait
+// socket would keep accepting new connections forever just to tell each one
+// "hub disconnected" instead of actually going away.
+func (h *Hub) teardownDeadConnection() {
+	if h.waiter != nil {
+		h.waiter.Close()
+	}
+	h.conn = nil
+	h.waiter = nil
+}
+
 func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if h.conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
+	}
+	if !h.conn.Connected() {
+		h.teardownDeadConnection()
+		return mcp.NewToolResultText("hub disconnected"), nil
 	}
 	text, err := req.RequireString("text")
 	if err != nil {
@@ -341,6 +369,15 @@ func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 	formatted, connected := h.conn.Drain()
 	if !connected {
+		h.teardownDeadConnection()
+		// Still surface anything that arrived right before the disconnect
+		// (e.g. a final message buffered just ahead of the read loop
+		// erroring out) instead of silently discarding it in favor of a
+		// bare "hub disconnected" — the caller can always tell the two
+		// apart since disconnected-with-content still ends with the note.
+		if formatted != "" {
+			return mcp.NewToolResultText(formatted + "\n\nhub disconnected"), nil
+		}
 		return mcp.NewToolResultText("hub disconnected"), nil
 	}
 	if formatted == "" {
@@ -405,8 +442,12 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	for {
 		if hasEvents, connected := h.conn.Peek(); hasEvents || !connected {
 			formatted, connected := h.conn.Drain()
-			if !connected && formatted == "" {
-				return mcp.NewToolResultText("hub disconnected"), nil
+			if !connected {
+				h.teardownDeadConnection()
+				if formatted == "" {
+					return mcp.NewToolResultText("hub disconnected"), nil
+				}
+				return mcp.NewToolResultText(formatted + "\n\nhub disconnected"), nil
 			}
 			return mcp.NewToolResultText(formatted), nil
 		}
@@ -426,6 +467,10 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 func (h *Hub) handlePeers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if h.conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
+	}
+	if !h.conn.Connected() {
+		h.teardownDeadConnection()
+		return mcp.NewToolResultText("hub disconnected"), nil
 	}
 	catchingUp := ""
 	if !h.conn.RosterComplete() {

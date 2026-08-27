@@ -1,4 +1,5 @@
 /bin/
+/dist/
 *.sock
 *.log
 *.secrets.json

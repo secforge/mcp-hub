@@ -314,6 +314,16 @@ func (c *Conn) Close() error {
 	return c.ws.Close()
 }
 
+// Connected reports whether the connection is still open, without touching
+// the event buffer — for a caller that needs to know the connection's own
+// state (e.g. before trusting cached data like the peer roster) rather than
+// draining or peeking at buffered events.
+func (c *Conn) Connected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closed
+}
+
 // Peek reports whether unread events are buffered, and whether the
 // connection is still open. Non-destructive.
 func (c *Conn) Peek() (hasEvents, connected bool) {
