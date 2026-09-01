@@ -38,6 +38,13 @@ func readTyped(t *testing.T, c *websocket.Conn) (wire.Type, []byte) {
 	return typ, raw
 }
 
+func TestManagerReturnsTheSessionManager(t *testing.T) {
+	h := NewHandler()
+	if h.Manager() == nil {
+		t.Fatal("expected Manager() to return a non-nil *hubsession.Manager")
+	}
+}
+
 func TestJoinRelayAndTeardown(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("MCP_HUB_LOG_DIR", dir)
@@ -442,7 +449,7 @@ func TestOverlongReconnectSecretRejectedBeforeUpgrade(t *testing.T) {
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
 
 	_, resp, err := websocket.DefaultDialer.Dial(
-		url+"/550e8400-e29b-41d4-a716-446655440000?reconnectSecret="+strings.Repeat("x", maxReconnectSecretRunes+1), nil)
+		url+"/550e8400-e29b-41d4-a716-446655440000?reconnectSecret="+strings.Repeat("x", MaxReconnectSecretRunes+1), nil)
 	if err == nil {
 		t.Fatal("expected the handshake to fail for an overlong reconnectSecret")
 	}

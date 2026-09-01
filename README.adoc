@@ -63,6 +63,59 @@ automatically.
 MCP_HUB_LOG_DIR=/var/log/mcp-hub ./bin/mcp-hub-server -addr :8765
 ----
 
+== HTTP-MCP endpoint (mcp-hub-server)
+
+`mcp-hub-server` also serves a Streamable-HTTP MCP endpoint at `/mcp`,
+alongside its existing websocket relay at `/{sessionId}` — no configuration
+change to existing deployments required, and no local process needed on the
+client side. This is for HTTP-MCP clients that would otherwise need
+`mcp-hub-client` running as a local stdio process (e.g. a centrally
+configured MCP client that can't spawn one per-machine).
+
+It exposes a deliberate subset of `mcp-hub-client`'s tools — only what the
+plain relay itself understands server-side:
+
+[cols="1,3"]
+|===
+|Tool |Purpose
+
+|`hub_connect(sessionId?, name?, agePublicKey?, reconnectSecret?)`
+|Join a hub session over this HTTP-MCP connection. Omit `sessionId` to
+create a brand new one (its id is returned, to share with whoever else
+should join). The result also includes a `watchToken` — see below.
+
+|`hub_disconnect()`
+|Leave the current hub session, if connected.
+
+|`hub_send(text, to?)`
+|Send a message; broadcasts unless `to` targets a single peer.
+
+|`hub_receive()`
+|Drain buffered events without blocking.
+
+|`hub_wait(timeoutSeconds?)`
+|Block until at least one event arrives, or the timeout elapses.
+
+|`hub_peers()`
+|List everyone else currently in the session.
+|===
+
+Reactions, edits, deletes, and history remain `mcp-hub-client`-only —
+those are chat-relay/Teams-bridge-specific concepts the plain relay has no
+server-side concept of at all.
+
+Since a blocking `hub_wait` ties up a conversation turn, `hub_connect`'s
+result includes a `watchToken`. `GET /watch?token=<token>&follow=1` streams
+that peer's events live as plain text (flushed as they arrive) — a client
+can background `curl -N` against it and watch the output asynchronously,
+the same shape `mcp-hub-client`'s own `wait --follow` provides via its local
+unix-socket mechanism (see below), but usable from a remote HTTP client with
+no local process. Omit `follow=1` for a single batch of currently-pending
+events instead of an open stream.
+
+Neither `/mcp` nor `/watch` add any new authentication — they match the
+websocket endpoint's existing (lack of) auth.
+
 == Adding the MCP to Claude Code
 
 Point Claude Code at the built `mcp-hub-client` binary as a stdio MCP server.
@@ -94,7 +147,7 @@ Equivalently, add it directly to a project's `.mcp.json`:
 }
 ----
 
-Once loaded, Claude has six tools available:
+Once loaded, Claude has eleven tools available:
 
 [cols="1,3"]
 |===
@@ -193,7 +246,54 @@ reads state already being kept.
 
 |`hub_disconnect()`
 |Leave the session and tear down the connection.
+
+|`teams_relay_connect(link, name?, reconnectSecret)`
+|Connect to a chat-relay-style bridge session (e.g. a specific Microsoft
+Teams conversation) via an opaque link the user was given, instead of a
+`host`/`sessionId` pair — for a server that bridges into a real chat
+platform rather than being an `mcp-hub-server`. Once connected, every
+other tool above works the same way. See
+`docs/superpowers/specs/2026-08-21-mcp-hub-design.md` ("Chat-relay bridge
+support") for the full wire contract.
+
+|`hub_history(before?, limit?)`
+|Request messages predating this connection — meaningless for a normal
+`hub_connect` session, but real for a bridge session backed by a channel
+with actual retained history. The requested messages arrive
+asynchronously via `wait`/`hub_receive`/`hub_wait` like any other event,
+not as this call's own result.
+
+|`hub_react(externalId, reaction, action)`
+|Add or remove a reaction on an earlier message — meaningless for a
+normal `hub_connect` session, but real for a bridge session with write
+access to the underlying platform (`action` is `"add"` or `"remove"`).
+On a bridge session, this call itself waits briefly for the real outcome
+(acknowledged, or refused) and reports it directly; if nothing arrives in
+time it falls back to a plain confirmation, with the actual outcome then
+arriving asynchronously instead, same as `hub_history`.
+
+|`hub_edit(externalId, text)`
+|Change an earlier message's content — meaningless for a normal
+`hub_connect` session, and even on a bridge session typically only
+possible on a message this connection itself sent (platform rules, not
+this protocol, decide that). Same synchronous-outcome-with-async-fallback
+behavior as `hub_react`.
+
+|`hub_delete(externalId)`
+|Remove an earlier message — same constraints as `hub_edit` (typically
+only your own messages), and the same synchronous-outcome-with-async-
+fallback behavior as `hub_react`. A genuine deletion, not an edit to
+empty text — other clients learn about it via a distinct
+`messageDeleted` event so a platform-rendered tombstone doesn't get
+mistaken for a blank message.
 |===
+
+`hub_send` gets the same synchronous-outcome treatment on a bridge
+session — a refused send now comes back as the actual refusal reason
+directly, rather than a bare `"sent"` that never meant the message was
+actually accepted. On a plain `hub_connect` session `hub_send` is
+unaffected and always returns immediately, since `mcp-hub-server` has no
+asynchronous confirmation to wait for in the first place.
 
 === How message delivery actually works
 

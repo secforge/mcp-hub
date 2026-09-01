@@ -17,14 +17,17 @@ import (
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
-// maxNameRunes bounds a peer's untrusted display name — long enough for any
+// MaxNameRunes bounds a peer's untrusted display name — long enough for any
 // reasonable name, short enough to keep it from bloating logs/events.
-const maxNameRunes = 64
+// Exported so other in-process peer implementations (see internal/httpmcp)
+// apply the exact same limit instead of a second, driftable copy of it.
+const MaxNameRunes = 64
 
-// maxReconnectSecretRunes bounds a reconnectSecret — generous for any
+// MaxReconnectSecretRunes bounds a reconnectSecret — generous for any
 // reasonable client-generated token, but bounded so a client can't bloat
-// Session.secretToPeerID with arbitrarily large values.
-const maxReconnectSecretRunes = 256
+// Session.secretToPeerID with arbitrarily large values. Exported for the
+// same reason as MaxNameRunes.
+const MaxReconnectSecretRunes = 256
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
@@ -33,9 +36,13 @@ var upgrader = websocket.Upgrader{
 }
 
 // Ping/pong keepalive periods. Vars (not consts) so tests can shorten them.
+// pongWait is deliberately well over 3x pingPeriod — see hubconn.pongWait's
+// doc comment for why a tight margin here false-triggers on ordinary
+// jitter (a delayed ping reads as a dead client) rather than only on an
+// actually-dead connection.
 var (
 	pingPeriod = 30 * time.Second
-	pongWait   = 40 * time.Second
+	pongWait   = 100 * time.Second
 	writeWait  = 10 * time.Second
 )
 
@@ -55,6 +62,14 @@ func NewHandler() *Handler {
 	mux.HandleFunc("/{sessionId}", h.handleUpgrade)
 	h.mux = mux
 	return h
+}
+
+// Manager exposes the session manager so other in-process protocol
+// handlers (see internal/httpmcp) can join/interact with the exact same
+// hubsession.Session objects this websocket handler uses, instead of a
+// second, disconnected set of sessions.
+func (h *Handler) Manager() *hubsession.Manager {
+	return h.manager
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -83,14 +98,14 @@ func (h *Handler) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 			sessionID, clientVersion, wire.ProtocolVersion)
 	}
 
-	name := sanitize.Text(r.URL.Query().Get("name"), maxNameRunes)
+	name := sanitize.Text(r.URL.Query().Get("name"), MaxNameRunes)
 	agePublicKey := r.URL.Query().Get("agePublicKey")
 	if agePublicKey != "" && !agekey.Valid(agePublicKey) {
 		http.Error(w, "invalid agePublicKey", http.StatusBadRequest)
 		return
 	}
 	reconnectSecret := r.URL.Query().Get("reconnectSecret")
-	if len(reconnectSecret) > maxReconnectSecretRunes {
+	if len(reconnectSecret) > MaxReconnectSecretRunes {
 		http.Error(w, "reconnectSecret too long", http.StatusBadRequest)
 		return
 	}

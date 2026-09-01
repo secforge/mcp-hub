@@ -130,6 +130,23 @@ func (s *Session) Leave(p Peer) (empty bool) {
 	return empty
 }
 
+// Peers returns a snapshot of everyone currently in the session, in no
+// particular order.
+func (s *Session) Peers() []Peer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peers := make([]Peer, 0, len(s.peers))
+	for _, p := range s.peers {
+		peers = append(peers, p)
+	}
+	return peers
+}
+
+// ID returns this session's id, as passed to Manager.GetOrCreate.
+func (s *Session) ID() string {
+	return s.id
+}
+
 func (s *Session) Broadcast(from Peer, event any) {
 	s.broadcastExcept(from.ID(), event)
 }

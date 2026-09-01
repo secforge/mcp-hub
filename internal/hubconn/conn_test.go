@@ -1,6 +1,7 @@
 package hubconn
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -27,6 +28,20 @@ func waitForActivity(t *testing.T, ch <-chan struct{}) {
 	case <-ch:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for activity")
+	}
+}
+
+func TestDecodeEventExportedWrapperMatchesInternalDecode(t *testing.T) {
+	raw, err := json.Marshal(wire.NewPeerJoined("550e8400-e29b-41d4-a716-446655440000", "Alice", ""))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	ev, ok := DecodeEvent(raw)
+	if !ok {
+		t.Fatal("expected DecodeEvent to succeed")
+	}
+	if ev.Kind != "peerJoined" || ev.PeerID != "550e8400-e29b-41d4-a716-446655440000" || ev.Name != "Alice" {
+		t.Fatalf("unexpected decoded event: %+v", ev)
 	}
 }
 
@@ -400,6 +415,9 @@ func TestSilentDropIsDetectedViaReadDeadline(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, connected := c.Peek(); !connected {
+			if note := c.DisconnectNote(); note == "" {
+				t.Fatal("expected DisconnectNote to explain a pongWait timeout, got empty string")
+			}
 			return
 		}
 		if time.Now().After(deadline) {
@@ -432,6 +450,348 @@ func TestDialEchoesBackSanitizedNameAndAgePublicKey(t *testing.T) {
 	}
 	if c.AgePublicKey() != testAgePublicKey {
 		t.Fatalf("got AgePublicKey %q, want %q", c.AgePublicKey(), testAgePublicKey)
+	}
+}
+
+func TestPeekSuppressesOwnReactionChangedAndMessageEdited(t *testing.T) {
+	c := &Conn{}
+	c.buffer = []Event{
+		{Kind: "reactionChanged", ExternalID: "ext-1", Own: true},
+		{Kind: "messageEdited", ExternalID: "ext-2", Own: true},
+		{Kind: "messageDeleted", ExternalID: "ext-3", Own: true},
+	}
+	if hasEvents, _ := c.Peek(); hasEvents {
+		t.Fatal("expected own reactionChanged/messageEdited to be suppressed like own msg")
+	}
+	c.buffer = append(c.buffer, Event{Kind: "peerJoined", PeerID: "peer-1"})
+	if hasEvents, _ := c.Peek(); !hasEvents {
+		t.Fatal("expected a non-own event to make the buffer wake-worthy")
+	}
+}
+
+func TestPeekTreatsNonOwnReactionChangedAsWakeWorthy(t *testing.T) {
+	c := &Conn{buffer: []Event{{Kind: "reactionChanged", ExternalID: "ext-1", PeerID: "peer-1"}}}
+	if hasEvents, _ := c.Peek(); !hasEvents {
+		t.Fatal("expected a reactionChanged from someone else to be wake-worthy")
+	}
+}
+
+func TestPeekSuppressesOwnMessagesUntilANonOwnEventArrives(t *testing.T) {
+	c := &Conn{}
+	c.buffer = []Event{
+		{Kind: "msg", PeerID: "peer-1", Text: "own 1", Own: true},
+		{Kind: "msg", PeerID: "peer-1", Text: "own 2", Own: true},
+	}
+	if hasEvents, connected := c.Peek(); hasEvents || !connected {
+		t.Fatalf("expected own-only buffer to not be wake-worthy, got hasEvents=%v connected=%v", hasEvents, connected)
+	}
+
+	c.buffer = append(c.buffer, Event{Kind: "msg", PeerID: "peer-2", Text: "their reply"})
+	if hasEvents, connected := c.Peek(); !hasEvents || !connected {
+		t.Fatalf("expected a non-own event to make the buffer wake-worthy, got hasEvents=%v connected=%v", hasEvents, connected)
+	}
+
+	formatted, connected := c.Drain()
+	if !connected {
+		t.Fatal("expected still connected")
+	}
+	for _, want := range []string{"own 1", "own 2", "their reply"} {
+		if !strings.Contains(formatted, want) {
+			t.Fatalf("expected Drain to return everything buffered together, missing %q in: %s", want, formatted)
+		}
+	}
+}
+
+func TestPeekWakesOnOwnMessageOverflowEvenWithNoReply(t *testing.T) {
+	c := &Conn{}
+	for i := 0; i < maxPendingOwnMessages-1; i++ {
+		c.buffer = append(c.buffer, Event{Kind: "msg", PeerID: "peer-1", Own: true})
+	}
+	if hasEvents, _ := c.Peek(); hasEvents {
+		t.Fatalf("expected %d own messages to still be suppressed (cap is %d)", maxPendingOwnMessages-1, maxPendingOwnMessages)
+	}
+	c.buffer = append(c.buffer, Event{Kind: "msg", PeerID: "peer-1", Own: true})
+	if hasEvents, _ := c.Peek(); !hasEvents {
+		t.Fatalf("expected reaching the %d-message cap to become wake-worthy with no reply", maxPendingOwnMessages)
+	}
+}
+
+func TestPeekTreatsNonMsgEventsAsAlwaysWakeWorthy(t *testing.T) {
+	for _, e := range []Event{
+		{Kind: "sendAck", ExternalID: "ext-1", ActionOK: true},
+		{Kind: "error", Text: "nope"},
+		{Kind: "peerJoined", PeerID: "peer-1"},
+		{Kind: "rosterComplete"},
+	} {
+		c := &Conn{buffer: []Event{e}}
+		if hasEvents, _ := c.Peek(); !hasEvents {
+			t.Fatalf("expected a bare %q event to be wake-worthy on its own, got hasEvents=false", e.Kind)
+		}
+	}
+}
+
+func TestPeekReportsDisconnectedEvenWithOnlySuppressedOwnMessages(t *testing.T) {
+	c := &Conn{closed: true}
+	c.buffer = []Event{{Kind: "msg", PeerID: "peer-1", Own: true}}
+	if hasEvents, connected := c.Peek(); connected {
+		t.Fatalf("expected disconnected to still report connected=false regardless of buffer contents, got hasEvents=%v connected=%v", hasEvents, connected)
+	}
+}
+
+func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		historical := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "old news", "ts")
+		historical.Historical = true
+		conn.WriteJSON(historical)
+		conn.WriteJSON(wire.NewHistoryComplete())
+		conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "nope", Code: "revoked", Retryable: false})
+		conn.WriteJSON(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "ext-1", OK: true})
+		conn.WriteJSON(wire.ReactionChanged{
+			Type: wire.TypeReactionChanged, ExternalID: "ext-2",
+			PeerID: "550e8400-e29b-41d4-a716-446655440002", Reaction: "👍", Label: "Like", Action: "add",
+		})
+		conn.WriteJSON(wire.MessageEdited{Type: wire.TypeMessageEdited, ExternalID: "ext-3", Text: "corrected"})
+		conn.WriteJSON(wire.ReactionAck{Type: wire.TypeReactionAck, ExternalID: "ext-4", Reaction: "👀", Action: "add", OK: true})
+		conn.WriteJSON(wire.EditAck{Type: wire.TypeEditAck, ExternalID: "ext-5", OK: true})
+		conn.WriteJSON(wire.MessageDeleted{Type: wire.TypeMessageDeleted, ExternalID: "ext-6", Cursor: "cursor-6"})
+		conn.WriteJSON(wire.DeleteAck{Type: wire.TypeDeleteAck, ExternalID: "ext-7", OK: true})
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasEvents, _ := c.Peek(); hasEvents {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	formatted, connected := c.Drain()
+	if !connected {
+		t.Fatalf("expected still connected, got formatted=%q", formatted)
+	}
+	if !strings.Contains(formatted, "[HUB HISTORY") {
+		t.Fatalf("expected the historical msg to render distinctly, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "[hub: history request complete]") {
+		t.Fatalf("expected historyComplete to render, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "code=revoked, retryable=false") {
+		t.Fatalf("expected the error's code/retryable to render, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "send acknowledged") || !strings.Contains(formatted, "ext-1") {
+		t.Fatalf("expected the sendAck to render, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "added a 👍 (Like) reaction") || !strings.Contains(formatted, "ext-2") {
+		t.Fatalf("expected the reactionChanged to render, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "HUB MESSAGE EDITED") || !strings.Contains(formatted, "corrected") {
+		t.Fatalf("expected the messageEdited to render, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "reaction add acknowledged") || !strings.Contains(formatted, "ext-4") {
+		t.Fatalf("expected the reactionAck to render, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "edit acknowledged") || !strings.Contains(formatted, "ext-5") {
+		t.Fatalf("expected the editAck to render, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "message deleted") || !strings.Contains(formatted, "ext-6") || !strings.Contains(formatted, "cursor-6") {
+		t.Fatalf("expected the messageDeleted to render, got: %s", formatted)
+	}
+	if !strings.Contains(formatted, "delete acknowledged") || !strings.Contains(formatted, "ext-7") {
+		t.Fatalf("expected the deleteAck to render, got: %s", formatted)
+	}
+}
+
+func TestRequestHistorySendsHistoryMessage(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotHistory := make(chan wire.History, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var h wire.History
+		if err := conn.ReadJSON(&h); err == nil {
+			gotHistory <- h
+		}
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.RequestHistory("cursor-9", 25); err != nil {
+		t.Fatalf("RequestHistory: %v", err)
+	}
+
+	select {
+	case h := <-gotHistory:
+		if h.Before != "cursor-9" || h.Limit != 25 {
+			t.Fatalf("unexpected history request: %+v", h)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the history request")
+	}
+}
+
+func TestReactSendsReactionMessage(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotReaction := make(chan wire.Reaction, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var rq wire.Reaction
+		if err := conn.ReadJSON(&rq); err == nil {
+			gotReaction <- rq
+		}
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.React("ext-1", "👍", "add"); err != nil {
+		t.Fatalf("React: %v", err)
+	}
+
+	select {
+	case rq := <-gotReaction:
+		if rq.ExternalID != "ext-1" || rq.Reaction != "👍" || rq.Action != "add" {
+			t.Fatalf("unexpected reaction request: %+v", rq)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the reaction request")
+	}
+}
+
+func TestEditMessageSendsEditMessage(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotEdit := make(chan wire.Edit, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var e wire.Edit
+		if err := conn.ReadJSON(&e); err == nil {
+			gotEdit <- e
+		}
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.EditMessage("ext-1", "corrected"); err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+
+	select {
+	case e := <-gotEdit:
+		if e.ExternalID != "ext-1" || e.Text != "corrected" {
+			t.Fatalf("unexpected edit request: %+v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the edit request")
+	}
+}
+
+func TestBridgeFieldsOnJoinedFlowThroughToAccessors(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		cursor := "cursor-9"
+		topic := "Support chat"
+		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		j.LatestCursor = &cursor
+		j.HistoryLimitMax = 50
+		j.CanSend = true
+		j.ConversationKind = "oneOnOne"
+		j.Topic = &topic
+		conn.WriteJSON(j)
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if got := c.LatestCursor(); got == nil || *got != "cursor-9" {
+		t.Fatalf("got LatestCursor %v", got)
+	}
+	if c.HistoryLimitMax() != 50 {
+		t.Fatalf("got HistoryLimitMax %d", c.HistoryLimitMax())
+	}
+	if !c.CanSend() {
+		t.Fatal("expected CanSend true")
+	}
+	if c.ConversationKind() != "oneOnOne" {
+		t.Fatalf("got ConversationKind %q", c.ConversationKind())
+	}
+	if got := c.Topic(); got == nil || *got != "Support chat" {
+		t.Fatalf("got Topic %v", got)
+	}
+}
+
+func TestBridgeFieldsAreZeroForAnOrdinaryConnect(t *testing.T) {
+	url := startTestServer(t)
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if got := c.LatestCursor(); got != nil {
+		t.Fatalf("expected nil LatestCursor for mcp-hub-server, got %v", *got)
+	}
+	if c.HistoryLimitMax() != 0 || c.CanSend() || c.ConversationKind() != "" || c.Topic() != nil {
+		t.Fatalf("expected all bridge fields zero, got HistoryLimitMax=%d CanSend=%v "+
+			"ConversationKind=%q Topic=%v", c.HistoryLimitMax(), c.CanSend(), c.ConversationKind(), c.Topic())
 	}
 }
 

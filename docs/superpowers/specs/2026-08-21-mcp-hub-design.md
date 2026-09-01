@@ -511,6 +511,26 @@ join/leave events.
   superseded returns a plain `"superseded by a newer hub_wait call"` text
   result, not an error, since nothing about the request itself failed.
   `TestHubWaitNewCallSupersedesInFlightOne` is the regression test.
+
+  A successful delivery (real content, connection still up — not the
+  "hub disconnected" or "superseded" outcomes) is prefixed with
+  `waitAgainReminder`, a fixed reminder telling the model to call
+  `hub_wait` again immediately, *before* the delivered content, not after
+  it. This is deliberate placement, not just phrasing: `hub_wait` is a
+  single blocking call with no follow-up chunk to fall back on, so if
+  whatever's reading the result is cut off partway through — a client-side
+  read timeout, a truncated display of a large result — a trailing
+  reminder is exactly the part most likely to never be seen, while a
+  leading one survives even a truncated read. The CLI `wait` binary's
+  default ("once") mode carries the identical fix for the identical
+  reason: `deliver()` in `internal/waiter/waiter.go` now writes "Run this
+  command again to keep receiving: ..." *before* the formatted event
+  content instead of after it. Neither change touches `wait --follow` or
+  its `ModeFollow` delivery path — a `--follow` connection keeps receiving
+  indefinitely over the same connection, so there's nothing to remind it
+  to restart. Regression tests: `TestHubWaitReturnsImmediatelyWhenAlreadyBuffered`
+  (asserts the reminder leads) and `TestWaitDeliversAlreadyBufferedEvent`
+  (same, for the CLI path).
 - **`hub_peers()`** — returns everyone else currently known to be in the
   session (sorted by peerId, one per line, or an explicit "no other peers"
   message if empty), including each peer's `name` and `agePublicKey` when
@@ -602,6 +622,555 @@ attacker-controlled content). A server `error` reply to a failed private send
 is surfaced as `[HUB ERROR] <message>` — also not wrapped as untrusted, since
 it originates from the hub server describing the sender's own action, not
 from another peer.
+
+## HTTP-MCP endpoint (`mcp-hub-server`)
+
+`mcp-hub-server` also serves a Streamable-HTTP MCP endpoint at `/mcp`,
+alongside its existing websocket relay at `/{sessionId}` — additive, no
+changes to the websocket path, `mcp-hub-client`'s stdio mode, or its
+`wait`/`wait --follow` unix-socket mechanism (below). It exposes
+`hub_connect`/`hub_disconnect`/`hub_send`/`hub_receive`/`hub_wait`/`hub_peers`
+— a deliberate subset matching only what the plain relay understands
+server-side (no reactions/edit/delete/history, which are
+chat-relay/Teams-bridge-specific). `hub_connect`'s result includes a
+`watchToken`; `GET /watch?token=<token>&follow=1` streams that peer's
+events live via `http.Flusher`, for `curl -N`-based async monitoring
+(the same purpose as `wait --follow`, for a remote HTTP client with no
+local process). Full rationale, rejected alternatives, and design details:
+`docs/superpowers/specs/2026-08-28-http-mcp-endpoint-design.md`.
+
+## Chat-relay bridge support (`teams_relay_connect`, `hub_history`)
+
+A second connect path, for a server that bridges into a real chat platform
+(the motivating case: a "chat-relay" project mirroring a bot account's
+Microsoft Teams conversations) rather than being an `mcp-hub-server`.
+Designed collaboratively over a live hub session with the Claude instance
+building that server — the two clients negotiated the wire contract
+directly, each grounded in their own actual code rather than assumption.
+`hub_connect`'s own constraints (`sessionId` must be a UUID; `host` must be
+bare scheme+authority, no path/query/fragment) made it unusable for a
+server that issues opaque, arbitrarily-shaped links, so this is a wholly
+separate tool rather than a relaxation of `hub_connect`'s rules.
+
+- **`teams_relay_connect(link, name?, reconnectSecret)`** — `link` is one
+  opaque string, unparsed and unvalidated beyond a single rule that never
+  changes: split on the first `#`. Everything before it is dialed as an
+  ordinary WebSocket URL (arbitrary path/query allowed, unlike
+  `hub_connect`'s `host`); everything after it is sent as
+  `Authorization: Bearer <secret>` on the handshake instead of ever
+  appearing in the request itself. This is deliberate: a URL fragment is
+  defined to never reach a server, so a secret placed there cannot leak
+  into that server's access logs, a proxy in front of it, or ours — by
+  construction, not by remembering to redact it afterward. `reconnectSecret`
+  is sent as a second header, `Reconnect-Secret: <secret>` — never as a
+  query parameter, for the identical log-exposure reason (this is *not*
+  the same field/purpose as `hub_connect`'s `reconnectSecret`: it doesn't
+  identify a peer — a link already fixes which conversation a connection
+  belongs to — it authorizes *resuming* after a drop, since a bridge link
+  may be single-use and the same spent link only works again if paired
+  with the same `reconnectSecret` presented at the original connect,
+  within whatever window the bridge grants). `name` is optional and sent
+  as a third header, `Agent-Name: <name>`, if given — a bridge server is
+  not obligated to make it visible on the other side of the bridge (in the
+  motivating case, it's audit-only: every client on a link posts under the
+  bridge's own bot identity in Teams, so `name` never appears in the
+  conversation itself).
+
+  Implemented as `hubconn.DialRelay` (`internal/hubconn/relay.go`),
+  distinct from `Dial` only in how it reaches an open `*websocket.Conn` —
+  both funnel into a shared `finishHandshake` that reads the initial
+  `joined` message, validates it, and starts the same background read
+  loop, buffering, keepalive, and disconnect detection either path uses.
+  A relay connection is an ordinary `Conn` after that point, including
+  reusing `hub_send`/`hub_receive`/`hub_wait`/`hub_peers` unmodified — this
+  is why the bridge's peer ids must stay UUID-shaped (the design
+  discussion settled on the bridge deriving synthetic per-link
+  HMAC-derived UUIDs for real participant identities, rather than this
+  client relaxing `decodeEvent`'s UUID validation to accommodate them).
+
+  Two protocol differences a bridge session must handle, agreed during
+  design:
+  - **A directed `hub_send` (`to`) must be refused with an `error` event,
+    never silently delivered as a broadcast** — a bridge with no
+    peer-to-peer delivery (everything goes into one shared conversation)
+    would otherwise disclose a message its sender believed was private.
+    Confirmed as already correct with no client changes needed: the read
+    loop only ever marks a connection closed on an actual
+    `ws.ReadMessage()` failure, never on a decoded `error` event, so a
+    mid-connection refusal (e.g. a policy-refused send) is buffered and
+    rendered like any other event without disturbing the connection.
+  - **Close codes 4001 (revoked), 4002 (expired), and 4003 (conversation
+    unavailable)** signal a dead credential rather than ordinary network
+    trouble — a client that reconnect-loops against one of these would
+    loop forever against something no retry can fix. The *primary* signal
+    is a server sending a final `error` event (with `Code`/`Retryable`,
+    see below) before it deliberately closes, since reconnection here is
+    entirely model-driven — a raw WebSocket close code is invisible to
+    whatever is actually deciding whether to retry, since nothing in this
+    client branches on one automatically. The close codes are a
+    *secondary*, best-effort signal for the case where that event was
+    missed: `hubconn.Conn` tracks the close frame's code
+    (`websocket.CloseError`) and `Conn.DisconnectNote()` maps the three
+    agreed codes to a suffix folded directly into the disconnect text
+    every call site already produces (`disconnectedText` in
+    `internal/mcptools/tools.go`; `Waiter.disconnectedMessage` in
+    `internal/waiter/waiter.go`, via a `disconnectNoter` duck-typed
+    interface so `waiter.Source` stays generic) — e.g. `"hub disconnected
+    (revoked — do not reconnect)"` instead of a bare `"hub disconnected"`.
+    Empty (a no-op) for every ordinary drop, including every
+    `mcp-hub-server` disconnect.
+
+  `wire.Error` gained two additive fields for this: `Code` (a stable
+  machine-readable reason, e.g. `"revoked"`, `"invalid_credential"`,
+  `"conversation_unavailable"`, `"unavailable"`) and `Retryable` (whether
+  retrying could succeed — `"unavailable"` is the one transient case in
+  the agreed starting set). Deliberately, per the bridge side's own
+  security reasoning: an *unverified* credential and a *revoked* one both
+  answer `invalid_credential` — a bridge server that distinguished them
+  would let anyone probing link ids learn which ones were ever real,
+  turning the handshake into an enumeration oracle for a bearer
+  capability. Only a secret that verifies earns a precise reason.
+  `hubconn`'s `FormatEvent` renders a coded error as `[HUB ERROR —
+  code=<code>, retryable=<bool>] <message>` instead of the plain `[HUB
+  ERROR] <message>` a codeless one still gets (unchanged, so this is
+  additive for a plain `mcp-hub-server` error too).
+
+- **`hub_history(before?, limit?)`** — requests messages predating this
+  connection, meaningless for an ordinary `hub_connect` session (a peer
+  only ever sees events from when it joined forward — there was never a
+  history concept to draw on here) but real for a bridge backed by a
+  channel with actual retained history. Sends `wire.History`
+  (`{"type":"history","before":...,"limit":...}`) via the new
+  `Conn.RequestHistory` and returns immediately with a confirmation — the
+  requested messages themselves arrive asynchronously through the normal
+  `wait`/`hub_receive`/`hub_wait` path, not as this call's own result,
+  since a bridge may take a moment to fetch what could be a large page.
+  `before` is an opaque, server-defined cursor and *exclusive* (the page
+  ends strictly before it — this avoids an off-by-one where paging
+  backward would repeat the same boundary message on every page); omitted
+  it means "the most recent `limit` messages." A client pages further back
+  by resending the request with the oldest cursor it has seen. Answering
+  messages are ordinary `msg` events carrying an additive `Historical:
+  true` flag (`wire.Msg.Historical`) — mirroring how a plain `hub_connect`
+  session already flags a *private* `msg` without inventing a whole new
+  message type, and letting an older client that doesn't know the field
+  simply render them as ordinary messages instead of silently dropping an
+  unrecognized type. `FormatEvent` renders a historical message as `[HUB
+  HISTORY — untrusted, from peer <peerId> at <ts>]` — distinctly from a
+  live `[HUB MESSAGE ...]`, so it's never mistaken for something that just
+  happened. The burst is terminated by a new `historyComplete` sentinel
+  event (`wire.HistoryComplete`/`TypeHistoryComplete`), mirroring
+  `rosterComplete`'s role for the initial roster: exhaustion is always an
+  explicit "there is no more," including an empty burst plus the sentinel,
+  never silently inferred from a gap in traffic.
+
+- **`sendAck` — confirms a send reached its destination, immediately.**
+  Found necessary by a real incident during the joint design/testing
+  session with chat-relay, not designed up front: chat-relay's server
+  originally gave no synchronous confirmation for `hub_send` at all,
+  reasoning that the sent message would come back through the normal
+  delivery pipe like any other — true in production, but its dev server
+  ran in a slow polling mode with a multi-hour reconciliation sweep, so
+  the sender got no ack, no error, and no echo for hours. Two identical
+  test sends were made in that gap because there was no way to tell
+  "still in flight" from "silently failed," and no way to know without
+  retrying whether a retry would create a duplicate — which it did,
+  landing two real messages in a real conversation. `sendAck`
+  (`wire.SendAck`/`TypeSendAck`, `{"type":"sendAck","externalId":...,
+  "ok":true}`) fixes this at the protocol level: sent right after the
+  bridge server's own send actually succeeds (or fails), correlating via
+  `externalId` (the bridge's own id for the sent message) with the
+  canonical `msg` that still arrives later, exactly once, through the
+  normal path — deliberately not a `msg` itself, so nothing is
+  double-counted and no cursor needs to be fabricated. Decoded into
+  `Event.ExternalID`/`Event.ActionOK`, rendered distinctly by `FormatEvent`
+  (`"send acknowledged"` vs `"send NOT acknowledged"`, both naming the
+  `externalId`) so a model reading it can't confuse "this specific send
+  succeeded" with "here is the message in the conversation." Additive and
+  optional per this project's own versioning convention — an older client
+  that doesn't know the type just doesn't get the early signal and falls
+  back to inferring from the later canonical message, same as before this
+  existed. `mcp-hub-server` never sends this, since a plain `hub_send`
+  already completes synchronously and has no such gap to cover.
+
+- **`msg.externalId`/`msg.own`, and own-message wake suppression.** Two
+  more additive `wire.Msg` fields, from the same joint session, discovered
+  in the opposite order from `sendAck`: chat-relay's user first asked for
+  the *server* to hold a sender's own message back and only flush it once
+  a reply arrived, framed as "the wake should carry information, not just
+  an echo of what the sender already knows it sent." That was then
+  overruled by the same user for a better reason: *which* events should
+  wake a caller is policy, and policy differs per consumer of the same
+  stream (an agent, a UI, a human-driven client) — a server holding
+  per-connection buffer state to enforce one fixed policy for everyone
+  couldn't express that, and the buffer dying on disconnect meant the
+  policy wasn't even reliable. The fix moved bookkeeping to where the
+  decision actually happens: the server tags, the client decides.
+  - `ExternalID` on `msg` is the same id `sendAck` returns for the send
+    that produced it — before this, a client could tell "my send
+    succeeded" and, separately, "a message just arrived," but had no real
+    way to know they were the *same* message short of matching text and
+    timing, which isn't a real answer once more than one send is in
+    flight.
+  - `Own` is `true` when *this exact connection* — not "the bridge's bot
+    identity" — sent the message. A message sent by a different
+    connection to the same bridge account, or through the bridge's own
+    agent API, arrives without the flag: it's genuine new information to
+    this connection even though it also originates from the bot.
+  - **The actual suppression lives entirely client-side**, in
+    `hubconn.Conn.Peek()` (`internal/hubconn/conn.go`): "wake-worthy" now
+    excludes a `msg` event with `Own` true — the sender already knows it
+    sent that message, so waking on nothing but its own echo is a wake
+    with no new information, and risks an agent seeing its own message
+    and answering itself. Such an event stays buffered, not dropped,
+    until either a genuinely new (non-own) event arrives — at which point
+    `Drain()` returns everything buffered together, in order, so the
+    caller sees `[my own message, their reply]` as one delivery — or
+    `maxPendingOwnMessages` (10) own messages have piled up with nothing
+    else, the overflow valve for "usually shouldn't happen" scenarios
+    (e.g. a burst of sends with no reply between them), so a connection
+    can never go silently unbounded on suppressed events. Every other
+    event kind, including `sendAck` itself, is always wake-worthy — the
+    ack exists specifically to be an immediate signal and this doesn't
+    touch it.
+  - This is the one place a change had to reach two independent
+    consumers of the same `Peek()`/`Drain()` contract, and only one of
+    them was obvious: `hub_wait`'s polling loop (`internal/mcptools/
+    tools.go`) already gates on `Peek()`, so it inherited the new
+    behavior for free. The CLI `wait` socket did not — `waiter.Waiter.
+    Poke()` (`internal/waiter/waiter.go`) used to drain and deliver
+    unconditionally whenever called, and `OnActivity` (wired in
+    `handleConnect`/`handleTeamsRelayConnect`) calls `Poke()` on *every*
+    buffered event, suppressed or not. Left unfixed, an own-message echo
+    would have been correctly held back from `hub_wait` while
+    simultaneously being delivered instantly to anyone running the CLI
+    `wait` binary against the same connection — the same underlying
+    buffer, two different wake behaviors depending on which door a caller
+    used. `Poke()` now checks `Peek()` itself, under the same lock that
+    reads/clears `w.current`, before consuming the registered waiter —
+    if the source isn't wake-worthy yet, it leaves the registration in
+    place for a later `Poke()` call to try again, exactly the discipline
+    `deliver()`'s own re-registration tail already used for the
+    registration-race fix (see above), for the identical reason: a callback
+    invoked far more often than it should actually act must recheck fresh
+    state under one lock rather than assume its last observation still
+    holds.
+  - Regression tests: `TestPeekSuppressesOwnMessagesUntilANonOwnEventArrives`,
+    `TestPeekWakesOnOwnMessageOverflowEvenWithNoReply`,
+    `TestPeekTreatsNonMsgEventsAsAlwaysWakeWorthy`,
+    `TestPeekReportsDisconnectedEvenWithOnlySuppressedOwnMessages`
+    (`internal/hubconn`); `TestPokeDoesNotDeliverWhileSourceReportsNotWakeWorthy`
+    (`internal/waiter`); `TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside`
+    (`internal/mcptools`, the end-to-end proof through the actual tool).
+
+- **Reactions and edits — full read/write, both sides live.** Requested
+  (by the human running this session) as a pair of writable actions —
+  add/remove a reaction on an earlier message, edit a previous message's
+  content. The write half was initially believed blocked: chat-relay
+  first cited `Chat.Read`/`ChatMessage.Send`/`offline_access` as its only
+  Graph scopes and said reactions/edits needed a broader
+  `ChatMessage.ReadWrite` grant, a real permission-scope decision for
+  their user, not something to absorb in-session. That citation turned
+  out to be wrong on inspection of Graph's own docs: `setReaction`/
+  `unsetReaction` need `Chat.ReadWrite, ChatMessage.Send` (the second of
+  which chat-relay already held, so reactions needed nothing new at all),
+  and editing a message needs `Chat.ReadWrite` — which chat-relay's user
+  had *already* granted, under a different name than what was being
+  searched for. The earlier belief that permissions blocked this was
+  simply incorrect; nothing here waited on a policy change, only on
+  someone checking the actual Graph documentation instead of citing from
+  memory. The read half (learning about a reaction or edit *someone else*
+  makes) was additionally held back from "cheap to build, so build it"
+  until chat-relay's own user separately confirmed wanting it — the same
+  discipline applied to the direct-join link earlier in this design: a
+  request arriving secondhand through one Claude session isn't itself
+  authorization for the other side to build against. Both halves are now
+  built, deployed on chat-relay's dev and staging environments, and
+  verified end to end against staging in a live joint test (see below).
+  - `wire.ReactionChanged` (`{"type":"reactionChanged","externalId":...,
+    "peerId":...,"reaction":"👍","label":"Like","action":"add"|"remove",
+    "ts":...,"own":...}`) — decode-only; mcp-hub-server never sends it,
+    and this client never constructs one. `Reaction`/`Label` are
+    deliberately open strings, not a closed enum — chat-relay's own live
+    data already contains "Eyes" and "Question mark" alongside the
+    classic "Like," so Teams' reaction set has expanded past assumption
+    and a client must not reject or normalize a value it doesn't
+    recognize; whatever the source platform reports is authoritative.
+    `PeerID` may be absent: a removal is detected by diffing the
+    reaction set on a message, and the remover isn't always identifiable
+    from that diff — the event still fires with `PeerID` omitted rather
+    than being suppressed for incomplete attribution, on the same
+    reasoning as every other "the system knew something and should say
+    so" fix from this design session: "someone removed a 👍, unattributed"
+    is real information; silently dropping it because the *who* is
+    missing would repeat exactly the failure mode (four of five real bugs
+    found this session presented as silence) that motivated `sendAck`,
+    the fan-out log line, and surfacing `joined`'s bridge fields in the
+    first place.
+  - `wire.MessageEdited` (`{"type":"messageEdited","externalId":...,
+    "text":...,"ts":...,"own":...}`) — also decode-only. `Text` is the
+    same simplified/rendered form a `msg` carries, directly comparable.
+    The edited message's own cursor does *not* change (chat-relay's
+    cursor is `(createdAt, id)`, and an edit moves neither), so a client
+    locates the message it already has by `ExternalID`, not a new cursor
+    — worth stating explicitly since the natural assumption is the
+    opposite. `Own` can currently never be true (a sender may only edit
+    its own messages, and editing needs the write permission that
+    doesn't exist yet), kept on the type for symmetry with `msg` rather
+    than omitted, so it's already correctly wired the moment the write
+    path lands rather than requiring another field-adding round then.
+  - Rendered by `FormatEvent` as `[hub: <peerId|"someone (unattributed)">
+    added/removed a <reaction> (<label>) reaction on message
+    externalId=<id>]` and `[HUB MESSAGE EDITED — untrusted,
+    externalId=<id> at <ts>]\n<text>` respectively — the edit is wrapped
+    as untrusted content, same as a `msg`, since its text is exactly as
+    attacker-controlled (editable by whoever sent the original).
+  - **Own-action wake suppression extends to both**, not just `msg`:
+    `hubconn.Conn`'s `isSuppressibleOwnEvent` (used by `Peek`, see
+    "own-message wake suppression" above) now covers `msg`,
+    `reactionChanged`, and `messageEdited` uniformly — a reaction you
+    added yourself is exactly as much a no-op echo as a message you sent
+    yourself, and the same `maxPendingOwnMessages` overflow valve and
+    together-with-the-next-real-event delivery apply. `messageEdited`'s
+    `Own` can't be true yet in practice, but the logic already handles it
+    correctly for when it can.
+  - Regression tests: `TestReactionChangedRoundTrip`,
+    `TestReactionChangedOmitsPeerIDWhenUnattributed`,
+    `TestMessageEditedRoundTrip` (`internal/wire`);
+    `TestFormatEventReactionChangedAdd`,
+    `TestFormatEventReactionChangedRemoveUnattributed`,
+    `TestFormatEventReactionChangedOwnIsMarked`,
+    `TestFormatEventMessageEditedIsWrappedAsUntrusted`,
+    `TestPeekSuppressesOwnReactionChangedAndMessageEdited`,
+    `TestPeekTreatsNonOwnReactionChangedAsWakeWorthy` (`internal/hubconn`).
+
+- **The write side: `hub_react`/`hub_edit`, `wire.Reaction`/`wire.Edit`,
+  `wire.ReactionAck`/`wire.EditAck`.** `Conn.React(externalID, reaction,
+  action)` and `Conn.EditMessage(externalID, text)` send
+  `{"type":"reaction",...}`/`{"type":"edit",...}` requests; not meaningful
+  for `mcp-hub-server`, which silently ignores any message type it
+  doesn't recognize (confirmed from its own read loop — an unrecognized
+  `Type` just `continue`s the loop), so sending either against a plain
+  `hub_connect` session is a harmless no-op rather than an error. Two new
+  MCP tools, `hub_react(externalId, reaction, action)` and
+  `hub_edit(externalId, text)`, expose these the same way `hub_history`
+  does: the call itself only confirms the request was sent, with the
+  actual outcome arriving asynchronously via `wait`/`hub_receive`/
+  `hub_wait` as a `reactionAck`/`editAck` (success) or an ordinary `error`
+  event (refusal — chat-relay routes reactions/edits through the same
+  tenant-lock gate as a send, so a federated conversation refuses all
+  three for the same reason). `reaction` accepts an open string exactly
+  as `wire.ReactionChanged.Reaction` does — chat-relay also accepts the
+  field under the name `reactionType` (mirroring Graph's own request-body
+  naming) if a different client would rather send that instead; this
+  client always sends `reaction`.
+
+  `Event.ActionOK` (renamed from the narrower `SendOK` once it needed to
+  cover three ack kinds, not one) and `Event.ExternalID` are now shared
+  across `sendAck`/`reactionAck`/`editAck` — a deliberate small refactor
+  rather than three near-duplicate boolean fields, since all three answer
+  the identical question ("did the action this connection asked for
+  succeed") for the identical reason `sendAck` was built: without an
+  explicit ack, a client can't tell "still in flight" from "silently
+  failed," which is exactly the ambiguity that caused two duplicate real
+  messages earlier in this design's own history. A refusal is expected to
+  arrive as an `error` event, not one of these acks with `OK: false` — the
+  field exists on the wire type for symmetry and in case a server ever
+  has a concrete reason to send a negative ack explicitly, but no server
+  currently does.
+
+  **Verified end to end in a live joint test against chat-relay's
+  staging** (deliberately staging, not dev: dev's `INGEST_MODE=poll`
+  four-hour sweep means the read-side events — `messageEdited`,
+  `reactionChanged` — would never arrive within any sensible wait, the
+  same ambiguity that caused the `sendAck` incident; staging's live
+  Graph subscription delivers them within a second or two): send →
+  `sendAck` → canonical `msg`; edit → `editAck` → `messageEdited` with
+  `own: true` genuinely set (previously always false, since editing
+  needed the write path this test is exercising); react add → `reactionAck`
+  → `reactionChanged` with `peerId` correctly present; react remove →
+  `reactionAck` → `reactionChanged`, `peerId` still present (chat-relay's
+  stored row retains who reacted even though Graph's own diff-based
+  detection can't always say). The test also confirmed, live and by
+  design rather than by accident, that own-message wake suppression (see
+  above) correctly withheld the canonical own `msg` from `Peek()` until
+  drained directly — the first time that logic ran against a real send
+  rather than a synthetic one.
+
+  **One genuine finding from that test, on chat-relay's side, not this
+  client's:** `reactionChanged` for this connection's own reaction —
+  both the add and the remove — arrived with `peerId` correctly set to
+  this connection's own peer id, but **without `own: true`**, despite
+  `wire.ReactionChanged.Own` existing specifically to mark that case (see
+  above; the design already anticipated this might not work, since
+  reaction attribution goes through the reactor's identity rather than
+  through which connection acted, unlike the send path). Reported back
+  to chat-relay for a fix; this client's own handling (rendering `own`
+  when present, suppressing the wake on it) needed no change, since it
+  was chat-relay's server that omitted the field, not this client
+  mis-decoding it. **Fix confirmed working** in a follow-up joint test
+  minutes later (reacting to the already-edited message from the prior
+  round, so no new message was needed) — both add and remove now arrive
+  correctly marked `own: true`. Root cause on chat-relay's side, for the
+  record: the field was declared on their event record and never
+  populated at all — always absent regardless of who reacted, which is
+  why their own tests (which check `DidSend`, "did you post this
+  message," not "did you put this reaction on it") couldn't have caught
+  it structurally, not just by chance.
+
+- **Making `hub_send`/`hub_react`/`hub_edit` report their own real outcome
+  synchronously, instead of a bare "sent" that doesn't mean anything on a
+  bridge session.** Raised as a direct question after the write side
+  landed: `handleSend` returned `"sent"` the moment the local websocket
+  write succeeded, saying nothing about whether chat-relay's server (or
+  Graph) actually accepted the message — the real answer arrived later,
+  asynchronously, as a `sendAck` or an `error` event, and nothing told
+  the model it needed to separately check for one. The fix isn't simply
+  "block on `Peek`/`Drain` until an ack shows up," though: `hub_wait`, the
+  CLI wait socket, and now three tool handlers would all be polling the
+  same shared, destructive, non-selective buffer — exactly the shape of
+  bug already found and fixed once this session (the `waiter` registration
+  race, where two independent pollers on one buffer could steal an event
+  meant for the other). A second independent poller reading `Peek`/`Drain`
+  would reintroduce it.
+
+  Instead, `hubconn.Conn` gained a proper claim mechanism that intercepts
+  matching events *before* they ever reach the general buffer, so nothing
+  else is competing for them:
+  - `Conn.claimNextAck(ackKind string) (result <-chan Event, cancel func())`
+    registers interest in the next event of exactly `ackKind`
+    (`"sendAck"`/`"reactionAck"`/`"editAck"`), or the next generic
+    `"error"` event, whichever arrives first. `readLoop` checks every
+    incoming event against `pendingAcks` (a `map[string]*ackClaim`,
+    keyed by ack kind) under the same lock it uses to append to the
+    buffer — `tryDivertToClaimLocked` — and if it matches, delivers the
+    event straight to the claim's channel and `continue`s the read loop
+    without ever touching `c.buffer` or firing `OnActivity` for it. A
+    non-matching event (a live `msg`, `peerJoined`, an ack of a
+    *different* kind, anything else) is completely unaffected and flows
+    through exactly as before, claim active or not.
+  - The generic-`"error"`-diversion part is a deliberate, acknowledged
+    protocol limitation, not something this method can fully close:
+    chat-relay's refusals (the tenant lock, an edit Graph won't permit)
+    carry no per-request id linking them back to the specific action that
+    caused them, so an error arriving while a claim is pending is
+    *assumed* to be that claim's outcome. With more than one claim active
+    at once (e.g. a concurrent `hub_send` and `hub_react`), an error
+    could in principle be attributed to the wrong one — accepted as a
+    known edge case rather than solved, since the protocol itself doesn't
+    distinguish them either.
+  - `Conn.SendAwaitingAck(text, to)` / `Conn.ReactAwaitingAck(externalID,
+    reaction, action)` / `Conn.EditMessageAwaitingAck(externalID, text)`
+    wrap claim-then-write-then-wait, but only *do* the wait for a bridge
+    connection (`Conn.IsBridge()`, true only when constructed via
+    `DialRelay`) — a plain `mcp-hub-server` connection never emits any
+    ack at all, so waiting on one would just be a fixed latency tax on
+    every single send for zero benefit. `IsBridge` is set once during
+    `finishHandshake` (a new parameter, `false` from `Dial`, `true` from
+    `DialRelay`) and read only after construction, so — like
+    `peerID`/`name`/etc. — it needs no locking of its own. Each method
+    returns `(Event{}, false, nil)` on a plain connection (report success
+    exactly as always) or on a real timeout (`AckWaitTimeout`, a
+    package var default 5s — generous relative to how fast an ack has
+    actually been observed to arrive against a real bridge server, well
+    under a second) — the write may still succeed or fail later, reported
+    the normal way via `wait`/`hub_receive`/`hub_wait`, unchanged from
+    before this existed. It returns `(event, true, nil)` the moment a
+    real outcome arrives, which `handleSend`/`handleReact`/`handleEdit`
+    now render directly with `FormatEvent` as their own tool result —
+    success *or* failure, synchronously, which is what closes the actual
+    gap: a refused send now reads as the real refusal reason immediately,
+    not as a misleading `"sent"`.
+  - Regression tests: `TestSendAwaitingAckOnPlainConnDoesNotWait`,
+    `TestSendAwaitingAckReturnsSendAckOnBridge`,
+    `TestSendAwaitingAckReturnsErrorEventOnRefusal`,
+    `TestSendAwaitingAckTimesOutWithoutStealingLaterEvents`,
+    `TestClaimNextAckDoesNotStealUnrelatedEvents` (`internal/hubconn`);
+    `TestHubReactReportsAckDirectly`, `TestHubEditReportsAckDirectly`,
+    `TestHubSendReportsAckDirectlyOnBridgeSession`,
+    `TestHubSendDoesNotWaitOnAPlainHubConnectSession` (`internal/mcptools`,
+    the last one specifically proving the `IsBridge` gate keeps a normal
+    session's `hub_send` exactly as fast as it always was).
+
+- **A real bug caught while adding `hub_delete`, on this client's side:
+  `wire.Msg` never actually had a `Cursor` field.** chat-relay had been
+  including a `cursor` on every message all along (mentioned as far back
+  as the original history design: "each with `historical: true` and a
+  cursor"), and this client silently dropped it every time —
+  `encoding/json` ignores an unrecognized field by default, so decoding
+  never errored, it just quietly lost the one piece of data
+  `hub_history`'s own paging story depends on. Concretely: `hub_history`'s
+  own description promises "page further back by passing the oldest
+  cursor seen so far," but there was no way to *see* a cursor at all —
+  every historical (and live) message rendered with no cursor in it.
+  Found only because `wire.MessageDeleted`'s spec explicitly called out a
+  `cursor` field and prompted a direct check of whether `Msg` already had
+  one. Fixed: `wire.Msg.Cursor` (additive, `omitempty`), threaded through
+  `decodeEvent` into `Event.Cursor`, and rendered by `FormatEvent` on
+  every `msg` that carries one (`... cursor=<value>]`) — including live
+  messages, not just historical ones, since a client resuming after a
+  drop may want to remember its own last-seen cursor from a live message
+  just as much as from a `hub_history` page. Regression tests:
+  `TestMsgCursorRoundTrip`, `TestMsgOmitsCursorWhenUnset` (`internal/wire`);
+  `TestFormatEventMsgIncludesCursorWhenPresent`,
+  `TestFormatEventMsgOmitsCursorWhenAbsent` (`internal/hubconn`).
+
+- **`hub_delete`/`wire.Delete`/`wire.DeleteAck`/`wire.MessageDeleted`** —
+  added alongside the `Cursor` fix, following the exact same shape as
+  `hub_edit`/`hub_react`: `Conn.DeleteMessage(externalID)` sends
+  `{"type":"delete","externalId":...}`; `Conn.DeleteMessageAwaitingAck`
+  claims its own `"deleteAck"`/`"error"` outcome the same way
+  `SendAwaitingAck`/`ReactAwaitingAck`/`EditMessageAwaitingAck` do, and
+  `handleDelete` reports it directly, falling back to an async
+  confirmation on timeout — no new plumbing needed, the claim mechanism
+  and the `IsBridge` gate were already general. Deliberately a distinct
+  request from `Edit` with empty text, not a special case of it: the
+  underlying platform payload for a deletion and an edit-to-nothing look
+  identical, but a client that conflated them would render an empty
+  message where the platform renders a tombstone. `wire.MessageDeleted`
+  (the read-side "someone deleted a message" notification) carries
+  `ExternalID`, `Cursor` (the deleted message's own position, so a client
+  can place the tombstone in a rendered transcript without having seen
+  the original message first), `TS`, and `Own` — `own` wake-suppression
+  (see above) was extended to cover `"messageDeleted"` alongside `"msg"`/
+  `"reactionChanged"`/`"messageEdited"`, on the same reasoning: your own
+  deletion isn't news to yourself either. Regression tests:
+  `TestDeleteRequestRoundTrip`, `TestDeleteAckRoundTrip`,
+  `TestMessageDeletedRoundTrip` (`internal/wire`);
+  `TestFormatEventMessageDeleted`, `TestFormatEventMessageDeletedOwnIsMarked`,
+  `TestFormatEventDeleteAckOK`, `TestFormatEventDeleteAckNotOK`,
+  `TestDeleteMessageAwaitingAckReturnsDeleteAckOnBridge`,
+  `TestDeleteMessageOnPlainConnDoesNotWait` (`internal/hubconn`);
+  `TestHubDeleteReportsAckDirectly`,
+  `TestHubDeleteSendsDeleteRequestAndFallsBackOnTimeout`,
+  `TestHubDeleteErrorsWhenNotConnected` (`internal/mcptools`).
+
+- **Bridge-only fields on `joined`**: `LatestCursor` (`*string`, nil if the
+  conversation has no messages yet), `HistoryLimitMax` (`int`), `CanSend`
+  (`bool`), `ConversationKind` (`string`, e.g. `"oneOnOne"`/`"group"`/
+  `"meeting"`), `Topic` (`*string`). All zero-valued for every
+  `mcp-hub-server` connection, since the server never sets them, and never
+  referenced by `handleConnect`'s own result text — only
+  `teams_relay_connect` reads them, via matching `Conn` accessors
+  (`LatestCursor()`, `HistoryLimitMax()`, `CanSend()`,
+  `ConversationKind()`, `Topic()`). This was a deliberate second pass, not
+  part of the original design: the first cut only confirmed unknown
+  `joined` fields decode without error (true, and necessary for
+  forward-compatibility — a bridge server can ship these before a client
+  supports them) but stopped there, which missed the actual point.
+  "Decodes without crashing" only matters if the data then reaches the
+  thing meant to act on it — here, the model reading `teams_relay_connect`'s
+  result text, not just a Go struct nobody reads. So `handleTeamsRelayConnect`
+  surfaces all five directly: the conversation kind/topic and message
+  count context up front, `CanSend` explicitly flagged as a connect-time
+  snapshot that can go stale (a chat can gain an outside participant
+  mid-session, which is exactly when a cached "yes" would be wrong — so a
+  later `hub_send` refusal even after `CanSend: true` is not a
+  contradiction), and `LatestCursor` framed as what a model should compare
+  against its own memory of an earlier cursor to decide whether to call
+  `hub_history` — deliberately not something this client tracks or
+  compares automatically, since "what a model remembers from a prior
+  session" isn't state this code has any access to.
 
 ## Background delivery (the `wait` command)
 

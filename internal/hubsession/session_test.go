@@ -451,6 +451,36 @@ func TestLeaveReportsEmptyWhenLastPeerLeaves(t *testing.T) {
 	}
 }
 
+func TestPeersReturnsAllCurrentMembers(t *testing.T) {
+	m := NewManager()
+	s := m.GetOrCreate("session-1")
+	a := joinFake(s, "Alice", "", "", nil)
+	b := joinFake(s, "Bob", "", "", nil)
+
+	peers := s.Peers()
+	if len(peers) != 2 {
+		t.Fatalf("expected 2 peers, got %d: %+v", len(peers), peers)
+	}
+	seen := map[string]bool{}
+	for _, p := range peers {
+		seen[p.ID()] = true
+	}
+	if !seen[a.ID()] || !seen[b.ID()] {
+		t.Fatalf("expected to see both a and b, got %+v", peers)
+	}
+}
+
+func TestPeersReflectsLeave(t *testing.T) {
+	m := NewManager()
+	s := m.GetOrCreate("session-1")
+	a := joinFake(s, "", "", "", nil)
+	s.Leave(a)
+
+	if peers := s.Peers(); len(peers) != 0 {
+		t.Fatalf("expected no peers after the only one left, got %+v", peers)
+	}
+}
+
 func TestManagerGetOrCreateReturnsSameSession(t *testing.T) {
 	m := NewManager()
 	s1 := m.GetOrCreate("session-1")

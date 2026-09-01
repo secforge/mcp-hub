@@ -6,8 +6,35 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/secforge/mcp-hub/internal/httpmcp"
 	"github.com/secforge/mcp-hub/internal/wsserver"
 )
+
+// buildMux wires the existing websocket relay together with the new
+// HTTP-MCP endpoint and its companion watch stream, all sharing one
+// hubsession.Manager (via wsHandler.Manager()) so a websocket peer and an
+// HTTP-MCP peer can join the very same hub session. /mcp and /watch are
+// exact, static routes; everything else (in particular "/{sessionId}")
+// falls through to wsHandler's own internal mux, unmodified.
+func buildMux() *http.ServeMux {
+	wsHandler := wsserver.NewHandler()
+
+	mcpSrv := httpmcp.NewServer(wsHandler.Manager())
+	mcpServer := server.NewMCPServer("mcp-hub-server", "0.1.0",
+		server.WithToolCapabilities(false),
+		server.WithHooks(mcpSrv.Hooks()),
+	)
+	mcpSrv.Register(mcpServer)
+	streamable := server.NewStreamableHTTPServer(mcpServer)
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", streamable)
+	mux.HandleFunc("/watch", mcpSrv.WatchHandler())
+	mux.Handle("/", wsHandler)
+	return mux
+}
 
 func main() {
 	addr := flag.String("addr", ":8765", "listen address")
@@ -21,7 +48,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           wsserver.NewHandler(),
+		Handler:           buildMux(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
