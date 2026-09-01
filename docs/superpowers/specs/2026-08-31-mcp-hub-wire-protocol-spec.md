@@ -220,6 +220,26 @@ by:
 — sent even for an empty result, so a client gets a positive "there is
 no more" rather than inferring completion from a traffic gap.
 
+**Security note for implementers, from a real incident:** a directed
+`msg` (§2.2, `to` set) is easy to get right on the *delivery* path
+(refuse to broadcast it, deliver only to the target) and easy to get
+wrong on the *history* path, because the two look like unrelated code —
+delivery-time routing state versus a stored-message read query — even
+though `private`/`to` must be enforced identically on both. A server
+that stores messages for `history` and later answers a `history` request
+straight from that store, filtered only by session/conversation, will
+hand a directed message to *any* peer that asks — including one that
+joined after it was sent and was never a party to it. This was found and
+fixed live during this protocol's own bring-up on a second
+implementation: store which peer a directed message was actually
+addressed to, filter `history` on "public, or I'm the sender, or I'm the
+recipient," and make sure a *refused* send (target absent, policy
+refusal) is never persisted for `history` to hand out later — a message
+the sender was told never went anywhere must not reappear for everyone
+via history. Also re-mark the historical copy `private: true` (and,
+ideally, still carry enough to identify the recipient) so a receiving
+client can render it consistently with how it would have looked live.
+
 ### 2.7 `ack` (both directions) — read receipts
 
 This is the read-cursor / read-receipt mechanism. It answers "has the
