@@ -114,8 +114,15 @@ func TestWaitDeliversAlreadyBufferedEvent(t *testing.T) {
 	defer w.Close()
 
 	got := dialAndRead(t, w.socketPath)
-	if got != "hello\n\nRun this command again to keep receiving:\n"+w.WaitCommand()+"\n" {
+	if got != "Run this command again to keep receiving:\n"+w.WaitCommand()+"\n\nhello\n" {
 		t.Fatalf("unexpected output: %q", got)
+	}
+	// The re-run reminder must lead, not trail: a reader whose own read
+	// times out partway through only ever sees a prefix of the output, so
+	// anything after that point (a reminder tacked onto the end) can be
+	// silently lost — see the comment on this in deliver().
+	if !strings.HasPrefix(got, "Run this command again to keep receiving:") {
+		t.Fatalf("expected the re-run reminder to lead the output, got: %q", got)
 	}
 }
 
@@ -141,6 +148,57 @@ func TestPokeDeliversToRegisteredWaiter(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for delivery")
+	}
+}
+
+// TestPokeDoesNotDeliverWhileSourceReportsNotWakeWorthy is the waiter-side
+// regression test for own-message suppression (see hubconn.Conn.Peek):
+// even with content already sitting in the source's buffer, Poke must not
+// drain and deliver it while Peek still says hasEvents=false (e.g. an
+// own-send echo held back pending a real reply) — otherwise the whole
+// point of the source's suppression decision would be defeated by the
+// waiter draining it anyway. Once the source flips to wake-worthy, the
+// still-registered waiter gets everything, including what was held back.
+func TestPokeDoesNotDeliverWhileSourceReportsNotWakeWorthy(t *testing.T) {
+	src := &fakeSource{connected: true}
+	w, err := Listen("session-notwakeworthy", "peer-notwakeworthy", src)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer w.Close()
+
+	done := make(chan string, 1)
+	go func() { done <- dialAndRead(t, w.socketPath) }()
+	time.Sleep(100 * time.Millisecond) // let it register as the current waiter
+
+	// Simulate content sitting in the buffer that the source has decided
+	// is not (yet) wake-worthy — Peek must keep reporting hasEvents=false
+	// even though Drain would return something.
+	src.mu.Lock()
+	src.formatted = "own echo, not wake-worthy yet"
+	src.mu.Unlock()
+	w.Poke()
+
+	select {
+	case got := <-done:
+		t.Fatalf("expected no delivery while the source isn't wake-worthy, got: %q", got)
+	case <-time.After(300 * time.Millisecond):
+		// expected: still registered, nothing delivered
+	}
+
+	// Now the source becomes wake-worthy (e.g. a real reply arrived).
+	src.mu.Lock()
+	src.hasEvents = true
+	src.mu.Unlock()
+	w.Poke()
+
+	select {
+	case got := <-done:
+		if !strings.Contains(got, "own echo, not wake-worthy yet") {
+			t.Fatalf("expected the held-back content to be delivered once wake-worthy, got: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for delivery after becoming wake-worthy")
 	}
 }
 
@@ -403,6 +461,31 @@ func TestDisconnectedSourceReportedImmediately(t *testing.T) {
 
 	got := dialAndRead(t, w.socketPath)
 	if got != "hub disconnected\n" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// fakeSourceWithNote is a fakeSource that also implements disconnectNoter,
+// simulating a bridge-style Source (e.g. *hubconn.Conn after a relay
+// server's close code) that can explain why it died beyond an ordinary
+// drop.
+type fakeSourceWithNote struct {
+	fakeSource
+	note string
+}
+
+func (f *fakeSourceWithNote) DisconnectNote() string { return f.note }
+
+func TestDisconnectedSourceNoteIsAppendedWhenSourceProvidesOne(t *testing.T) {
+	src := &fakeSourceWithNote{fakeSource: fakeSource{connected: false}, note: " (revoked — do not reconnect)"}
+	w, err := Listen("session-note", "peer-note", src)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer w.Close()
+
+	got := dialAndRead(t, w.socketPath)
+	if got != "hub disconnected (revoked — do not reconnect)\n" {
 		t.Fatalf("got %q", got)
 	}
 }

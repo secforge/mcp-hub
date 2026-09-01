@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/waiter"
 )
 
@@ -14,7 +15,11 @@ import (
 // both, this package's tests would leak files into (or, worse, sweep real
 // stale-but-legitimate socket files out of) the real OS temp dir, since
 // this package is the only one outside internal/waiter itself that
-// exercises Listen for real.
+// exercises Listen for real. It also shortens hubconn's closeFlushGrace —
+// see hubconn.SetCloseFlushGraceForTesting's doc comment — since this
+// package's tests call handleDisconnect (and so Close) heavily over
+// loopback, where the real network flush race that delay exists for
+// doesn't occur.
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "mcp-hub-mcptools-logs")
 	if err != nil {
@@ -22,7 +27,9 @@ func TestMain(m *testing.M) {
 	}
 	os.Setenv("MCP_HUB_LOG_DIR", dir)
 	restoreSocketDir := waiter.SocketDirForTesting(dir)
+	restoreCloseFlushGrace := hubconn.SetCloseFlushGraceForTesting(0)
 	code := m.Run()
+	restoreCloseFlushGrace()
 	restoreSocketDir()
 	os.RemoveAll(dir)
 	os.Exit(code)

@@ -200,9 +200,25 @@ func (w *Waiter) handleAccept(conn net.Conn) {
 }
 
 // Poke delivers to the currently registered waiter, if any, using whatever
-// the source currently has buffered.
+// the source currently has buffered — but only if the source actually
+// considers itself wake-worthy right now (see hubconn.Conn.Peek: a source
+// may buffer something without yet wanting to wake anyone on it, e.g. an
+// own-send echo held back pending a real reply). Checking Peek() here,
+// under the same lock that reads/clears w.current, is required for the
+// same reason deliver's re-registration tail does it: onActivity fires on
+// every single event from the connection's read loop, suppressed or not,
+// so Poke is called far more often than it should actually act — without
+// this check it would fire on an event the source doesn't consider
+// wake-worthy yet, prematurely draining and losing the "wait for
+// something that matters" property entirely. When it declines to act,
+// the registration is left in place untouched, to be woken by a later
+// Poke call once the source's own state changes.
 func (w *Waiter) Poke() {
 	w.mu.Lock()
+	if hasEvents, connected := w.source.Peek(); !hasEvents && connected {
+		w.mu.Unlock()
+		return
+	}
 	rw := w.current
 	w.current = nil
 	w.mu.Unlock()
@@ -215,11 +231,17 @@ func (w *Waiter) Poke() {
 func (w *Waiter) deliver(rw *registeredWaiter) {
 	formatted, connected := w.source.Drain()
 	if !connected {
-		writeAndClose(rw.conn, "hub disconnected\n")
+		writeAndClose(rw.conn, w.disconnectedMessage())
 		return
 	}
 	if !rw.follow {
-		writeAndClose(rw.conn, formatted+"\n\nRun this command again to keep receiving:\n"+w.WaitCommand()+"\n")
+		// The reminder to re-run leads, rather than trails, the delivered
+		// content — this is a single one-shot response with nothing to
+		// fall back on, so if whatever's reading it gets cut off partway
+		// through (e.g. a caller with its own read timeout), a trailing
+		// reminder is exactly the part most likely to be lost. Leading
+		// with it means the instruction survives even a truncated read.
+		writeAndClose(rw.conn, "Run this command again to keep receiving:\n"+w.WaitCommand()+"\n\n"+formatted+"\n")
 		return
 	}
 
@@ -263,13 +285,32 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 func (w *Waiter) Close() error {
 	w.mu.Lock()
 	if w.current != nil {
-		writeAndClose(w.current.conn, "hub disconnected\n")
+		writeAndClose(w.current.conn, w.disconnectedMessage())
 		w.current = nil
 	}
 	w.mu.Unlock()
 	err := w.ln.Close()
 	_ = os.Remove(w.socketPath)
 	return err
+}
+
+// disconnectNoter is implemented by a Source that can explain why the
+// connection died beyond an ordinary drop (currently *hubconn.Conn, for a
+// bridge server's close code signaling a dead credential — see
+// hubconn.Conn.DisconnectNote). Checked via an interface, not a direct
+// hubconn dependency, since Source is meant to stay generic.
+type disconnectNoter interface {
+	DisconnectNote() string
+}
+
+// disconnectedMessage is the "hub disconnected" text sent to a waiter,
+// with whatever extra note the source can offer appended.
+func (w *Waiter) disconnectedMessage() string {
+	note := ""
+	if n, ok := w.source.(disconnectNoter); ok {
+		note = n.DisconnectNote()
+	}
+	return "hub disconnected" + note + "\n"
 }
 
 // supersededMessage tells the losing wait's process not to restart itself —

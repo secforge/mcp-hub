@@ -414,6 +414,124 @@ func TestUnrelatedBadCursorErrorDoesNotDisableAcks(t *testing.T) {
 	}
 }
 
+func TestCloseSendsNormalClosureCloseFrame(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	type closeInfo struct {
+		code int
+		text string
+	}
+	gotClose := make(chan closeInfo, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				if ce, ok := err.(*websocket.CloseError); ok {
+					gotClose <- closeInfo{code: ce.Code, text: ce.Text}
+				} else {
+					gotClose <- closeInfo{code: -1}
+				}
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	c.Close()
+
+	select {
+	case got := <-gotClose:
+		if got.code != websocket.CloseNormalClosure {
+			t.Fatalf("expected the server to see a normal-closure close frame (code %d), got %d",
+				websocket.CloseNormalClosure, got.code)
+		}
+		if got.text == "" {
+			t.Fatal("expected a non-empty close reason so the server's log line is self-explanatory")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never observed the connection closing")
+	}
+}
+
+func TestCloseWaitsForFlushGraceAfterSuccessfulWrite(t *testing.T) {
+	origGrace := closeFlushGrace
+	closeFlushGrace = 100 * time.Millisecond
+	defer func() { closeFlushGrace = origGrace }()
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	start := time.Now()
+	c.Close()
+	elapsed := time.Since(start)
+	if elapsed < closeFlushGrace {
+		t.Fatalf("expected Close to wait at least %s for the frame to flush before closing, took %s",
+			closeFlushGrace, elapsed)
+	}
+}
+
+func TestCloseReturnsWriteControlErrorWhenFrameCannotBeSent(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	// Kill the underlying connection out from under Close, so its own
+	// WriteControl call fails — proving that error is surfaced (not
+	// silently discarded) rather than masked by the subsequent Close call
+	// on the already-dead socket.
+	c.ws.Close()
+
+	if err := c.Close(); err == nil {
+		t.Fatal("expected Close to surface the write error from an already-dead connection, got nil")
+	}
+}
+
 func TestDialRejectsInvalidSessionID(t *testing.T) {
 	url := startTestServer(t)
 	if _, err := Dial(url, "not-a-uuid", DialOptions{}); err == nil {

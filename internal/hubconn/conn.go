@@ -959,8 +959,53 @@ func (c *Conn) DeleteMessageAwaitingAck(externalID string) (Event, bool, error) 
 	}
 }
 
+// closeFlushGrace is how long Close waits, after successfully writing the
+// close frame, before tearing down the underlying connection. A successful
+// WriteControl only means the frame was handed to the OS, not that it
+// reached the peer — closing immediately after races the write, and can
+// tear the connection down before the frame is actually transmitted,
+// producing exactly the abnormal closure (1006) this was meant to prevent.
+// Found live: a session where the frame apparently never reached the
+// server despite Close() otherwise behaving normally, traced (by
+// elimination — the connection was confirmed alive and the server's own
+// process confirmed not to have restarted) to this race, not to a missing
+// or bridge-specific code path. Var so tests can shorten it.
+var closeFlushGrace = 200 * time.Millisecond
+
+// SetCloseFlushGraceForTesting overrides closeFlushGrace (see its own doc
+// comment) for tests in another package that call Close() on loopback,
+// where the real network flush race this exists for doesn't occur — the
+// default would otherwise tax every such test. Mirrors
+// waiter.SocketDirForTesting's shape.
+func SetCloseFlushGraceForTesting(d time.Duration) (restore func()) {
+	orig := closeFlushGrace
+	closeFlushGrace = d
+	return func() { closeFlushGrace = orig }
+}
+
+// Close sends a normal-closure WebSocket close frame before closing the
+// underlying connection, so a deliberate disconnect (e.g. hub_disconnect)
+// is distinguishable server-side from a crash or network failure — without
+// this, every Close looked identical to an abnormal closure (1006) in a
+// server's own end-reason logging, and to a peer's own next-connect
+// context, making a clean disconnect indistinguishable from one that
+// wasn't. If the write itself fails (e.g. the connection is already dead),
+// there's nothing to flush, so Close proceeds straight to closing the
+// underlying connection and returns the write's error — not silently
+// discarded, since "did the frame actually go out" is exactly the
+// question a caller debugging an unattributed drop needs answered.
 func (c *Conn) Close() error {
-	return c.ws.Close()
+	writeErr := c.ws.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "client disconnect"),
+		time.Now().Add(writeWait))
+	if writeErr == nil {
+		time.Sleep(closeFlushGrace)
+	}
+	closeErr := c.ws.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
 }
 
 // Connected reports whether the connection is still open, without touching
