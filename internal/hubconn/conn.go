@@ -34,6 +34,11 @@ import (
 var (
 	pongWait  = 100 * time.Second
 	writeWait = 10 * time.Second
+	// ackIdleInterval is how long to wait, with nothing else about to be
+	// sent anyway, before firing a standalone read receipt for a consumed
+	// position that hasn't been reported yet — see Conn.ackLoop. Var so
+	// tests can shorten it.
+	ackIdleInterval = 60 * time.Second
 )
 
 type Event struct {
@@ -108,6 +113,11 @@ type Conn struct {
 	// goroutine-creation happens-before edge instead.
 	pongWait time.Duration
 
+	// ackIdleInterval is snapshotted the same way and for the same reason
+	// as pongWait above — read only by ackLoop, captured before it's
+	// spawned.
+	ackIdleInterval time.Duration
+
 	// isBridge is true only for a connection made via DialRelay — set once
 	// during construction, read only after Dial/DialRelay has returned, so
 	// (like peerID/name/etc. above) it needs no locking: the happens-before
@@ -134,9 +144,25 @@ type Conn struct {
 	// buffer that carried one (a "msg" or "messageDeleted") — see
 	// LastSeenCursor. Distinct from latestCursor (the server's own newest
 	// cursor as of connect time, in wire.Joined): this is what the model
-	// actually saw through this connection, the input hub_history(before:
-	// ...) needs to catch up on anything that arrived after.
-	lastSeenCursor  string
+	// actually saw through this connection, the input hub_history(after:
+	// ...) needs to catch up on anything that arrived while disconnected.
+	lastSeenCursor string
+	// lastConsumed/lastAckSent/ackDisabled implement the read-receipt
+	// contract — see LastConsumedCursor, Drain, and ackLoop.
+	//   - lastConsumed: cursor of the most recent event actually returned
+	//     by Drain (i.e. delivered to the model, not merely buffered).
+	//   - lastAckSent: cursor value of the last read receipt actually sent
+	//     (piggybacked or standalone) — the idle timer only fires a
+	//     standalone ack when lastConsumed has moved past this.
+	//   - ackDisabled: set true if the server ever rejects a receipt as
+	//     bad_ack/bad_ack_cursor (the ack-subsystem-specific codes — not
+	//     the generic bad_cursor/bad_request other request kinds may also
+	//     use) — per the server side's own guidance, that's a client-side
+	//     bug, not transient, so retrying (with any cursor) would fail
+	//     identically; stop trying rather than loop.
+	lastConsumed    string
+	lastAckSent     string
+	ackDisabled     bool
 	onActivity      func()
 	peers           map[string]PeerInfo
 	rosterAnnounced bool
@@ -235,7 +261,7 @@ type DialOptions struct {
 func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 	// Snapshot once, synchronously, before any goroutine is spawned — see
 	// the pongWait field's doc comment on Conn for why.
-	snapPongWait, snapWriteWait := pongWait, writeWait
+	snapPongWait, snapWriteWait, snapAckIdleInterval := pongWait, writeWait, ackIdleInterval
 
 	base, err := normalizeHost(host)
 	if err != nil {
@@ -258,7 +284,7 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return finishHandshake(ws, snapPongWait, snapWriteWait, false)
+	return finishHandshake(ws, snapPongWait, snapWriteWait, snapAckIdleInterval, false)
 }
 
 // finishHandshake reads the server's initial "joined" message off an
@@ -267,7 +293,7 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 // reach an open *websocket.Conn (a normalized host+sessionId URL with no
 // custom headers, vs. an arbitrary caller-supplied URL with an
 // Authorization/etc. header) and in isBridge, which DialRelay passes true.
-func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait time.Duration, isBridge bool) (*Conn, error) {
+func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdleInterval time.Duration, isBridge bool) (*Conn, error) {
 	_, raw, err := ws.ReadMessage()
 	if err != nil {
 		ws.Close()
@@ -303,6 +329,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait time.Durati
 		isBridge:         isBridge,
 		lastFrameKind:    "joined",
 		lastFrameAt:      time.Now(),
+		ackIdleInterval:  snapAckIdleInterval,
 	}
 	ws.SetPingHandler(func(appData string) error {
 		ws.SetReadDeadline(time.Now().Add(snapPongWait))
@@ -312,6 +339,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait time.Durati
 		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(snapWriteWait))
 	})
 	go c.readLoop()
+	go c.ackLoop()
 	return c, nil
 }
 
@@ -494,6 +522,77 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 	return false
 }
 
+// handleAckPlumbingLocked intercepts the read-receipt protocol's own
+// traffic — the server's reply to an ack we sent (success or a stale-cursor
+// rejection) and the two error codes that mean an ack itself was malformed
+// — before it ever reaches the model-visible buffer or the claim-diversion
+// mechanism. None of this is something the model asked for or should see:
+// it's internal bookkeeping about how far this connection has told the
+// server it has read. Reports whether ev was consumed here (true) or
+// should fall through to normal handling (false). Must be called with c.mu
+// held.
+func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
+	if ev.Kind == "ack" {
+		if !ev.ActionOK {
+			// Our receipt was behind what the server holds — per the
+			// server side's own guidance, adopt its reported position as
+			// our own lastAckSent rather than retry: monotonicity means
+			// nothing is lost, since it only rejects a position older
+			// than one it already has.
+			c.lastAckSent = ev.Cursor
+		}
+		return true
+	}
+	if ev.Kind == "error" && (ev.Code == "bad_ack" || ev.Code == "bad_ack_cursor") {
+		// bad_ack/bad_ack_cursor are specific to the ack subsystem — unlike
+		// the generic bad_cursor/bad_request a bridge server may also use
+		// for unrelated requests (a malformed reaction, a history request
+		// naming both before and after), which must never trip this: error
+		// events carry no correlation id, so a generic code can't be
+		// attributed to "this was about an ack" at all. A malformed or
+		// missing ack cursor is a bug in this client's own bookkeeping, not
+		// a transient condition (retryable is false, and resending would
+		// fail identically) — stop sending receipts entirely rather than
+		// repeat the same mistake on every future event. Not surfaced to
+		// the model: it never asked for this ack,
+		// so an error about it would be pure noise.
+		c.ackDisabled = true
+		return true
+	}
+	return false
+}
+
+// ackLoop periodically sends a standalone read receipt (wire.Ack) if
+// lastConsumed has moved past lastAckSent since the last one actually sent
+// — piggybacked or standalone — since the last tick. Sends nothing when
+// nothing new has been read: an idle receipt repeating a position the
+// server already holds would turn a read receipt into a heartbeat. Runs
+// for the connection's lifetime; a write to a closed connection simply
+// errors and ends the loop on its own, the same shape pingLoop uses
+// server-side (see wsserver.peer.pingLoop).
+func (c *Conn) ackLoop() {
+	ticker := time.NewTicker(c.ackIdleInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.mu.Lock()
+		if c.ackDisabled || c.closed {
+			c.mu.Unlock()
+			return
+		}
+		consumed, sent := c.lastConsumed, c.lastAckSent
+		c.mu.Unlock()
+		if consumed == "" || consumed == sent {
+			continue
+		}
+		if err := c.ws.WriteJSON(wire.NewAck(consumed)); err != nil {
+			return
+		}
+		c.mu.Lock()
+		c.lastAckSent = consumed
+		c.mu.Unlock()
+	}
+}
+
 func (c *Conn) readLoop() {
 	for {
 		_, raw, err := c.ws.ReadMessage()
@@ -522,6 +621,10 @@ func (c *Conn) readLoop() {
 		}
 		c.mu.Lock()
 		c.lastFrameKind, c.lastFrameAt = ev.Kind, time.Now()
+		if c.handleAckPlumbingLocked(ev) {
+			c.mu.Unlock()
+			continue
+		}
 		if c.tryDivertToClaimLocked(ev) {
 			c.mu.Unlock()
 			continue
@@ -637,13 +740,43 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "messageDeleted", ExternalID: d.ExternalID, Cursor: d.Cursor, TS: d.TS, Own: d.Own}, true
+	case wire.TypeAck:
+		var a wire.Ack
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return Event{}, false
+		}
+		// Cursor here is the server's reply, not an echo — see wire.Ack's
+		// doc comment: on OK false it's the position the server actually
+		// holds, to be adopted rather than treated as confirmation of what
+		// was sent.
+		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK}, true
 	default:
 		return Event{}, false
 	}
 }
 
+// ackCursorForOutbound returns the read-receipt cursor to piggyback on the
+// next outbound message, and records that it's about to be sent (updating
+// lastAckSent) — see the Conn field doc comments for the full contract.
+// Every outbound method sends this unconditionally (rule: "piggyback it on
+// every outbound message"), even when unchanged from the last one sent;
+// only the idle timer (ackLoop) additionally checks whether it moved.
+// Empty once ackDisabled (a prior bad_ack/bad_ack_cursor) or before
+// anything has been consumed yet.
+func (c *Conn) ackCursorForOutbound() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ackDisabled || c.lastConsumed == "" {
+		return ""
+	}
+	c.lastAckSent = c.lastConsumed
+	return c.lastConsumed
+}
+
 func (c *Conn) Send(text string) error {
-	return c.ws.WriteJSON(wire.NewOutgoingMsg(text))
+	m := wire.NewOutgoingMsg(text)
+	m.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(m)
 }
 
 // SendTo sends text privately to a single peer, identified by peerId. The
@@ -651,7 +784,9 @@ func (c *Conn) Send(text string) error {
 // or departed peer) does not surface as a returned error here, but as a
 // buffered "error" event picked up by a later Peek/Drain.
 func (c *Conn) SendTo(text, peerID string) error {
-	return c.ws.WriteJSON(wire.NewOutgoingDirectedMsg(text, peerID))
+	m := wire.NewOutgoingDirectedMsg(text, peerID)
+	m.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(m)
 }
 
 // RequestHistory asks the server for messages preceding before (a
@@ -662,7 +797,9 @@ func (c *Conn) SendTo(text, peerID string) error {
 // events (Event.Historical true) terminated by a "historyComplete" event,
 // picked up by a later Peek/Drain like anything else.
 func (c *Conn) RequestHistory(before string, limit int) error {
-	return c.ws.WriteJSON(wire.NewHistoryRequest(before, limit))
+	h := wire.NewHistoryRequest(before, limit)
+	h.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(h)
 }
 
 // RequestHistoryAfter asks the server for messages strictly after after (a
@@ -671,7 +808,9 @@ func (c *Conn) RequestHistory(before string, limit int) error {
 // way RequestHistory's does (buffered "msg" events with Historical true,
 // terminated by "historyComplete").
 func (c *Conn) RequestHistoryAfter(after string, limit int) error {
-	return c.ws.WriteJSON(wire.NewHistoryAfterRequest(after, limit))
+	h := wire.NewHistoryAfterRequest(after, limit)
+	h.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(h)
 }
 
 // React asks the server to add or remove a reaction on an earlier
@@ -683,7 +822,9 @@ func (c *Conn) RequestHistoryAfter(after string, limit int) error {
 // picked up by a later Peek/Drain like anything else — this call only
 // confirms the request was sent.
 func (c *Conn) React(externalID, reaction, action string) error {
-	return c.ws.WriteJSON(wire.NewReactionRequest(externalID, reaction, action))
+	r := wire.NewReactionRequest(externalID, reaction, action)
+	r.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(r)
 }
 
 // EditMessage asks the server to change an earlier message's content,
@@ -691,7 +832,9 @@ func (c *Conn) React(externalID, reaction, action string) error {
 // mcp-hub-server. Success/failure arrives asynchronously as an "editAck"
 // (or an "error" event on refusal), like React.
 func (c *Conn) EditMessage(externalID, text string) error {
-	return c.ws.WriteJSON(wire.NewEditRequest(externalID, text))
+	e := wire.NewEditRequest(externalID, text)
+	e.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(e)
 }
 
 // DeleteMessage asks the server to remove an earlier message, identified
@@ -699,7 +842,9 @@ func (c *Conn) EditMessage(externalID, text string) error {
 // Success/failure arrives asynchronously as a "deleteAck" (or an "error"
 // event on refusal), like React/EditMessage.
 func (c *Conn) DeleteMessage(externalID string) error {
-	return c.ws.WriteJSON(wire.NewDeleteRequest(externalID))
+	d := wire.NewDeleteRequest(externalID)
+	d.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(d)
 }
 
 // AckWaitTimeout is how long SendAwaitingAck/ReactAwaitingAck/
@@ -886,12 +1031,48 @@ func (c *Conn) hasWakeWorthyEventsLocked() bool {
 }
 
 // Drain clears and returns the buffered events formatted for delivery, and
-// whether the connection is still open.
+// whether the connection is still open. This is the read-receipt system's
+// "consumed" boundary (see lastConsumed's doc comment): once events leave
+// here, they're considered delivered to the model, not merely received.
 func (c *Conn) Drain() (formatted string, connected bool) {
 	c.mu.Lock()
 	events := c.buffer
 	c.buffer = nil
 	connected = !c.closed
+	for _, e := range events {
+		if e.Cursor != "" {
+			c.lastConsumed = e.Cursor
+		}
+	}
 	c.mu.Unlock()
 	return FormatEvents(events), connected
+}
+
+// LastConsumedCursor is the cursor of the most recent event actually
+// delivered via Drain — exposed for tests and for a caller that wants to
+// inspect read-receipt state directly, though the ack piggybacking/idle
+// timer already act on it automatically.
+func (c *Conn) LastConsumedCursor() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastConsumed
+}
+
+// LastAckSentCursor is the cursor value of the last read receipt actually
+// sent (piggybacked or standalone) — exposed for tests and diagnostics,
+// same reasoning as LastConsumedCursor.
+func (c *Conn) LastAckSentCursor() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastAckSent
+}
+
+// AckDisabled reports whether the server has ever rejected a read receipt
+// as malformed (bad_ack/bad_ack_cursor) — once true, this connection stops
+// sending them for the rest of its lifetime. Exposed for tests and
+// diagnostics.
+func (c *Conn) AckDisabled() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ackDisabled
 }

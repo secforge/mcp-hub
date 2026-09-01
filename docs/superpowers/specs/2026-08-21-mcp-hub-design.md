@@ -785,6 +785,46 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   (e.g. chat-relay) implements `After`/`HistoryAfter` on its own side —
   `mcp-hub-server`'s own relay has no history concept at all.
 
+- **Read receipts (`ackCursor`/`wire.Ack`) — the model's actual read
+  position, not just what the client received.** Designed and built
+  server-side first by chat-relay, coordinated live over the hub session;
+  motivated by a real gap ("has the agent actually seen my message?" —
+  `lastUsedAt` only proves a socket was active). `wire.Msg`/`Reaction`/
+  `Edit`/`Delete`/`History` all gained an `AckCursor string` field,
+  piggybacked on every outbound message once `Conn` has consumed
+  something (via `Drain` — deliberately *not* readLoop's buffering, since
+  a buffered-but-undrained event doesn't mean the model saw it). A new
+  `wire.Ack` (`{"type":"ack","ackCursor":...}`) is the standalone form,
+  fired by a new `Conn.ackLoop` background goroutine after `ackIdleInterval`
+  (60s) of otherwise-idle connection, but only if the consumed position
+  moved since the last receipt actually sent — an idle ack repeating an
+  already-known position would turn a read receipt into a heartbeat.
+  `Conn.lastConsumed`/`lastAckSent`/`ackDisabled` track this; none of it
+  is exposed as a tool — it's fully automatic.
+
+  The server's reply protocol has two distinct shapes for two distinct
+  failures: `wire.Ack{OK: false}` for a stale-but-valid receipt (the
+  server reports the position it actually holds; the client adopts it
+  rather than retrying, since monotonicity means nothing was lost), and a
+  plain `wire.Error{Code: "bad_ack"/"bad_ack_cursor"}` for a malformed
+  receipt (a client bug, not transient — resending would fail
+  identically, so the client permanently disables further receipts on
+  that connection rather than repeat the mistake). These two codes are
+  deliberately ack-subsystem-specific, not the generic `bad_cursor`/
+  `bad_request` a bridge server may also use for unrelated requests (a
+  malformed reaction, a history request naming both `before` and
+  `after`) — error events carry no correlation id, so reacting to the
+  generic codes would have let one unrelated malformed request silently
+  and permanently disable read receipts for the rest of the session
+  (caught and fixed during the same live coordination, before shipping).
+  Neither shape is ever surfaced to the model: `Conn.handleAckPlumbingLocked`
+  intercepts both before they'd otherwise reach the buffer or (for the
+  error path) risk
+  being stolen by an unrelated pending `claimNextAck`. mcp-hub-server
+  ignores `ackCursor` entirely (unrecognized field, silently dropped by
+  `encoding/json`) — this only does anything once a bridge server (e.g.
+  chat-relay) implements it server-side.
+
 - **`sendAck` — confirms a send reached its destination, immediately.**
   Found necessary by a real incident during the joint design/testing
   session with chat-relay, not designed up front: chat-relay's server

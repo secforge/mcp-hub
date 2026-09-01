@@ -90,6 +90,330 @@ func TestLastSeenCursorTracksMostRecentDeliveredMsg(t *testing.T) {
 	}
 }
 
+func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotMsg := make(chan wire.Msg, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
+		var m wire.Msg
+		for {
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			if m.Type == wire.TypeMsg {
+				gotMsg <- m
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for c.LastSeenCursor() != "cursor-1" {
+		if time.Now().After(deadline) {
+			t.Fatal("never saw cursor-1 buffered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, connected := c.Drain(); !connected {
+		t.Fatal("expected still connected")
+	}
+	if c.LastConsumedCursor() != "cursor-1" {
+		t.Fatalf("expected LastConsumedCursor cursor-1, got %q", c.LastConsumedCursor())
+	}
+
+	if err := c.Send("hello"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case m := <-gotMsg:
+		if m.AckCursor != "cursor-1" {
+			t.Fatalf("expected piggybacked ackCursor %q, got %q", "cursor-1", m.AckCursor)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the send")
+	}
+}
+
+func TestAckCursorOmittedBeforeAnythingConsumed(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotMsg := make(chan wire.Msg, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var m wire.Msg
+		for {
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			if m.Type == wire.TypeMsg {
+				gotMsg <- m
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.Send("hello"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case m := <-gotMsg:
+		if m.AckCursor != "" {
+			t.Fatalf("expected no ackCursor before anything was consumed, got %q", m.AckCursor)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the send")
+	}
+}
+
+func TestAckLoopSendsStandaloneAckWhenIdleAndConsumedMoved(t *testing.T) {
+	origAckIdleInterval := ackIdleInterval
+	ackIdleInterval = 50 * time.Millisecond
+	defer func() { ackIdleInterval = origAckIdleInterval }()
+
+	upgrader := websocket.Upgrader{}
+	gotAck := make(chan wire.Ack, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
+		for {
+			var raw json.RawMessage
+			if err := conn.ReadJSON(&raw); err != nil {
+				return
+			}
+			typ, err := wire.DecodeType(raw)
+			if err != nil || typ != wire.TypeAck {
+				continue
+			}
+			var a wire.Ack
+			json.Unmarshal(raw, &a)
+			gotAck <- a
+			return
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for c.LastSeenCursor() != "cursor-1" {
+		if time.Now().After(deadline) {
+			t.Fatal("never saw cursor-1 buffered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.Drain()
+
+	select {
+	case a := <-gotAck:
+		if a.AckCursor != "cursor-1" {
+			t.Fatalf("expected standalone ack for cursor-1, got %+v", a)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("never received a standalone ack after the idle interval")
+	}
+}
+
+func TestAckReplyRejectionAdoptsServerReportedCursor(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
+		var m wire.Msg
+		for {
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			if m.Type == wire.TypeMsg {
+				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-server-actual", OK: false})
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for c.LastSeenCursor() != "cursor-1" {
+		if time.Now().After(deadline) {
+			t.Fatal("never saw cursor-1 buffered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.Drain()
+	if err := c.Send("hello"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for c.LastAckSentCursor() != "cursor-server-actual" {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected LastAckSentCursor to adopt the server's reported cursor, got %q", c.LastAckSentCursor())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestBadAckCursorErrorDisablesFurtherAcks(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
+		var m wire.Msg
+		for {
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			if m.Type == wire.TypeMsg {
+				conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "bad ack cursor", Code: "bad_ack_cursor", Retryable: false})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for c.LastSeenCursor() != "cursor-1" {
+		if time.Now().After(deadline) {
+			t.Fatal("never saw cursor-1 buffered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.Drain()
+	if err := c.Send("first"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for !c.AckDisabled() {
+		if time.Now().After(deadline) {
+			t.Fatal("expected AckDisabled to become true after a bad_ack_cursor error")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := c.ackCursorForOutbound(); got != "" {
+		t.Fatalf("expected no further ack cursors once disabled, got %q", got)
+	}
+
+	// The bad_ack_cursor error must never reach the model-visible buffer —
+	// it's ack-plumbing internal, not something the model asked for.
+	formatted, _ := c.Drain()
+	if strings.Contains(formatted, "bad_ack_cursor") || strings.Contains(formatted, "bad ack cursor") {
+		t.Fatalf("expected the bad_ack_cursor error to be filtered from the model-visible buffer, got: %s", formatted)
+	}
+}
+
+// TestUnrelatedBadCursorErrorDoesNotDisableAcks proves the fix for a real
+// bug: bad_cursor/bad_request are emitted by many unrelated request kinds
+// on a bridge server (e.g. a malformed reaction, a history request naming
+// both before and after) — only bad_ack/bad_ack_cursor are specific to the
+// ack subsystem. Reacting to the generic codes would have let one
+// malformed reaction silently and permanently kill read receipts for the
+// rest of the session.
+func TestUnrelatedBadCursorErrorDoesNotDisableAcks(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		// Simulates an unrelated request (e.g. a malformed reaction, or a
+		// history request naming both before and after) being refused with
+		// the same generic codes an ack failure could also use.
+		conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "bad cursor", Code: "bad_cursor", Retryable: false})
+		conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "bad request", Code: "bad_request", Retryable: false})
+		select {}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if formatted, _ := c.Peek(); formatted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never saw the errors buffered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	formatted, _ := c.Drain()
+	if !strings.Contains(formatted, "bad_cursor") || !strings.Contains(formatted, "bad_request") {
+		t.Fatalf("expected unrelated bad_cursor/bad_request errors to reach the model buffer normally, got: %s", formatted)
+	}
+	if c.AckDisabled() {
+		t.Fatal("expected AckDisabled to remain false for errors unrelated to the ack subsystem")
+	}
+}
+
 func TestDialRejectsInvalidSessionID(t *testing.T) {
 	url := startTestServer(t)
 	if _, err := Dial(url, "not-a-uuid", DialOptions{}); err == nil {

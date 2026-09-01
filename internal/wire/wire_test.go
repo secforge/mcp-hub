@@ -232,6 +232,84 @@ func TestHistoryCompleteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAckRoundTrip(t *testing.T) {
+	a := NewAck("cursor-123")
+	raw, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if got := string(raw); got != `{"type":"ack","ackCursor":"cursor-123"}` {
+		t.Fatalf("unexpected marshal: %s", got)
+	}
+	var decoded Ack
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.AckCursor != "cursor-123" || decoded.OK {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestAckDecodesServerReplyWithOK(t *testing.T) {
+	raw := []byte(`{"type":"ack","ackCursor":"cursor-9","ok":true}`)
+	var a Ack
+	if err := json.Unmarshal(raw, &a); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if a.AckCursor != "cursor-9" || !a.OK {
+		t.Fatalf("unexpected decode: %+v", a)
+	}
+}
+
+func TestMsgAckCursorRoundTrip(t *testing.T) {
+	m := NewOutgoingMsg("hi")
+	m.AckCursor = "cursor-1"
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Msg
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.AckCursor != "cursor-1" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMsgOmitsAckCursorWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewOutgoingMsg("hi"))
+	if strings.Contains(string(raw), "ackCursor") {
+		t.Fatalf("expected ackCursor to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestReactionEditDeleteHistoryCarryAckCursor(t *testing.T) {
+	r := NewReactionRequest("ext-1", "thumbsup", "add")
+	r.AckCursor = "cursor-r"
+	if raw, _ := json.Marshal(r); !strings.Contains(string(raw), `"ackCursor":"cursor-r"`) {
+		t.Fatalf("expected Reaction to carry ackCursor, got: %s", raw)
+	}
+
+	e := NewEditRequest("ext-1", "new text")
+	e.AckCursor = "cursor-e"
+	if raw, _ := json.Marshal(e); !strings.Contains(string(raw), `"ackCursor":"cursor-e"`) {
+		t.Fatalf("expected Edit to carry ackCursor, got: %s", raw)
+	}
+
+	d := NewDeleteRequest("ext-1")
+	d.AckCursor = "cursor-d"
+	if raw, _ := json.Marshal(d); !strings.Contains(string(raw), `"ackCursor":"cursor-d"`) {
+		t.Fatalf("expected Delete to carry ackCursor, got: %s", raw)
+	}
+
+	h := NewHistoryRequest("", 10)
+	h.AckCursor = "cursor-h"
+	if raw, _ := json.Marshal(h); !strings.Contains(string(raw), `"ackCursor":"cursor-h"`) {
+		t.Fatalf("expected History to carry ackCursor, got: %s", raw)
+	}
+}
+
 func TestMsgHistoricalFlagRoundTrip(t *testing.T) {
 	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z")
 	m.Historical = true

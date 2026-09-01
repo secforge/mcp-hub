@@ -40,6 +40,7 @@ const (
 	TypeDelete          Type = "delete"
 	TypeDeleteAck       Type = "deleteAck"
 	TypeMessageDeleted  Type = "messageDeleted"
+	TypeAck             Type = "ack"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -180,6 +181,12 @@ type Msg struct {
 	// page further back past it. mcp-hub-server never sets this, since it
 	// has no history concept at all.
 	Cursor string `json:"cursor,omitempty"`
+	// AckCursor, set by the client, piggybacks a read receipt on this
+	// message: "this is the cursor of the last event I've actually
+	// consumed" — not merely received. See Ack for the standalone form and
+	// the full read-receipt contract. Ignored by mcp-hub-server, which has
+	// no history/read-receipt concept at all.
+	AckCursor string `json:"ackCursor,omitempty"`
 }
 
 // NewOutgoingMsg is what a client sends to the server to broadcast to the
@@ -265,6 +272,8 @@ type History struct {
 	Before string `json:"before,omitempty"`
 	After  string `json:"after,omitempty"`
 	Limit  int    `json:"limit"`
+	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
+	AckCursor string `json:"ackCursor,omitempty"`
 }
 
 func NewHistoryRequest(before string, limit int) History {
@@ -289,6 +298,29 @@ type HistoryComplete struct {
 
 func NewHistoryComplete() HistoryComplete {
 	return HistoryComplete{Type: TypeHistoryComplete}
+}
+
+// Ack is a standalone read receipt — the same information Msg/Reaction/
+// Edit/Delete/History.AckCursor piggyback, sent on its own when nothing
+// else is about to go out anyway (see hubconn's idle-ack timer). Also
+// doubles as the server's reply shape to either form: OK true confirms the
+// cursor was accepted; OK false means it was behind what the server
+// already holds, and AckCursor in that reply is the server's actual
+// position, not an echo of what was sent — the client should adopt it
+// rather than retry. A malformed or missing cursor is refused as a plain
+// Error (code "bad_ack_cursor"/"bad_ack" — ack-subsystem-specific, not the
+// generic "bad_cursor"/"bad_request" other request kinds may also use,
+// since error events carry no correlation id and a generic code couldn't
+// be attributed to the ack that caused it) instead of an Ack reply, since
+// that's a protocol violation rather than a stale-but-valid receipt.
+type Ack struct {
+	Type      Type   `json:"type"`
+	AckCursor string `json:"ackCursor,omitempty"`
+	OK        bool   `json:"ok,omitempty"`
+}
+
+func NewAck(ackCursor string) Ack {
+	return Ack{Type: TypeAck, AckCursor: ackCursor}
 }
 
 // SendAck confirms a send reached its destination, sent immediately —
@@ -369,6 +401,8 @@ type Reaction struct {
 	ExternalID string `json:"externalId"`
 	Reaction   string `json:"reaction"`
 	Action     string `json:"action"`
+	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
+	AckCursor string `json:"ackCursor,omitempty"`
 }
 
 func NewReactionRequest(externalID, reaction, action string) Reaction {
@@ -385,6 +419,8 @@ type Edit struct {
 	Type       Type   `json:"type"`
 	ExternalID string `json:"externalId"`
 	Text       string `json:"text"`
+	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
+	AckCursor string `json:"ackCursor,omitempty"`
 }
 
 func NewEditRequest(externalID, text string) Edit {
@@ -423,6 +459,8 @@ type EditAck struct {
 type Delete struct {
 	Type       Type   `json:"type"`
 	ExternalID string `json:"externalId"`
+	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
+	AckCursor string `json:"ackCursor,omitempty"`
 }
 
 func NewDeleteRequest(externalID string) Delete {

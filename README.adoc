@@ -301,6 +301,21 @@ actually accepted. On a plain `hub_connect` session `hub_send` is
 unaffected and always returns immediately, since `mcp-hub-server` has no
 asynchronous confirmation to wait for in the first place.
 
+=== Read receipts (bridge sessions)
+
+On a bridge session that supports it, `hubconn.Conn` automatically reports
+how far the model has actually read — not merely how far the client has
+received — by piggybacking an `ackCursor` on every outbound message
+(`hub_send`/`hub_react`/`hub_edit`/`hub_delete`/`hub_history`) once
+something has been consumed via `hub_receive`/`hub_wait`, and, failing
+that, firing a standalone receipt after 60s of otherwise-idle connection
+if the read position moved since the last one actually sent. This is
+entirely automatic — no tool exposes it directly — and purely additive:
+`mcp-hub-server` and any bridge that doesn't understand `ackCursor` simply
+ignores the field. A malformed receipt (a client-side bug, not a
+transient condition) permanently disables further receipts for that
+connection rather than repeating the same mistake.
+
 === How message delivery actually works
 
 Claude Code has no built-in way for a plain MCP server to push new
