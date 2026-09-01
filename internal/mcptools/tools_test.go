@@ -1172,6 +1172,38 @@ func TestTeamsRelayConnectDoesNotTouchConnstore(t *testing.T) {
 	}
 }
 
+func TestConnectPassesCreateTokenAsHeader(t *testing.T) {
+	var gotHeader string
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Hub-Create-Token")
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+	}))
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{
+		"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+		"createToken": "prefix.secretvalue",
+	}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	if gotHeader != "prefix.secretvalue" {
+		t.Fatalf("expected the createToken to be sent as X-Hub-Create-Token, got %q", gotHeader)
+	}
+}
+
 func TestConnectTwiceErrors(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"

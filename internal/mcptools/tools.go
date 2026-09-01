@@ -207,6 +207,15 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"instead, to avoid a collision). Pass your own explicitly to override "+
 					"the stored one — e.g. to force a fresh identity for this target, or to "+
 					"resume one from elsewhere (another machine, a value the user gave you)")),
+			mcp.WithString("createToken", mcp.Description(
+				"Optional, and not part of the base mcp-hub protocol — a server-specific "+
+					"extension (e.g. chat-relay) for creating and claiming a brand-new "+
+					"sessionId in this same handshake, for a server that refuses an unknown "+
+					"sessionId by design rather than creating one on first connect. Only "+
+					"meaningful when sessionId doesn't already exist on the target server — "+
+					"if it does, this is ignored and the join proceeds normally. The user "+
+					"gives you this token (it's a capability, shown once when issued); this "+
+					"tool never generates or discovers one on its own")),
 		),
 		h.handleConnect,
 	)
@@ -501,8 +510,10 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			reconnectSecret = uuid.NewString()
 		}
 	}
+	createToken := req.GetString("createToken", "")
 	conn, err := hubconn.Dial(host, sessionID, hubconn.DialOptions{
 		Name: name, AgePublicKey: agePublicKey, ReconnectSecret: reconnectSecret,
+		CreateToken: createToken,
 	})
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %v", err)), nil

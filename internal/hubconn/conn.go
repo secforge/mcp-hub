@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -138,8 +139,8 @@ type Conn struct {
 	// readLoop). Surfaced by DisconnectNote on a timeout so "the connection
 	// died" comes with "and here's the last thing we actually heard",
 	// rather than requiring a second round of debugging to find out.
-	lastFrameKind   string
-	lastFrameAt     time.Time
+	lastFrameKind string
+	lastFrameAt   time.Time
 	// lastSeenCursor is the Cursor of the most recent event delivered into
 	// buffer that carried one (a "msg" or "messageDeleted") — see
 	// LastSeenCursor. Distinct from latestCursor (the server's own newest
@@ -249,6 +250,19 @@ type DialOptions struct {
 	// random token, whatever the caller wants to remember and present again
 	// later.
 	ReconnectSecret string
+	// CreateToken, if given, is sent as the X-Hub-Create-Token header — a
+	// chat-relay extension (not part of the base wire protocol: an unknown
+	// server simply never looks at it, per the protocol's own "unknown
+	// fields are ignored" rule) letting a client create and claim a
+	// brand-new session in one handshake, for a server that 404s an
+	// unknown sessionId by design rather than creating one on first
+	// connect (mcp-hub-server's own behavior). Sent as a header rather
+	// than a query parameter deliberately: a query string ends up in
+	// plaintext in a reverse proxy's access log, a header does not. Only
+	// meaningful when sessionID doesn't already exist on the target
+	// server — an existing session is joined normally and the token is
+	// ignored.
+	CreateToken string
 }
 
 // Dial connects to host+"/"+sessionID (e.g. "ws://localhost:8765" joining
@@ -280,7 +294,12 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 	if opts.ReconnectSecret != "" {
 		target += "&reconnectSecret=" + url.QueryEscape(opts.ReconnectSecret)
 	}
-	ws, _, err := websocket.DefaultDialer.Dial(target, nil)
+	var header http.Header
+	if opts.CreateToken != "" {
+		header = http.Header{}
+		header.Set("X-Hub-Create-Token", opts.CreateToken)
+	}
+	ws, _, err := websocket.DefaultDialer.Dial(target, header)
 	if err != nil {
 		return nil, err
 	}

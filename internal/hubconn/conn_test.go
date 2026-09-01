@@ -549,6 +549,58 @@ func TestCloseReturnsWriteControlErrorWhenFrameCannotBeSent(t *testing.T) {
 	}
 }
 
+func TestDialSendsCreateTokenHeaderWhenGiven(t *testing.T) {
+	var gotHeader string
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Hub-Create-Token")
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{CreateToken: "abc123.secretvalue"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if gotHeader != "abc123.secretvalue" {
+		t.Fatalf("expected X-Hub-Create-Token header %q, got %q", "abc123.secretvalue", gotHeader)
+	}
+}
+
+func TestDialOmitsCreateTokenHeaderWhenNotGiven(t *testing.T) {
+	var sawHeader bool
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawHeader = r.Header.Get("X-Hub-Create-Token") != ""
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if sawHeader {
+		t.Fatal("expected no X-Hub-Create-Token header when none was given")
+	}
+}
+
 func TestDialRejectsInvalidSessionID(t *testing.T) {
 	url := startTestServer(t)
 	if _, err := Dial(url, "not-a-uuid", DialOptions{}); err == nil {

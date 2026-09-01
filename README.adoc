@@ -153,7 +153,7 @@ Once loaded, Claude has twelve tools available:
 |===
 |Tool |Purpose
 
-|`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret?)`
+|`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret?, createToken?)`
 |Join a session. `host` is the server's base websocket URL, e.g.
 `ws://localhost:8765` or `wss://relay.example.com:8765` — the `sessionId` is
 appended as a path segment automatically (`<host>/<sessionId>`) — never
@@ -216,6 +216,18 @@ never the secret itself — see `internal/identitystore`) and survives both
 a server restart and the session becoming fully empty — there's currently
 no expiry or cleanup for it, so it's recognized for as long as the file
 exists.
++
+`createToken` is optional and not part of the base protocol — a
+server-specific extension (currently: chat-relay) for creating and
+claiming a brand-new `sessionId` in the same handshake, for a server that
+refuses an unknown `sessionId` by design rather than creating one on
+first connect (`mcp-hub-server`'s own default behavior). Sent as an
+`X-Hub-Create-Token` header. Ignored entirely if `sessionId` already
+exists — never mutually exclusive with `reconnectSecret`. The user
+supplies this token; `hub_connect` never generates or discovers one on
+its own. See
+`docs/superpowers/specs/2026-08-31-mcp-hub-wire-protocol-spec.md` ("§8.
+Server extensions outside this spec") for the exact contract.
 +
 If `name`/`agePublicKey` was given, the result confirms what other peers
 can now see for you — including the sanitized name, if it differs from

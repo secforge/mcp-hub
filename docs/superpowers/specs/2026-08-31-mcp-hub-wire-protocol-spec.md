@@ -455,6 +455,33 @@ protocol-level negotiation.
   server should not treat client silence beyond that as a health check
   result either way.
 
+## §8. Server extensions outside this spec
+
+Nothing stops a server from adding its own handshake-time mechanism on
+top of §1, as long as it stays additive (an unrecognized header/query
+param is simply ignored by any other server or client — this is exactly
+the "unknown fields ignored" rule §6 already establishes for message
+bodies, extended to the handshake). One such extension exists today,
+documented here for reference, not as something every server needs:
+
+**`X-Hub-Create-Token` (chat-relay).** A capability token, transport
+`{prefix}.{secret}` (both base64url), sent as a request header on the
+handshake (preferred — a query-string equivalent, `?create=...`, exists
+as a fallback for a client that can't set headers, but ends up in
+plaintext in a reverse proxy's access log, so header is strictly
+better when available). Lets a client create and claim a brand-new
+`sessionId` in the same handshake that joins it — meaningful only for a
+server that refuses an unknown `sessionId` by design (chat-relay 404s
+one rather than creating it, unlike `mcp-hub-server`'s create-on-first-
+connect behavior). If `sessionId` already exists, the token is ignored
+entirely and the join proceeds normally — never mutually exclusive with
+`reconnectSecret`/`name`/`agePublicKey`. The reference client
+(`hubconn.DialOptions.CreateToken`, surfaced as `hub_connect`'s
+`createToken` parameter) sends it as the header form only; it never
+generates or discovers a token on its own — the user supplies one,
+issued out of band (chat-relay: `POST /api/conversations/hub/create-
+tokens`, shown once, only its hash is later stored).
+
 ## Appendix: reference client's own tuning constants
 
 For context, not requirements — a second implementation is free to
