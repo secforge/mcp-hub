@@ -803,6 +803,26 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	return mcp.NewToolResultText("disconnected"), nil
 }
 
+// Shutdown tears down the active connection exactly as handleDisconnect
+// does (same reasoning: closing the wait socket makes a backgrounded
+// `wait --follow` CLI process see its connection end and exit on its own,
+// rather than lingering as a background process the harness has to warn
+// about) — but is meant to be called once, at process shutdown, not from
+// a tool call. A no-op if nothing is connected.
+func (h *Hub) Shutdown() {
+	conn, w, target := h.clearActiveConn()
+	if conn == nil {
+		return
+	}
+	if w != nil {
+		w.Close()
+	}
+	conn.Close()
+	if target != (connstore.Target{}) {
+		_ = connstore.MarkDisconnected(target)
+	}
+}
+
 func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	entries, err := connstore.List()
 	if err != nil {

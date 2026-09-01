@@ -642,6 +642,18 @@ still marked open from a connection that never got an explicit
 a server-initiated push into the model's context, not a guaranteed
 notification. Full rationale and design: `docs/superpowers/specs/2026-09-01-mcp-hub-client-connection-store-design.md`.
 
+`Hub.Shutdown()` (`cmd/mcp-hub-client/main.go`, called once after
+`server.ServeStdio` returns, before any `os.Exit`) tears the active
+connection down the same way `hub_disconnect` does, on both paths
+`mcp-go`'s `ServeStdio` already handles for us — `SIGTERM`/`SIGINT` (it
+installs a handler that cancels its context) and stdin EOF (the MCP
+client closing the pipe). This is what keeps a `connstore` entry from
+being left "still marked open" on an ordinary session end, and — since
+closing the wait socket makes a backgrounded `wait --follow` CLI process
+see EOF and exit on its own — is what stops that process from lingering
+as an orphaned background job the harness has to warn about. Cannot run
+on a hard `SIGKILL`, which no process can catch in any language.
+
 ## HTTP-MCP endpoint (`mcp-hub-server`)
 
 `mcp-hub-server` also serves a Streamable-HTTP MCP endpoint at `/mcp`,

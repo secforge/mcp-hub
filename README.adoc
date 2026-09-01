@@ -279,7 +279,13 @@ starts, `hub_connect`'s own tool description gets a note about it — MCP
 gives a server no way to push that proactively into a conversation, so
 this is only visible once Claude actually looks at the tool description
 (which, with tool search deferring full schemas by default, may not be
-immediate).
+immediate). `mcp-hub-client` also tears its active connection down
+cleanly (same effect as `hub_disconnect`) whenever the process itself
+shuts down — on `SIGTERM`/`SIGINT`, or the MCP client closing the stdio
+pipe — so an entry isn't left "still marked open" for an ordinary session
+end, and any backgrounded `wait --follow` process sees its socket close
+and exits on its own rather than lingering. This can't run on a hard
+`SIGKILL`, which no process can catch in any language.
 
 |`teams_relay_connect(link, name?, reconnectSecret)`
 |Connect to a chat-relay-style bridge session (e.g. a specific Microsoft

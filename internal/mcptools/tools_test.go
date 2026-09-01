@@ -1172,6 +1172,38 @@ func TestTeamsRelayConnectDoesNotTouchConnstore(t *testing.T) {
 	}
 }
 
+func TestShutdownClosesActiveConnectionAndMarksStoreDisconnected(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+
+	hub.Shutdown()
+
+	conn, _ := hub.activeConn()
+	if conn != nil {
+		t.Fatal("expected Shutdown to clear the active connection")
+	}
+	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID})
+	if !ok {
+		t.Fatal("expected the entry to still exist")
+	}
+	if stored.Connected {
+		t.Fatal("expected Shutdown to mark the connstore entry disconnected")
+	}
+}
+
+func TestShutdownWithoutAnyConnectionIsANoop(t *testing.T) {
+	hub := NewHub()
+	hub.Shutdown() // must not panic
+}
+
 func TestConnectPassesCreateTokenAsHeader(t *testing.T) {
 	var gotHeader string
 	upgrader := websocket.Upgrader{}
