@@ -37,12 +37,35 @@ func TestNormalizeHostRewritesHTTPSchemes(t *testing.T) {
 	}
 }
 
-func TestNormalizeHostRejectsPathQueryOrFragment(t *testing.T) {
+func TestNormalizeHostAcceptsBasePath(t *testing.T) {
+	// A server may be served under a path prefix (e.g. behind a reverse
+	// proxy or alongside a SPA that owns the bare root) — sessionId is
+	// still appended as a further path segment, so this must survive
+	// unchanged other than a stripped trailing slash.
+	cases := map[string]string{
+		"wss://chat-relay.secforge.de/hub":         "wss://chat-relay.secforge.de/hub",
+		"wss://chat-relay.secforge.de/hub/":         "wss://chat-relay.secforge.de/hub",
+		"wss://mcp-hub.secforge.de/some/deep/path":  "wss://mcp-hub.secforge.de/some/deep/path",
+		"wss://mcp-hub.secforge.de/some/deep/path/": "wss://mcp-hub.secforge.de/some/deep/path",
+	}
+	for in, want := range cases {
+		got, err := normalizeHost(in)
+		if err != nil {
+			t.Errorf("normalizeHost(%q) unexpected error: %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("normalizeHost(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeHostRejectsQueryOrFragment(t *testing.T) {
 	cases := []string{
-		"wss://mcp-hub.secforge.de/ws",
-		"wss://mcp-hub.secforge.de/some/path",
 		"wss://mcp-hub.secforge.de?x=1",
 		"wss://mcp-hub.secforge.de#frag",
+		"wss://mcp-hub.secforge.de/hub?x=1",
+		"wss://mcp-hub.secforge.de/hub#frag",
 	}
 	for _, in := range cases {
 		if _, err := normalizeHost(in); err == nil {

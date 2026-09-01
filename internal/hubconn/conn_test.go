@@ -57,6 +57,23 @@ func TestDialJoinsAndAssignsPeerID(t *testing.T) {
 	}
 }
 
+func TestDialReachesServerMountedUnderABasePath(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("/hub/", http.StripPrefix("/hub", wsserver.NewHandler()))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	host := "ws" + strings.TrimPrefix(srv.URL, "http") + "/hub"
+
+	c, err := Dial(host, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if c.PeerID() == "" {
+		t.Fatal("expected a non-empty peerID")
+	}
+}
+
 func TestLastSeenCursorTracksMostRecentDeliveredMsg(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
