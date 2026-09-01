@@ -278,6 +278,13 @@ func TestHubWaitReturnsImmediatelyWhenAlreadyBuffered(t *testing.T) {
 	if !strings.Contains(textOf(res), "already there by the time we wait") {
 		t.Fatalf("expected the buffered message, got: %s", textOf(res))
 	}
+	// The reminder to call hub_wait again must lead the result, not trail
+	// it: hub_wait is a single blocking call with nothing to fall back on,
+	// so if whatever's reading the result gets cut off partway through, a
+	// trailing reminder is exactly the part most likely to be lost.
+	if !strings.HasPrefix(textOf(res), "REMINDER:") {
+		t.Fatalf("expected the hub_wait-again reminder to lead the result, got: %s", textOf(res))
+	}
 }
 
 func TestHubWaitBlocksUntilMessageArrives(t *testing.T) {
@@ -405,6 +412,94 @@ func TestHubWaitNewCallSupersedesInFlightOne(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the surviving hub_wait call never returned")
+	}
+}
+
+func TestDisconnectedTextHintsHubHistoryAfterWhenSupported(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, HistoryAfter: true})
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-xyz"})
+		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000"}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+
+	deadlinePoll(t, func() bool { return hub.conn.LastSeenCursor() == "cursor-xyz" })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		res, _ := hub.handleReceive(ctx, mcp.CallToolRequest{})
+		if strings.Contains(textOf(res), "disconnected") {
+			if !strings.Contains(textOf(res), `"cursor-xyz"`) || !strings.Contains(textOf(res), "hub_history(after:") {
+				t.Fatalf("expected the disconnect text to hint at hub_history(after: ...) with the last seen cursor, got: %s", textOf(res))
+			}
+			if strings.Contains(textOf(res), "hub_history(before:") {
+				t.Fatalf("must never suggest before for catching up — it pages backward, got: %s", textOf(res))
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never observed a disconnected result, last: %s", textOf(res))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestDisconnectedTextFallsBackWhenAfterNotSupported(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-xyz"})
+		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000"}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+
+	deadlinePoll(t, func() bool { return hub.conn.LastSeenCursor() == "cursor-xyz" })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		res, _ := hub.handleReceive(ctx, mcp.CallToolRequest{})
+		if strings.Contains(textOf(res), "disconnected") {
+			if !strings.Contains(textOf(res), `"cursor-xyz"`) || !strings.Contains(textOf(res), "does not support hub_history's after") {
+				t.Fatalf("expected the disconnect text to explain after isn't supported, got: %s", textOf(res))
+			}
+			if strings.Contains(textOf(res), "hub_history(before:") || strings.Contains(textOf(res), "hub_history(after:") {
+				t.Fatalf("must not suggest a specific before/after call when after isn't supported and the gap can't be filled, got: %s", textOf(res))
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never observed a disconnected result, last: %s", textOf(res))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

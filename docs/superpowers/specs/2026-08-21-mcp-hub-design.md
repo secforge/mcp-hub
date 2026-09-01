@@ -764,6 +764,27 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   explicit "there is no more," including an empty burst plus the sentinel,
   never silently inferred from a gap in traffic.
 
+- **`hub_history`'s `after` parameter — forward paging, for reconnect
+  catch-up.** `before` only ever reaches *older* messages; it cannot be
+  used to fetch what arrived while a client was disconnected, and the
+  original reconnect-hint wording ("call hub_history(before: your last
+  known cursor)") was simply wrong about this — flagged from the hub
+  session itself, by an agent who'd hit it live. `wire.History` gained
+  `After string` (exclusive, forward — the page starts strictly after the
+  given cursor) alongside `Before`; a client should never send both.
+  `wire.Joined` gained `HistoryAfter bool`, a capability flag a server
+  sets to advertise support (false, including every `mcp-hub-server`,
+  means only `Before` is honored). `Conn.RequestHistoryAfter` /
+  `Conn.HistoryAfterSupported()` mirror the existing `Before`-side
+  methods. `disconnectedText` (`internal/mcptools`) now names the exact
+  last-seen cursor and, when the server supports it, the exact
+  `hub_history(after: ...)` call to make — or, when it doesn't, says so
+  plainly instead of suggesting `before` (which would silently do the
+  wrong thing). The connect-time hint mirrors this same branch. This is a
+  wire-protocol addition that only does anything once a bridge server
+  (e.g. chat-relay) implements `After`/`HistoryAfter` on its own side —
+  `mcp-hub-server`'s own relay has no history concept at all.
+
 - **`sendAck` — confirms a send reached its destination, immediately.**
   Found necessary by a real incident during the joint design/testing
   session with chat-relay, not designed up front: chat-relay's server

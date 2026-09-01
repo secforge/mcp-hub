@@ -92,6 +92,7 @@ type Conn struct {
 	// The fields below are only ever set for a bridge-style session (see
 	// wire.Joined) — zero-valued for every mcp-hub-server connection.
 	latestCursor     *string
+	historyAfter     bool
 	historyLimitMax  int
 	canSend          bool
 	conversationKind string
@@ -114,11 +115,28 @@ type Conn struct {
 	// this immutable-after-construction group already relies on.
 	isBridge bool
 
-	mu              sync.Mutex
-	buffer          []Event
-	closed          bool
-	closeCode       int  // set from the WebSocket close frame's code, if any — see DisconnectNote
-	timedOut        bool // set when the connection was dropped by our own pongWait deadline, not a close frame — see DisconnectNote
+	mu         sync.Mutex
+	buffer     []Event
+	closed     bool
+	closeCode  int       // set from the WebSocket close frame's code, if any — see DisconnectNote
+	timedOut   bool      // set when the connection was dropped by our own pongWait deadline, not a close frame — see DisconnectNote
+	timedOutAt time.Time // when timedOut was set — see DisconnectNote's use of it against lastFrameAt
+	// lastFrameKind/lastFrameAt record the most recent frame observed —
+	// "joined" (construction), "ping" (a control frame, from
+	// SetPingHandler — gorilla handles these internally and they never
+	// reach readLoop directly), or a decoded Event.Kind (a data frame, from
+	// readLoop). Surfaced by DisconnectNote on a timeout so "the connection
+	// died" comes with "and here's the last thing we actually heard",
+	// rather than requiring a second round of debugging to find out.
+	lastFrameKind   string
+	lastFrameAt     time.Time
+	// lastSeenCursor is the Cursor of the most recent event delivered into
+	// buffer that carried one (a "msg" or "messageDeleted") — see
+	// LastSeenCursor. Distinct from latestCursor (the server's own newest
+	// cursor as of connect time, in wire.Joined): this is what the model
+	// actually saw through this connection, the input hub_history(before:
+	// ...) needs to catch up on anything that arrived after.
+	lastSeenCursor  string
 	onActivity      func()
 	peers           map[string]PeerInfo
 	rosterAnnounced bool
@@ -166,7 +184,9 @@ func (c *Conn) DisconnectNote() string {
 	}
 	if c.timedOut {
 		return fmt.Sprintf(" (no activity from the server for %s — connection assumed dead;"+
-			" this does not by itself indicate which side or which network hop failed)", c.pongWait)
+			" this does not by itself indicate which side or which network hop failed;"+
+			" last frame seen was %q, %s before the deadline expired)",
+			c.pongWait, c.lastFrameKind, c.timedOutAt.Sub(c.lastFrameAt).Round(time.Second))
 	}
 	// CloseNormalClosure/CloseGoingAway are a deliberate, expected close (the
 	// server said goodbye on purpose) — not a mystery worth reporting.
@@ -264,10 +284,6 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait time.Durati
 	}
 
 	ws.SetReadDeadline(time.Now().Add(snapPongWait))
-	ws.SetPingHandler(func(appData string) error {
-		ws.SetReadDeadline(time.Now().Add(snapPongWait))
-		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(snapWriteWait))
-	})
 
 	c := &Conn{
 		ws:               ws,
@@ -279,12 +295,22 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait time.Durati
 		peers:            make(map[string]PeerInfo),
 		pongWait:         snapPongWait,
 		latestCursor:     joined.LatestCursor,
+		historyAfter:     joined.HistoryAfter,
 		historyLimitMax:  joined.HistoryLimitMax,
 		canSend:          joined.CanSend,
 		conversationKind: joined.ConversationKind,
 		topic:            joined.Topic,
 		isBridge:         isBridge,
+		lastFrameKind:    "joined",
+		lastFrameAt:      time.Now(),
 	}
+	ws.SetPingHandler(func(appData string) error {
+		ws.SetReadDeadline(time.Now().Add(snapPongWait))
+		c.mu.Lock()
+		c.lastFrameKind, c.lastFrameAt = "ping", time.Now()
+		c.mu.Unlock()
+		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(snapWriteWait))
+	})
 	go c.readLoop()
 	return c, nil
 }
@@ -316,6 +342,26 @@ func (c *Conn) ExpectedPeerCount() int { return c.expectedPeers }
 // holds, or nil if there are none yet (or the server doesn't support
 // history at all).
 func (c *Conn) LatestCursor() *string { return c.latestCursor }
+
+// HistoryAfterSupported reports whether this server accepts a forward-paging
+// RequestHistoryAfter call — see wire.Joined.HistoryAfter. False (including
+// every mcp-hub-server) means only RequestHistory's backward paging is
+// available, which cannot fill a reconnect gap by itself.
+func (c *Conn) HistoryAfterSupported() bool { return c.historyAfter }
+
+// LastSeenCursor is the cursor of the most recent message (or
+// messageDeleted) this connection actually delivered — via Peek/Drain, so
+// through hub_receive/hub_wait — not merely wrote to the underlying
+// socket. Empty if nothing carrying a cursor has been delivered yet. Not
+// bridge-specific like LatestCursor above: it's set from whatever this
+// connection has itself observed, on any server. Report this on disconnect
+// so a reconnecting client knows exactly what to pass hub_history(before:
+// ...) instead of having to have remembered it unprompted.
+func (c *Conn) LastSeenCursor() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastSeenCursor
+}
 
 // HistoryLimitMax is the server's cap on a single History request's
 // limit, or zero if the server didn't set one.
@@ -461,6 +507,7 @@ func (c *Conn) readLoop() {
 				c.closeCode = ce.Code
 			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				c.timedOut = true
+				c.timedOutAt = time.Now()
 			}
 			f := c.onActivity
 			c.mu.Unlock()
@@ -474,11 +521,15 @@ func (c *Conn) readLoop() {
 			continue
 		}
 		c.mu.Lock()
+		c.lastFrameKind, c.lastFrameAt = ev.Kind, time.Now()
 		if c.tryDivertToClaimLocked(ev) {
 			c.mu.Unlock()
 			continue
 		}
 		c.buffer = append(c.buffer, ev)
+		if ev.Cursor != "" {
+			c.lastSeenCursor = ev.Cursor
+		}
 		switch ev.Kind {
 		case "peerJoined":
 			c.peers[ev.PeerID] = PeerInfo{ID: ev.PeerID, Name: ev.Name, AgePublicKey: ev.AgePublicKey}
@@ -612,6 +663,15 @@ func (c *Conn) SendTo(text, peerID string) error {
 // picked up by a later Peek/Drain like anything else.
 func (c *Conn) RequestHistory(before string, limit int) error {
 	return c.ws.WriteJSON(wire.NewHistoryRequest(before, limit))
+}
+
+// RequestHistoryAfter asks the server for messages strictly after after (a
+// server-defined cursor) — see wire.History.After. Only meaningful when
+// HistoryAfterSupported reports true; the answering burst arrives the same
+// way RequestHistory's does (buffered "msg" events with Historical true,
+// terminated by "historyComplete").
+func (c *Conn) RequestHistoryAfter(after string, limit int) error {
+	return c.ws.WriteJSON(wire.NewHistoryAfterRequest(after, limit))
 }
 
 // React asks the server to add or remove a reaction on an earlier

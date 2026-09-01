@@ -256,12 +256,18 @@ other tool above works the same way. See
 `docs/superpowers/specs/2026-08-21-mcp-hub-design.md` ("Chat-relay bridge
 support") for the full wire contract.
 
-|`hub_history(before?, limit?)`
-|Request messages predating this connection — meaningless for a normal
+|`hub_history(before?, after?, limit?)`
+|Request messages relative to this connection — meaningless for a normal
 `hub_connect` session, but real for a bridge session backed by a channel
-with actual retained history. The requested messages arrive
-asynchronously via `wait`/`hub_receive`/`hub_wait` like any other event,
-not as this call's own result.
+with actual retained history. `before` pages backward (older messages
+only — never use it to catch up on a reconnect gap). `after` pages
+forward, strictly after a given cursor, and is what a reconnecting client
+should use to fetch exactly what arrived while disconnected; it only
+works if the server advertised support via `joined.historyAfter` (errors
+otherwise, explaining why). At most one of `before`/`after` may be given.
+The requested messages arrive asynchronously via
+`wait`/`hub_receive`/`hub_wait` like any other event, not as this call's
+own result.
 
 |`hub_react(externalId, reaction, action)`
 |Add or remove a reaction on an earlier message — meaningless for a

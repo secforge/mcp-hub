@@ -57,6 +57,39 @@ func TestDialJoinsAndAssignsPeerID(t *testing.T) {
 	}
 }
 
+func TestLastSeenCursorTracksMostRecentDeliveredMsg(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "first", TS: "ts1", Cursor: "cursor-1"})
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "second", TS: "ts2", Cursor: "cursor-2"})
+		select {}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if c.LastSeenCursor() == "cursor-2" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected LastSeenCursor to become %q, got %q", "cursor-2", c.LastSeenCursor())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestDialRejectsInvalidSessionID(t *testing.T) {
 	url := startTestServer(t)
 	if _, err := Dial(url, "not-a-uuid", DialOptions{}); err == nil {
@@ -415,8 +448,12 @@ func TestSilentDropIsDetectedViaReadDeadline(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, connected := c.Peek(); !connected {
-			if note := c.DisconnectNote(); note == "" {
+			note := c.DisconnectNote()
+			if note == "" {
 				t.Fatal("expected DisconnectNote to explain a pongWait timeout, got empty string")
+			}
+			if !strings.Contains(note, `last frame seen was "joined"`) {
+				t.Fatalf("expected the note to name the last frame seen (the initial joined message, since the server went silent after it), got %q", note)
 			}
 			return
 		}
@@ -652,6 +689,61 @@ func TestRequestHistorySendsHistoryMessage(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received the history request")
+	}
+}
+
+func TestRequestHistoryAfterSendsAfterField(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotHistory := make(chan wire.History, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, HistoryAfter: true})
+		var h wire.History
+		if err := conn.ReadJSON(&h); err == nil {
+			gotHistory <- h
+		}
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if !c.HistoryAfterSupported() {
+		t.Fatal("expected HistoryAfterSupported to be true when joined.historyAfter is set")
+	}
+	if err := c.RequestHistoryAfter("cursor-9", 25); err != nil {
+		t.Fatalf("RequestHistoryAfter: %v", err)
+	}
+
+	select {
+	case h := <-gotHistory:
+		if h.After != "cursor-9" || h.Before != "" || h.Limit != 25 {
+			t.Fatalf("unexpected history request: %+v", h)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the history request")
+	}
+}
+
+func TestHistoryAfterSupportedFalseByDefault(t *testing.T) {
+	url := startTestServer(t)
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if c.HistoryAfterSupported() {
+		t.Fatal("expected HistoryAfterSupported to be false against a plain mcp-hub-server")
 	}
 }
 
