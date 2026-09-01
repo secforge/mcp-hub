@@ -12,6 +12,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/secforge/mcp-hub/internal/agekey"
+	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/waiter"
 	"github.com/secforge/mcp-hub/internal/wire"
@@ -20,15 +21,20 @@ import (
 // Hub bundles the single active hub connection + wait socket for one
 // mcp-hub-client process.
 type Hub struct {
-	// mu guards conn/waiter. Needed because, unlike every other mutation of
-	// these fields (which happens synchronously inside a tool call),
-	// conn.OnActivity's disconnect callback (see handleConnect) can clear
-	// them from the Conn's own background read goroutine at any moment —
-	// automatic detection of a dead connection, not just the reactive
-	// per-call check a tool handler does.
+	// mu guards conn/waiter/connTarget. Needed because, unlike every other
+	// mutation of these fields (which happens synchronously inside a tool
+	// call), conn.OnActivity's disconnect callback (see handleConnect) can
+	// clear them from the Conn's own background read goroutine at any
+	// moment — automatic detection of a dead connection, not just the
+	// reactive per-call check a tool handler does.
 	mu     sync.Mutex
 	conn   *hubconn.Conn
 	waiter *waiter.Waiter
+	// connTarget is the connstore.Target the active conn was reached
+	// through, so teardownIfCurrent/clearActiveConn can mark it
+	// disconnected in the store — zero-valued for a connection not tracked
+	// there at all (teams_relay_connect; see handleTeamsRelayConnect).
+	connTarget connstore.Target
 
 	// waitMu, waitCancel, and waitGen let a new handleWait call supersede
 	// one already in flight, mirroring waiter.Waiter's single-registered-
@@ -42,6 +48,39 @@ func NewHub() *Hub {
 	return &Hub{}
 }
 
+// startupConnectionsNote returns text to append to hub_connect's own
+// description when connstore has any entry still marked Connected from a
+// prior process — computed once, when Register() runs, i.e. at process
+// launch ("startup"). This is the only mechanism available for surfacing
+// this: MCP gives a server no way to push anything into the model's
+// context on its own, so the note is only ever seen once the model
+// actually looks at hub_connect's description (which, with tool search
+// deferring full schemas by default, may not be immediately) — a
+// best-effort notice, not a guaranteed one.
+func startupConnectionsNote() string {
+	entries, err := connstore.List()
+	if err != nil {
+		return ""
+	}
+	var openCount int
+	for _, e := range entries {
+		if e.Connected {
+			openCount++
+		}
+	}
+	if openCount == 0 {
+		return ""
+	}
+	plural := ""
+	if openCount != 1 {
+		plural = "s"
+	}
+	return fmt.Sprintf(
+		"\n\nNOTE: %d session%s still marked open when this client last ran (it may have "+
+			"simply ended mid-conversation, not necessarily crashed) — call "+
+			"hub_list_connections() to see them.", openCount, plural)
+}
+
 // activeConn returns the current connection and its wait socket, or (nil,
 // nil) if not connected.
 func (h *Hub) activeConn() (*hubconn.Conn, *waiter.Waiter) {
@@ -51,22 +90,25 @@ func (h *Hub) activeConn() (*hubconn.Conn, *waiter.Waiter) {
 }
 
 // setActiveConn records a newly established connection as the active one.
-func (h *Hub) setActiveConn(conn *hubconn.Conn, w *waiter.Waiter) {
+// target identifies it in connstore for later teardown bookkeeping — the
+// zero Target for a connection kind connstore doesn't track at all.
+func (h *Hub) setActiveConn(conn *hubconn.Conn, w *waiter.Waiter, target connstore.Target) {
 	h.mu.Lock()
-	h.conn, h.waiter = conn, w
+	h.conn, h.waiter, h.connTarget = conn, w, target
 	h.mu.Unlock()
 }
 
 // clearActiveConn unconditionally forgets whatever connection is currently
-// active and returns it, for an explicit hub_disconnect — which should
-// tear down whatever is active right now, regardless of which Conn
-// instance a caller happens to be holding a reference to.
-func (h *Hub) clearActiveConn() (*hubconn.Conn, *waiter.Waiter) {
+// active and returns it plus the connstore.Target it was reached through,
+// for an explicit hub_disconnect — which should tear down whatever is
+// active right now, regardless of which Conn instance a caller happens to
+// be holding a reference to.
+func (h *Hub) clearActiveConn() (*hubconn.Conn, *waiter.Waiter, connstore.Target) {
 	h.mu.Lock()
-	conn, w := h.conn, h.waiter
-	h.conn, h.waiter = nil, nil
+	conn, w, target := h.conn, h.waiter, h.connTarget
+	h.conn, h.waiter, h.connTarget = nil, nil, connstore.Target{}
 	h.mu.Unlock()
-	return conn, w
+	return conn, w, target
 }
 
 // teardownIfCurrent tears down the active connection, but only if it's
@@ -75,7 +117,10 @@ func (h *Hub) clearActiveConn() (*hubconn.Conn, *waiter.Waiter) {
 // racing against a fresh hub_connect (or an explicit hub_disconnect) that
 // may have already replaced or cleared it; without this check, a stale
 // notification about a connection nobody cares about anymore could wrongly
-// tear down whatever legitimately replaced it.
+// tear down whatever legitimately replaced it. Also marks the connection's
+// connstore entry (if any) disconnected — this is the automatic-drop path,
+// not just explicit hub_disconnect, so a session that ends this way isn't
+// wrongly reported as "still open" by a later process's startup note.
 func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
 	h.mu.Lock()
 	if h.conn != conn {
@@ -83,10 +128,14 @@ func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
 		return
 	}
 	w := h.waiter
-	h.conn, h.waiter = nil, nil
+	target := h.connTarget
+	h.conn, h.waiter, h.connTarget = nil, nil, connstore.Target{}
 	h.mu.Unlock()
 	if w != nil {
 		w.Close()
+	}
+	if target != (connstore.Target{}) {
+		_ = connstore.MarkDisconnected(target)
 	}
 }
 
@@ -123,7 +172,7 @@ func disconnectedText(conn *hubconn.Conn) string {
 func (h *Hub) Register(s *server.MCPServer) {
 	s.AddTool(
 		mcp.NewTool("hub_connect",
-			mcp.WithDescription("Connect to an mcp-hub-server session"),
+			mcp.WithDescription("Connect to an mcp-hub-server session"+startupConnectionsNote()),
 			mcp.WithString("host", mcp.Required(),
 				mcp.Description("Server base address, e.g. ws://localhost:8765 (the "+
 					"sessionId is appended as a path segment automatically)")),
@@ -143,20 +192,21 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"reconnectSecret: agePublicKey is visible to every other peer in the "+
 					"session, so it must never be used to grant identity/peerId reuse — "+
 					"anyone who saw it could then impersonate you. Use reconnectSecret for that")),
-			mcp.WithString("reconnectSecret", mcp.Required(), mcp.Description(
-				"Required — always pass one, even on a brand new session. Never distributed "+
-					"to anyone (only you and the server ever see it) — any string you choose "+
-					"to remember, e.g. a UUID; generate one yourself if the user hasn't given "+
-					"you one to reuse. Presenting the exact same reconnectSecret on a later "+
-					"hub_connect reassigns your previous peerId instead of a new one, so "+
-					"you're recognized as the same participant across a dropped connection, a "+
-					"server restart, or even the whole session having emptied out and later "+
-					"been reconstituted — as long as that previous connection isn't still "+
-					"active (which would get you a fresh peerId instead, to avoid a "+
-					"collision). This is required only by this MCP tool's contract, as a "+
-					"guardrail so you never end up unable to resume your identity — the hub "+
-					"server itself has no such requirement and happily accepts connections "+
-					"without one")),
+			mcp.WithString("reconnectSecret", mcp.Description(
+				"Optional — omit it and this client manages it for you: on the first "+
+					"connect to a given host+sessionId it generates and stores one "+
+					"automatically; on a later connect to that same host+sessionId (even "+
+					"from a different process, e.g. after a restart) it's reused "+
+					"automatically, reassigning your previous peerId with nothing for you "+
+					"to remember or pass. Presenting the exact same reconnectSecret on a "+
+					"later hub_connect reassigns your previous peerId instead of a new one, "+
+					"so you're recognized as the same participant across a dropped "+
+					"connection, a server restart, or even the whole session having "+
+					"emptied out and later been reconstituted — as long as that previous "+
+					"connection isn't still active (which would get you a fresh peerId "+
+					"instead, to avoid a collision). Pass your own explicitly to override "+
+					"the stored one — e.g. to force a fresh identity for this target, or to "+
+					"resume one from elsewhere (another machine, a value the user gave you)")),
 		),
 		h.handleConnect,
 	)
@@ -212,6 +262,17 @@ func (h *Hub) Register(s *server.MCPServer) {
 		mcp.NewTool("hub_disconnect",
 			mcp.WithDescription("Disconnect from the current hub session")),
 		h.handleDisconnect,
+	)
+	s.AddTool(
+		mcp.NewTool("hub_list_connections",
+			mcp.WithDescription("List every host+sessionId this client has connected to "+
+				"before (via hub_connect — not teams_relay_connect, which manages identity "+
+				"differently), with the peerId and display name last used and whether it's "+
+				"still marked open from a previous connect that never got an explicit "+
+				"hub_disconnect. Read-only, no side effects. Never includes reconnectSecret "+
+				"values — those stay out of your context by design; you don't need them "+
+				"yourself, hub_connect reuses them automatically")),
+		h.handleListConnections,
 	)
 	s.AddTool(
 		mcp.NewTool("hub_receive",
@@ -429,7 +490,17 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if agePublicKey != "" && !agekey.Valid(agePublicKey) {
 		return mcp.NewToolResultError("agePublicKey is not a validly formatted age public key"), nil
 	}
+	target := connstore.Target{Host: host, SessionID: sessionID}
 	reconnectSecret := req.GetString("reconnectSecret", "")
+	explicitSecret := reconnectSecret != ""
+	var reusedFromStore bool
+	if !explicitSecret {
+		if stored, ok := connstore.Get(target); ok {
+			reconnectSecret, reusedFromStore = stored.ReconnectSecret, true
+		} else {
+			reconnectSecret = uuid.NewString()
+		}
+	}
 	conn, err := hubconn.Dial(host, sessionID, hubconn.DialOptions{
 		Name: name, AgePublicKey: agePublicKey, ReconnectSecret: reconnectSecret,
 	})
@@ -453,24 +524,20 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			h.teardownIfCurrent(conn)
 		}
 	})
-	h.setActiveConn(conn, w)
+	h.setActiveConn(conn, w, target)
+	_ = connstore.Upsert(connstore.Entry{
+		Host: host, SessionID: sessionID, PeerID: conn.PeerID(), Name: conn.Name(),
+		ReconnectSecret: reconnectSecret, LastConnectedAt: time.Now().UTC(), Connected: true,
+	})
 
-	waitBlock := buildWaitBlock(ctx, w, "reconnect with the same sessionId and reconnectSecret")
-	if reconnectSecret == "" && looksLikeCodex(clientName(ctx)) {
-		waitBlock += "\n\nNote: no reconnectSecret was given on this connect, so step 2 " +
-			"above has nothing to reconnect with yet — a reconnect after a disconnect " +
-			"would get a new peerId instead of resuming this one. If continuity across a " +
-			"disconnect matters, disconnect and reconnect once more now, this time " +
-			"passing a reconnectSecret you'll remember and reuse for every future " +
-			"reconnect in this monitoring cycle."
-	}
+	waitBlock := buildWaitBlock(ctx, w, "reconnect with the same sessionId (reconnectSecret is now managed for you automatically)")
 
 	invite := fmt.Sprintf(
 		"YOU MUST tell the user the exact sentence below before doing anything else — this "+
 			"session is useless alone, and the user is the only one who can forward it to "+
 			"whoever (human or AI) should join it. Do not paraphrase, summarize, or omit it; "+
 			"quote it verbatim so it can be copy-pasted straight into another AI's prompt:\n"+
-			"  Connect to the hub at %s with sessionId %s, then wait for messages.",
+			"  Connect the mcp-hub to %s with sessionId %s, then wait for messages.",
 		host, sessionID,
 	)
 
@@ -511,10 +578,22 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		}
 		identityNote = "\nOther peers (via hub_peers()) can see your " + strings.Join(parts, " and ") + "."
 	}
-	if reconnectSecret != "" {
-		identityNote += "\nThis reconnectSecret is remembered (not shared with anyone, and " +
-			"it survives a server restart or the session emptying out) — present it again " +
-			"on a future hub_connect to be reassigned this same peerId."
+	switch {
+	case explicitSecret:
+		identityNote += "\nThe reconnectSecret you provided has been stored for this host+" +
+			"sessionId — a future hub_connect to the same target can omit it and this " +
+			"exact identity will be reused automatically. Pass a different one explicitly " +
+			"at any time to get a fresh identity instead."
+	case reusedFromStore:
+		identityNote += "\nNo reconnectSecret was given, so the one stored from a previous " +
+			"connection to this exact host+sessionId was reused automatically — this is " +
+			"why you were reassigned the same peerId as before, with no need to remember " +
+			"or pass anything yourself."
+	default:
+		identityNote += "\nNo reconnectSecret was given, so one was generated and stored " +
+			"automatically for this host+sessionId — you don't need to remember it; a " +
+			"future hub_connect to this same target will reuse it automatically. Pass " +
+			"your own explicitly instead if you want a fresh identity next time."
 	}
 
 	if generated {
@@ -571,7 +650,7 @@ func (h *Hub) handleTeamsRelayConnect(ctx context.Context, req mcp.CallToolReque
 			h.teardownIfCurrent(conn)
 		}
 	})
-	h.setActiveConn(conn, w)
+	h.setActiveConn(conn, w, connstore.Target{})
 
 	waitBlock := buildWaitBlock(ctx, w, "reconnect via teams_relay_connect with the same link and reconnectSecret")
 
@@ -699,7 +778,7 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, w := h.clearActiveConn()
+	conn, w, target := h.clearActiveConn()
 	if conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
@@ -707,7 +786,33 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 		w.Close()
 	}
 	conn.Close()
+	if target != (connstore.Target{}) {
+		_ = connstore.MarkDisconnected(target)
+	}
 	return mcp.NewToolResultText("disconnected"), nil
+}
+
+func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	entries, err := connstore.List()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("could not list stored connections: %v", err)), nil
+	}
+	if len(entries) == 0 {
+		return mcp.NewToolResultText("no stored connections"), nil
+	}
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		line := fmt.Sprintf("host=%s sessionId=%s peerId=%s", e.Host, e.SessionID, e.PeerID)
+		if e.Name != "" {
+			line += fmt.Sprintf(" name=%q", e.Name)
+		}
+		line += fmt.Sprintf(" lastConnectedAt=%s", e.LastConnectedAt.Format(time.RFC3339))
+		if e.Connected {
+			line += " (still marked open)"
+		}
+		lines = append(lines, line)
+	}
+	return mcp.NewToolResultText(strings.Join(lines, "\n")), nil
 }
 
 func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

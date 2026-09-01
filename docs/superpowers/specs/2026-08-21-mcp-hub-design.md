@@ -623,6 +623,25 @@ is surfaced as `[HUB ERROR] <message>` — also not wrapped as untrusted, since
 it originates from the hub server describing the sender's own action, not
 from another peer.
 
+## Persisted connection identity (`mcp-hub-client`)
+
+`reconnectSecret` on `hub_connect` is now optional — `mcp-hub-client`
+manages it itself via a new `internal/connstore` package (one JSON file
+per machine, `os.UserConfigDir()/mcp-hub/connections.json`, keyed by
+`host`+`sessionId`), rather than requiring the model to remember and
+repeat a secret across turns/sessions. Omitted with no prior entry for
+that target: one is generated and stored after a successful connect.
+Omitted with a prior entry: it's reused automatically, reassigning the
+same `peerId`. Passed explicitly: always wins, unconditionally — this is
+the entire "reject the automatic default" mechanism, no separate flag or
+tool. A new `hub_list_connections` tool lists stored entries (never the
+secret itself). `hub_connect`'s own tool description gets a note, computed
+once at `Register()` time (= process launch), when any stored entry is
+still marked open from a connection that never got an explicit
+`hub_disconnect` — the best available mechanism given MCP's total lack of
+a server-initiated push into the model's context, not a guaranteed
+notification. Full rationale and design: `docs/superpowers/specs/2026-09-01-mcp-hub-client-connection-store-design.md`.
+
 ## HTTP-MCP endpoint (`mcp-hub-server`)
 
 `mcp-hub-server` also serves a Streamable-HTTP MCP endpoint at `/mcp`,

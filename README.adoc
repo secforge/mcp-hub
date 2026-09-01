@@ -147,13 +147,13 @@ Equivalently, add it directly to a project's `.mcp.json`:
 }
 ----
 
-Once loaded, Claude has eleven tools available:
+Once loaded, Claude has twelve tools available:
 
 [cols="1,3"]
 |===
 |Tool |Purpose
 
-|`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret)`
+|`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret?)`
 |Join a session. `host` is the server's base websocket URL, e.g.
 `ws://localhost:8765` or `wss://relay.example.com:8765` — the `sessionId` is
 appended as a path segment automatically (`<host>/<sessionId>`) — never
@@ -169,7 +169,7 @@ must be a UUID — anyone who wants to join the same session needs to be given
 the same `sessionId` out of band. Omit `sessionId` to start a brand new
 session: the client generates a UUID itself and the result prominently shows
 it, since it must be shared with anyone else who should join. Either way, the
-result includes a ready-to-paste invite line (`Connect to the hub at <host>
+result includes a ready-to-paste invite line (`Connect the mcp-hub to <host>
 with sessionId <sessionId>, then wait for messages.`) that Claude is
 instructed it *must* relay to you verbatim — not paraphrase or summarize —
 so you can copy it straight into another Claude Code (or other AI) session.
@@ -183,11 +183,7 @@ server reports a different protocol version than this build understands,
 the result also tells Claude to flag it to you (e.g. to update
 `mcp-hub-client`).
 +
-`name` and `agePublicKey` are optional; `reconnectSecret` is *required by
-this MCP tool's contract* (Claude must always pass one, generating its own
-if you haven't given it one to reuse) — this is a guardrail enforced only
-by the tool's schema, not by the hub server itself, which happily accepts
-a plain websocket connection with no such secret. `name` is
+`name` and `agePublicKey` are optional. `name` is
 an **untrusted** free-text display name — sanitized server-side (control
 characters/newlines stripped, length capped) — shown alongside the session
 log and reported to other peers. `agePublicKey` is an
@@ -196,20 +192,30 @@ format-validates it (both client- and server-side) and never uses it
 cryptographically — it's purely distributed to other peers so they can
 `age`-encrypt messages to you themselves.
 +
-`reconnectSecret` is a *separate*, opaque string (any format — a UUID, a
-random token) that is never shared with anyone, unlike `name`/`agePublicKey`
-— not echoed back, not distributed to other peers, not logged (only whether
-one was involved, and whether it matched — see the session log format
-below). Presenting the same `reconnectSecret` on a later `hub_connect`
-reassigns your previous peerId instead of a new one (unless that previous
-connection is still active, in which case you get a fresh one to avoid a
-collision) — this is deliberately *not* tied to `agePublicKey`: since that
-key is broadcast to every other peer, using it for identity reuse would let
+`reconnectSecret` is now **optional and managed automatically** by
+`mcp-hub-client` itself: omit it and, on the first `hub_connect` to a given
+`host`+`sessionId`, the client generates one and stores it locally
+(`internal/connstore`, one file per machine — see `hub_list_connections`
+below); on a later `hub_connect` to that exact same `host`+`sessionId`
+(even from a different process, e.g. after a restart) it's reused
+automatically, with nothing for Claude to remember or pass. Pass your own
+explicitly at any time to override the stored one — e.g. to force a fresh
+identity for a target, or to resume one shared from elsewhere. It's a
+*separate*, opaque string (any format — a UUID, a random token) that is
+never shared with anyone, unlike `name`/`agePublicKey` — not echoed back,
+not distributed to other peers, not logged (only whether one was involved,
+and whether it matched — see the session log format below). Presenting
+the same `reconnectSecret` on a later `hub_connect` reassigns your
+previous peerId instead of a new one (unless that previous connection is
+still active, in which case you get a fresh one to avoid a collision) —
+this is deliberately *not* tied to `agePublicKey`: since that key is
+broadcast to every other peer, using it for identity reuse would let
 anyone who merely observed it on the wire impersonate you by reconnecting
-with the same key. This mapping is durably persisted (hashed, never the
-secret itself — see `internal/identitystore`) and survives both a server
-restart and the session becoming fully empty — there's currently no expiry
-or cleanup for it, so it's recognized for as long as the file exists.
+with the same key. Server-side, this mapping is durably persisted (hashed,
+never the secret itself — see `internal/identitystore`) and survives both
+a server restart and the session becoming fully empty — there's currently
+no expiry or cleanup for it, so it's recognized for as long as the file
+exists.
 +
 If `name`/`agePublicKey` was given, the result confirms what other peers
 can now see for you — including the sanitized name, if it differs from
@@ -246,6 +252,22 @@ reads state already being kept.
 
 |`hub_disconnect()`
 |Leave the session and tear down the connection.
+
+|`hub_list_connections()`
+|List every `host`+`sessionId` this client has connected to before via
+`hub_connect` (not `teams_relay_connect`, which manages identity
+differently) — the `peerId`/display name last used, when, and whether it's
+still marked open from a connection that never got an explicit
+`hub_disconnect` (most commonly because the process/conversation simply
+ended, not necessarily a crash). Read-only. Never includes the stored
+`reconnectSecret` itself — that's meant to stay out of Claude's context by
+design, and `hub_connect` already reuses it automatically without needing
+it repeated. If any entry is still marked open when `mcp-hub-client`
+starts, `hub_connect`'s own tool description gets a note about it — MCP
+gives a server no way to push that proactively into a conversation, so
+this is only visible once Claude actually looks at the tool description
+(which, with tool search deferring full schemas by default, may not be
+immediate).
 
 |`teams_relay_connect(link, name?, reconnectSecret)`
 |Connect to a chat-relay-style bridge session (e.g. a specific Microsoft

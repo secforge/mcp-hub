@@ -12,6 +12,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/wire"
 	"github.com/secforge/mcp-hub/internal/wsserver"
 )
@@ -103,7 +104,7 @@ func TestConnectResultTellsCodexToUseHubWait(t *testing.T) {
 	if !strings.Contains(text, "Never return a final response merely because one waiter call ended") {
 		t.Fatalf("expected the never-stop-early instruction, got: %s", text)
 	}
-	if !strings.Contains(text, "reconnect with the same sessionId and reconnectSecret") {
+	if !strings.Contains(text, "reconnect with the same sessionId") {
 		t.Fatalf("expected the reconnect-on-disconnect instruction, got: %s", text)
 	}
 	// The generic "background one of these two modes" framing, and the CLI
@@ -120,10 +121,11 @@ func TestConnectResultTellsCodexToUseHubWait(t *testing.T) {
 	if !strings.Contains(text, "A timeout with no event is normal") {
 		t.Fatalf("expected the timeout-is-normal note, got: %s", text)
 	}
-	// No reconnectSecret was passed in this test, so step 2's prerequisite
-	// is missing — the result should flag that explicitly.
-	if !strings.Contains(text, "no reconnectSecret was given") {
-		t.Fatalf("expected a note that reconnectSecret is missing, got: %s", text)
+	// No reconnectSecret was passed in this test — with auto-management,
+	// step 2 no longer has a missing prerequisite (Codex included): one
+	// was generated and stored automatically, and the result says so.
+	if !strings.Contains(text, "was generated and stored automatically") {
+		t.Fatalf("expected a note that a reconnectSecret was auto-generated, got: %s", text)
 	}
 }
 
@@ -645,8 +647,14 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 	if !strings.Contains(textOf(res), pubkey) {
 		t.Fatalf("expected b's connect result to confirm its age public key, got: %s", textOf(res))
 	}
-	if strings.Contains(textOf(res), "reconnectSecret") {
-		t.Fatalf("expected no reconnectSecret note when none was given, got: %s", textOf(res))
+	// b omitted reconnectSecret, and a had already connected to this same
+	// host+sessionId — so b's connect should have automatically reused a's
+	// stored secret for this target (a itself still being live is what
+	// keeps b from colliding onto a's own peerId, per hubsession's own
+	// collision-avoidance rule; this test just checks the note reflects
+	// the reuse, not the exact peerId outcome).
+	if !strings.Contains(textOf(res), "was reused automatically") {
+		t.Fatalf("expected a note that the stored reconnectSecret was reused automatically, got: %s", textOf(res))
 	}
 
 	var peersText string
@@ -985,7 +993,7 @@ func TestConnectWithoutSessionIDGeneratesOneAndShowsIt(t *testing.T) {
 	}
 	hub2.handleDisconnect(ctx, mcp.CallToolRequest{})
 
-	want := "Connect to the hub at " + url + " with sessionId " + sessionID + ", then wait for messages."
+	want := "Connect the mcp-hub to " + url + " with sessionId " + sessionID + ", then wait for messages."
 	if !strings.Contains(text, want) {
 		t.Fatalf("expected a copy-pasteable invite string %q in result, got: %s", want, text)
 	}
@@ -1011,9 +1019,156 @@ func TestConnectWithSessionIDDoesNotClaimItsNew(t *testing.T) {
 		t.Fatalf("should not claim a new session was generated when one was given: %s", textOf(res))
 	}
 
-	want := "Connect to the hub at " + url + " with sessionId 550e8400-e29b-41d4-a716-446655440000, then wait for messages."
+	want := "Connect the mcp-hub to " + url + " with sessionId 550e8400-e29b-41d4-a716-446655440000, then wait for messages."
 	if !strings.Contains(textOf(res), want) {
 		t.Fatalf("expected a copy-pasteable invite string %q in result, got: %s", want, textOf(res))
+	}
+}
+
+func TestReconnectAfterDisconnectReusesStoredSecretAndPeerID(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+
+	res1, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res1.IsError {
+		t.Fatalf("first connect failed: err=%v result=%+v", err, res1)
+	}
+	firstPeerID := hub.conn.PeerID()
+
+	if res, err := hub.handleDisconnect(ctx, mcp.CallToolRequest{}); err != nil || res.IsError {
+		t.Fatalf("disconnect failed: err=%v result=%+v", err, res)
+	}
+
+	res2, err := hub.handleConnect(ctx, connReq) // still no reconnectSecret passed
+	if err != nil || res2.IsError {
+		t.Fatalf("second connect failed: err=%v result=%+v", err, res2)
+	}
+	if hub.conn.PeerID() != firstPeerID {
+		t.Fatalf("expected the same peerID %q to be reassigned via the auto-stored secret, got %q",
+			firstPeerID, hub.conn.PeerID())
+	}
+	if !strings.Contains(textOf(res2), "was reused automatically") {
+		t.Fatalf("expected a note that the stored secret was reused, got: %s", textOf(res2))
+	}
+	hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+}
+
+func TestExplicitReconnectSecretOverridesStoredOne(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	res1, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res1.IsError {
+		t.Fatalf("first connect failed: err=%v result=%+v", err, res1)
+	}
+	hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	connReq2 := mcp.CallToolRequest{}
+	connReq2.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID, "reconnectSecret": "my-own-secret"}
+	res2, err := hub.handleConnect(ctx, connReq2)
+	if err != nil || res2.IsError {
+		t.Fatalf("second connect failed: err=%v result=%+v", err, res2)
+	}
+	if !strings.Contains(textOf(res2), "has been stored for this host+sessionId") {
+		t.Fatalf("expected a note confirming the explicit secret was stored, got: %s", textOf(res2))
+	}
+
+	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID})
+	if !ok {
+		t.Fatal("expected an entry to be stored")
+	}
+	if stored.ReconnectSecret != "my-own-secret" {
+		t.Fatalf("expected the explicitly passed secret to be stored, got %q", stored.ReconnectSecret)
+	}
+	hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+}
+
+func TestHandleListConnectionsShowsEntriesWithoutLeakingSecret(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+
+	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID})
+	if !ok {
+		t.Fatal("expected an entry to be stored")
+	}
+
+	res, err := hub.handleListConnections(ctx, mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("handleListConnections failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, url) || !strings.Contains(text, sessionID) || !strings.Contains(text, "(still marked open)") {
+		t.Fatalf("expected the still-open entry listed, got: %s", text)
+	}
+	if strings.Contains(text, stored.ReconnectSecret) {
+		t.Fatalf("expected the reconnectSecret to never appear in hub_list_connections output, got: %s", text)
+	}
+
+	hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	res2, err := hub.handleListConnections(ctx, mcp.CallToolRequest{})
+	if err != nil || res2.IsError {
+		t.Fatalf("second handleListConnections failed: err=%v result=%+v", err, res2)
+	}
+	if strings.Contains(textOf(res2), "(still marked open)") {
+		t.Fatalf("expected the entry to no longer be marked open after disconnect, got: %s", textOf(res2))
+	}
+}
+
+func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+
+	if note := startupConnectionsNote(); note != "" {
+		t.Fatalf("expected no note with an empty store, got: %s", note)
+	}
+
+	if err := connstore.Upsert(connstore.Entry{
+		Host: "wss://a", SessionID: "550e8400-e29b-41d4-a716-446655440000", Connected: true,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	note := startupConnectionsNote()
+	if !strings.Contains(note, "1 session") || !strings.Contains(note, "hub_list_connections") {
+		t.Fatalf("expected a note naming 1 open session, got: %s", note)
+	}
+}
+
+func TestTeamsRelayConnectDoesNotTouchConnstore(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := startRelayTestServer(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
+	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	entries, err := connstore.List()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected teams_relay_connect to leave connstore untouched, got %+v", entries)
 	}
 }
 
