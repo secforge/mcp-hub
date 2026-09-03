@@ -64,6 +64,22 @@ type Event struct {
 	// ack kinds: "did the action this connection asked for succeed."
 	ExternalID string
 	ActionOK   bool
+	// ReplyTo/ReplyPreview carry a "msg"/"messageEdited"'s reply
+	// reference, if any — see wire.Msg.ReplyTo/ReplyPreview. Empty (not a
+	// distinguishable "absent" vs. "empty string") when this message
+	// isn't a reply.
+	ReplyTo      string
+	ReplyPreview string
+	// Mentions/MentionedMe carry a "msg"/"messageEdited"'s @-mentions, if
+	// any — see wire.Msg.Mentions/wire.Msg.MentionedMe.
+	Mentions    []wire.Mention
+	MentionedMe bool
+	// IsOperator is true when this event's PeerID equals the session's
+	// wire.Joined.SystemPeerID (see Conn.SystemPeerID) — set here, not
+	// decoded from the frame itself, since a frame has no way to declare
+	// its own authority. Only meaningful together with a non-empty
+	// PeerID; false whenever a server has no SystemPeerID concept at all.
+	IsOperator bool
 	// Own marks a "msg" this exact connection sent — see wire.Msg.Own. Also
 	// used on "reactionChanged" for the same purpose — see wire.ReactionChanged.Own.
 	Own bool
@@ -79,6 +95,36 @@ type Event struct {
 	// "messageDeleted"'s, for placing its tombstone (see
 	// wire.MessageDeleted.Cursor).
 	Cursor string
+	// Attachments carries a "msg"/"messageEdited"'s attachments, if any —
+	// see wire.Msg.Attachments/wire.MessageEdited.Attachments. Each entry
+	// may be either the inline form (ContentBytes already base64, exactly
+	// the form an MCP ImageContent block's Data field expects — no
+	// re-encoding needed) or the reference form (wire.Attachment.
+	// IsReference true) — fetch the latter with Conn.RequestAttachment
+	// before it can be rendered or saved.
+	Attachments []wire.Attachment
+	// AttachmentToken/AttachmentName/AttachmentContentType/
+	// AttachmentContentBytes carry an "attachmentData" event's payload —
+	// the reply to RequestAttachment's fetch-by-token request. See
+	// wire.AttachmentData.
+	AttachmentToken        string
+	AttachmentName         string
+	AttachmentContentType  string
+	AttachmentContentBytes string
+	// Format carries a "msg"/"messageEdited"'s wire.Msg.Format/
+	// wire.MessageEdited.Format — a server extension (chat-relay: "text"
+	// or "html") describing how Text should be interpreted. Empty means
+	// either the field was absent or unset — the receiving side's own
+	// default ("text").
+	Format string
+	// HistoryCount/HistoryOldest/HistoryNewest carry a "historyComplete"
+	// event's wire.HistoryComplete.Count/Oldest/Newest, if the server set
+	// them — see that type's doc comment. Zero/empty when a server
+	// doesn't set this extension (including every mcp-hub-server, which
+	// has no history concept at all).
+	HistoryCount  int
+	HistoryOldest string
+	HistoryNewest string
 }
 
 // PeerInfo is what's known about one other peer in the session.
@@ -103,6 +149,7 @@ type Conn struct {
 	canSend          bool
 	conversationKind string
 	topic            *string
+	systemPeerID     string
 	// pongWait is snapshotted from the package-level var once, synchronously,
 	// in Dial — never read from the background readLoop goroutine directly.
 	// Reading the mutable package var from that goroutine on every loop
@@ -345,6 +392,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		canSend:          joined.CanSend,
 		conversationKind: joined.ConversationKind,
 		topic:            joined.Topic,
+		systemPeerID:     joined.SystemPeerID,
 		isBridge:         isBridge,
 		lastFrameKind:    "joined",
 		lastFrameAt:      time.Now(),
@@ -375,6 +423,11 @@ func (c *Conn) AgePublicKey() string { return c.agePublicKey }
 // ServerVersion is the wire.ProtocolVersion the server reported in "joined".
 // Compare against wire.ProtocolVersion to tell if this client is behind.
 func (c *Conn) ServerVersion() int { return c.serverVersion }
+
+// SystemPeerID is the server's operator/system peerId for this session, if
+// it has one — see wire.Joined.SystemPeerID. Empty when the server doesn't
+// set this concept (including every mcp-hub-server).
+func (c *Conn) SystemPeerID() string { return c.systemPeerID }
 
 // ExpectedPeerCount is how many peers were already in the session at join
 // time, as reported by the server's "joined" message — i.e. how many
@@ -648,6 +701,9 @@ func (c *Conn) readLoop() {
 			c.mu.Unlock()
 			continue
 		}
+		if ev.PeerID != "" && c.systemPeerID != "" && ev.PeerID == c.systemPeerID {
+			ev.IsOperator = true
+		}
 		c.buffer = append(c.buffer, ev)
 		if ev.Cursor != "" {
 			c.lastSeenCursor = ev.Cursor
@@ -689,7 +745,9 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "msg", PeerID: m.PeerID, Text: m.Text, TS: m.TS, Private: m.Private,
-			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor}, true
+			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
+			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
+			Mentions: m.Mentions, MentionedMe: m.MentionedMe}, true
 	case wire.TypeError:
 		var e wire.Error
 		if err := json.Unmarshal(raw, &e); err != nil {
@@ -711,7 +769,17 @@ func decodeEvent(raw []byte) (Event, bool) {
 	case wire.TypeRosterComplete:
 		return Event{Kind: "rosterComplete"}, true
 	case wire.TypeHistoryComplete:
-		return Event{Kind: "historyComplete"}, true
+		var hc wire.HistoryComplete
+		if err := json.Unmarshal(raw, &hc); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "historyComplete", HistoryCount: hc.Count, HistoryOldest: hc.Oldest, HistoryNewest: hc.Newest}, true
+	case wire.TypeHistoryBegin:
+		var hb wire.HistoryBegin
+		if err := json.Unmarshal(raw, &hb); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "historyBegin", HistoryCount: hb.Count, HistoryOldest: hb.Oldest, HistoryNewest: hb.Newest}, true
 	case wire.TypeSendAck:
 		var a wire.SendAck
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -733,7 +801,9 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &m); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "messageEdited", ExternalID: m.ExternalID, Text: m.Text, TS: m.TS, Own: m.Own}, true
+		return Event{Kind: "messageEdited", ExternalID: m.ExternalID, Text: m.Text, TS: m.TS, Own: m.Own,
+			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
+			Mentions: m.Mentions, MentionedMe: m.MentionedMe}, true
 	case wire.TypeReactionAck:
 		var a wire.ReactionAck
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -769,6 +839,13 @@ func decodeEvent(raw []byte) (Event, bool) {
 		// holds, to be adopted rather than treated as confirmation of what
 		// was sent.
 		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK}, true
+	case wire.TypeAttachmentData:
+		var a wire.AttachmentData
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "attachmentData", AttachmentToken: a.Token, AttachmentName: a.Name,
+			AttachmentContentType: a.ContentType, AttachmentContentBytes: a.ContentBytes}, true
 	default:
 		return Event{}, false
 	}
@@ -792,9 +869,12 @@ func (c *Conn) ackCursorForOutbound() string {
 	return c.lastConsumed
 }
 
-func (c *Conn) Send(text string) error {
+func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo string) error {
 	m := wire.NewOutgoingMsg(text)
 	m.AckCursor = c.ackCursorForOutbound()
+	m.Attachments = attachments
+	m.Format = format
+	m.ReplyTo = replyTo
 	return c.ws.WriteJSON(m)
 }
 
@@ -802,9 +882,12 @@ func (c *Conn) Send(text string) error {
 // server processes this asynchronously: a delivery failure (e.g. an unknown
 // or departed peer) does not surface as a returned error here, but as a
 // buffered "error" event picked up by a later Peek/Drain.
-func (c *Conn) SendTo(text, peerID string) error {
+func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format, replyTo string) error {
 	m := wire.NewOutgoingDirectedMsg(text, peerID)
 	m.AckCursor = c.ackCursorForOutbound()
+	m.Attachments = attachments
+	m.Format = format
+	m.ReplyTo = replyTo
 	return c.ws.WriteJSON(m)
 }
 
@@ -849,9 +932,11 @@ func (c *Conn) React(externalID, reaction, action string) error {
 // EditMessage asks the server to change an earlier message's content,
 // identified by externalID — see wire.Edit. Not meaningful for
 // mcp-hub-server. Success/failure arrives asynchronously as an "editAck"
-// (or an "error" event on refusal), like React.
-func (c *Conn) EditMessage(externalID, text string) error {
-	e := wire.NewEditRequest(externalID, text)
+// (or an "error" event on refusal), like React. attachments, if non-nil,
+// replaces the message's attachments (always the inline form — see
+// wire.Edit.Attachments); pass nil to leave existing attachments alone.
+func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachment, format, replyTo string) error {
+	e := wire.NewEditRequest(externalID, text, attachments, format, replyTo)
 	e.AckCursor = c.ackCursorForOutbound()
 	return c.ws.WriteJSON(e)
 }
@@ -892,20 +977,20 @@ var AckWaitTimeout = 5 * time.Second
 // succeed or fail later, reported the normal way via wait/hub_receive/
 // hub_wait, exactly as before this existed. Returns (Event{}, false, err)
 // only if the write itself failed locally.
-func (c *Conn) SendAwaitingAck(text, to string) (Event, bool, error) {
+func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, format, replyTo string) (Event, bool, error) {
 	if !c.isBridge {
 		if to == "" {
-			return Event{}, false, c.Send(text)
+			return Event{}, false, c.Send(text, attachments, format, replyTo)
 		}
-		return Event{}, false, c.SendTo(text, to)
+		return Event{}, false, c.SendTo(text, to, attachments, format, replyTo)
 	}
 	resultCh, cancel := c.claimNextAck("sendAck")
 	defer cancel()
 	var err error
 	if to == "" {
-		err = c.Send(text)
+		err = c.Send(text, attachments, format, replyTo)
 	} else {
-		err = c.SendTo(text, to)
+		err = c.SendTo(text, to, attachments, format, replyTo)
 	}
 	if err != nil {
 		return Event{}, false, err
@@ -941,13 +1026,37 @@ func (c *Conn) ReactAwaitingAck(externalID, reaction, action string) (Event, boo
 // EditMessageAwaitingAck is EditMessage, but — only for a bridge
 // connection — waits up to AckWaitTimeout for its own "editAck"/"error"
 // outcome. See SendAwaitingAck for the full contract; identical shape.
-func (c *Conn) EditMessageAwaitingAck(externalID, text string) (Event, bool, error) {
+func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wire.Attachment, format, replyTo string) (Event, bool, error) {
 	if !c.isBridge {
-		return Event{}, false, c.EditMessage(externalID, text)
+		return Event{}, false, c.EditMessage(externalID, text, attachments, format, replyTo)
 	}
 	resultCh, cancel := c.claimNextAck("editAck")
 	defer cancel()
-	if err := c.EditMessage(externalID, text); err != nil {
+	if err := c.EditMessage(externalID, text, attachments, format, replyTo); err != nil {
+		return Event{}, false, err
+	}
+	select {
+	case ev := <-resultCh:
+		return ev, true, nil
+	case <-time.After(AckWaitTimeout):
+		return Event{}, false, nil
+	}
+}
+
+// RequestAttachment fetches the actual bytes behind a reference-form
+// attachment's Token (see wire.Attachment.IsReference) by sending an
+// AttachmentRequest and waiting up to AckWaitTimeout for the server's
+// reply — an "attachmentData" event on success, an "error" event
+// (bad_attachment/not_found/unavailable) on refusal. Returns (Event{},
+// false, nil) on a bare timeout, same convention as SendAwaitingAck and
+// friends — most notably including mcp-hub-server's own relay, which
+// never emits a Token in the first place and so never replies to this at
+// all; a caller should only ever call this for a Token actually seen on
+// an Attachment.IsReference()==true entry.
+func (c *Conn) RequestAttachment(token string) (Event, bool, error) {
+	resultCh, cancel := c.claimNextAck("attachmentData")
+	defer cancel()
+	if err := c.ws.WriteJSON(wire.NewAttachmentRequest(token)); err != nil {
 		return Event{}, false, err
 	}
 	select {
@@ -1099,8 +1208,29 @@ func (c *Conn) hasWakeWorthyEventsLocked() bool {
 // "consumed" boundary (see lastConsumed's doc comment): once events leave
 // here, they're considered delivered to the model, not merely received.
 func (c *Conn) Drain() (formatted string, connected bool) {
+	events, connected := c.DrainEvents()
+	return FormatEvents(events), connected
+}
+
+// DrainBatch is Drain, but keeps each buffered event as its own formatted
+// string rather than joining them into one — for a caller (Waiter's
+// follow-mode delivery) that can issue one network write per event
+// instead of bundling a whole burst into a single write. See
+// FormatEventsBatch's doc comment for why this matters. Same
+// consumed-boundary semantics as Drain/DrainEvents; only one of the three
+// should be called on a given batch.
+func (c *Conn) DrainBatch() (chunks []string, connected bool) {
+	events, connected := c.DrainEvents()
+	return FormatEventsBatch(events), connected
+}
+
+// DrainEvents is Drain without the text formatting — for a caller (like
+// mcptools' image-rendering path) that needs the raw Event.Attachments
+// rather than FormatEvents' text-only rendering. Same consumed-boundary
+// semantics as Drain; the two must not both be called on the same batch.
+func (c *Conn) DrainEvents() (events []Event, connected bool) {
 	c.mu.Lock()
-	events := c.buffer
+	events = c.buffer
 	c.buffer = nil
 	connected = !c.closed
 	for _, e := range events {
@@ -1109,7 +1239,7 @@ func (c *Conn) Drain() (formatted string, connected bool) {
 		}
 	}
 	c.mu.Unlock()
-	return FormatEvents(events), connected
+	return events, connected
 }
 
 // LastConsumedCursor is the cursor of the most recent event actually

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/secforge/mcp-hub/internal/hubsession"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -554,6 +555,55 @@ func TestReconnectingWithSameReconnectSecretReusesPeerID(t *testing.T) {
 	if joinedSecond.PeerID != joinedFirst.PeerID {
 		t.Fatalf("expected reconnecting with the same reconnectSecret to reuse peerID %q, got %q",
 			joinedFirst.PeerID, joinedSecond.PeerID)
+	}
+}
+
+// TestReconnectingWithSameReconnectSecretWhileStillLiveSupersedes is the
+// end-to-end counterpart to hubsession's own supersede tests: a second
+// connection presenting the same reconnectSecret while the first is still
+// live must take over its peerId (not get a fresh, unrelated one) and the
+// first connection must actually be closed server-side with
+// hubsession.SupersededCloseCode, not just silently forgotten while its
+// own socket still thinks it's connected.
+func TestReconnectingWithSameReconnectSecretWhileStillLiveSupersedes(t *testing.T) {
+	srv := httptest.NewServer(NewHandler())
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	const secret = "super-secret-reconnect-token"
+
+	first, _, err := websocket.DefaultDialer.Dial(url+"/"+sessionID+"?reconnectSecret="+secret, nil)
+	if err != nil {
+		t.Fatalf("dial first: %v", err)
+	}
+	defer first.Close()
+	_, raw := readTyped(t, first)
+	var joinedFirst wire.Joined
+	decodeJSON(t, raw, &joinedFirst)
+	readTyped(t, first) // first: rosterComplete (empty roster, no other peers yet)
+
+	second, _, err := websocket.DefaultDialer.Dial(url+"/"+sessionID+"?reconnectSecret="+secret, nil)
+	if err != nil {
+		t.Fatalf("dial second: %v", err)
+	}
+	defer second.Close()
+	_, raw = readTyped(t, second)
+	var joinedSecond wire.Joined
+	decodeJSON(t, raw, &joinedSecond)
+
+	if joinedSecond.PeerID != joinedFirst.PeerID {
+		t.Fatalf("expected the second connection to supersede and reclaim peerID %q, got %q",
+			joinedFirst.PeerID, joinedSecond.PeerID)
+	}
+
+	first.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = first.ReadMessage()
+	closeErr, ok := err.(*websocket.CloseError)
+	if !ok {
+		t.Fatalf("expected the superseded first connection to receive a close frame, got err=%v", err)
+	}
+	if closeErr.Code != hubsession.SupersededCloseCode {
+		t.Fatalf("expected close code %d, got %d", hubsession.SupersededCloseCode, closeErr.Code)
 	}
 }
 

@@ -2,8 +2,11 @@ package mcptools
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +25,25 @@ func startTestServer(t *testing.T) string {
 	srv := httptest.NewServer(wsserver.NewHandler())
 	t.Cleanup(srv.Close)
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+// connectAs calls hub.handleConnect(ctx, connReq) with connstore's project
+// scope (see connstore.CurrentProject) pinned to project for the duration
+// of this call — used any time a test connects more than one *Hub to the
+// exact same host+sessionId with no explicit reconnectSecret: without a
+// distinct project per hub, they'd all resolve the same auto-managed
+// stored secret (see handleConnect) and, now that Session.Join supersedes
+// a still-live identity instead of assigning a fresh one on collision
+// (see hubsession.SupersededCloseCode), each connect would silently kill
+// the previous one — exactly the real multi-agent collision this
+// project-scoping exists to prevent, just simulated by multiple *Hub
+// instances in one test process instead of separate real ones. t.Setenv
+// auto-restores the previous value at test end and is safe here because
+// every call site connects sequentially, never concurrently.
+func connectAs(t *testing.T, ctx context.Context, hub *Hub, connReq mcp.CallToolRequest, project string) (*mcp.CallToolResult, error) {
+	t.Helper()
+	t.Setenv("MCP_HUB_PROJECT_DIR", project)
+	return hub.handleConnect(ctx, connReq)
 }
 
 // fakeClientSession is a minimal server.SessionWithClientInfo, used to put
@@ -169,6 +191,377 @@ func TestConnectResultDoesNotWarnNonCodexClients(t *testing.T) {
 	}
 }
 
+func TestSendWithFormatReachesOtherPeer(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := connectAs(t, ctx, hubA, connReq, "hubA"); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hubB := NewHub()
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "<b>hi</b>", "format": "html"}
+	if res, err := hubB.handleSend(ctx, sendReq); err != nil || res.IsError {
+		t.Fatalf("send failed: err=%v result=%+v", err, res)
+	}
+
+	var gotFormat string
+	deadlinePoll(t, func() bool {
+		conn, _ := hubA.activeConn()
+		events, _ := conn.DrainEvents()
+		for _, ev := range events {
+			if ev.Kind == "msg" && strings.Contains(ev.Text, "hi") {
+				gotFormat = ev.Format
+				return true
+			}
+		}
+		return false
+	})
+	if gotFormat != "html" {
+		t.Fatalf("expected the received msg event to carry format=html, got %q", gotFormat)
+	}
+}
+
+func TestSendWithReplyToReachesOtherPeer(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := connectAs(t, ctx, hubA, connReq, "hubA"); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hubB := NewHub()
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "reply text", "replyTo": "ext-orig"}
+	if res, err := hubB.handleSend(ctx, sendReq); err != nil || res.IsError {
+		t.Fatalf("send failed: err=%v result=%+v", err, res)
+	}
+
+	var gotReplyTo string
+	deadlinePoll(t, func() bool {
+		conn, _ := hubA.activeConn()
+		events, _ := conn.DrainEvents()
+		for _, ev := range events {
+			if ev.Kind == "msg" && strings.Contains(ev.Text, "reply text") {
+				gotReplyTo = ev.ReplyTo
+				return true
+			}
+		}
+		return false
+	})
+	if gotReplyTo != "ext-orig" {
+		t.Fatalf("expected the received msg event to carry replyTo=ext-orig, got %q", gotReplyTo)
+	}
+}
+
+func TestSendWithFilePathSendsAndSavesNonImageAttachment(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := connectAs(t, ctx, hubA, connReq, "hubA"); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hubB := NewHub()
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	filePath := filepath.Join(t.TempDir(), "report.pdf")
+	rawFile := []byte("%PDF-1.4 not a real pdf, just test bytes")
+	if err := os.WriteFile(filePath, rawFile, 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "here's the report", "filePath": filePath}
+	if res, err := hubB.handleSend(ctx, sendReq); err != nil || res.IsError {
+		t.Fatalf("send failed: err=%v result=%+v", err, res)
+	}
+
+	var res *mcp.CallToolResult
+	deadlinePoll(t, func() bool {
+		var err error
+		res, err = hubA.handleReceive(ctx, mcp.CallToolRequest{})
+		if err != nil {
+			t.Fatalf("receive failed: %v", err)
+		}
+		return strings.Contains(textOf(res), "here's the report")
+	})
+
+	text := textOf(res)
+	if len(imagesOf(res)) != 0 {
+		t.Fatalf("expected no inline image content blocks for a non-image attachment, got %+v", res.Content)
+	}
+	savedPath := extractSavedImagePath(t, text)
+	got, err := os.ReadFile(savedPath)
+	if err != nil {
+		t.Fatalf("could not read saved attachment at %q: %v", savedPath, err)
+	}
+	if string(got) != string(rawFile) {
+		t.Fatalf("saved attachment content mismatch: got %q, want %q", got, rawFile)
+	}
+	if filepath.Base(savedPath) != "1-report.pdf" {
+		t.Fatalf("expected the saved filename to preserve the original name, got %q", filepath.Base(savedPath))
+	}
+}
+
+func TestSendRejectsBothImagePathAndFilePath(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{
+		"text": "hi", "imagePath": "/tmp/whatever.png", "filePath": "/tmp/whatever.bin",
+	}
+	res, err := hub.handleSend(ctx, sendReq)
+	if err != nil {
+		t.Fatalf("handleSend returned unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result when both imagePath and filePath are given")
+	}
+}
+
+func TestSendWithImagePathSavesReceivedImageLocallyAndReturnsPath(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hubA := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := connectAs(t, ctx, hubA, connReq, "hubA"); err != nil || res.IsError {
+		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
+	}
+	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hubB := NewHub()
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
+		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
+	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	imgPath := filepath.Join(t.TempDir(), "pic.png")
+	rawImage := []byte("not a real png, just test bytes")
+	if err := os.WriteFile(imgPath, rawImage, 0o600); err != nil {
+		t.Fatalf("write test image: %v", err)
+	}
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "look at this", "imagePath": imgPath}
+	if res, err := hubB.handleSend(ctx, sendReq); err != nil || res.IsError {
+		t.Fatalf("send failed: err=%v result=%+v", err, res)
+	}
+
+	var res *mcp.CallToolResult
+	deadlinePoll(t, func() bool {
+		var err error
+		res, err = hubA.handleReceive(ctx, mcp.CallToolRequest{})
+		if err != nil {
+			t.Fatalf("receive failed: %v", err)
+		}
+		return strings.Contains(textOf(res), "look at this")
+	})
+
+	text := textOf(res)
+	if len(imagesOf(res)) != 0 {
+		t.Fatalf("expected no inline image content blocks (mcp-hub-client saves to disk instead), got %+v", res.Content)
+	}
+	savedPath := extractSavedImagePath(t, text)
+	got, err := os.ReadFile(savedPath)
+	if err != nil {
+		t.Fatalf("could not read saved image at %q: %v", savedPath, err)
+	}
+	if string(got) != string(rawImage) {
+		t.Fatalf("saved image content mismatch: got %q, want %q", got, rawImage)
+	}
+	if filepath.Ext(savedPath) != ".png" {
+		t.Fatalf("expected saved image to have a .png extension, got %q", savedPath)
+	}
+
+	// The saved file is cleaned up once the receiving connection disconnects.
+	if _, err := hubA.handleDisconnect(context.Background(), mcp.CallToolRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(savedPath); !os.IsNotExist(err) {
+		t.Fatalf("expected saved image to be removed after disconnect, stat err=%v", err)
+	}
+}
+
+// extractSavedImagePath pulls the "saved to <path> (" filesystem path out
+// of Hub.saveReceivedAttachments' annotation text.
+func extractSavedImagePath(t *testing.T, text string) string {
+	t.Helper()
+	const marker = "saved to "
+	i := strings.Index(text, marker)
+	if i == -1 {
+		t.Fatalf("expected a %q annotation in received text, got: %s", marker, text)
+	}
+	rest := text[i+len(marker):]
+	end := strings.Index(rest, " (")
+	if end == -1 {
+		t.Fatalf("could not find end of saved path in: %s", rest)
+	}
+	return rest[:end]
+}
+
+func TestSendRejectsImagePathOverSizeLimit(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	imgPath := filepath.Join(t.TempDir(), "big.png")
+	if err := os.WriteFile(imgPath, make([]byte, wire.MaxAttachmentRawBytes+1), 0o600); err != nil {
+		t.Fatalf("write test image: %v", err)
+	}
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "too big", "imagePath": imgPath}
+	res, err := hub.handleSend(ctx, sendReq)
+	if err != nil {
+		t.Fatalf("handleSend returned unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result for an oversized image")
+	}
+}
+
+func TestSendRejectsUnsupportedImageExtension(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	imgPath := filepath.Join(t.TempDir(), "not-an-image.txt")
+	if err := os.WriteFile(imgPath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{"text": "nope", "imagePath": imgPath}
+	res, err := hub.handleSend(ctx, sendReq)
+	if err != nil {
+		t.Fatalf("handleSend returned unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result for an unsupported extension")
+	}
+}
+
+// TestReceiveResolvesReferenceFormAttachment covers a chat-relay-style
+// server: a delivered msg carries only a token (no inline contentBytes),
+// and the actual bytes must be fetched with a follow-up attachment
+// request before mcp-hub-client's usual save-to-local-file handling can
+// run — see wire.Attachment.IsReference and hubconn.Conn.RequestAttachment.
+func TestReceiveResolvesReferenceFormAttachment(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.Msg{
+			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "look", TS: "ts1",
+			Attachments: []wire.Attachment{{Token: "att-3142", ContentType: "image/webp", Name: "shot.png", Kind: "image"}},
+		})
+		var req wire.AttachmentRequest
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+		conn.WriteJSON(wire.AttachmentData{
+			Type: wire.TypeAttachmentData, Token: req.Token, Name: "shot.png",
+			ContentType: "image/webp", ContentBytes: base64.StdEncoding.EncodeToString([]byte("bytes-here")),
+		})
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000"}
+	if res, err := hub.handleConnect(context.Background(), connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(context.Background(), mcp.CallToolRequest{})
+
+	var res *mcp.CallToolResult
+	deadlinePoll(t, func() bool {
+		var err error
+		res, err = hub.handleReceive(context.Background(), mcp.CallToolRequest{})
+		if err != nil {
+			t.Fatalf("receive failed: %v", err)
+		}
+		return strings.Contains(textOf(res), "look")
+	})
+
+	savedPath := extractSavedImagePath(t, textOf(res))
+	got, err := os.ReadFile(savedPath)
+	if err != nil {
+		t.Fatalf("could not read saved image at %q: %v", savedPath, err)
+	}
+	if string(got) != "bytes-here" {
+		t.Fatalf("saved image content mismatch: got %q", got)
+	}
+	if filepath.Ext(savedPath) != ".webp" {
+		t.Fatalf("expected a .webp extension (from the fetched attachmentData's contentType), got %q", savedPath)
+	}
+}
+
 func TestConnectSendReceiveDisconnect(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -177,13 +570,13 @@ func TestConnectSendReceiveDisconnect(t *testing.T) {
 	hubA := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	res, err := hubA.handleConnect(ctx, connReq)
+	res, err := connectAs(t, ctx, hubA, connReq, "hubA")
 	if err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
 	hubB := NewHub()
-	res, err = hubB.handleConnect(ctx, connReq)
+	res, err = connectAs(t, ctx, hubB, connReq, "hubB")
 	if err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
@@ -239,13 +632,13 @@ func TestHubWaitReturnsImmediatelyWhenAlreadyBuffered(t *testing.T) {
 	hubA := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	if res, err := hubA.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubA, connReq, "hubA"); err != nil || res.IsError {
 		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
 	}
 	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
 
 	hubB := NewHub()
-	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
 	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -297,13 +690,13 @@ func TestHubWaitBlocksUntilMessageArrives(t *testing.T) {
 	hubA := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	if res, err := hubA.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubA, connReq, "hubA"); err != nil || res.IsError {
 		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
 	}
 	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
 
 	hubB := NewHub()
-	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
 	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -353,7 +746,7 @@ func TestHubWaitNewCallSupersedesInFlightOne(t *testing.T) {
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hub, connReq, "hubA"); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -365,7 +758,7 @@ func TestHubWaitNewCallSupersedesInFlightOne(t *testing.T) {
 	// call starts — otherwise whichever call is actively polling would
 	// devour that roster event instead of the real message sent later.
 	hubB := NewHub()
-	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
 	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -581,7 +974,7 @@ func TestPeersToolReturnsRoster(t *testing.T) {
 	hubA := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	if res, err := hubA.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubA, connReq, "hubA"); err != nil || res.IsError {
 		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
 	}
 	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -595,7 +988,7 @@ func TestPeersToolReturnsRoster(t *testing.T) {
 	}
 
 	hubB := NewHub()
-	res, err = hubB.handleConnect(ctx, connReq)
+	res, err = connectAs(t, ctx, hubB, connReq, "hubB")
 	if err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
@@ -619,10 +1012,17 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 	ctx := context.Background()
 	pubkey := "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"
 
+	// hubA and hubB get distinct project scopes (see connectAs) so hubB's
+	// omitted reconnectSecret doesn't resolve to hubA's own auto-stored
+	// one — that specific reuse mechanic (and its "was reused
+	// automatically" note) has its own dedicated coverage in
+	// TestReconnectAfterDisconnectReusesStoredSecretAndPeerID; this test's
+	// job is just to verify a's roster actually reflects b's name/
+	// agePublicKey, which needs an ordinary, non-colliding join.
 	hubA := NewHub()
 	connReqA := mcp.CallToolRequest{}
 	connReqA.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	if res, err := hubA.handleConnect(ctx, connReqA); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubA, connReqA, "hubA"); err != nil || res.IsError {
 		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
 	}
 	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -632,10 +1032,11 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 	connReqB.Params.Arguments = map[string]any{
 		"host": url, "sessionId": sessionID, "name": "Alice\nfake log line", "agePublicKey": pubkey,
 	}
-	res, err := hubB.handleConnect(ctx, connReqB)
+	res, err := connectAs(t, ctx, hubB, connReqB, "hubB")
 	if err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
+	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
 	for _, line := range strings.Split(textOf(res), "\n") {
 		if strings.TrimSpace(line) == "fake log line" {
 			t.Fatalf("expected the newline in the raw name to be stripped (no line injection), got line %q in: %s", line, textOf(res))
@@ -646,15 +1047,6 @@ func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
 	}
 	if !strings.Contains(textOf(res), pubkey) {
 		t.Fatalf("expected b's connect result to confirm its age public key, got: %s", textOf(res))
-	}
-	// b omitted reconnectSecret, and a had already connected to this same
-	// host+sessionId — so b's connect should have automatically reused a's
-	// stored secret for this target (a itself still being live is what
-	// keeps b from colliding onto a's own peerId, per hubsession's own
-	// collision-avoidance rule; this test just checks the note reflects
-	// the reuse, not the exact peerId outcome).
-	if !strings.Contains(textOf(res), "was reused automatically") {
-		t.Fatalf("expected a note that the stored reconnectSecret was reused automatically, got: %s", textOf(res))
 	}
 
 	var peersText string
@@ -747,7 +1139,7 @@ func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T)
 	hubA := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	res, err := hubA.handleConnect(ctx, connReq)
+	res, err := connectAs(t, ctx, hubA, connReq, "hubA")
 	if err != nil || res.IsError {
 		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
 	}
@@ -760,7 +1152,7 @@ func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T)
 	}
 
 	hubB := NewHub()
-	res, err = hubB.handleConnect(ctx, connReq)
+	res, err = connectAs(t, ctx, hubB, connReq, "hubB")
 	if err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
@@ -781,13 +1173,13 @@ func TestPeersToolNotesWhenStillCatchingUp(t *testing.T) {
 	hubA := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	if res, err := hubA.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubA, connReq, "hubA"); err != nil || res.IsError {
 		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
 	}
 	defer hubA.handleDisconnect(ctx, mcp.CallToolRequest{})
 
 	hubB := NewHub()
-	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
 	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -862,19 +1254,19 @@ func TestPrivateSendOnlyReachesTarget(t *testing.T) {
 	hubA := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	res, err := hubA.handleConnect(ctx, connReq)
+	res, err := connectAs(t, ctx, hubA, connReq, "hubA")
 	if err != nil || res.IsError {
 		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
 	}
 	peerA := hubA.conn.PeerID()
 
 	hubB := NewHub()
-	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
 
 	hubC := NewHub()
-	if res, err := hubC.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubC, connReq, "hubC"); err != nil || res.IsError {
 		t.Fatalf("connect c failed: err=%v result=%+v", err, res)
 	}
 
@@ -1082,7 +1474,7 @@ func TestExplicitReconnectSecretOverridesStoredOne(t *testing.T) {
 		t.Fatalf("expected a note confirming the explicit secret was stored, got: %s", textOf(res2))
 	}
 
-	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID})
+	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID, Project: connstore.CurrentProject()})
 	if !ok {
 		t.Fatal("expected an entry to be stored")
 	}
@@ -1104,7 +1496,7 @@ func TestHandleListConnectionsShowsEntriesWithoutLeakingSecret(t *testing.T) {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
-	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID})
+	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID, Project: connstore.CurrentProject()})
 	if !ok {
 		t.Fatal("expected an entry to be stored")
 	}
@@ -1126,8 +1518,23 @@ func TestHandleListConnectionsShowsEntriesWithoutLeakingSecret(t *testing.T) {
 	if err != nil || res2.IsError {
 		t.Fatalf("second handleListConnections failed: err=%v result=%+v", err, res2)
 	}
-	if strings.Contains(textOf(res2), "(still marked open)") {
-		t.Fatalf("expected the entry to no longer be marked open after disconnect, got: %s", textOf(res2))
+	// Scoped to this test's own entry line (identified by its own unique
+	// url/port), not the whole listing — connstore is one shared file for
+	// the whole test binary run (see TestMain), so other tests' own
+	// still-open entries legitimately coexist here and aren't this
+	// assertion's concern.
+	ownLine := ""
+	for _, line := range strings.Split(textOf(res2), "\n") {
+		if strings.Contains(line, url) {
+			ownLine = line
+			break
+		}
+	}
+	if ownLine == "" {
+		t.Fatalf("expected to find this test's own entry in the listing, got: %s", textOf(res2))
+	}
+	if strings.Contains(ownLine, "(still marked open)") {
+		t.Fatalf("expected this test's own entry to no longer be marked open after disconnect, got line: %s", ownLine)
 	}
 }
 
@@ -1190,7 +1597,7 @@ func TestShutdownClosesActiveConnectionAndMarksStoreDisconnected(t *testing.T) {
 	if conn != nil {
 		t.Fatal("expected Shutdown to clear the active connection")
 	}
-	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID})
+	stored, ok := connstore.Get(connstore.Target{Host: url, SessionID: sessionID, Project: connstore.CurrentProject()})
 	if !ok {
 		t.Fatal("expected the entry to still exist")
 	}
@@ -1279,6 +1686,16 @@ func textOf(res *mcp.CallToolResult) string {
 	return b.String()
 }
 
+func imagesOf(res *mcp.CallToolResult) []mcp.ImageContent {
+	var images []mcp.ImageContent
+	for _, c := range res.Content {
+		if ic, ok := c.(mcp.ImageContent); ok {
+			images = append(images, ic)
+		}
+	}
+	return images
+}
+
 // TestPeersToolReportsDisconnectInsteadOfStaleRoster is a regression test:
 // hub_peers used to read straight from Conn.Peers() with no check on
 // whether the underlying connection was still alive, so a silent
@@ -1294,12 +1711,12 @@ func TestPeersToolReportsDisconnectInsteadOfStaleRoster(t *testing.T) {
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
-	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hub, connReq, "hubA"); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
 	hubB := NewHub()
-	if res, err := hubB.handleConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := connectAs(t, ctx, hubB, connReq, "hubB"); err != nil || res.IsError {
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
 	defer hubB.handleDisconnect(ctx, mcp.CallToolRequest{})

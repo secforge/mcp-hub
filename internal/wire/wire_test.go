@@ -1,7 +1,9 @@
 package wire
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -53,7 +55,7 @@ func TestProtocolVersionIsOne(t *testing.T) {
 }
 
 func TestBroadcastMsgFields(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hello", "2026-08-21T10:00:00Z")
+	m := NewBroadcastMsg("peer-1", "hello", "2026-08-21T10:00:00Z", nil, "", "")
 	raw, _ := json.Marshal(m)
 	var decoded Msg
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -81,7 +83,7 @@ func TestOutgoingDirectedMsgHasTo(t *testing.T) {
 }
 
 func TestDirectedMsgIsMarkedPrivate(t *testing.T) {
-	m := NewDirectedMsg("peer-1", "hello", "2026-08-21T10:00:00Z")
+	m := NewDirectedMsg("peer-1", "hello", "2026-08-21T10:00:00Z", nil, "", "")
 	raw, _ := json.Marshal(m)
 	var decoded Msg
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -96,7 +98,7 @@ func TestDirectedMsgIsMarkedPrivate(t *testing.T) {
 }
 
 func TestBroadcastMsgIsNotPrivate(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hello", "ts")
+	m := NewBroadcastMsg("peer-1", "hello", "ts", nil, "", "")
 	if m.Private {
 		t.Fatal("broadcast messages must not be marked private")
 	}
@@ -232,6 +234,42 @@ func TestHistoryCompleteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHistoryCompleteWithCountsRoundTrip(t *testing.T) {
+	hc := HistoryComplete{Type: TypeHistoryComplete, Count: 3, Oldest: "cursor-1", Newest: "cursor-3"}
+	raw, err := json.Marshal(hc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded HistoryComplete
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Count != 3 || decoded.Oldest != "cursor-1" || decoded.Newest != "cursor-3" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestHistoryBeginRoundTrip(t *testing.T) {
+	raw, err := json.Marshal(NewHistoryBegin(3, "cursor-1", "cursor-3"))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded HistoryBegin
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Type != TypeHistoryBegin || decoded.Count != 3 || decoded.Oldest != "cursor-1" || decoded.Newest != "cursor-3" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestHistoryBeginOmitsFieldsWhenEmpty(t *testing.T) {
+	raw, _ := json.Marshal(NewHistoryBegin(0, "", ""))
+	if got := string(raw); got != `{"type":"historyBegin"}` {
+		t.Fatalf("unexpected marshal: %s", got)
+	}
+}
+
 func TestAckRoundTrip(t *testing.T) {
 	a := NewAck("cursor-123")
 	raw, err := json.Marshal(a)
@@ -284,6 +322,356 @@ func TestMsgOmitsAckCursorWhenUnset(t *testing.T) {
 	}
 }
 
+func TestMsgAttachmentsRoundTrip(t *testing.T) {
+	m := NewOutgoingMsg("a picture")
+	m.Attachments = []Attachment{{ContentType: "image/png", ContentBytes: "aGVsbG8="}}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Msg
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Attachments) != 1 || decoded.Attachments[0].ContentType != "image/png" ||
+		decoded.Attachments[0].ContentBytes != "aGVsbG8=" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMsgOmitsAttachmentsWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewOutgoingMsg("hi"))
+	if strings.Contains(string(raw), "attachments") {
+		t.Fatalf("expected attachments to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestAttachmentIsReference(t *testing.T) {
+	inline := Attachment{ContentType: "image/png", ContentBytes: "aGVsbG8="}
+	if inline.IsReference() {
+		t.Fatal("expected an inline attachment (contentBytes set) to not be a reference")
+	}
+	ref := Attachment{Token: "att-3142", ContentType: "image/webp"}
+	if !ref.IsReference() {
+		t.Fatal("expected a token-only attachment to be a reference")
+	}
+	empty := Attachment{}
+	if empty.IsReference() {
+		t.Fatal("expected a zero-value attachment to not be a reference")
+	}
+}
+
+func TestAttachmentRequestDataRoundTrip(t *testing.T) {
+	req := NewAttachmentRequest("att-3142")
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decodedReq AttachmentRequest
+	if err := json.Unmarshal(raw, &decodedReq); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decodedReq.Type != TypeAttachment || decodedReq.Token != "att-3142" {
+		t.Fatalf("unexpected round trip: %+v", decodedReq)
+	}
+
+	data := AttachmentData{
+		Type: TypeAttachmentData, Token: "att-3142", Name: "shot.png",
+		ContentType: "image/webp", ContentBytes: "aGVsbG8=",
+	}
+	raw, err = json.Marshal(data)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decodedData AttachmentData
+	if err := json.Unmarshal(raw, &decodedData); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decodedData != data {
+		t.Fatalf("unexpected round trip: got %+v, want %+v", decodedData, data)
+	}
+}
+
+func TestEditWithAttachmentsRoundTrip(t *testing.T) {
+	attachments := []Attachment{{ContentType: "image/png", ContentBytes: "aGVsbG8="}}
+	e := NewEditRequest("ext-1", "corrected", attachments, "", "")
+	raw, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Edit
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Attachments) != 1 || decoded.Attachments[0].ContentType != "image/png" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestReadFileAttachmentAcceptsNonImageType(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/report.pdf"
+	if err := os.WriteFile(path, []byte("%PDF-1.4 fake content"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	attachments, err := ReadFileAttachment(path)
+	if err != nil {
+		t.Fatalf("ReadFileAttachment: %v", err)
+	}
+	if len(attachments) != 1 || attachments[0].ContentType != "application/pdf" || attachments[0].Name != "report.pdf" {
+		t.Fatalf("unexpected attachment: %+v", attachments)
+	}
+}
+
+func TestReadFileAttachmentFallsBackToOctetStreamForUnknownExt(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/data.xyzunknown"
+	if err := os.WriteFile(path, []byte("raw bytes"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	attachments, err := ReadFileAttachment(path)
+	if err != nil {
+		t.Fatalf("ReadFileAttachment: %v", err)
+	}
+	if len(attachments) != 1 || attachments[0].ContentType != "application/octet-stream" {
+		t.Fatalf("unexpected attachment: %+v", attachments)
+	}
+}
+
+func TestReadFileAttachmentRejectsOversizedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/big.bin"
+	if err := os.WriteFile(path, make([]byte, MaxAttachmentRawBytes+1), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	if _, err := ReadFileAttachment(path); err == nil {
+		t.Fatal("expected an error for an oversized file")
+	}
+}
+
+func TestReadFileAttachmentEmptyPathIsNoop(t *testing.T) {
+	attachments, err := ReadFileAttachment("")
+	if err != nil || attachments != nil {
+		t.Fatalf("expected (nil, nil) for an empty path, got (%+v, %v)", attachments, err)
+	}
+}
+
+func TestNewFileAttachmentFromDataAcceptsAnyContentType(t *testing.T) {
+	data := base64.StdEncoding.EncodeToString([]byte("hello"))
+	attachments, err := NewFileAttachmentFromData(data, "application/pdf", "report.pdf")
+	if err != nil {
+		t.Fatalf("NewFileAttachmentFromData: %v", err)
+	}
+	if len(attachments) != 1 || attachments[0].ContentType != "application/pdf" ||
+		attachments[0].Name != "report.pdf" || attachments[0].ContentBytes != data {
+		t.Fatalf("unexpected attachment: %+v", attachments)
+	}
+}
+
+func TestNewFileAttachmentFromDataDefaultsContentType(t *testing.T) {
+	data := base64.StdEncoding.EncodeToString([]byte("hello"))
+	attachments, err := NewFileAttachmentFromData(data, "", "")
+	if err != nil {
+		t.Fatalf("NewFileAttachmentFromData: %v", err)
+	}
+	if len(attachments) != 1 || attachments[0].ContentType != "application/octet-stream" {
+		t.Fatalf("unexpected attachment: %+v", attachments)
+	}
+}
+
+func TestNewFileAttachmentFromDataRejectsOversizedData(t *testing.T) {
+	data := base64.StdEncoding.EncodeToString(make([]byte, MaxAttachmentRawBytes+1))
+	if _, err := NewFileAttachmentFromData(data, "application/octet-stream", ""); err == nil {
+		t.Fatal("expected an error for oversized data")
+	}
+}
+
+func TestMsgReplyToRoundTrip(t *testing.T) {
+	m := NewOutgoingMsg("reply text")
+	m.ReplyTo = "1788356170987"
+	m.ReplyPreview = "GT-158 pending item 2/3"
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Msg
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.ReplyTo != "1788356170987" || decoded.ReplyPreview != "GT-158 pending item 2/3" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMsgOmitsReplyToWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewOutgoingMsg("hi"))
+	if strings.Contains(string(raw), "replyTo") || strings.Contains(string(raw), "replyPreview") {
+		t.Fatalf("expected replyTo/replyPreview to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestMessageEditedReplyToRoundTrip(t *testing.T) {
+	m := MessageEdited{
+		Type: TypeMessageEdited, ExternalID: "ext-1", Text: "corrected",
+		ReplyTo: "1788356170987", ReplyPreview: "GT-158 pending item 2/3",
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded MessageEdited
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.ReplyTo != "1788356170987" || decoded.ReplyPreview != "GT-158 pending item 2/3" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMsgMentionsRoundTrip(t *testing.T) {
+	m := NewOutgoingMsg("hi @alice")
+	m.Mentions = []Mention{{Name: "Alice", ID: "dir-uuid-1"}, {ID: "dir-uuid-2"}}
+	m.MentionedMe = true
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Msg
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Mentions) != 2 || decoded.Mentions[0].Name != "Alice" || decoded.Mentions[0].ID != "dir-uuid-1" ||
+		decoded.Mentions[1].Name != "" || decoded.Mentions[1].ID != "dir-uuid-2" || !decoded.MentionedMe {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMsgOmitsMentionsWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewOutgoingMsg("hi"))
+	if strings.Contains(string(raw), "mentions") || strings.Contains(string(raw), "mentionedMe") {
+		t.Fatalf("expected mentions/mentionedMe to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestMessageEditedMentionsRoundTrip(t *testing.T) {
+	m := MessageEdited{
+		Type: TypeMessageEdited, ExternalID: "ext-1", Text: "corrected @bob",
+		Mentions: []Mention{{Name: "Bob", ID: "dir-uuid-3"}}, MentionedMe: true,
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded MessageEdited
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Mentions) != 1 || decoded.Mentions[0].ID != "dir-uuid-3" || !decoded.MentionedMe {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestJoinedSystemPeerIDRoundTrip(t *testing.T) {
+	j := NewJoined("peer-1", 0, "", "")
+	j.SystemPeerID = "00000000-0000-0000-0000-000000000000"
+	raw, err := json.Marshal(j)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Joined
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.SystemPeerID != "00000000-0000-0000-0000-000000000000" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestJoinedOmitsSystemPeerIDWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewJoined("peer-1", 0, "", ""))
+	if strings.Contains(string(raw), "systemPeerId") {
+		t.Fatalf("expected systemPeerId to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestMsgFormatRoundTrip(t *testing.T) {
+	m := NewOutgoingMsg("<b>hi</b>")
+	m.Format = "html"
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Msg
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Format != "html" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMsgOmitsFormatWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewOutgoingMsg("hi"))
+	if strings.Contains(string(raw), "format") {
+		t.Fatalf("expected format to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestEditFormatRoundTrip(t *testing.T) {
+	e := NewEditRequest("ext-1", "<b>corrected</b>", nil, "html", "")
+	raw, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Edit
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Format != "html" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMessageEditedFormatRoundTrip(t *testing.T) {
+	m := MessageEdited{Type: TypeMessageEdited, ExternalID: "ext-1", Text: "<b>x</b>", Format: "html"}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded MessageEdited
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Format != "html" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestEditOmitsAttachmentsWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewEditRequest("ext-1", "corrected", nil, "", ""))
+	if strings.Contains(string(raw), "attachments") {
+		t.Fatalf("expected attachments to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestMessageEditedAttachmentsRoundTrip(t *testing.T) {
+	m := MessageEdited{
+		Type: TypeMessageEdited, ExternalID: "ext-1", Text: "corrected",
+		Attachments: []Attachment{{Token: "att-3142", ContentType: "image/webp", Kind: "image"}},
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded MessageEdited
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Attachments) != 1 || !decoded.Attachments[0].IsReference() {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
 func TestReactionEditDeleteHistoryCarryAckCursor(t *testing.T) {
 	r := NewReactionRequest("ext-1", "thumbsup", "add")
 	r.AckCursor = "cursor-r"
@@ -291,7 +679,7 @@ func TestReactionEditDeleteHistoryCarryAckCursor(t *testing.T) {
 		t.Fatalf("expected Reaction to carry ackCursor, got: %s", raw)
 	}
 
-	e := NewEditRequest("ext-1", "new text")
+	e := NewEditRequest("ext-1", "new text", nil, "", "")
 	e.AckCursor = "cursor-e"
 	if raw, _ := json.Marshal(e); !strings.Contains(string(raw), `"ackCursor":"cursor-e"`) {
 		t.Fatalf("expected Edit to carry ackCursor, got: %s", raw)
@@ -311,7 +699,7 @@ func TestReactionEditDeleteHistoryCarryAckCursor(t *testing.T) {
 }
 
 func TestMsgHistoricalFlagRoundTrip(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z")
+	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "")
 	m.Historical = true
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -327,7 +715,7 @@ func TestMsgHistoricalFlagRoundTrip(t *testing.T) {
 }
 
 func TestMsgOmitsHistoricalWhenFalse(t *testing.T) {
-	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z"))
+	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", ""))
 	if got := string(raw); strings.Contains(got, "historical") {
 		t.Fatalf("expected historical:false to be omitted, got: %s", got)
 	}
@@ -356,7 +744,7 @@ func TestNewErrorOmitsCodeAndRetryable(t *testing.T) {
 }
 
 func TestMsgExternalIDAndOwnRoundTrip(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z")
+	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "")
 	m.ExternalID = "ext-1"
 	m.Own = true
 	raw, err := json.Marshal(m)
@@ -373,7 +761,7 @@ func TestMsgExternalIDAndOwnRoundTrip(t *testing.T) {
 }
 
 func TestMsgOmitsExternalIDAndOwnWhenUnset(t *testing.T) {
-	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z"))
+	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", ""))
 	if got := string(raw); strings.Contains(got, "externalId") || strings.Contains(got, "own") {
 		t.Fatalf("expected externalId/own to be omitted, got: %s", got)
 	}
@@ -420,7 +808,7 @@ func TestMessageEditedRoundTrip(t *testing.T) {
 }
 
 func TestMsgCursorRoundTrip(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z")
+	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "")
 	m.Cursor = "cursor-123"
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -436,7 +824,7 @@ func TestMsgCursorRoundTrip(t *testing.T) {
 }
 
 func TestMsgOmitsCursorWhenUnset(t *testing.T) {
-	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z"))
+	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", ""))
 	if got := string(raw); strings.Contains(got, "cursor") {
 		t.Fatalf("expected cursor to be omitted when unset, got: %s", got)
 	}
@@ -511,7 +899,7 @@ func TestReactionRequestRoundTrip(t *testing.T) {
 }
 
 func TestEditRequestRoundTrip(t *testing.T) {
-	e := NewEditRequest("ext-1", "corrected")
+	e := NewEditRequest("ext-1", "corrected", nil, "", "")
 	raw, err := json.Marshal(e)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

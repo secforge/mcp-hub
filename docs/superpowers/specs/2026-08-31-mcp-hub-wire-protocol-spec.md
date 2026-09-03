@@ -108,6 +108,7 @@ bump — see §6.
 | `canSend` | bool | no | Whether sending is currently permitted — a snapshot, not a guarantee (re-checked per send). |
 | `conversationKind` | string | no | e.g. `"oneOnOne"`, `"group"`, `"meeting"` — free text, not a closed enum. |
 | `topic` | string\|null | no | Display name/topic of what was joined, if applicable. |
+| `systemPeerId` | string | no | This server's own peerId for operator/system-originated messages on this session, if it has one. A client must not hardcode a guessed value (e.g. chat-relay's all-zeros UUID) — treat this field as the only authoritative source, and treat it as absent (no operator concept) when omitted. |
 
 ### 2.2 `msg` (both directions)
 
@@ -124,6 +125,170 @@ bump — see §6.
 | `own` | bool | no | server→client | True if *this exact connection* sent it. A receiving client's own policy decision whether to treat this as wake-worthy — see §3 for what the reference client does. |
 | `cursor` | string | no | server→client | This message's own opaque position — pass back as `history.before`/`history.after`. |
 | `ackCursor` | string | no | client→server | Piggybacked read receipt — see §2.7. |
+| `attachments` | array of Attachment (see below) | no | both | Binary content, inline or by reference. |
+| `format` | string | no | both | How `text` should be interpreted — see below. |
+| `replyTo` | string | no | both | `externalId` of the message this one is a threaded reply/citation to — see below. |
+| `replyPreview` | string | no | server→client | Server's own lossy abbreviation of the quoted message — see below. |
+| `mentions` | array of `{name?, id}` | no | server→client | Who this message @-mentions, if anyone — see below. |
+| `mentionedMe` | bool | no | server→client | Whether the receiving connection's own identity is among `mentions` — see below. |
+
+`replyTo`, when present, is in the same id space as `externalId`/`sendAck`
+— directly comparable against a message a client already holds, and
+usable as the target of `reaction`/`edit`/`delete` on the quoted message,
+not just a display reference. Server→client, it's set on a delivered
+`msg`/`messageEdited` when that message is a reply (absent, not null/
+empty, when it isn't — an edit never changes what a message replies to,
+so a bridge server should carry the same value through on
+`messageEdited` too, not just the original `msg`). Client→server, a
+client may set it on an outgoing `msg`/`edit` to request a threaded
+citation; a server that supports this should validate it strictly —
+refuse the whole send outright (nothing sent, not a partial send without
+the citation) for an id it doesn't hold, holds in a *different*
+conversation, or that's malformed/empty, since resolving a citation can
+surface that other message's own preview text and an unvalidated
+cross-conversation reference is a disclosure risk, not merely a bad
+request. `mcp-hub-server`'s own relay has no opinion on this field
+either direction — accepted and relayed unmodified (`wsserver` threads
+it through to `NewBroadcastMsg`/`NewDirectedMsg` on send, same as
+`attachments`/`format`), never validated or interpreted.
+
+One `replyTo` may mean two different underlying operations depending on
+what kind of conversation it's in, and a client never needs to know
+which: in a flat conversation (e.g. a chat) it's a citation naming the
+quoted message; in a threaded one (e.g. a channel) it's a reply into
+that message's thread — and if `replyTo` names a reply rather than a
+thread root, the new message should land in that reply's thread, not be
+refused for not being a root. Same field, same client-side contract
+(refuse outright, per above, rather than degrade) either way — this is
+purely a note for a server implementer translating `replyTo` into a
+specific backend's API, not something a client needs to branch on.
+
+`replyPreview`, when present, is the server's own lossy (formatting
+flattened, possibly truncated) abbreviation of the quoted message's
+text — a fallback for a `replyTo` that names a message outside a
+client's own history, not the authoritative quoted text (use `history`
+around that cursor for that). Server→client only; a client never sets
+this on send — the server derives it once it has resolved `replyTo`.
+
+`format`, when present, is `"text"` (the default if omitted — plain,
+escaped verbatim) or `"html"` (bold/lists/code/quotes/tables/links,
+sanitized server-side through the same allowlist used to render it:
+scripts, event handlers, styles, iframes, and off-host images are
+stripped). A server that validates this field should refuse an
+unrecognized value outright (e.g. as an `error`, §2.5) rather than
+silently downgrading it to `"text"` — a client should never guess a
+value the target server wasn't confirmed to accept, since that failure
+mode is much harder to notice than an outright refusal. `mcp-hub-server`
+itself has no opinion on this field — it's accepted and relayed
+unmodified (`wsserver` threads it through to `NewBroadcastMsg`/
+`NewDirectedMsg` just like `attachments`), but never interpreted, since
+its relay does no rendering of any kind. `edit` (§2.8) also carries
+`format`, applying to the new `text` it sets.
+
+`mentions`, when present, lists who a message @-mentions — each entry's
+`id` is the sending platform's own directory id (opaque to this spec, not
+a hub `peerId` — there is no wire-level way to resolve one into the
+other), `name` is a display name if the server has one. Absent (nil, not
+an empty array) when the message mentions no one. `mentionedMe` is true
+when the *receiving connection's own identity* is among `mentions` — a
+server computes this per connection (or, per chat-relay: per conversation,
+when every connection on that conversation necessarily shares one
+identity — either way, a client never needs to know its own directory id
+to use this field). Both server→client only; `mcp-hub-server`'s own relay
+never sets either. `messageEdited` (§2.8) carries the same two fields,
+reflecting the edited text — an edit can change who's mentioned, unlike
+`replyTo`/`replyPreview` which never change on edit.
+
+`systemPeerId` (§2.1, `joined`) names a `peerId` a server itself
+originates operator/system messages from on this session. Since every
+`peerId` is necessarily server-assigned — no inbound client frame ever
+supplies one — a client can treat a `msg`/`peerJoined`/`peerLeft` whose
+`peerId` equals `systemPeerId` as reliably from the server's own operator
+channel, not from a peer that typed the same claim into ordinary message
+text. That guarantee covers the *sender's identity* only, not the
+*content* of what they said: a client surfacing this to a model should
+frame an operator message as outranking another **agent's** instructions
+on this hub, while never outranking the model's own user, who isn't a
+party to the hub session at all. `mcp-hub-server` never sets
+`systemPeerId` — there is no operator concept on a plain hub session,
+every peer is an ordinary participant.
+
+An **Attachment** is one of two shapes sharing the same object, distinguished
+by which fields are present — a client attaching its own content (client→server,
+on `msg` or `edit`) always sends the inline shape; what comes back
+server→client depends on the server:
+
+- **Inline**: `{contentType, contentBytes, name?}` — `contentType` is
+  open, not a closed enum: `image/png`/`jpeg`/`gif`/`webp` render inline
+  on both `mcp-hub-server`'s relay and chat-relay's hub sessions (Teams
+  sessions still refuse anything non-image outright — see below); any
+  other type is accepted too on a hub session (not Teams), just without
+  inline rendering — chat-relay stores it and serves it back only as an
+  `application/octet-stream` download, `mcp-hub-server`'s relay just
+  passes it through unmodified with no server-side handling at all.
+  `contentBytes` is base64 of the raw file; `name`, when given, is the
+  original filename (useful for anything that isn't an image — it
+  becomes the download filename on a server that honors it). A sender
+  should keep raw (pre-base64) size under a server-defined cap — 32MB is
+  the figure both `mcp-hub-server`/its reference clients and chat-relay
+  settled on (raised together from an earlier 8MB, coordinated live
+  specifically so the two numbers can't drift apart the way an earlier
+  1MB-vs-12MB split once did on chat-relay's own side) — and check that
+  against the raw bytes, not the base64-inflated wire size.
+  `mcp-hub-server`'s own relay only ever produces this shape.
+- **Reference**: `{token, contentType, name?, kind?}`, no `contentBytes`
+  — used by a server that doesn't want to inline bytes into every
+  delivery (chat-relay does this). `contentType` here describes the
+  server's *recoded* stored copy for an image, which may differ from
+  whatever the original sender attached — every image is decoded and
+  re-encoded before ever being served; a non-image is stored and served
+  byte-identical, but still only as a download, never inline, and never
+  under its own declared type in a way a client should trust for
+  rendering. Fetch the actual bytes with an `attachment` request (§2.2a)
+  using `token`. A client can tell the shapes apart by whether `token`
+  is set and `contentBytes` is absent.
+
+**Teams-bridge sessions specifically** (as opposed to a bridge server's
+*hub* sessions, which follow the general rule above) still refuse any
+non-image `attachments` entry outright — enforced independently of
+whatever content-type list a server's hub sessions accept, so widening
+that list elsewhere can never leak a binary attachment into a Teams
+conversation. A file would need to be uploaded into the chat's SharePoint
+folder, a different permission and a different design, not something
+this field covers.
+
+Like every other field in this table, an unrecognized `attachments` is
+safely ignored by `encoding/json`-style decoders — a server or client
+with no attachment support just never populates or reads it. `edit`
+(§2.8) also carries `attachments`, always the inline shape even against a
+reference-style server (which then recodes/stores/references it the same
+as for a live `msg`): an *absent* `attachments` on an edit must be read
+as "unchanged", never as "remove them" — there is deliberately no way to
+express attachment removal in this version of the protocol. `reaction`/
+`delete` carry no `attachments` — not applicable.
+
+### 2.2a `attachment` (client → server) / `attachmentData` (server → client)
+
+Fetches the actual bytes behind a reference-shape Attachment's `token`
+(§2.2). Not meaningful against a server that only ever produces the
+inline shape — `mcp-hub-server` silently ignores an `attachment` request
+like any other unrecognized type, so a client waiting on a reply simply
+times out; only send this for a `token` actually seen on a received
+Attachment.
+
+| Field | Type | Required | Direction | Notes |
+|---|---|---|---|---|
+| `type` | `"attachment"` / `"attachmentData"` | yes | both | |
+| `token` | string | yes | both | Echoed back on the reply. |
+| `name` | string | no | server→client | Original filename, if known. |
+| `contentType` | string | yes | server→client | The recoded stored copy's type. |
+| `contentBytes` | string | yes | server→client | base64 of the raw (recoded) file. |
+
+A request that can't be satisfied comes back as an ordinary `error`
+(§2.5) instead of `attachmentData`, with `code` one of `bad_attachment`
+(malformed token), `not_found` (unknown token, or belongs to a different
+session), or `unavailable` (recorded but no servable bytes, e.g. a recode
+failure — never served raw as a fallback).
 
 A plain broadcast (`to` omitted) is never echoed back to its own sender
 by `mcp-hub-server`'s relay logic (broadcast excludes the sender) — if
@@ -179,6 +344,26 @@ closed set — treat `code` as an open string):
   different codes for the ack case, not the same ones, or every client
   built against this spec will misattribute your unrelated errors to
   their ack subsystem.
+- `bad_reply_to`, `retryable:false` — a `msg`/`edit`'s `replyTo` (§2.2)
+  named a message the server won't cite: unknown, held in a different
+  conversation, or malformed/empty. Nothing is sent when this fires — not
+  a partial send with the citation silently dropped. A message the
+  server once held but that's since been deleted upstream is a different
+  failure (e.g. `send_failed`), not this code — `bad_reply_to` is
+  specifically about validating the reference itself before attempting
+  anything. **Why this is its own strict code, not generic validation**:
+  a server implementing citations typically has to resolve `replyTo` to
+  build the citation payload (fetching that message's own preview/sender
+  to embed) — an unvalidated id would let a client pull another
+  conversation's content into this one just by naming a message id it
+  was never actually shown, a disclosure risk rather than a mere bad
+  request, especially for a server-side identity present in many
+  conversations at once. `message` (not `code`) is the place to
+  distinguish *why* a given id was refused (e.g. "held in a different
+  conversation" vs. "never seen, possibly predating this server's
+  history") — a client can act on that difference (the latter likely
+  means "too old to cite, fall back to quoting the text"), but `code`
+  alone doesn't carry it.
 
 ### 2.6 `history` (client → server) / `historyComplete` (server → client)
 
@@ -210,15 +395,52 @@ this.
   the same value). Only meaningful if you advertised
   `Joined.historyAfter: true`.
 
-Response: a burst of `msg` events (each `historical: true`), terminated
-by:
+Response: optionally led by, and always terminated by, a frame stating
+how many `msg` events (each `historical: true`) make up the burst:
 
 ```json
-{"type": "historyComplete"}
+{"type": "historyBegin", "count": 5, "oldest": "cursor-1", "newest": "cursor-5"}
+... 5 × msg (historical: true) ...
+{"type": "historyComplete", "count": 5, "oldest": "cursor-1", "newest": "cursor-5"}
 ```
 
-— sent even for an empty result, so a client gets a positive "there is
-no more" rather than inferring completion from a traffic gap.
+`historyBegin` is optional (a server may implement `historyComplete`
+alone, as before this addition); `historyComplete` is mandatory and sent
+even for an empty result (`count: 0`, `oldest`/`newest` omitted), so a
+client gets a positive "there is no more" rather than inferring
+completion from a traffic gap. `count`/`oldest`/`newest` are themselves
+optional and additive on both frames — a server may emit bare
+`{"type":"historyComplete"}` as before, and a client that doesn't
+recognize `historyBegin` at all just ignores it like any other unknown
+frame type.
+
+**Why both ends carry the same numbers, rather than just one**: confirmed
+live, 2026-09-03 — an agent believed it had received a message that was
+in fact delivered by the server and received intact by its own client's
+socket; the loss was entirely in a display/notification layer sitting
+*above* the wire client, which truncated a multi-message burst to its
+first few lines with no indication anything was cut. A client has no way
+to detect that kind of loss on its own unless it can compare "how many
+did I actually render" against a number the protocol told it to expect.
+A single count sent only at the end doesn't help, because the *cut
+itself* overwhelmingly removes the tail, not the head — a trailing-only
+marker gets truncated away in precisely the scenario it exists to catch.
+`historyBegin` at the head survives a tail cut; `historyComplete` at the
+tail survives the rarer head cut; a client that captures both can also
+catch a cut in the middle by comparing them against each other.
+
+**General rule for any future burst-shaped addition to this protocol**:
+put a count, size, or "read the full copy at X" pointer at the **head**
+of the burst it describes, not only the tail — a real downstream
+truncation observed against this protocol removed the tail of a
+multi-event delivery, not the head. This isn't specific to `history`:
+the reference client (`mcp-hub`) applies the identical idea to *any*
+multi-event delivery over `wait --follow`/`hub_receive`/`hub_wait`, not
+just history bursts — prefixing every batch of more than one event with
+an explicit "delivering N events below" header, since ordinary live
+traffic arriving in a burst (several messages landing before a listener
+catches up) has the exact same undetectable-truncation exposure history
+does, with no protocol-level count to fall back on at all.
 
 **Security note for implementers, from a real incident:** a directed
 `msg` (§2.2, `to` set) is easy to get right on the *delivery* path
@@ -299,14 +521,16 @@ Requests:
 
 ```json
 {"type": "reaction", "externalId": "...", "reaction": "👍", "action": "add", "ackCursor": "..."}
-{"type": "edit", "externalId": "...", "text": "...", "ackCursor": "..."}
+{"type": "edit", "externalId": "...", "text": "...", "ackCursor": "...", "attachments": [...], "format": "...", "replyTo": "..."}
 {"type": "delete", "externalId": "...", "ackCursor": "..."}
 ```
 
 `action` is `"add"` or `"remove"`. `reaction` is an open string — do not
 validate against a closed set; whatever the underlying platform reports
 is authoritative (real data has included things like `"Eyes"` and
-`"Question mark"` alongside `"Like"`).
+`"Question mark"` alongside `"Like"`). `edit.attachments`, when present,
+is always the inline Attachment shape (§2.2) even against a
+reference-style server — see §2.2's note on absent-means-unchanged.
 
 Acks (server → client, sent once the action is actually carried out —
 **a refusal is an `error` event, §2.5, not one of these with `ok:
@@ -323,11 +547,17 @@ receiving client requested):
 
 ```json
 {"type": "reactionChanged", "externalId": "...", "peerId": "...", "reaction": "...", "label": "...", "action": "add", "ts": "...", "own": false}
-{"type": "messageEdited", "externalId": "...", "text": "...", "ts": "...", "own": false}
+{"type": "messageEdited", "externalId": "...", "text": "...", "ts": "...", "own": false, "attachments": [...], "format": "...", "replyTo": "...", "replyPreview": "...", "mentions": [...], "mentionedMe": false}
 {"type": "messageDeleted", "externalId": "...", "cursor": "...", "ts": "...", "own": false}
 ```
 
 Notes:
+- `messageEdited.attachments` is the edited message's *current* full set
+  (inline or reference shape, per §2.2 — not a diff against what it had
+  before). Absent here means the `edit` request itself carried no
+  `attachments` and so left them unchanged — a receiving client should
+  keep whatever attachments it already had for this `externalId`, not
+  treat an absent field as "now has none."
 - `reactionChanged.peerId` may be **absent** — if a removal is detected
   by diffing a message's reaction set and the remover isn't identifiable
   from that diff, still send the event (the removal is real information)
@@ -387,10 +617,22 @@ substitutes for it. `mcp-hub-server` never sends this (a plain
   doesn't require it, but treat it as a MUST for interop with that
   client).
 - Presenting the **exact same** `reconnectSecret` on a later connect
-  reassigns the same `peerId` as before, **if and only if** the previous
-  connection holding that secret is not currently live. If it *is*
-  still connected, a fresh `peerId` is assigned instead — never collide
-  two live connections onto one identity.
+  reassigns the same `peerId` as before. If the previous connection
+  holding that secret is not currently live, this is an ordinary
+  reconnect. If it *is* still connected, the new connection **supersedes**
+  it — the old connection is force-closed (with close code 4004, §5) and
+  the new one takes over the identity, rather than the new connection
+  being handed a fresh, unrelated `peerId`. This was a deliberate
+  correction from an earlier revision of this contract (which assigned a
+  fresh id on live collision): that behavior silently defeated
+  `reconnectSecret`'s entire purpose for exactly the case that needs it
+  most — a fast reconnect racing the server's own detection that the old
+  socket died, where "live" from the server's point of view can simply
+  mean "hasn't noticed yet." Never collide two live connections onto one
+  identity; always resolve to exactly one.
+  No `peerLeft`/`peerJoined` is broadcast to other peers for a
+  supersede — from their perspective this identity never left, it just
+  changed which connection holds it.
 - The secret is never distributed to any other peer — it's a private
   channel between one client and the server, unlike `agePublicKey`
   (which is broadcast) or `peerId` (which is public within the session).
@@ -413,6 +655,7 @@ substitutes for it. `mcp-hub-server` never sends this (a plain
 | 4001 | Bridge-specific: credential revoked | Client surfaces "(revoked — do not reconnect)". |
 | 4002 | Bridge-specific: credential/link expired | Client surfaces "(expired — do not reconnect)". |
 | 4003 | Bridge-specific: the underlying conversation became unavailable | Client surfaces "(conversation unavailable — do not reconnect)". |
+| 4004 | A new connection presented the same `reconnectSecret` while this one was still live, and took over (superseded) rather than being assigned a fresh, unrelated peerId | Client surfaces "(connection closed, code N)" (no specific-case guidance yet — this is new) — **do not treat this as a signal to avoid reconnecting**, unlike 4001–4003: the identity is alive and well on the connection that superseded this one, this is simply not that connection anymore. |
 | any other non-1000/1001 code | Generic | Client surfaces "(connection closed, code N)" — no specific guidance. |
 
 4001–4003 are an existing convention for "this credential is dead, don't
@@ -421,10 +664,15 @@ link), you may mint a new code in the same private range (4000–4999);
 the reference client will fall back to the generic "(connection closed,
 code N)" note for anything it doesn't specifically recognize, which is
 safe but less informative — worth coordinating a code and getting it
-added client-side if the case is common enough to matter.
+added client-side if the case is common enough to matter. 4004 itself is
+exactly such a coordinated code: chosen to match chat-relay's own
+existing convention for the identical case on its LINK sessions (the
+newcomer takes the identity, the older connection is closed with 4004),
+rather than picked independently.
 
-`mcp-hub-server`'s relay never sends 4001–4003 — those are entirely a
-bridge-server convention.
+`mcp-hub-server`'s relay sends 4004 when `hubsession.Session.Join`
+supersedes a still-live identity (see §4 below) — the one core-protocol
+case in this table, not a bridge-only convention like 4001–4003.
 
 A server should always prefer sending an `error` event (§2.5) before
 closing, when the close reason is something the model could act on

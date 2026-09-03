@@ -23,7 +23,7 @@ func TestNewHTTPPeerHasIdentityAndWatchToken(t *testing.T) {
 
 func TestDeliverThenDrainReturnsFormattableEvent(t *testing.T) {
 	p := newHTTPPeer("550e8400-e29b-41d4-a716-446655440000", "", "")
-	p.Deliver(wire.NewBroadcastMsg("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "hi there", "2026-08-28T10:00:00Z"))
+	p.Deliver(wire.NewBroadcastMsg("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "hi there", "2026-08-28T10:00:00Z", nil, "", ""))
 
 	events := p.Drain()
 	if len(events) != 1 {
@@ -55,7 +55,7 @@ func TestWaitBlocksUntilDeliverThenReturns(t *testing.T) {
 	}()
 
 	time.Sleep(20 * time.Millisecond) // give Wait time to block first
-	p.Deliver(wire.NewBroadcastMsg("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "hi", "2026-08-28T10:00:00Z"))
+	p.Deliver(wire.NewBroadcastMsg("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "hi", "2026-08-28T10:00:00Z", nil, "", ""))
 
 	select {
 	case r := <-results:
@@ -83,7 +83,7 @@ func TestWaitReturnsErrorOnContextTimeout(t *testing.T) {
 
 func TestWaitReturnsImmediatelyIfAlreadyBuffered(t *testing.T) {
 	p := newHTTPPeer("550e8400-e29b-41d4-a716-446655440000", "", "")
-	p.Deliver(wire.NewBroadcastMsg("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "hi", "2026-08-28T10:00:00Z"))
+	p.Deliver(wire.NewBroadcastMsg("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "hi", "2026-08-28T10:00:00Z", nil, "", ""))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

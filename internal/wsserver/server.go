@@ -29,6 +29,19 @@ const MaxNameRunes = 64
 // same reason as MaxNameRunes.
 const MaxReconnectSecretRunes = 256
 
+// maxReadMessageBytes bounds a single incoming websocket frame — plain text
+// chatter is nowhere near this, but an attachment's base64 payload (see
+// wire.Attachment; clients cap raw bytes at wire.MaxAttachmentRawBytes,
+// currently 32MB, base64 inflates that by ~33%) plus JSON envelope
+// overhead needs real headroom above that raw figure. Without this,
+// gorilla/websocket has no default cap of its own, so an unbounded frame
+// from a malicious client would be read entirely into memory. 48MB —
+// matches chat-relay's own coordinated whole-frame cap (44MB) with a
+// little extra headroom, rather than deriving it independently; the two
+// caps were raised together for the same reason (arbitrary binary
+// attachments, not just images) and there's no benefit to them disagreeing.
+const maxReadMessageBytes = 48 * 1024 * 1024
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
@@ -166,6 +179,7 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 		}
 	}()
 
+	conn.SetReadLimit(maxReadMessageBytes)
 	conn.SetReadDeadline(time.Now().Add(snapPongWait))
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(snapPongWait))
@@ -187,11 +201,11 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 			if logger != nil {
 				logger.Append(peerID, m.Text, ts)
 			}
-			session.Broadcast(p, wire.NewBroadcastMsg(peerID, m.Text, ts))
+			session.Broadcast(p, wire.NewBroadcastMsg(peerID, m.Text, ts, m.Attachments, m.Format, m.ReplyTo))
 			continue
 		}
 
-		if err := session.DeliverTo(p, m.To, wire.NewDirectedMsg(peerID, m.Text, ts)); err != nil {
+		if err := session.DeliverTo(p, m.To, wire.NewDirectedMsg(peerID, m.Text, ts, m.Attachments, m.Format, m.ReplyTo)); err != nil {
 			conn.WriteJSON(wire.NewError(err.Error()))
 			continue
 		}
@@ -220,6 +234,20 @@ func (p *peer) Deliver(event any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	_ = p.conn.WriteJSON(event)
+}
+
+// Close implements hubsession.Peer — see its doc comment on why this must
+// not (and does not) touch Session state itself. Sends a close frame
+// (best-effort; a write failure here just means the connection was
+// already gone) and closes the underlying socket, which makes the
+// blocked ReadMessage call in serve's loop return an error and run its
+// own normal teardown (session.Leave, log append) on its own goroutine.
+func (p *peer) Close(code int, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_ = p.conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(code, reason), time.Now().Add(p.writeWait))
+	_ = p.conn.Close()
 }
 
 // pingLoop periodically pings the connection until either a write fails

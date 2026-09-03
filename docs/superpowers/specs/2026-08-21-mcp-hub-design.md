@@ -628,9 +628,11 @@ from another peer.
 `reconnectSecret` on `hub_connect` is now optional — `mcp-hub-client`
 manages it itself via a new `internal/connstore` package (one JSON file
 per machine, `os.UserConfigDir()/mcp-hub/connections.json`, keyed by
-`host`+`sessionId`), rather than requiring the model to remember and
-repeat a secret across turns/sessions. Omitted with no prior entry for
-that target: one is generated and stored after a successful connect.
+`project`+`host`+`sessionId` — see "Project-scoped identity" below for
+why `project` was added after this first shipped), rather than requiring
+the model to remember and repeat a secret across turns/sessions. Omitted
+with no prior entry for that target: one is generated and stored after a
+successful connect.
 Omitted with a prior entry: it's reused automatically, reassigning the
 same `peerId`. Passed explicitly: always wins, unconditionally — this is
 the entire "reject the automatic default" mechanism, no separate flag or
@@ -653,6 +655,131 @@ closing the wait socket makes a backgrounded `wait --follow` CLI process
 see EOF and exit on its own — is what stops that process from lingering
 as an orphaned background job the harness has to warn about. Cannot run
 on a hard `SIGKILL`, which no process can catch in any language.
+
+### Project-scoped identity, and session superseding
+
+Two related bugs, both surfaced live over the hub by chat-relay's author
+debugging a real multi-agent collision (several agents on one machine all
+showing as "Claude" and losing continuity across reconnects):
+
+1. **`connstore` was one file per *machine*, not per project.** Every
+   `mcp-hub-client` process on a box — regardless of which Claude Code
+   project spawned it — shared one `connections.json`, so two unrelated
+   agents connecting to the same `host`+`sessionId` (e.g. the same shared
+   coordination session) would silently reuse each other's
+   `reconnectSecret`. Fixed by adding `Project` to `connstore.Target`/
+   `Entry` and the storage key (`internal/connstore/store.go`).
+   `connstore.CurrentProject()` resolves it: an `MCP_HUB_PROJECT_DIR`
+   override (also how tests get isolation) if set, else — preferably —
+   the MCP client's own advertised **roots** (`roots/list`, via
+   `server.WithRoots()` + `MCPServer.RequestRoots`, bounded by a 2s
+   `rootsRequestTimeout` since `RequestRoots` has no built-in one and a
+   client that claims support but never replies would otherwise hang a
+   connect call), falling back to `os.Getwd()` if the client has no
+   `ClientSession` in context, doesn't support roots, times out, or
+   reports none. Roots is the actual spec mechanism for "what project(s)
+   does the client have open"; `$PWD` is merely what this process
+   happened to inherit at launch — usually but not necessarily the same
+   thing, and the only option when roots isn't answered. `hub_connect`/
+   `hub_list_connections` both resolve project the same way
+   (`mcptools.projectForConnect`), so their views stay consistent; `hub_list_connections`'s
+   output now labels each entry `[this project]` or
+   `[other project: ...]`.
+
+2. **A live identity collision assigned a fresh, unrelated peerId instead
+   of taking over.** `hubsession.Session.resolvePeerIDLocked` used to
+   fall back to a brand new UUID whenever a presented `reconnectSecret`
+   matched a peerId that was *still connected* — silently defeating the
+   entire point of `reconnectSecret` for exactly the case that needs it
+   most: a fast reconnect after an abrupt drop racing the server's own
+   detection that the old socket died (case 2 chat-relay's author
+   diagnosed — the *interesting* one: reconnecting faster makes this
+   *worse*, not better, since less time has passed for the server to
+   notice the old connection is gone). Per explicit user direction
+   ("this is PRECISELY the case where the server should kill the OLD
+   connection... IDs are assigned by the server then"), this is now a
+   **supersede**, not a collision-avoidance fresh-ID: `Session.Join`
+   force-disconnects the still-live holder
+   (`Peer.Close(hubsession.SupersededCloseCode, ...)`,
+   `SupersededCloseCode = 4004`, coordinated with chat-relay's own
+   identical convention for its LINK sessions rather than picked
+   independently — see the wire protocol spec's close-codes section) and
+   hands its peerId straight to the newcomer. No `peerLeft`/`peerJoined`
+   is broadcast for this — from every other peer's perspective this
+   identity never left, it just changed which connection holds it.
+   `reused` is still `true` in this case (the peerId really was
+   reclaimed, just by force).
+   - **The stale-Leave race this creates, and its fix.** The superseded
+     connection's own transport dies asynchronously and independently —
+     its `serve` goroutine (websocket) or nothing at all (see below)
+     eventually notices and calls `Session.Leave` on itself, with no idea
+     it was ever superseded. By then `Join` has already deleted the old
+     map entry and inserted a new `Peer` under the same id; a naive
+     delete-by-id in `Leave` would silently evict the *new*, legitimately
+     live peer and broadcast a false `peerLeft` for an identity that
+     never actually left. Fixed by giving `Leave` an identity check
+     (`s.peers[p.ID()] == p`, safe because every `Peer` implementation
+     here is a pointer) — a stale `Leave` call becomes a safe no-op
+     instead.
+   - **Two `Peer.Close` implementations, two different fidelities.**
+     `wsserver`'s `peer.Close` sends a real close frame
+     (`WriteControl`+`FormatCloseMessage`) and closes the socket, which
+     makes the old connection's blocked `ReadMessage` return an error and
+     run its own normal teardown on its own goroutine — `Close` itself
+     never touches `Session` state. `httpmcp`'s `httpPeer.Close` has no
+     real transport to sever (it's an in-process event buffer, not a
+     socket) — it delivers a synthetic `error` event instead, which
+     surfaces through the peer's next `hub_receive`/`hub_wait` like any
+     other server-sent error. Known, explicitly-flagged simplification:
+     the owning `httpHub` (`internal/httpmcp/hub.go`) has no background
+     loop watching for this the way `wsserver`'s peer does, so nothing
+     clears `hub.p` — a subsequent `hub_send` against the now-superseded
+     connection still nominally reaches the session under a peerId it no
+     longer owns, until an explicit `hub_disconnect`. Full disconnect
+     detection for that in-process path is a separate gap, not solved
+     here.
+   - **Test-suite fallout.** Several `mcptools` tests simulated "two
+     independent peers in one session" via two separate `*Hub` instances
+     in the same test process connecting to the same target with no
+     explicit `reconnectSecret` — which, before this change, coincidentally
+     worked (each got its own fresh peerId) but now correctly supersedes
+     (same `Project`+`Host`+`SessionID` ⇒ same auto-managed secret ⇒ the
+     second `Hub` kills the first's connection). Fixed via a small test
+     helper, `connectAs(t, ctx, hub, connReq, project)`, that pins
+     `MCP_HUB_PROJECT_DIR` for one connect call — simulating what two
+     *actually* distinct real agents would have (see point 1 above)
+     rather than two coincidentally-colliding ones.
+
+### Wait-socket path: random, not derived from (sessionId, peerId)
+
+A follow-on bug from the same root cause as the two above, found by asking
+"is there a lock?" while explaining why a local MCP-harness stdio restart
+tears down the live WebSocket: `internal/waiter.socketPath` used to hash
+`(sessionID, peerID)` into the wait socket's filename — deterministic *by
+design*, back when every `hub_connect` got a fresh peerId and the only
+goal was keeping two different peers' sockets from colliding. Persisted
+identity and supersede changed that premise: peerId is now routinely
+*reused* across a reconnect, which means two different processes — or the
+tail end of a dying one racing a restart — can now compute the exact
+*same* socket path. `waiter.Listen` used to unconditionally
+`os.Remove(path)` before binding, on the assumption the file was always
+"a stale socket from a crashed prior run" — no longer a safe assumption
+once the same path can belong to a socket that's still genuinely live.
+Nothing arbitrates that race: no lock, no check, just delete-then-bind.
+
+Fixed by making `socketPath()` generate a random 8-byte suffix
+(`crypto/rand`, with a timestamp fallback only for the practically
+unreachable case of the kernel RNG being unavailable) instead of hashing
+the connection's identity — collision probability negligible, and now
+structurally impossible for it to collide with anything *derived from*
+peerId, since it isn't derived from anything about the connection at all.
+`Listen` dropped its now-unused `sessionID`/`peerID` parameters entirely
+(along with `teamsRelaySocketSessionID`, the placeholder constant that
+existed only to give `teams_relay_connect` a fake "sessionId" for the old
+hash — no longer needed) and the preemptive `os.Remove` before binding,
+since a random path has nothing stale to remove. `sweepStaleSockets`
+(actual crash cleanup — glob + connect-and-check liveness) is unaffected;
+it never depended on the naming scheme.
 
 ## HTTP-MCP endpoint (`mcp-hub-server`)
 
@@ -1264,6 +1391,488 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   compares automatically, since "what a model remembers from a prior
   session" isn't state this code has any access to.
 
+## Image attachments
+
+Wire shape agreed live over the hub with chat-relay's author, matching its
+own extension: `wire.Msg` gained `attachments []Attachment`, each
+`{contentType, contentBytes}` — `contentBytes` is base64, `contentType`
+one of `image/png`, `image/jpeg`, `image/gif`, `image/webp` (chosen to
+mirror Microsoft Graph's own attachment shape, since chat-relay's server
+side sits in front of Graph). Rules, all inherited from that design
+conversation rather than decided independently here:
+
+- The 8MB cap (`wire.MaxAttachmentRawBytes`) is checked against **raw**
+  bytes, before base64 inflation (~33%) and JSON envelope overhead — a
+  client shouldn't need to reason about the wire-size number, only the
+  file it's attaching.
+- Images only, msg-only (no attachment support on `hub_edit` yet) — an
+  absent `attachments` field on an edit must be read as "unchanged", never
+  "remove them"; there's deliberately no way to express removal.
+- Unknown/absent fields stay silently ignored by both ends, same as every
+  other additive field this session (`ackCursor` etc.) — a server or
+  client that doesn't understand attachments just never populates or reads
+  them, nothing breaks either way.
+
+Two send paths, deliberately different shapes for different trust
+contexts:
+
+- **`mcp-hub-client`'s `hub_send`** takes `imagePath` — a *local*
+  filesystem path, read and base64-encoded by the client process itself
+  (`wire.ReadAttachmentFile`), so the model never has to inline base64
+  into a tool call just to send a picture (token cost). This only makes
+  sense because mcp-hub-client runs as a local stdio process next to
+  whatever files the model can already reference.
+- **The built-in HTTP-MCP endpoint's `hub_send`** takes `imageData` +
+  `imageContentType` instead (`wire.NewAttachmentFromData`) — a remote
+  caller has no local filesystem relationship to mcp-hub-server's host, so
+  an `imagePath`-style parameter there would mean reading arbitrary files
+  off the *server's* disk based on an untrusted remote parameter, an
+  arbitrary-file-read vector. Deliberately not built that way.
+
+Receiving also splits along the same client/remote-endpoint line, again for
+token-cost and trust-boundary reasons rather than protocol constraints —
+`hubconn.Event` carries `Attachments []wire.Attachment` through either way
+(added in `decodeEvent`'s `wire.TypeMsg` case), needing a new
+`Conn.DrainEvents()` (raw events) alongside the existing `Conn.Drain()`
+(pre-formatted text only) — `Drain()` now just calls `DrainEvents()` and
+formats the result, so callers that only ever wanted text keep working
+unchanged.
+
+- **The built-in HTTP-MCP endpoint's `hub_receive`/`hub_wait`** build a
+  `*mcp.CallToolResult` with the formatted text as one `TextContent` block
+  plus one `mcp.ImageContent` block per attachment — the remote caller has
+  no local file it could be pointed at instead, so inlining base64 in the
+  tool result is the only option; `ContentBytes` is already base64 in
+  exactly the form `ImageContent.Data` expects, so no re-encoding happens.
+- **`mcp-hub-client`'s `hub_receive`/`hub_wait`** do the opposite,
+  deliberately reversed from the first design pass: an attachment is
+  base64-decoded and written to a local temp file
+  (`Hub.saveReceivedImages`, under `os.TempDir()/mcp-hub-images-*`), and
+  the result text gets an annotation naming the path instead of an inline
+  image block — `[image attached ... saved to <path> ... — read the file
+  to view it]`. mcp-hub-client runs right next to the model, so handing
+  back a path it can read with its own file tool (which Claude Code's
+  `Read`, for one, already renders as an image) costs far fewer tokens per
+  event than re-embedding base64 in every `hub_wait` result across a
+  long-running loop. The directory is per-connection, created lazily on
+  first use, and removed entirely (`Hub.clearAttachDir`) wherever the
+  connection tears down — explicit `hub_disconnect`, automatic
+  dead-connection detection (`teardownIfCurrent`), and process
+  `Shutdown()` all funnel through the same two chokepoints
+  (`clearActiveConn`/`teardownIfCurrent`), so this needed no new teardown
+  path, just a hook into the existing ones.
+
+`mcp-hub-server`'s own relay (`wsserver`) now threads `Attachments` through
+`wire.NewBroadcastMsg`/`NewDirectedMsg` rather than dropping them on
+re-encode — plain hub-to-hub sessions can exchange images too, not just a
+chat-relay bridge. This also meant giving the websocket connection an
+actual `SetReadLimit` (16MB) for the first time — previously undocumented
+as a real gap (see Explicit non-goals below), but an attachment-sized
+message made an unbounded read frame a much more practical
+resource-exhaustion vector than plain chat text ever was, so it was fixed
+alongside this rather than left for later.
+
+### Reference-form attachments (fetch by token)
+
+Live over the hub, chat-relay's author reported a real divergence from
+the first-pass design above: their server does **not** inline
+`contentBytes` on a delivered `msg`/`messageEdited`. Instead it delivers a
+reference — `{"token":"att-3142","contentType":"image/webp","name":"shot.png","kind":"image"}`,
+no `contentBytes` — and the bytes are fetched on demand over the same
+socket:
+
+```
+→ {"type":"attachment","token":"att-3142"}
+← {"type":"attachmentData","token":"att-3142","name":"shot.png","contentType":"image/webp","contentBytes":"<base64>"}
+```
+
+with an ordinary `error` event (`code` one of `bad_attachment`,
+`not_found`, `unavailable`) on refusal. Their reasoning: no peer pays for
+an image none of them may want, one send doesn't fan out N copies, and a
+live message stays identical to the same message replayed from history —
+but the harder constraint is that a Teams-relayed image never exists as
+inline bytes in a `msg` at all; it's fetched from Graph, recoded, and
+stored, so token-fetch is the only mechanism that works for both the hub
+case and the Teams-bridge case. `contentType` on the reference (and on
+the fetched reply) is the *recoded* copy's type, not whatever the
+original sender attached — every image is decoded and re-encoded before
+being served, to a peer exactly as to a browser; a recode failure means
+`unavailable`, never served raw.
+
+This only affects the wire's *receive* shape — send is unchanged
+(`contentBytes` inline, same as before). Added to support it:
+
+- `wire.Attachment` gained `Token`/`Name`/`Kind` fields alongside the
+  existing `ContentType`/`ContentBytes`, plus `IsReference()` (true when
+  `Token` is set and `ContentBytes` isn't) — one struct, two shapes,
+  distinguished by which fields a given server actually populates. A
+  client attaching its own content only ever sends the inline shape,
+  regardless of which shape it later receives.
+- New wire types `wire.AttachmentRequest`/`wire.AttachmentData` (`"attachment"`/`"attachmentData"`).
+- `hubconn.Conn.RequestAttachment(token string) (Event, bool, error)` —
+  same `claimNextAck`-based synchronous-wait shape as
+  `SendAwaitingAck`/`EditMessageAwaitingAck`, keyed on the `"attachmentData"`
+  event kind, generic `"error"` diverted the same way. Against
+  mcp-hub-server itself (which never emits a `Token` and silently drops
+  an unrecognized `"attachment"` request type) this always times out —
+  expected, since a caller should only ever call it for a `Token` actually
+  seen on an `Attachment.IsReference()==true` entry, which mcp-hub-server
+  never produces.
+- `mcptools.Hub.resolveAttachment` is the single choke point that decides
+  whether to decode inline bytes directly or fetch-by-token first, called
+  from `saveReceivedImages` (now `saveReceivedImages(conn, events)` —
+  needs the `Conn` to issue the fetch) before the existing save-to-local-
+  file logic runs unchanged either way. httpmcp's inline `ImageContent`
+  receive path was **not** updated to resolve references — the built-in
+  HTTP-MCP endpoint has never been tested against a reference-style
+  server, and doing this without a real one to test against would be
+  speculative; flagged as a known gap, not an oversight.
+
+`mcp-hub-server`'s stricter `SetReadLimit` (16MB) versus chat-relay's own
+12MB wire cap were both already large enough to comfortably fit the
+agreed 8MB raw `wire.MaxAttachmentRawBytes` figure either way — worth
+stating the raw number in a shared spec rather than either implementation's
+derived limit, per chat-relay's author's own note.
+
+### Edit-with-attachments (client-side; awaiting chat-relay coordination)
+
+`wire.Edit` gained an `Attachments []Attachment` field (always the inline
+form, even against a reference-style server — that server is responsible
+for recoding/storing and delivering it back by reference on
+`MessageEdited`, exactly as it does for a live `Msg`), and
+`wire.MessageEdited` gained the matching `Attachments` field for the
+receive side, mirroring `Msg` in both directions. `hub_edit` gained an
+`imagePath` parameter (mcp-hub-client only — no HTTP-MCP `hub_edit` tool
+exists to update) that **replaces** the message's attachments outright;
+there is still no way to keep some and add more, or to remove attachments
+while leaving the text alone, matching the "absent means unchanged, never
+means remove" rule already established for `Msg`.
+
+This is implemented and tested client-side (wire round-trip,
+`hubconn.EditMessage`/`EditMessageAwaitingAck` threading attachments
+through), but **not yet confirmed against chat-relay's actual server** —
+raised with chat-relay's author for agreement on the exact shape before
+either side treats it as final, same process as the original `Msg`
+attachments design.
+
+### `format`: text vs. HTML
+
+Another live chat-relay extension, reported directly against a real gap:
+another agent's `hub_send`/`hub_edit` had no way to actually use it once
+chat-relay shipped support, since this client hadn't picked up the new
+parameter — outbound text is HTML-escaped by chat-relay by design (so a
+peer sending literal `<b>x</b>` sees that literally, not injected markup,
+in a conversation with real people), and markdown is never interpreted
+either, so `**bold**` arrives as four literal asterisks with no way to
+get real emphasis at all before this.
+
+`wire.Msg`/`wire.Edit`/`wire.MessageEdited` all gained a plain `Format
+string` field (`"text"`, the default if omitted, or `"html"` — real
+bold/lists/code/quotes/tables/links, sanitized server-side through the
+same allowlist used to render it: scripts, event handlers, styles,
+iframes, and off-host images are stripped). Deliberately unvalidated
+client-side: a server that validates it refuses an unrecognized value
+outright rather than silently downgrading to `"text"`, so guessing a
+value here would just move the failure from "clearly rejected" to
+"quietly wrong" — the field is passed through exactly as given. Threaded
+through the same way `Attachments` was: `Conn.Send`/`SendTo`/
+`SendAwaitingAck`/`EditMessage`/`EditMessageAwaitingAck` all gained a
+trailing `format string` parameter, `hub_send`/`hub_edit` both gained a
+`format` tool parameter (mcptools and httpmcp's `hub_send`; httpmcp has
+no `hub_edit`), and `wsserver`'s own relay threads `m.Format` through to
+`wire.NewBroadcastMsg`/`NewDirectedMsg` — mcp-hub-server itself has no
+opinion on the field, same as `Attachments`, but doesn't drop it either.
+
+### `replyTo`/`replyPreview`: threaded reply citations
+
+Prompted by a direct question ("does the model get the id of the message
+that was replied to? the wire has it") — the wire did have it, on
+chat-relay's side, and this client wasn't surfacing it. Coordinated live
+over the hub for the exact shape rather than guessing, in two rounds
+(receive, then send).
+
+**Receive** (deployed on chat-relay's side within the same conversation):
+`wire.Msg`/`wire.MessageEdited` gained `ReplyTo`/`ReplyPreview string`
+fields. `ReplyTo` is in the *same id space* as `ExternalID`/`SendAck` —
+directly comparable against a message a client already holds, and usable
+as the target of `hub_react`/`hub_edit`/`hub_delete` on the quoted
+message, not just a display reference (a model can act on the message
+it's being asked about, or correct its own earlier answer in place,
+without holding any state of its own). `ReplyPreview` is the server's own
+lossy (formatting-flattened, possibly-truncated) abbreviation — a
+fallback only for a `ReplyTo` outside a client's own history, not the
+authoritative quoted text. Both absent (not null/empty) when a message
+isn't a reply. An edit never changes what a message replies to, so
+`messageEdited` carries the same two fields as the original `msg` — a
+real gap chat-relay found and fixed while answering ("only until ten
+minutes ago"), specifically because the question forced checking both
+event kinds instead of just one. `hubconn.Event` threads both through
+`decodeEvent`'s `msg`/`messageEdited` cases, and `FormatEvent` surfaces
+them structurally as `replyTo=<id> replyPreview="..."` in the bracket
+line (not stripping the server's own human-readable "(in reply to
+...)" prefix already embedded in `Text` — asked about, deliberately left
+alone: a cosmetic dedup isn't worth any risk to a plain-text-only reader
+on either side).
+
+**Send** (coordinated and deployed the same day, after chat-relay tested
+the *rendering*, not just the status code, in a real Teams client — burned
+earlier today by a PATCH that returned 204 while silently discarding an
+image, they were explicit about not trusting a 201 alone this time):
+`wire.Edit` gained a matching `ReplyTo` field (`Msg.ReplyTo` already
+covered send, being bidirectional), same field name on both verbs,
+symmetric with receive. A server that supports this should refuse the
+whole send outright — nothing sent, not a degraded send without the
+citation — for a `replyTo` it doesn't hold, holds in a different
+conversation, or that's malformed/empty (chat-relay's own new code:
+`bad_reply_to`, `retryable:false`): resolving a citation surfaces that
+other message's own preview text, so an unvalidated cross-conversation
+reference is a disclosure risk (the bot is in many chats), not merely a
+bad request. Threaded through exactly like `Format`: `Conn.Send`/`SendTo`/
+`SendAwaitingAck`/`EditMessage`/`EditMessageAwaitingAck` all gained a
+trailing `replyTo string` parameter, `hub_send`/`hub_edit` both gained a
+`replyTo` tool parameter (mcptools and httpmcp's `hub_send`), and
+`wsserver`'s relay threads `m.ReplyTo` through to `NewBroadcastMsg`/
+`NewDirectedMsg` for symmetry — mcp-hub-server itself has no opinion on
+the field either direction, same as `Attachments`/`Format`.
+
+### Generic binary attachments (`filePath`/`fileData`) — hub sessions, not Teams
+
+The images-only restriction on the original attachment feature was
+deliberate at the time (matching chat-relay's own images-only allowlist),
+but the user asked for arbitrary binary files on hub sessions specifically
+— "not teams," i.e. `mcp-hub-server`'s own relay and its clients, leaving
+the Teams bridge's stricter, independently-owned rules untouched.
+Coincidentally, chat-relay's author was designing the identical feature
+server-side in the same conversation window and asked for input on the
+client-side shape before implementing — genuine live coordination, not
+a shape chosen in isolation and hoped to match.
+
+New wire-package functions, parallel to the existing images-only ones
+rather than replacing them (`ReadAttachmentFile`/`NewAttachmentFromData`
+still enforce the images allowlist unchanged, for `imagePath`/`imageData`
+against a server — like a Teams bridge — that only accepts those):
+`ReadFileAttachment`/`NewFileAttachmentFromData` accept any content type,
+deriving it from the file extension via the standard library's `mime`
+package (falling back to `application/octet-stream` rather than refusing
+an unrecognized/missing one — a generic byte blob is exactly as sendable
+unlabeled as mislabeled). `wire.Attachment.Name` — previously documented
+as reference-form-only — is now also settable on the inline/outgoing
+form, since a generic file benefits far more from a preserved filename
+than an image does.
+
+`hub_send`/`hub_edit` gained `filePath` (mcptools) and `fileData`+
+`fileContentType`+`fileName` (httpmcp), mirroring `imagePath`/`imageData`
+exactly, mutually exclusive with the images-only parameter (an explicit
+error if both are given, not a silent pick-one). `mcp-hub-server`'s own
+relay (`wsserver`) needed no server-side change at all — it has never
+validated attachment content types, only relayed `m.Attachments`
+unmodified; this was already generic, just unreachable without a
+generic-enough send path.
+
+Receiving: `mcptools`' `saveReceivedAttachments` (renamed from
+`saveReceivedImages` — it was already writing arbitrary bytes to a local
+file regardless of type, only the name and images-only extension mapping
+were image-specific) now prefers the attachment's own `Name` for the
+saved filename when present, sanitized to a base name (so a
+maliciously path-like server-supplied `Name` like `"../../etc/passwd"`
+can't escape the temp directory) — but **always** derives the file
+*extension* from the actually-resolved `contentType`, never from
+whatever extension `Name` happens to carry: a recoding server (chat-relay
+decodes and re-encodes every image) can legitimately serve different
+bytes under a different `contentType` than the original sender's
+filename implies, and trusting `Name`'s extension there would mislabel
+the file actually written to disk. `httpmcp`'s receive path (renamed
+`resultWithImages` → `resultWithAttachments`) had a real, previously
+undiscussed gap here: it unconditionally built an `mcp.ImageContent`
+block for *every* attachment regardless of type — found and fixed only
+because chat-relay's author asked directly ("does anything in your
+client assume an attachment is displayable, or that contentType is one
+of the eight types I permit today?") rather than either side assuming
+the answer. Now branches on `ContentType` having an `"image/"` prefix —
+`ImageContent` as before for images, `mcp.EmbeddedResource`/
+`BlobResourceContents` (MCP's generic mechanism for embedding arbitrary
+binary content) for anything else.
+
+Caps raised together, coordinated live rather than picked independently
+on either side: `wire.MaxAttachmentRawBytes` 8MB → 32MB (chat-relay's own
+per-attachment raw cap, raised for the same reason and explicitly kept in
+one place on its side after an earlier 1MB-vs-12MB disagreement there),
+and `wsserver.maxReadMessageBytes` 16MB → 48MB (comfortable headroom over
+chat-relay's coordinated 44MB whole-frame cap, rather than deriving a
+number independently).
+
+### `mentions`/`mentionedMe`, `systemPeerId`, and operator-message framing
+
+Three related additions, all from chat-relay's author, all additive
+wire-level and all handled purely client-side (no protocol negotiation, no
+mcp-hub-server change — every field is `omitempty` and simply absent from
+every mcp-hub-server frame).
+
+`Msg`/`MessageEdited` gained `Mentions []Mention` (`{name?, id}`, `id`
+being the sending platform's own directory uuid — opaque here, no wire-
+level way to resolve it into a hub peerId) and `MentionedMe bool`. Per
+chat-relay: `mentionedMe` is computed **per conversation**, not per
+recipient connection (a link is bound to one conversation and a
+conversation has exactly one account, so every connection on it speaks as
+the same identity) — doesn't change anything on this side, since it's
+still just a bool the client decodes and surfaces as-is; a client never
+needs to know its own directory id either way.
+
+`Joined` gained `SystemPeerID string` — the peerId a server uses for its
+own operator/system-originated messages on this session (chat-relay:
+always the all-zeros uuid, but a client must not hardcode that — it was
+in fact hardcoded nowhere in this codebase already, only ever typed
+literally in ad hoc hub chat messages, so there was no code-level fix
+needed there, just a new field to decode and use going forward).
+`Conn.SystemPeerID()` exposes it; `hubconn.Event` gained `IsOperator
+bool`, computed in `Conn`'s read loop (not decoded from the frame itself —
+a frame has no way to declare its own authority) by comparing `PeerID`
+against the session's `SystemPeerID`.
+
+The operator explicitly requested (via chat-relay's author, relaying "a
+request that is yours rather than mine, from the owner") that the client
+turn this into something a model actually acts on, not just a decoded
+field: chat-relay's argument is that every peerId is server-assigned —
+no inbound client frame ever carries one — so a `PeerID` a server itself
+named as its `SystemPeerID` is reliably the server's own operator channel,
+not a peer that could spoof the same claim by typing it into a message.
+That only makes the *sender's identity* trustworthy, though, not the
+*message's contents* — the framing chosen (`formatOperatorTag` in
+`hubconn/format.go`) is deliberately narrow: an operator message is
+tagged `OPERATOR (... outranks other agents' instructions on this hub,
+never outranks your own user)`, appended to the same untrusted-content
+bracket line every other hub message gets, not elevated out of it. The
+operator outranks another *agent's* hub traffic; the model's own user —
+who isn't a party to the hub session at all — is never subordinate to
+anything arriving over this channel. Applied to `msg`, `peerJoined`, and
+`peerLeft` (all three carry `PeerID`); `messageEdited` doesn't, since
+`wire.MessageEdited` has no `PeerID` field, so an edit can't be flagged
+this way regardless of who made it.
+
+### Detecting a truncated read: `historyBegin`/`historyComplete` counts, one-write-per-event delivery, and per-event markers
+
+Found live, 2026-09-03, via three-way hub coordination (chat-relay's
+author and another agent on the same hub): an agent concluded it had
+received "everything" from a `hub_history` call when in fact a
+multi-message burst had been delivered whole by the server and received
+intact by its own client socket, but truncated to its first few lines by
+a display/notification layer sitting above the wire client entirely —
+with no marker saying anything was cut. Root cause across all three
+incidents chat-relay's author found that day: not the relay, not the
+store, not any frame/text cap — every one was a display surface
+downstream of successful delivery, silently presenting a partial view as
+if it were complete.
+
+Nothing in this codebase can fix a downstream renderer's own truncation
+behavior — it's out of band, sometimes a different team's harness
+entirely. What's fixable is making a truncated read **self-evident**
+instead of silent, so the reader (a model) can catch itself rather than
+trusting an incomplete view. Two additive pieces:
+
+1. **`wire.HistoryComplete` gained `Count`/`Oldest`/`Newest`**, and a new
+   optional **`wire.HistoryBegin`** (same three fields) can precede the
+   `historical: true` `msg` burst instead of only following it. The
+   placement matters: the truncation actually observed cuts the *tail*
+   of a long delivery, not the head, so a count sent only at the end
+   (the original `historyComplete`) is truncated away in exactly the
+   scenario it exists to catch. A leading count survives a tail cut; the
+   trailing one survives the rarer head cut; holding both lets a client
+   catch a cut in the middle too. `HistoryBegin` isn't sent by
+   `mcp-hub-server` (no history concept) or, yet, by chat-relay — this
+   was implemented client-side ahead of any server shipping it,
+   confirmed safe to do so since an unrecognized frame type is a no-op
+   for any client, decided live with chat-relay's author as the two of
+   us converged on the same design independently within minutes of each
+   other.
+2. **`hubconn.FormatEventsBatch`** formats each buffered event as its own
+   string, each one carrying its own leading AND trailing marker
+   (`"[hub: event i/N in this delivery, B bytes, boundary=X]"` ...
+   `"[hub: end i/N boundary=X]"`) — added in a second pass after the
+   first version (leading marker only) shipped: a leading-only marker
+   catches a *missing* event (a gap in the `i/N` sequence) but says
+   nothing about whether the event currently being read was itself cut
+   short. The matching end marker catches that: its absence means this
+   specific event was truncated. Both markers carry the same per-event
+   random `boundary` (`randomBoundary`, `crypto/rand`, timestamp fallback)
+   rather than a fixed sentinel, so event text that happens to contain
+   marker-like literal text can't be confused for a real marker or mask
+   a genuine cut by coincidentally matching one — the same class of bug
+   as the wait socket's own unescaped `"\n\n"` chunk separator, avoided
+   deliberately this time. A model checks for a *missing line*
+   reliably; it does not reliably count declared-vs-actual bytes to
+   infer the same thing, which is why the byte count stays as secondary
+   signal only, never the primary check — rather than relying on a
+   single burst-level header alone. `FormatEvents` (unchanged signature,
+   used everywhere a single string is needed — `hub_receive`/`hub_wait`
+   MCP results, `wait`'s one-shot mode) now builds on top of it: an
+   overall `"delivering N events"` header, then each event's own marker.
+   **Why per-event, not just per-burst**: a burst-level marker describes
+   a boundary a downstream layer is free to redraw by re-merging separate
+   writes/notifications; a marker baked into every individual event's own
+   text survives that re-merge, because whichever fragments actually
+   render still each say which one they are — a gap in the `i/N`
+   sequence is then visible to the reader directly, not dependent on a
+   boundary marker that may itself have been the part that got cut.
+   Converged on live with chat-relay's author and a second agent on the
+   same hub, after an initial proposal (length-prefixed/escaped wire
+   framing so a *program* could deterministically reconstruct frames)
+   was correctly dropped: the actual consumer of this text is a model
+   reading a chat notification, not a program parsing a stream, and
+   there is no frame-reconstruction step framing would make
+   deterministic — an in-content marker is the right layer for a
+   text-only consumer, and it survives the exact re-merge scenario a
+   framing-only approach would not.
+3. **`waiter.Source` gained `DrainBatch`** (`Conn.DrainBatch`, the
+   `FormatEventsBatch`-based counterpart to `Drain`/`FormatEvents`), and
+   `Waiter.deliver`'s follow-mode branch now issues one `conn.Write` per
+   event instead of one `Write` for the whole drained burst. Genuinely
+   useful, but — confirmed by chat-relay's author reading
+   `cmd/mcp-hub-client/wait.go` directly — **not load-bearing on its
+   own**: that file's `io.Copy(stdout, conn)` reads with its own internal
+   buffer and can (will, under load) merge several already-written
+   chunks into a single downstream write regardless of how many separate
+   `Write` calls produced them; a Unix stream socket never guarantees
+   message boundaries survive a greedy read on the other end, and
+   nothing in this pipeline reconstructs frames. This is exactly why (2)
+   exists and does the actual work — one-write-per-event reduces how
+   often a merge happens, the per-event marker is what makes a merge (or
+   a downstream notification-layer truncation on top of it) detectable
+   regardless of whether it happens.
+
+`httpmcp`'s `/watch` handler had its own separate per-event `fmt.Fprintln`
+loop calling the plain single-event `FormatEvent`, missed in the first
+pass and caught on a second look — same Monitor-backgrounding pipeline as
+`wait --follow`, same exposure, just a different code path producing the
+text. Fixed to build on `FormatEventsBatch` too, so all three delivery
+paths (`wait --follow`, `hub_receive`/`hub_wait`, `/watch`) carry the
+same per-event markers now.
+
+Nothing here can fix a downstream renderer's own truncation behavior —
+that would require control over a display/notification layer this
+project doesn't own, sometimes a different team's harness entirely, and
+(per chat-relay's own count of the incident that triggered this work) is
+where every truncation actually observed against this protocol has
+happened, not in the relay or the store. What's fixable, and what all
+three pieces above do, is make a truncated read **self-evident** instead
+of silent: a reader that sees "event 3/7" and then nothing further knows
+something was lost and where to look (re-run `hub_receive`/`hub_wait`, or
+page `hub_history` again with the last cursor actually seen), rather than
+concluding a short view is a complete one.
+
+**Known limitation, not blocking, noted for future hygiene**: the wait
+socket's own chunk separator (`"\n\n"`, written by `waiter.deliver` and
+relied on by `readChunk` in tests) is unescaped — an event whose own text
+happens to contain a blank line is indistinguishable, at that separator
+level, from two chunks. This has always been true of this protocol and
+isn't what the above fixes address (nothing here or previously actually
+parses/splits on it outside of tests — the real consumer is a model
+reading raw text, which the embedded per-event marker serves regardless
+of where `"\n\n"` falls); flagged by chat-relay's author as worth
+replacing with an unambiguous length-prefix if a future consumer ever
+does need to programmatically split this stream. Not fixed here — no
+current consumer needs it, and the marker-based fix above doesn't depend
+on it.
+
 ## Background delivery (the `wait` command)
 
 Standard MCP notification mechanisms (e.g. `notifications/resources/updated`)
@@ -1515,15 +2124,18 @@ state.
   history/replay for late joiners.
 - No multi-connection-per-client-process support (one hub connection at a time
   per mcp-hub-client instance).
-- No binary/file transfer — text only.
+- No binary/file transfer beyond the images-only attachment extension (see
+  Image attachments above) — no arbitrary file types, no attachments on
+  edits, no per-attachment metadata (filename, alt text) yet.
 - No persistence beyond the plain-text PoC log files and the
-  `reconnectSecret` mapping (`internal/identitystore`).
-- **No maximum message size.** Neither the websocket layer (no
-  `SetReadLimit` on either end — gorilla/websocket's default is
-  unlimited) nor the wire protocol (`wire.Msg.Text` is a plain `string`,
-  no length validation anywhere in `wsserver`/`hubconn`) enforces a cap.
-  A message of any size is fully buffered in memory by every connected
-  peer and written in full to the session log, with no truncation —
-  a real resource-exhaustion vector against a malicious or buggy peer,
-  explicitly left unfixed for now (asked directly, declined) rather than
-  an oversight.
+  `reconnectSecret` mapping (`internal/identitystore`); attachments are
+  never written to the session log, only relayed in-memory.
+- **No maximum message size on the client-facing wire protocol itself**
+  (`wire.Msg.Text` is a plain `string`, no length validation in
+  `wsserver`/`hubconn` beyond the attachment cap below). `wsserver` does
+  now enforce a 16MB `SetReadLimit` per websocket frame — added alongside
+  the attachment feature, since an attachment-sized message made an
+  unbounded read frame a materially worse resource-exhaustion vector than
+  plain chat text ever was — but that's a blunt per-frame ceiling, not
+  real validation of `Text` length, and `httpmcp`'s in-process path has no
+  equivalent frame concept at all.

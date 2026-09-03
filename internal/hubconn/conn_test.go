@@ -45,6 +45,87 @@ func TestDecodeEventExportedWrapperMatchesInternalDecode(t *testing.T) {
 	}
 }
 
+func TestDecodeEventCarriesReplyToAndReplyPreview(t *testing.T) {
+	m := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "reply text", "ts", nil, "", "")
+	m.ReplyTo = "ext-orig"
+	m.ReplyPreview = "GT-158 pending item 2/3"
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	ev, ok := DecodeEvent(raw)
+	if !ok {
+		t.Fatal("expected DecodeEvent to succeed")
+	}
+	if ev.ReplyTo != "ext-orig" || ev.ReplyPreview != "GT-158 pending item 2/3" {
+		t.Fatalf("unexpected decoded event: %+v", ev)
+	}
+}
+
+func TestDecodeEventCarriesHistoryCompleteCounts(t *testing.T) {
+	hc := wire.HistoryComplete{Type: wire.TypeHistoryComplete, Count: 5, Oldest: "c1", Newest: "c5"}
+	raw, err := json.Marshal(hc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	ev, ok := DecodeEvent(raw)
+	if !ok {
+		t.Fatal("expected DecodeEvent to succeed")
+	}
+	if ev.Kind != "historyComplete" || ev.HistoryCount != 5 || ev.HistoryOldest != "c1" || ev.HistoryNewest != "c5" {
+		t.Fatalf("unexpected decoded event: %+v", ev)
+	}
+}
+
+func TestDecodeEventCarriesHistoryBegin(t *testing.T) {
+	raw, err := json.Marshal(wire.NewHistoryBegin(5, "c1", "c5"))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	ev, ok := DecodeEvent(raw)
+	if !ok {
+		t.Fatal("expected DecodeEvent to succeed")
+	}
+	if ev.Kind != "historyBegin" || ev.HistoryCount != 5 || ev.HistoryOldest != "c1" || ev.HistoryNewest != "c5" {
+		t.Fatalf("unexpected decoded event: %+v", ev)
+	}
+}
+
+func TestDecodeEventCarriesMentions(t *testing.T) {
+	m := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "hi @alice", "ts", nil, "", "")
+	m.Mentions = []wire.Mention{{Name: "Alice", ID: "dir-1"}}
+	m.MentionedMe = true
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	ev, ok := DecodeEvent(raw)
+	if !ok {
+		t.Fatal("expected DecodeEvent to succeed")
+	}
+	if len(ev.Mentions) != 1 || ev.Mentions[0].ID != "dir-1" || !ev.MentionedMe {
+		t.Fatalf("unexpected decoded event: %+v", ev)
+	}
+}
+
+func TestDecodeEventMessageEditedCarriesReplyTo(t *testing.T) {
+	m := wire.MessageEdited{
+		Type: wire.TypeMessageEdited, ExternalID: "ext-1", Text: "corrected",
+		ReplyTo: "ext-orig", ReplyPreview: "preview text",
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	ev, ok := DecodeEvent(raw)
+	if !ok {
+		t.Fatal("expected DecodeEvent to succeed")
+	}
+	if ev.ReplyTo != "ext-orig" || ev.ReplyPreview != "preview text" {
+		t.Fatalf("unexpected decoded event: %+v", ev)
+	}
+}
+
 func TestDialJoinsAndAssignsPeerID(t *testing.T) {
 	url := startTestServer(t)
 	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
@@ -152,7 +233,7 @@ func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
 		t.Fatalf("expected LastConsumedCursor cursor-1, got %q", c.LastConsumedCursor())
 	}
 
-	if err := c.Send("hello"); err != nil {
+	if err := c.Send("hello", nil, "", ""); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -196,7 +277,7 @@ func TestAckCursorOmittedBeforeAnythingConsumed(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.Send("hello"); err != nil {
+	if err := c.Send("hello", nil, "", ""); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -306,7 +387,7 @@ func TestAckReplyRejectionAdoptsServerReportedCursor(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	c.Drain()
-	if err := c.Send("hello"); err != nil {
+	if err := c.Send("hello", nil, "", ""); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -356,7 +437,7 @@ func TestBadAckCursorErrorDisablesFurtherAcks(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	c.Drain()
-	if err := c.Send("first"); err != nil {
+	if err := c.Send("first", nil, "", ""); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -647,6 +728,86 @@ func TestDialCapturesServerVersion(t *testing.T) {
 	}
 }
 
+func TestSystemPeerIDCapturedFromJoined(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		j.SystemPeerID = "00000000-0000-0000-0000-000000000000"
+		conn.WriteJSON(j)
+		for {
+			var raw json.RawMessage
+			if err := conn.ReadJSON(&raw); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if c.SystemPeerID() != "00000000-0000-0000-0000-000000000000" {
+		t.Fatalf("got SystemPeerID %q, want the all-zeros uuid", c.SystemPeerID())
+	}
+}
+
+func TestMsgFromSystemPeerIsMarkedOperator(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		j := wire.NewJoined("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 0, "", "")
+		j.SystemPeerID = "00000000-0000-0000-0000-000000000000"
+		conn.WriteJSON(j)
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "00000000-0000-0000-0000-000000000000", Text: "go ahead", TS: "ts1"})
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440000", Text: "ordinary peer", TS: "ts2"})
+		for {
+			var raw json.RawMessage
+			if err := conn.ReadJSON(&raw); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var events []Event
+	for len(events) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("only saw %d events before timeout", len(events))
+		}
+		ev, _ := c.DrainEvents()
+		events = append(events, ev...)
+		if len(events) < 2 {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !events[0].IsOperator {
+		t.Fatalf("expected the system-peer msg to be marked IsOperator, got: %+v", events[0])
+	}
+	if events[1].IsOperator {
+		t.Fatalf("expected the ordinary-peer msg to NOT be marked IsOperator, got: %+v", events[1])
+	}
+}
+
 func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -760,7 +921,7 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 
 	waitForActivity(t, activity) // a sees b's peerJoined
 
-	if err := b.Send("hello"); err != nil {
+	if err := b.Send("hello", nil, "", ""); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	waitForActivity(t, activity) // a sees the message
@@ -771,6 +932,53 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 	}
 	if !strings.Contains(formatted, "hello") {
 		t.Fatalf("expected drained events to include the message, got: %s", formatted)
+	}
+}
+
+func TestSendWithAttachmentsDeliversThem(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+
+	a, err := Dial(url, sessionID, DialOptions{})
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+
+	activity := make(chan struct{}, 8)
+	a.OnActivity(func() { activity <- struct{}{} })
+	waitForActivity(t, activity) // a's own rosterComplete
+
+	b, err := Dial(url, sessionID, DialOptions{})
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	waitForActivity(t, activity) // a sees b's peerJoined
+
+	attachments := []wire.Attachment{{ContentType: "image/png", ContentBytes: "aGVsbG8="}}
+	if err := b.Send("a picture", attachments, "", ""); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	waitForActivity(t, activity) // a sees the message
+
+	events, connected := a.DrainEvents()
+	if !connected {
+		t.Fatal("expected still connected")
+	}
+	var found bool
+	for _, ev := range events {
+		if ev.Kind != "msg" {
+			continue
+		}
+		if len(ev.Attachments) != 1 || ev.Attachments[0].ContentType != "image/png" ||
+			ev.Attachments[0].ContentBytes != "aGVsbG8=" {
+			t.Fatalf("unexpected attachments on msg event: %+v", ev.Attachments)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("expected a msg event among drained events, got: %+v", events)
 	}
 }
 
@@ -798,7 +1006,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	waitForActivity(t, activityA) // a sees b's peerJoined
 	a.Drain()
 
-	if err := b.SendTo("just for you", a.PeerID()); err != nil {
+	if err := b.SendTo("just for you", a.PeerID(), nil, "", ""); err != nil {
 		t.Fatalf("sendTo: %v", err)
 	}
 	waitForActivity(t, activityA)
@@ -825,7 +1033,7 @@ func TestSendToUnknownPeerSurfacesAsErrorEvent(t *testing.T) {
 	a.OnActivity(func() { activity <- struct{}{} })
 	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
 
-	if err := a.SendTo("hello?", "00000000-0000-0000-0000-000000000000"); err != nil {
+	if err := a.SendTo("hello?", "00000000-0000-0000-0000-000000000000", nil, "", ""); err != nil {
 		t.Fatalf("sendTo: %v", err)
 	}
 	waitForActivity(t, activity)
@@ -1095,7 +1303,7 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 		}
 		defer conn.Close()
 		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
-		historical := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "old news", "ts")
+		historical := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "old news", "ts", nil, "", "")
 		historical.Historical = true
 		conn.WriteJSON(historical)
 		conn.WriteJSON(wire.NewHistoryComplete())
@@ -1121,14 +1329,25 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 	}
 	defer c.Close()
 
+	// Accumulate across repeated Drain calls until the last of the 10
+	// rapid-fire server writes has actually been processed and buffered,
+	// rather than draining as soon as merely the *first* one shows up —
+	// under -race's scheduling overhead in particular, that first-event
+	// trigger reliably fires well before the read loop has caught up on
+	// the rest, making a single Peek-then-Drain a real, reproducible
+	// flake rather than a hypothetical one.
+	var formatted string
+	var connected bool
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if hasEvents, _ := c.Peek(); hasEvents {
+		chunk, stillConnected := c.Drain()
+		formatted += chunk
+		connected = stillConnected
+		if strings.Contains(formatted, "delete acknowledged") || !connected {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	formatted, connected := c.Drain()
 	if !connected {
 		t.Fatalf("expected still connected, got formatted=%q", formatted)
 	}
@@ -1322,7 +1541,7 @@ func TestEditMessageSendsEditMessage(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.EditMessage("ext-1", "corrected"); err != nil {
+	if err := c.EditMessage("ext-1", "corrected", nil, "", ""); err != nil {
 		t.Fatalf("EditMessage: %v", err)
 	}
 
@@ -1333,6 +1552,207 @@ func TestEditMessageSendsEditMessage(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received the edit request")
+	}
+}
+
+func TestEditMessageSendsAttachments(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotEdit := make(chan wire.Edit, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var e wire.Edit
+		if err := conn.ReadJSON(&e); err == nil {
+			gotEdit <- e
+		}
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	attachments := []wire.Attachment{{ContentType: "image/png", ContentBytes: "aGVsbG8="}}
+	if err := c.EditMessage("ext-1", "corrected", attachments, "", ""); err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+
+	select {
+	case e := <-gotEdit:
+		if len(e.Attachments) != 1 || e.Attachments[0].ContentType != "image/png" {
+			t.Fatalf("expected attachments on the edit request, got: %+v", e.Attachments)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the edit request")
+	}
+}
+
+func TestSendWithReplyToSetsField(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotMsg := make(chan wire.Msg, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var m wire.Msg
+		if err := conn.ReadJSON(&m); err == nil {
+			gotMsg <- m
+		}
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.Send("reply text", nil, "", "ext-orig"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case m := <-gotMsg:
+		if m.ReplyTo != "ext-orig" {
+			t.Fatalf("expected replyTo=ext-orig on the sent message, got: %+v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the send")
+	}
+}
+
+func TestEditMessageSendsReplyTo(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotEdit := make(chan wire.Edit, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var e wire.Edit
+		if err := conn.ReadJSON(&e); err == nil {
+			gotEdit <- e
+		}
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.EditMessage("ext-1", "corrected", nil, "", "ext-orig"); err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+
+	select {
+	case e := <-gotEdit:
+		if e.ReplyTo != "ext-orig" {
+			t.Fatalf("expected replyTo=ext-orig on the edit request, got: %+v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the edit request")
+	}
+}
+
+func TestRequestAttachmentReturnsFetchedBytes(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var req wire.AttachmentRequest
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+		if req.Type != wire.TypeAttachment || req.Token != "att-3142" {
+			return
+		}
+		conn.WriteJSON(wire.AttachmentData{
+			Type: wire.TypeAttachmentData, Token: "att-3142", Name: "shot.png",
+			ContentType: "image/webp", ContentBytes: "aGVsbG8=",
+		})
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestAttachment("att-3142")
+	if err != nil {
+		t.Fatalf("RequestAttachment: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected a reply within AckWaitTimeout")
+	}
+	if ev.Kind != "attachmentData" || ev.AttachmentToken != "att-3142" ||
+		ev.AttachmentContentType != "image/webp" || ev.AttachmentContentBytes != "aGVsbG8=" {
+		t.Fatalf("unexpected attachmentData event: %+v", ev)
+	}
+}
+
+func TestRequestAttachmentSurfacesServerError(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var req wire.AttachmentRequest
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+		e := wire.NewError("no such attachment")
+		e.Code = "not_found"
+		conn.WriteJSON(e)
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestAttachment("does-not-exist")
+	if err != nil {
+		t.Fatalf("RequestAttachment: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected a reply within AckWaitTimeout")
+	}
+	if ev.Kind != "error" || ev.Code != "not_found" {
+		t.Fatalf("expected a not_found error event, got: %+v", ev)
 	}
 }
 

@@ -2,6 +2,7 @@ package httpmcp
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/secforge/mcp-hub/internal/hubsession"
+	"github.com/secforge/mcp-hub/internal/wire"
 )
 
 // fakeSession is a minimal server.ClientSession for tests that need to put
@@ -94,6 +96,149 @@ func TestConnectSendReceiveRoundTrip(t *testing.T) {
 	selfReceived := callTool(t, ctxA, s, s.handleReceive, map[string]any{})
 	if strings.Contains(selfReceived, "hello from Alice") {
 		t.Fatalf("sender should not receive its own broadcast, got %q", selfReceived)
+	}
+}
+
+func TestSendWithImageDataDeliversImageContentBlock(t *testing.T) {
+	s, mcpServer := newTestServer(t)
+	ctxA := ctxFor(mcpServer, "mcp-a")
+	ctxB := ctxFor(mcpServer, "mcp-b")
+
+	connectA := callTool(t, ctxA, s, s.handleConnect, map[string]any{"name": "Alice"})
+	if !strings.Contains(connectA, "sessionId=") {
+		t.Fatalf("expected connect result to include a sessionId, got %q", connectA)
+	}
+	sessionID := s.hubFor("mcp-a").session().ID()
+	callTool(t, ctxB, s, s.handleConnect, map[string]any{"sessionId": sessionID, "name": "Bob"})
+
+	rawImage := []byte("not a real png, just test bytes")
+	imageData := base64.StdEncoding.EncodeToString(rawImage)
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"text": "look at this", "imageData": imageData, "imageContentType": "image/png",
+	}
+	sendRes, err := s.handleSend(ctxA, req)
+	if err != nil || sendRes.IsError {
+		t.Fatalf("send failed: err=%v result=%+v", err, sendRes)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	recvRes, err := s.handleReceive(ctxB, mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("receive failed: %v", err)
+	}
+
+	var gotImage *mcp.ImageContent
+	var gotText string
+	for _, c := range recvRes.Content {
+		switch v := c.(type) {
+		case mcp.ImageContent:
+			gotImage = &v
+		case mcp.TextContent:
+			gotText += v.Text
+		}
+	}
+	if !strings.Contains(gotText, "look at this") {
+		t.Fatalf("expected text content to include the message, got %q", gotText)
+	}
+	if gotImage == nil {
+		t.Fatalf("expected an image content block, got %+v", recvRes.Content)
+	}
+	if gotImage.MIMEType != "image/png" || gotImage.Data != imageData {
+		t.Fatalf("unexpected image content block: %+v", gotImage)
+	}
+}
+
+func TestSendWithFileDataDeliversEmbeddedResourceBlock(t *testing.T) {
+	s, mcpServer := newTestServer(t)
+	ctxA := ctxFor(mcpServer, "mcp-a")
+	ctxB := ctxFor(mcpServer, "mcp-b")
+
+	callTool(t, ctxA, s, s.handleConnect, map[string]any{"name": "Alice"})
+	sessionID := s.hubFor("mcp-a").session().ID()
+	callTool(t, ctxB, s, s.handleConnect, map[string]any{"sessionId": sessionID, "name": "Bob"})
+
+	rawFile := []byte("%PDF-1.4 not a real pdf, just test bytes")
+	fileData := base64.StdEncoding.EncodeToString(rawFile)
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"text": "here's the report", "fileData": fileData,
+		"fileContentType": "application/pdf", "fileName": "report.pdf",
+	}
+	sendRes, err := s.handleSend(ctxA, req)
+	if err != nil || sendRes.IsError {
+		t.Fatalf("send failed: err=%v result=%+v", err, sendRes)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	recvRes, err := s.handleReceive(ctxB, mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("receive failed: %v", err)
+	}
+
+	var gotResource *mcp.EmbeddedResource
+	var gotText string
+	for _, c := range recvRes.Content {
+		switch v := c.(type) {
+		case mcp.EmbeddedResource:
+			gotResource = &v
+		case mcp.TextContent:
+			gotText += v.Text
+		case mcp.ImageContent:
+			t.Fatalf("expected no image content block for a non-image attachment, got %+v", v)
+		}
+	}
+	if !strings.Contains(gotText, "here's the report") {
+		t.Fatalf("expected text content to include the message, got %q", gotText)
+	}
+	if gotResource == nil {
+		t.Fatalf("expected an embedded resource block, got %+v", recvRes.Content)
+	}
+	blob, ok := gotResource.Resource.(mcp.BlobResourceContents)
+	if !ok {
+		t.Fatalf("expected BlobResourceContents, got %T", gotResource.Resource)
+	}
+	if blob.MIMEType != "application/pdf" || blob.Blob != fileData {
+		t.Fatalf("unexpected embedded resource: %+v", blob)
+	}
+}
+
+func TestSendRejectsImageDataOverSizeLimit(t *testing.T) {
+	s, mcpServer := newTestServer(t)
+	ctx := ctxFor(mcpServer, "mcp-a")
+	callTool(t, ctx, s, s.handleConnect, map[string]any{"name": "Alice"})
+
+	oversized := base64.StdEncoding.EncodeToString(make([]byte, wire.MaxAttachmentRawBytes+1))
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"text": "too big", "imageData": oversized, "imageContentType": "image/png",
+	}
+	res, err := s.handleSend(ctx, req)
+	if err != nil {
+		t.Fatalf("handleSend returned unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result for oversized imageData")
+	}
+}
+
+func TestSendRejectsUnsupportedImageContentType(t *testing.T) {
+	s, mcpServer := newTestServer(t)
+	ctx := ctxFor(mcpServer, "mcp-a")
+	callTool(t, ctx, s, s.handleConnect, map[string]any{"name": "Alice"})
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"text": "nope", "imageData": base64.StdEncoding.EncodeToString([]byte("x")), "imageContentType": "application/pdf",
+	}
+	res, err := s.handleSend(ctx, req)
+	if err != nil {
+		t.Fatalf("handleSend returned unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result for an unsupported content type")
 	}
 }
 

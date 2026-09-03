@@ -1,7 +1,8 @@
 package waiter
 
 import (
-	"crypto/sha256"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -19,6 +20,20 @@ type Source interface {
 	// Drain clears and returns the buffered events formatted for delivery,
 	// and whether the connection is still open.
 	Drain() (formatted string, connected bool)
+	// DrainBatch is Drain, but keeps each buffered event as its own
+	// formatted string rather than one joined blob — used by follow-mode
+	// delivery so a multi-event burst goes out as one network write per
+	// event instead of a single write a downstream layer could truncate
+	// as one unit with no signal anything was cut. See
+	// hubconn.FormatEventsBatch's doc comment for the full reasoning
+	// (confirmed live, 2026-09-03: the actual truncation observed against
+	// this protocol happens downstream of this client, in a
+	// notification/display layer this codebase doesn't own — this can't
+	// prevent that layer from re-merging separate writes, but removing
+	// the batching this code itself used to do is still strictly better
+	// than not doing it, and every event's own per-event marker — see
+	// FormatEventsBatch — survives even a re-merge).
+	DrainBatch() (chunks []string, connected bool)
 }
 
 // Mode selector bytes a `wait` client sends as the first byte after
@@ -64,16 +79,20 @@ func SocketDirForTesting(dir string) (restore func()) {
 	return func() { socketDir = orig }
 }
 
-// Listen opens the wait socket for this (sessionID, peerID) connection and
-// starts accepting connections. peerID is included in the path (not just
-// sessionID) so two separate mcp-hub-client processes joining the same
-// session on the same host don't collide on the same socket path. Only one
-// connection to this socket may be registered at a time; a new connection
-// always supersedes any previously registered one, whether it was in "once"
-// or "follow" mode.
-func Listen(sessionID, peerID string, source Source) (*Waiter, error) {
-	path := socketPath(sessionID, peerID)
-	_ = os.Remove(path) // stale socket from a crashed prior run
+// Listen opens the wait socket for this connection and starts accepting
+// connections. The path is random per call (see socketPath) — no longer
+// derived from (sessionID, peerID) — specifically so two different
+// processes never
+// compute the same path: peerID is now routinely *reused* across a
+// reconnect (persisted reconnectSecret, and a server-side supersede on a
+// still-live collision — see hubsession.SupersededCloseCode), so a
+// deterministic path would let a second, still-alive process's Listen
+// unlink and rebind the first's socket file out from under it, mid-race,
+// with nothing to arbitrate between them. Only one connection to this
+// socket may be registered at a time; a new connection always supersedes
+// any previously registered one, whether it was in "once" or "follow" mode.
+func Listen(source Source) (*Waiter, error) {
+	path := socketPath()
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
@@ -125,19 +144,25 @@ func isStaleSocket(path string) bool {
 	return false
 }
 
-// socketPath derives a short, fixed-length wait-socket filename from
-// (sessionID, peerID) instead of embedding both raw UUIDs. Unix-domain
-// sockets have a 108-byte sun_path limit on Linux, macOS, and Windows'
-// AF_UNIX implementation; two 36-char UUIDs plus the surrounding literal
-// text alone already total ~91 bytes, leaving no headroom for the OS temp
-// directory once it's joined in (on Windows in particular, %TEMP% is often
-// 40-50+ bytes) — net.Listen then fails, and the caller closes the
-// connection it just opened, producing an immediate join-then-leave. A
-// truncated SHA-256 hash keeps collision risk negligible for this
-// short-lived, single-host use while staying well under the limit.
-func socketPath(sessionID, peerID string) string {
-	sum := sha256.Sum256([]byte(sessionID + "-" + peerID))
-	return filepath.Join(socketDir, fmt.Sprintf("mcp-hub-wait-%x.sock", sum[:8]))
+// socketPath generates a short, random wait-socket filename — deliberately
+// not derived from (sessionID, peerID) (see Listen's doc comment on why
+// determinism there was a real cross-process collision hazard once peerID
+// became routinely reusable). Unix-domain sockets have a 108-byte sun_path
+// limit on Linux, macOS, and Windows' AF_UNIX implementation, so this stays
+// well under it with real headroom even on Windows (%TEMP% is often
+// 40-50+ bytes) — an 8-byte random suffix, same length as the truncated
+// hash this replaces, keeps collision probability negligible for this
+// short-lived, single-host use.
+func socketPath() string {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// crypto/rand failing at all is exceptionally rare (kernel RNG
+		// unavailable) — fall back to a timestamp rather than a fixed
+		// name, so a failure here still can't reintroduce the collision
+		// hazard this function exists to avoid.
+		binary.BigEndian.PutUint64(buf[:], uint64(time.Now().UnixNano()))
+	}
+	return filepath.Join(socketDir, fmt.Sprintf("mcp-hub-wait-%x.sock", buf))
 }
 
 // WaitCommand is the exact command Claude should run in the background to
@@ -229,12 +254,12 @@ func (w *Waiter) Poke() {
 }
 
 func (w *Waiter) deliver(rw *registeredWaiter) {
-	formatted, connected := w.source.Drain()
-	if !connected {
-		writeAndClose(rw.conn, w.disconnectedMessage())
-		return
-	}
 	if !rw.follow {
+		formatted, connected := w.source.Drain()
+		if !connected {
+			writeAndClose(rw.conn, w.disconnectedMessage())
+			return
+		}
 		// The reminder to re-run leads, rather than trails, the delivered
 		// content — this is a single one-shot response with nothing to
 		// fall back on, so if whatever's reading it gets cut off partway
@@ -245,9 +270,22 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 		return
 	}
 
-	if _, err := rw.conn.Write([]byte(formatted + "\n\n")); err != nil {
-		rw.conn.Close()
+	// Follow mode: one network write per event (DrainBatch), not one
+	// write for the whole burst (Drain) — see Source.DrainBatch's doc
+	// comment. A multi-event burst that used to leave here as a single
+	// write, ripe for a downstream layer to truncate as one unit, now
+	// leaves as N separate writes, each individually complete and
+	// self-identifying (FormatEventsBatch's "i/N" marker).
+	chunks, connected := w.source.DrainBatch()
+	if !connected {
+		writeAndClose(rw.conn, w.disconnectedMessage())
 		return
+	}
+	for _, c := range chunks {
+		if _, err := rw.conn.Write([]byte(c + "\n\n")); err != nil {
+			rw.conn.Close()
+			return
+		}
 	}
 
 	// Re-register for the next event — checking w.source.Peek() and setting

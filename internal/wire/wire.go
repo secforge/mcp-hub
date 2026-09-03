@@ -1,8 +1,14 @@
 package wire
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"mime"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 var idPattern = regexp.MustCompile(
@@ -29,6 +35,7 @@ const (
 	TypePeerLeft        Type = "peerLeft"
 	TypeRosterComplete  Type = "rosterComplete"
 	TypeHistory         Type = "history"
+	TypeHistoryBegin    Type = "historyBegin"
 	TypeHistoryComplete Type = "historyComplete"
 	TypeSendAck         Type = "sendAck"
 	TypeReactionChanged Type = "reactionChanged"
@@ -41,6 +48,8 @@ const (
 	TypeDeleteAck       Type = "deleteAck"
 	TypeMessageDeleted  Type = "messageDeleted"
 	TypeAck             Type = "ack"
+	TypeAttachment      Type = "attachment"
+	TypeAttachmentData  Type = "attachmentData"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -123,6 +132,17 @@ type Joined struct {
 	// applicable or not set by the server.
 	ConversationKind string  `json:"conversationKind,omitempty"`
 	Topic            *string `json:"topic,omitempty"`
+	// SystemPeerID, if set, is the peerId a server uses for its own
+	// operator/system-originated messages on this session (chat-relay:
+	// always the all-zeros UUID, but a client must not hardcode that —
+	// this field is the authoritative source, and the value is otherwise
+	// only a server-side convention). Every peerId is server-assigned —
+	// no inbound client frame ever carries one — so a msg/messageEdited
+	// whose PeerID equals this one is reliably the server's own operator
+	// channel, not something a peer could spoof by claiming the same id.
+	// Empty when a server has no such concept (including every
+	// mcp-hub-server, where every peerId is an ordinary participant).
+	SystemPeerID string `json:"systemPeerId,omitempty"`
 }
 
 func NewJoined(peerID string, peerCount int, name, agePublicKey string) Joined {
@@ -151,6 +171,12 @@ func NewError(message string) Error {
 	return Error{Type: TypeError, Message: message}
 }
 
+// Mention is one @-mention on a Msg/MessageEdited — see Msg.Mentions.
+type Mention struct {
+	Name string `json:"name,omitempty"`
+	ID   string `json:"id"`
+}
+
 type Msg struct {
 	Type    Type   `json:"type"`
 	PeerID  string `json:"peerId,omitempty"`
@@ -169,6 +195,41 @@ type Msg struct {
 	// produced it) — correlates a canonical msg with the sendAck that
 	// preceded it. Empty when not applicable.
 	ExternalID string `json:"externalId,omitempty"`
+	// ReplyTo is the ExternalID of the message this one is a reply to — a
+	// server extension (chat-relay), absent (not null/empty) when this
+	// message isn't a reply. Same id space as ExternalID/SendAck, so it's
+	// directly usable as the target of a Reaction/Edit/Delete on the
+	// quoted message, not just a display reference. Set by the server on
+	// a delivered msg/messageEdited (see below); a client may also set it
+	// on an outgoing send to request a native threaded-reply citation —
+	// see Edit.ReplyTo's doc comment for the validation a server should
+	// apply in that direction (refuse an unrecognized/foreign id outright
+	// rather than send anything, since resolving the citation can surface
+	// that other message's own preview text).
+	ReplyTo string `json:"replyTo,omitempty"`
+	// ReplyPreview is the server's own (lossy — formatting flattened,
+	// possibly truncated) abbreviation of the quoted message's text, for
+	// when ReplyTo names a message outside a client's own history. Not
+	// the authoritative quoted text — use History around ReplyTo's cursor
+	// for that. Text on the same server may already open with a
+	// human-readable "(in reply to X: preview)" line for plain-text-only
+	// readers; ReplyTo/ReplyPreview are the structural form of that same
+	// information, so a client surfacing both may want to avoid saying it
+	// twice.
+	ReplyPreview string `json:"replyPreview,omitempty"`
+	// Mentions lists who this message @-mentions, if any — a server
+	// extension (chat-relay), absent (nil, not an empty slice) when the
+	// message mentions no one. Each entry's ID is the sending platform's
+	// own directory id (opaque here — this package doesn't validate its
+	// form, same as PeerID/ExternalID), not a hub peerId; there is no
+	// wire-level way to resolve one into the other.
+	Mentions []Mention `json:"mentions,omitempty"`
+	// MentionedMe is true when the receiving connection's own identity is
+	// among Mentions — computed per conversation (all connections on the
+	// same conversation share one identity there), never per hub peerId,
+	// so a client never needs to know its own directory id to use this.
+	// mcp-hub-server never sets it.
+	MentionedMe bool `json:"mentionedMe,omitempty"`
 	// Own, for a bridge session, is true when this exact connection is
 	// the one that sent the message. Deliberately a decision for the
 	// receiving client to act on, not the server: whether to skip waking
@@ -187,6 +248,259 @@ type Msg struct {
 	// the full read-receipt contract. Ignored by mcp-hub-server, which has
 	// no history/read-receipt concept at all.
 	AckCursor string `json:"ackCursor,omitempty"`
+	// Attachments carries inline binary content — see Attachment. A
+	// server extension (not part of the base protocol, hence "unknown
+	// fields ignored" keeps mcp-hub-server's own relay unaffected either
+	// way, same as AckCursor). On an edit (see Edit/MessageEdited), an
+	// absent Attachments must be read as "unchanged", never "remove them"
+	// — there is deliberately no way to express attachment removal here.
+	Attachments []Attachment `json:"attachments,omitempty"`
+	// Format is a server extension (chat-relay) declaring how Text should
+	// be interpreted: "text" (the default if omitted — plain, escaped
+	// verbatim) or "html" (bold/lists/code/quotes/tables/links, sanitized
+	// server-side through the same allowlist used to render it — scripts,
+	// event handlers, styles, iframes, and off-host images are stripped).
+	// An unrecognized value is refused outright by a server that validates
+	// it, not silently downgraded to "text" — so don't guess a value the
+	// target server wasn't confirmed to accept. mcp-hub-server's own relay
+	// has no opinion on this field at all, same as Attachments.
+	Format string `json:"format,omitempty"`
+}
+
+// Attachment is binary content attached to a Msg/Edit — a server
+// extension, currently images only by convention (image/png, image/jpeg,
+// image/gif, image/webp; a server may refuse anything else). Two shapes
+// share this one struct, distinguished by which fields are set:
+//
+//   - Sent by a client, and as mcp-hub-server's own relay delivers it:
+//     ContentType + ContentBytes (base64-encoded raw bytes) inline, no
+//     Token. Servers that enforce a size cap generally do so on the raw
+//     byte size (8MB is the number chat-relay settled on) — the wire/JSON
+//     size after base64 inflation (~33%) and envelope overhead is
+//     implementation detail a client shouldn't need to reason about, so
+//     check raw size client-side before encoding, not the encoded
+//     string's length.
+//   - Delivered by a reference-style server (chat-relay): Token +
+//     ContentType (+ optional Name/Kind), ContentBytes empty — see
+//     IsReference. The actual bytes are fetched on demand by sending an
+//     AttachmentRequest for Token and reading back an AttachmentData
+//     reply. A server does this so no peer pays for bytes it doesn't
+//     want, one send doesn't fan out N copies, and a live message stays
+//     identical to the same message replayed from history — and because
+//     some content (e.g. a Teams-relayed image, fetched from Graph on
+//     demand) never exists as inline bytes in a msg at all.
+type Attachment struct {
+	ContentType  string `json:"contentType"`
+	ContentBytes string `json:"contentBytes,omitempty"`
+	// Token identifies this attachment for a later AttachmentRequest —
+	// set only on the reference form (see IsReference), never sent by a
+	// client attaching its own content.
+	Token string `json:"token,omitempty"`
+	// Name is an optional original filename. Always present on the
+	// reference form when the server has one; also settable on the
+	// inline/outgoing form by a client sending a generic file (see
+	// ReadFileAttachment/NewFileAttachmentFromData) — a receiving server
+	// or client with no use for it just ignores it, same as any other
+	// additive field.
+	Name string `json:"name,omitempty"`
+	// Kind is an optional server-defined category (e.g. "image"),
+	// reference form only — informational, not required to interpret
+	// ContentType.
+	Kind string `json:"kind,omitempty"`
+}
+
+// IsReference reports whether this Attachment is the reference form (a
+// Token to fetch, no inline bytes yet) rather than inline content.
+func (a Attachment) IsReference() bool {
+	return a.Token != "" && a.ContentBytes == ""
+}
+
+// AttachmentRequest asks a reference-style server (see Attachment) for the
+// actual bytes behind a Token seen on an earlier Msg/MessageEdited. Not
+// meaningful against mcp-hub-server's own relay, which always inlines
+// bytes and never emits a Token to fetch in the first place — sending
+// this against it just gets silently ignored, same as any other
+// unrecognized type.
+type AttachmentRequest struct {
+	Type  Type   `json:"type"`
+	Token string `json:"token"`
+}
+
+func NewAttachmentRequest(token string) AttachmentRequest {
+	return AttachmentRequest{Type: TypeAttachment, Token: token}
+}
+
+// AttachmentData is the server's reply to an AttachmentRequest — the
+// actual bytes for Token. A request that can't be satisfied comes back as
+// an ordinary Error instead, with Code one of "bad_attachment" (malformed
+// token), "not_found" (unknown, or belongs to a different session), or
+// "unavailable" (recorded but no servable bytes, e.g. a recode failure).
+type AttachmentData struct {
+	Type        Type   `json:"type"`
+	Token       string `json:"token"`
+	Name        string `json:"name,omitempty"`
+	ContentType string `json:"contentType"`
+	// ContentBytes is base64-encoded raw bytes — the recoded copy a
+	// reference-style server actually stores and serves, which may differ
+	// in ContentType from whatever was originally sent (e.g. an upstream
+	// platform's own re-encode).
+	ContentBytes string `json:"contentBytes"`
+}
+
+// MaxAttachmentRawBytes is the raw (pre-base64) size cap a sending client
+// should enforce before ever encoding a file — see Attachment's doc
+// comment on why this is checked against raw bytes, not the inflated wire
+// size. Shared by every send path (mcptools, httpmcp) so the limit can't
+// drift between them. 32MB, coordinated live with chat-relay when it
+// raised its own limit from 8MB for the same reason (arbitrary binary
+// attachments, not just images) — its own two caps (per-attachment raw,
+// whole-frame after base64+JSON overhead) live in one place on its side
+// specifically so they can't disagree the way an earlier 1MB-vs-12MB split
+// once did there; matching its number here is the same discipline applied
+// across servers, not just within one.
+const MaxAttachmentRawBytes = 32 * 1024 * 1024
+
+// AllowedAttachmentContentTypes are the only content types the attachment
+// extension accepts — images only, matching what chat-relay refuses
+// server-side with error/unsupported_media. Checking client-side too gives
+// a faster, clearer error than a round trip just to be told no.
+var AllowedAttachmentContentTypes = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+	"image/webp": true,
+}
+
+// AttachmentContentTypeForExt maps a file extension (case-insensitive,
+// with or without a leading dot) to its content type, for a client that
+// reads a local image file and needs to derive contentType rather than
+// being told it directly.
+func AttachmentContentTypeForExt(ext string) (string, bool) {
+	switch strings.ToLower(strings.TrimPrefix(ext, ".")) {
+	case "png":
+		return "image/png", true
+	case "jpg", "jpeg":
+		return "image/jpeg", true
+	case "gif":
+		return "image/gif", true
+	case "webp":
+		return "image/webp", true
+	default:
+		return "", false
+	}
+}
+
+// ReadAttachmentFile reads path from the local filesystem, validates its
+// extension and raw size against AttachmentContentTypeForExt/
+// MaxAttachmentRawBytes, and returns a single-element Attachment slice
+// ready to send — the shared implementation behind every "imagePath"-style
+// send-tool parameter (mcptools, httpmcp), so the rules can't drift between
+// them. Returns a nil slice, nil error for an empty path (no attachment
+// requested — not an error).
+func ReadAttachmentFile(path string) ([]Attachment, error) {
+	if path == "" {
+		return nil, nil
+	}
+	contentType, ok := AttachmentContentTypeForExt(filepath.Ext(path))
+	if !ok {
+		return nil, fmt.Errorf("unsupported image type — only .png, .jpg/.jpeg, .gif, .webp are accepted")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not read imagePath: %w", err)
+	}
+	if len(data) > MaxAttachmentRawBytes {
+		return nil, fmt.Errorf("image too large: %d bytes exceeds the %d byte limit", len(data), MaxAttachmentRawBytes)
+	}
+	return []Attachment{{
+		ContentType:  contentType,
+		ContentBytes: base64.StdEncoding.EncodeToString(data),
+	}}, nil
+}
+
+// NewAttachmentFromData validates and wraps client-supplied base64 image
+// bytes directly — the shape a remote sender (no local filesystem to read
+// a path from, unlike ReadAttachmentFile) must use instead. Returns a
+// nil slice, nil error if data is empty (no attachment requested).
+func NewAttachmentFromData(data, contentType string) ([]Attachment, error) {
+	if data == "" {
+		return nil, nil
+	}
+	if !AllowedAttachmentContentTypes[contentType] {
+		return nil, fmt.Errorf(
+			"unsupported image type — only image/png, image/jpeg, image/gif, image/webp are accepted")
+	}
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, fmt.Errorf("imageData is not valid base64: %w", err)
+	}
+	if len(raw) > MaxAttachmentRawBytes {
+		return nil, fmt.Errorf("image too large: %d bytes exceeds the %d byte limit", len(raw), MaxAttachmentRawBytes)
+	}
+	return []Attachment{{ContentType: contentType, ContentBytes: data}}, nil
+}
+
+// ReadFileAttachment is ReadAttachmentFile without the images-only
+// restriction — for a hub-to-hub session (mcp-hub-server's own relay,
+// which never validates attachment content types at all) where a client
+// wants to send an arbitrary binary file, not just an image. Content type
+// is derived from the file's extension via the standard library's mime
+// package (registered per-OS/per-install, so results can vary — this is
+// a best-effort label for the receiving side to act on, not a guarantee),
+// falling back to "application/octet-stream" for an unrecognized or
+// missing extension rather than refusing the send outright: unlike the
+// images-only path (where an unrecognized extension usually means "this
+// isn't an image, don't pretend it is"), a generic byte blob is exactly
+// as sendable without a specific label as with a wrong one. The original
+// filename is preserved in Attachment.Name so the receiving side can
+// offer a better name than a generic one. Same MaxAttachmentRawBytes cap
+// as the images-only path — this is not a bigger-file allowance, just a
+// broader content-type one. Returns a nil slice, nil error for an empty
+// path (no attachment requested — not an error).
+func ReadFileAttachment(path string) ([]Attachment, error) {
+	if path == "" {
+		return nil, nil
+	}
+	contentType := mime.TypeByExtension(filepath.Ext(path))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not read filePath: %w", err)
+	}
+	if len(data) > MaxAttachmentRawBytes {
+		return nil, fmt.Errorf("file too large: %d bytes exceeds the %d byte limit", len(data), MaxAttachmentRawBytes)
+	}
+	return []Attachment{{
+		ContentType:  contentType,
+		ContentBytes: base64.StdEncoding.EncodeToString(data),
+		Name:         filepath.Base(path),
+	}}, nil
+}
+
+// NewFileAttachmentFromData is NewAttachmentFromData without the
+// images-only restriction — see ReadFileAttachment for why, and for the
+// same reasoning behind not refusing an unrecognized/empty contentType
+// outright (a generic byte blob is exactly as sendable unlabeled as
+// mislabeled). name is optional and, if given, preserved in
+// Attachment.Name for the receiving side. Returns a nil slice, nil error
+// if data is empty (no attachment requested).
+func NewFileAttachmentFromData(data, contentType, name string) ([]Attachment, error) {
+	if data == "" {
+		return nil, nil
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, fmt.Errorf("fileData is not valid base64: %w", err)
+	}
+	if len(raw) > MaxAttachmentRawBytes {
+		return nil, fmt.Errorf("file too large: %d bytes exceeds the %d byte limit", len(raw), MaxAttachmentRawBytes)
+	}
+	return []Attachment{{ContentType: contentType, ContentBytes: data, Name: name}}, nil
 }
 
 // NewOutgoingMsg is what a client sends to the server to broadcast to the
@@ -202,14 +516,14 @@ func NewOutgoingDirectedMsg(text, to string) Msg {
 }
 
 // NewBroadcastMsg is what the server sends to other session members.
-func NewBroadcastMsg(peerID, text, ts string) Msg {
-	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts}
+func NewBroadcastMsg(peerID, text, ts string, attachments []Attachment, format, replyTo string) Msg {
+	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts, Attachments: attachments, Format: format, ReplyTo: replyTo}
 }
 
 // NewDirectedMsg is what the server sends to the single targeted peer for a
 // private message.
-func NewDirectedMsg(peerID, text, ts string) Msg {
-	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts, Private: true}
+func NewDirectedMsg(peerID, text, ts string, attachments []Attachment, format, replyTo string) Msg {
+	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts, Private: true, Attachments: attachments, Format: format, ReplyTo: replyTo}
 }
 
 type PeerEvent struct {
@@ -292,12 +606,64 @@ func NewHistoryAfterRequest(after string, limit int) History {
 // including an empty burst, so a client at the start of a conversation
 // gets a positive "there is no more" rather than inferring completion from
 // a gap in traffic. Mirrors RosterComplete's role for the initial roster.
+//
+// Count/Oldest/Newest exist so a client can tell a truncated READ apart
+// from a truncated SEND — the server-side burst was complete and correct
+// (verified, live, 2026-09-03: a message a client believed it never
+// received was intact in the server's own store and delivered whole; the
+// loss was entirely in a display/notification layer downstream of this
+// client, one that cut a many-event burst to its first few lines with no
+// indication anything was cut). Without a number to check against, "I
+// only see 4 of the 20 events you say you sent" is not something a client
+// can detect on its own — it just looks like a short but complete answer.
+// All three additive/omitempty: an older client/server that doesn't know
+// them loses nothing it had.
 type HistoryComplete struct {
 	Type Type `json:"type"`
+	// Count is how many msg events this burst delivered (0 for an empty
+	// burst — still sent, not omitted, so "no history" is also
+	// positively confirmed). Compare against however many Historical
+	// events were actually seen since the matching History request; a
+	// mismatch means something between the server and this exact reading
+	// of it was lost, and hub_history(before/after: <the gap>) is how to
+	// recover it, not just re-reading the same notification.
+	Count int `json:"count,omitempty"`
+	// Oldest/Newest are the delivered burst's own cursor range (its
+	// first and last Msg.Cursor, in delivery order) — omitted along with
+	// Count when the burst was empty. A client that already holds a
+	// cursor from further back than Oldest knows this page didn't reach
+	// far enough and should page again with before/after.
+	Oldest string `json:"oldest,omitempty"`
+	Newest string `json:"newest,omitempty"`
 }
 
 func NewHistoryComplete() HistoryComplete {
 	return HistoryComplete{Type: TypeHistoryComplete}
+}
+
+// HistoryBegin is an optional leading counterpart to HistoryComplete, sent
+// (if a server implements it) BEFORE a History request's answering burst
+// of msg events rather than after — same Count/Oldest/Newest fields,
+// known ahead of the loop since the page is materialized before it's
+// streamed out. The reason for a second frame carrying the same
+// information twice: a downstream display/notification layer that
+// truncates a long burst overwhelmingly cuts the TAIL, not the head
+// (confirmed live, 2026-09-03), so a trailing-only marker is truncated
+// away in exactly the scenario it exists to catch. A leading marker
+// survives a tail cut; the trailing HistoryComplete survives a (rarer)
+// head cut; a client holding both can also catch a middle cut by
+// comparing them. Not sent by any server today — additive/optional, so a
+// server that doesn't implement it is unaffected, and a client that
+// doesn't recognize this type ignores it like any other unknown frame.
+type HistoryBegin struct {
+	Type   Type   `json:"type"`
+	Count  int    `json:"count,omitempty"`
+	Oldest string `json:"oldest,omitempty"`
+	Newest string `json:"newest,omitempty"`
+}
+
+func NewHistoryBegin(count int, oldest, newest string) HistoryBegin {
+	return HistoryBegin{Type: TypeHistoryBegin, Count: count, Oldest: oldest, Newest: newest}
 }
 
 // Ack is a standalone read receipt — the same information Msg/Reaction/
@@ -385,6 +751,27 @@ type MessageEdited struct {
 	Text       string `json:"text"`
 	TS         string `json:"ts,omitempty"`
 	Own        bool   `json:"own,omitempty"`
+	// Attachments mirrors Msg.Attachments — the edited message's current
+	// attachments (inline or reference form, same as a live Msg), not a
+	// diff against what it had before. Absent means the edit itself
+	// carried no Attachments field at all (see Edit.Attachments) and so
+	// left them unchanged; a receiving client should keep whatever
+	// attachments it already associated with this externalId in that
+	// case, not treat an absent field here as "now has none."
+	Attachments []Attachment `json:"attachments,omitempty"`
+	// Format mirrors Msg.Format — how Text should be interpreted.
+	Format string `json:"format,omitempty"`
+	// ReplyTo/ReplyPreview mirror Msg.ReplyTo/Msg.ReplyPreview — an edit
+	// never changes what a message replies to, so these are set from the
+	// same underlying reply reference as the original Msg, present here
+	// too so a client that only ever saw the edited version still has it.
+	ReplyTo      string `json:"replyTo,omitempty"`
+	ReplyPreview string `json:"replyPreview,omitempty"`
+	// Mentions/MentionedMe mirror Msg.Mentions/Msg.MentionedMe — an edit
+	// can change who's mentioned, so these reflect the edited text, not
+	// the original.
+	Mentions    []Mention `json:"mentions,omitempty"`
+	MentionedMe bool      `json:"mentionedMe,omitempty"`
 }
 
 // Reaction is a client request to add or remove a reaction on an earlier
@@ -421,10 +808,33 @@ type Edit struct {
 	Text       string `json:"text"`
 	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
 	AckCursor string `json:"ackCursor,omitempty"`
+	// Attachments, like Msg.Attachments, carries inline content (see
+	// Attachment) to attach — always the inline form (ContentType +
+	// ContentBytes), even against a reference-style server, which is
+	// responsible for recoding/storing it and delivering it back by
+	// reference on MessageEdited, the same as it does for a Msg. Absent
+	// means "leave existing attachments as they are" — there is
+	// deliberately no way to express attachment removal via Edit, same as
+	// Msg.
+	Attachments []Attachment `json:"attachments,omitempty"`
+	// Format is a server extension — see Msg.Format for the full contract
+	// ("text"/"html", unrecognized values refused). Applies to the new
+	// Text this edit sets.
+	Format string `json:"format,omitempty"`
+	// ReplyTo requests a native threaded-reply citation to another
+	// message, identified by its externalId — a server extension
+	// (chat-relay), symmetric with the ReplyTo a client receives (see
+	// Msg.ReplyTo). Must name a message the server actually holds in this
+	// same conversation; a server that validates it should refuse
+	// outright (not send anything) for an unknown/foreign/malformed
+	// value, since resolving the citation can surface that message's own
+	// preview text — an unvalidated cross-conversation reference is a
+	// disclosure risk, not just a bad request. Empty means "not a reply."
+	ReplyTo string `json:"replyTo,omitempty"`
 }
 
-func NewEditRequest(externalID, text string) Edit {
-	return Edit{Type: TypeEdit, ExternalID: externalID, Text: text}
+func NewEditRequest(externalID, text string, attachments []Attachment, format, replyTo string) Edit {
+	return Edit{Type: TypeEdit, ExternalID: externalID, Text: text, Attachments: attachments, Format: format, ReplyTo: replyTo}
 }
 
 // ReactionAck and EditAck confirm a Reaction/Edit request was actually

@@ -20,7 +20,31 @@ type Peer interface {
 	// catch-up) receive about it.
 	Name() string
 	AgePublicKey() string
+	// Close forcibly disconnects this peer — used by Join when a new
+	// connection presents a reconnectSecret that maps to this peer's
+	// identity while it's still live (see Join, SupersededCloseCode): the
+	// newcomer takes over the identity, and this connection needs to
+	// actually go away rather than being silently forgotten server-side
+	// while its own transport still thinks it's connected. code/reason
+	// are the close-code/message to use where the underlying transport
+	// has such a concept (e.g. a websocket close frame); an
+	// implementation with none (e.g. an in-process HTTP-MCP peer) may
+	// synthesize equivalent behavior however fits. Close must not itself
+	// touch Session state — cleanup happens through this peer's own
+	// normal disconnect path noticing its transport is gone (see Leave's
+	// identity check for why that's safe even though it now runs after
+	// this peerID has already been reassigned).
+	Close(code int, reason string)
 }
+
+// SupersededCloseCode is the websocket close code used when a new
+// connection reclaims a peerId whose previous connection was still live
+// (see Join) — chosen to match chat-relay's own convention for the
+// identical case on its LINK sessions (see the wire protocol spec's
+// close-codes section: 4000-4999 is the private range other servers are
+// invited to mint from, and this value was coordinated rather than picked
+// independently).
+const SupersededCloseCode = 4004
 
 type Session struct {
 	id    string
@@ -70,12 +94,33 @@ func newSession(id string) *Session {
 // from a matching reconnectSecret (true) or freshly generated (false) — the
 // caller (wsserver) surfaces this in the session log so a reconnect with a
 // valid secret is visible there without having to infer it from a repeated
-// peerId across entries.
+// peerId across entries. reused is also true in the supersede case (see
+// resolvePeerIDLocked) — the peerID itself really was reclaimed, just by
+// force rather than because the old holder had already gone.
 func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer, beforeVisible func(existingCount int)) (p Peer, reused bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	peerID, reused := s.resolvePeerIDLocked(reconnectSecret)
+	peerID, reused, supersede := s.resolvePeerIDLocked(reconnectSecret)
+	if supersede != nil {
+		// The identity this reconnectSecret maps to is still attached to a
+		// live connection — take over rather than handing the newcomer a
+		// fresh, unrelated peerID (see resolvePeerIDLocked's doc comment
+		// for why: a fresh ID here silently defeats the entire point of
+		// reconnectSecret for exactly the caller who most needs it, a fast
+		// reconnect after an abrupt drop). Remove it from the roster now,
+		// before existing is snapshotted below, so the roster this Join
+		// delivers/announces is already consistent with the takeover
+		// having happened. Its own connection is closed with
+		// SupersededCloseCode — its transport will notice independently
+		// and run its own normal teardown (Leave), which Leave's identity
+		// check makes a safe no-op once this peerID has been reassigned
+		// below. No peerLeft/peerJoined is broadcast for this — from
+		// every other peer's perspective this identity never left, it
+		// just changed which connection holds it.
+		delete(s.peers, peerID)
+		supersede.Close(SupersededCloseCode, "superseded by a new connection with the same identity")
+	}
 	existing := make([]Peer, 0, len(s.peers))
 	for _, ep := range s.peers {
 		existing = append(existing, ep)
@@ -100,32 +145,59 @@ func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer
 		p.Deliver(wire.NewPeerJoined(ep.ID(), ep.Name(), ep.AgePublicKey()))
 	}
 	p.Deliver(wire.NewRosterComplete())
-	s.broadcastExceptLocked(peerID, wire.NewPeerJoined(peerID, p.Name(), p.AgePublicKey()))
+	if supersede == nil {
+		s.broadcastExceptLocked(peerID, wire.NewPeerJoined(peerID, p.Name(), p.AgePublicKey()))
+	}
 	return p, reused
 }
 
 // resolvePeerIDLocked returns the peerID a joining connection should use,
-// and whether it was reclaimed from a matching reconnectSecret. Called with
-// s.mu already held.
-func (s *Session) resolvePeerIDLocked(reconnectSecret string) (peerID string, reused bool) {
+// whether it was reclaimed from a matching reconnectSecret (reused), and —
+// only when the secret matches an identity that's still attached to a
+// live connection — that connection's Peer, for Join to supersede
+// (forcibly disconnect and hand its identity to the newcomer) rather than
+// silently falling back to an unrelated fresh ID. Called with s.mu
+// already held.
+func (s *Session) resolvePeerIDLocked(reconnectSecret string) (peerID string, reused bool, supersede Peer) {
 	if reconnectSecret != "" {
 		if id, ok := s.secretToPeerID[identitystore.HashSecret(reconnectSecret)]; ok {
-			if _, stillConnected := s.peers[id]; !stillConnected {
-				return id, true
+			if existing, stillConnected := s.peers[id]; stillConnected {
+				return id, true, existing
 			}
+			return id, true, nil
 		}
 	}
-	return uuid.NewString(), false
+	return uuid.NewString(), false, nil
 }
 
 // Leave removes p from the session and reports whether the session is now
 // empty. The caller is responsible for tearing the session down via
 // Manager.Remove when empty is true.
+// Leave removes p from the session, but only if p is still exactly the
+// peer currently registered under its own ID — this identity check (not
+// just a key match) matters because of Join's supersede path: a
+// superseded connection's own transport notices its socket died
+// independently and asynchronously, and calls Leave on itself with no
+// idea it was ever superseded. By the time that runs, Join has already
+// deleted the old entry and inserted a new Peer under the same ID; a
+// plain delete-by-ID here would silently evict that new, legitimately
+// live peer and broadcast a false peerLeft for an identity that, from
+// every other peer's perspective, never actually left. When the check
+// fails (p is stale), this is a safe no-op — not an error, since Leave is
+// meant to always be safely callable from a connection's own teardown
+// path regardless of what happened to its identity in the meantime.
 func (s *Session) Leave(p Peer) (empty bool) {
 	s.mu.Lock()
-	delete(s.peers, p.ID())
+	current, ok := s.peers[p.ID()]
+	stale := ok && current != p
+	if ok && !stale {
+		delete(s.peers, p.ID())
+	}
 	empty = len(s.peers) == 0
 	s.mu.Unlock()
+	if stale {
+		return empty
+	}
 	s.broadcastExcept(p.ID(), wire.NewPeerLeft(p.ID()))
 	return empty
 }

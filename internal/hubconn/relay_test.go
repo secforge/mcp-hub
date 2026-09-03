@@ -57,7 +57,7 @@ func TestSendAwaitingAckOnPlainConnDoesNotWait(t *testing.T) {
 		t.Fatal("expected a plain Dial connection to report IsBridge() false")
 	}
 	start := time.Now()
-	ev, ok, err := c.SendAwaitingAck("hello", "")
+	ev, ok, err := c.SendAwaitingAck("hello", "", nil, "", "")
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("SendAwaitingAck: %v", err)
@@ -85,7 +85,7 @@ func TestSendAwaitingAckReturnsSendAckOnBridge(t *testing.T) {
 	}
 	defer c.Close()
 
-	ev, ok, err := c.SendAwaitingAck("hello", "")
+	ev, ok, err := c.SendAwaitingAck("hello", "", nil, "", "")
 	if err != nil {
 		t.Fatalf("SendAwaitingAck: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestSendAwaitingAckReturnsErrorEventOnRefusal(t *testing.T) {
 	}
 	defer c.Close()
 
-	ev, ok, err := c.SendAwaitingAck("hello", "")
+	ev, ok, err := c.SendAwaitingAck("hello", "", nil, "", "")
 	if err != nil {
 		t.Fatalf("SendAwaitingAck: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSendAwaitingAckTimesOutWithoutStealingLaterEvents(t *testing.T) {
 	}
 	defer c.Close()
 
-	_, ok, err := c.SendAwaitingAck("hello", "")
+	_, ok, err := c.SendAwaitingAck("hello", "", nil, "", "")
 	if err != nil {
 		t.Fatalf("SendAwaitingAck: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestClaimNextAckDoesNotStealUnrelatedEvents(t *testing.T) {
 	}
 	defer c.Close()
 
-	ev, ok, err := c.SendAwaitingAck("hello", "")
+	ev, ok, err := c.SendAwaitingAck("hello", "", nil, "", "")
 	if err != nil {
 		t.Fatalf("SendAwaitingAck: %v", err)
 	}

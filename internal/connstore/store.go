@@ -1,11 +1,23 @@
 // Package connstore persists mcp-hub-client's own record of which
-// (host, sessionId) targets it has connected to before — the peerId it
-// was assigned and the reconnectSecret that earns it back — so the model
-// no longer has to remember and repeat a reconnectSecret itself across
-// turns/sessions to keep the same identity. One shared file for the whole
-// machine: mcp-hub-client has no project/working-directory awareness at
-// all (it reads no CWD, no project env var), so there is no natural way
-// to scope this any narrower than "every invocation of this client."
+// (project, host, sessionId) targets it has connected to before — the
+// peerId it was assigned and the reconnectSecret that earns it back — so
+// the model no longer has to remember and repeat a reconnectSecret itself
+// across turns/sessions to keep the same identity.
+//
+// One shared file for the whole machine, but keyed by Project (see
+// CurrentProject) as well as host+sessionId — every mcp-hub-client
+// invocation on a machine still writes to the same connections.json, but
+// two different projects (e.g. two separate Claude Code working
+// directories) connecting to the identical host+sessionId no longer
+// collide on one shared reconnectSecret and fight over the same peerId.
+// This was a real, reported problem: without it, whichever agent
+// connected first held the live identity and every other agent on the
+// same machine reconnecting to that same session got reassigned a fresh
+// peerId every time, losing read-position/"own" continuity. Two
+// mcp-hub-client processes in the *same* project can still race each
+// other here (see save's doc comment) — that scope is deliberately not
+// narrowed further, since two agents legitimately sharing one project's
+// identity is the common case this is meant to support, not a bug.
 //
 // This stores the raw reconnectSecret, not a hash of it (unlike
 // internal/identitystore, which is server-side and only ever needs to
@@ -15,12 +27,13 @@
 // this package existed: storing it locally on the user's own machine
 // instead is, if anything, a narrower trust boundary than that.
 //
-// Reads/writes are a full read-modify-write of one JSON file per call, no
-// cross-process locking. Two mcp-hub-client processes racing a write here
-// (e.g. two Claude Code sessions in different projects) can lose one's
-// update — an accepted PoC-grade limitation, consistent with this
-// project's existing precedent elsewhere (e.g. hublog's session logs),
-// not silently pretended away.
+// Reads/writes are a full read-modify-write of one JSON file per call,
+// guarded by a cross-process advisory file lock (see withLock) — an
+// exclusive lock around each write's whole load-modify-save sequence, a
+// shared lock around each read, so two mcp-hub-client processes racing a
+// write here (e.g. two Claude Code sessions in the same project) can no
+// longer silently lose one's update the way an earlier, unguarded version
+// of this package could.
 package connstore
 
 import (
@@ -28,18 +41,25 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 // Target identifies which hub session an Entry is about.
 type Target struct {
 	Host      string
 	SessionID string
+	// Project scopes this target to one working directory — see
+	// CurrentProject. Two Targets with the same Host+SessionID but
+	// different Project are entirely distinct entries.
+	Project string
 }
 
 // Entry is what's remembered about one prior connection to a Target.
 type Entry struct {
 	Host            string
 	SessionID       string
+	Project         string
 	PeerID          string
 	Name            string
 	ReconnectSecret string
@@ -53,8 +73,29 @@ type Entry struct {
 	Connected bool
 }
 
+// CurrentProject identifies "this working directory" for Target.Project —
+// MCP_HUB_PROJECT_DIR if set (an explicit override, and how tests get
+// isolation without touching the real cwd), else the process's actual
+// working directory. mcp-hub-client is launched by its MCP client (e.g.
+// Claude Code) as a local stdio subprocess, which normally inherits the
+// project's own working directory — that's what makes this a meaningful
+// project identifier at all, not an arbitrary choice. Empty (rather than
+// erroring) if the working directory can't be determined, which just
+// means every such invocation shares one "unknown project" scope — a
+// degraded-but-safe fallback, not a crash.
+func CurrentProject() string {
+	if p := os.Getenv("MCP_HUB_PROJECT_DIR"); p != "" {
+		return p
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return wd
+}
+
 func key(t Target) string {
-	return t.Host + "\x00" + t.SessionID
+	return t.Host + "\x00" + t.SessionID + "\x00" + t.Project
 }
 
 func dir() string {
@@ -69,6 +110,41 @@ func dir() string {
 
 func path() string {
 	return filepath.Join(dir(), "connections.json")
+}
+
+// lockPath is a separate file from connections.json itself — flock
+// locking and the atomic write-tmp-then-rename save() both want exclusive
+// use of "their" path, and rename replacing the locked inode out from
+// under a held lock is exactly the kind of subtlety not worth relying on
+// working consistently across platforms. Locking a dedicated, never-
+// renamed file sidesteps the question entirely.
+func lockPath() string {
+	return filepath.Join(dir(), "connections.json.lock")
+}
+
+// withLock runs fn while holding a cross-process advisory lock on
+// lockPath — exclusive for a write (nothing else may read or write while
+// held), shared for a read (any number of readers may hold it
+// concurrently, but never alongside a writer). This is what actually
+// closes the lost-update race a bare load-then-save has: two writers
+// racing here now serialize instead of one silently overwriting the
+// other's change with a stale snapshot.
+func withLock(exclusive bool, fn func() error) error {
+	if err := os.MkdirAll(dir(), 0o700); err != nil {
+		return err
+	}
+	fl := flock.New(lockPath())
+	var err error
+	if exclusive {
+		err = fl.Lock()
+	} else {
+		err = fl.RLock()
+	}
+	if err != nil {
+		return err
+	}
+	defer fl.Unlock()
+	return fn()
 }
 
 // load reads the persisted store. A missing or unreadable file is not an
@@ -107,37 +183,50 @@ func save(entries map[string]Entry) error {
 
 // Get returns the stored entry for target, if any.
 func Get(target Target) (Entry, bool) {
-	e, ok := load()[key(target)]
+	var e Entry
+	var ok bool
+	_ = withLock(false, func() error {
+		e, ok = load()[key(target)]
+		return nil
+	})
 	return e, ok
 }
 
 // Upsert stores entry, replacing whatever was stored before for the same
-// (entry.Host, entry.SessionID).
+// (entry.Host, entry.SessionID, entry.Project).
 func Upsert(entry Entry) error {
-	entries := load()
-	entries[key(Target{Host: entry.Host, SessionID: entry.SessionID})] = entry
-	return save(entries)
+	return withLock(true, func() error {
+		entries := load()
+		entries[key(Target{Host: entry.Host, SessionID: entry.SessionID, Project: entry.Project})] = entry
+		return save(entries)
+	})
 }
 
 // MarkDisconnected clears Connected on target's stored entry, if one
 // exists — a no-op, not an error, if there's nothing stored for it.
 func MarkDisconnected(target Target) error {
-	entries := load()
-	e, ok := entries[key(target)]
-	if !ok {
-		return nil
-	}
-	e.Connected = false
-	entries[key(target)] = e
-	return save(entries)
+	return withLock(true, func() error {
+		entries := load()
+		e, ok := entries[key(target)]
+		if !ok {
+			return nil
+		}
+		e.Connected = false
+		entries[key(target)] = e
+		return save(entries)
+	})
 }
 
 // List returns every stored entry, in no particular order.
 func List() ([]Entry, error) {
-	entries := load()
-	out := make([]Entry, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, e)
-	}
-	return out, nil
+	var out []Entry
+	err := withLock(false, func() error {
+		entries := load()
+		out = make([]Entry, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, e)
+		}
+		return nil
+	})
+	return out, err
 }

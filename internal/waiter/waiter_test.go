@@ -16,7 +16,10 @@ type fakeSource struct {
 	mu        sync.Mutex
 	hasEvents bool
 	connected bool
-	formatted string
+	// chunks holds one entry per push (mirroring hubconn.Conn's buffer of
+	// discrete events, one formatted string each) — Drain joins them into
+	// a single string (space-separated); DrainBatch returns them as-is.
+	chunks []string
 }
 
 func (f *fakeSource) Peek() (bool, bool) {
@@ -28,23 +31,29 @@ func (f *fakeSource) Peek() (bool, bool) {
 func (f *fakeSource) Drain() (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	formatted := f.formatted
+	formatted := strings.Join(f.chunks, " ")
 	f.hasEvents = false
-	f.formatted = ""
+	f.chunks = nil
 	return formatted, f.connected
 }
 
-// push appends text to whatever's already buffered (joined by a space),
-// mirroring hubconn.Conn's real buffer — which accumulates every event
-// until drained — rather than overwriting, so concurrent pushes before a
-// Drain aren't lost at the fake's own level.
+func (f *fakeSource) DrainBatch() ([]string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	chunks := f.chunks
+	f.hasEvents = false
+	f.chunks = nil
+	return chunks, f.connected
+}
+
+// push appends text to whatever's already buffered, mirroring
+// hubconn.Conn's real buffer — which accumulates every event until
+// drained — rather than overwriting, so concurrent pushes before a Drain
+// aren't lost at the fake's own level.
 func (f *fakeSource) push(text string) {
 	f.mu.Lock()
 	f.hasEvents = true
-	if f.formatted != "" {
-		f.formatted += " "
-	}
-	f.formatted += text
+	f.chunks = append(f.chunks, text)
 	f.mu.Unlock()
 }
 
@@ -107,7 +116,7 @@ func readChunk(t *testing.T, conn net.Conn) string {
 func TestWaitDeliversAlreadyBufferedEvent(t *testing.T) {
 	src := &fakeSource{connected: true}
 	src.push("hello")
-	w, err := Listen("session-a", "peer-a", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -128,7 +137,7 @@ func TestWaitDeliversAlreadyBufferedEvent(t *testing.T) {
 
 func TestPokeDeliversToRegisteredWaiter(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen("session-b", "peer-b", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -161,7 +170,7 @@ func TestPokeDeliversToRegisteredWaiter(t *testing.T) {
 // still-registered waiter gets everything, including what was held back.
 func TestPokeDoesNotDeliverWhileSourceReportsNotWakeWorthy(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen("session-notwakeworthy", "peer-notwakeworthy", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -175,7 +184,7 @@ func TestPokeDoesNotDeliverWhileSourceReportsNotWakeWorthy(t *testing.T) {
 	// is not (yet) wake-worthy — Peek must keep reporting hasEvents=false
 	// even though Drain would return something.
 	src.mu.Lock()
-	src.formatted = "own echo, not wake-worthy yet"
+	src.chunks = []string{"own echo, not wake-worthy yet"}
 	src.mu.Unlock()
 	w.Poke()
 
@@ -204,7 +213,7 @@ func TestPokeDoesNotDeliverWhileSourceReportsNotWakeWorthy(t *testing.T) {
 
 func TestNewWaiterSupersedesOld(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen("session-c", "peer-c", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -239,14 +248,12 @@ func TestNewWaiterSupersedesOld(t *testing.T) {
 }
 
 func TestSocketPathStaysWithinUnixSocketPathLimit(t *testing.T) {
-	// Real sessionId/peerId are both 36-char UUIDs. Unix-domain sockets have a
-	// 108-byte sun_path limit on Linux, macOS, AND Windows' AF_UNIX - the
-	// filename portion alone must leave generous headroom for the OS temp
-	// directory (which on Windows can itself be 40-50+ chars).
+	// Unix-domain sockets have a 108-byte sun_path limit on Linux, macOS,
+	// AND Windows' AF_UNIX - the filename portion alone must leave
+	// generous headroom for the OS temp directory (which on Windows can
+	// itself be 40-50+ chars).
 	src := &fakeSource{connected: true}
-	sessionID := "550e8400-e29b-41d4-a716-446655440000"
-	peerID := "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-	w, err := Listen(sessionID, peerID, src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -259,31 +266,37 @@ func TestSocketPathStaysWithinUnixSocketPathLimit(t *testing.T) {
 	}
 }
 
-func TestSocketPathDiffersForDifferentPeers(t *testing.T) {
+// TestSocketPathDiffersAcrossCalls proves the path is genuinely random per
+// call, not derived from anything about the connection — including two
+// Listen calls that would, under the old (sessionID, peerID)-derived
+// scheme, have produced the identical path (same peerID both times, the
+// now-routine case via a persisted reconnectSecret/supersede). See
+// Listen's own doc comment for why a deterministic path became a real
+// cross-process collision hazard once that became the common case.
+func TestSocketPathDiffersAcrossCalls(t *testing.T) {
 	src := &fakeSource{connected: true}
-	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	w1, err := Listen(sessionID, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", src)
+	w1, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen 1: %v", err)
 	}
 	defer w1.Close()
 
-	w2, err := Listen(sessionID, "6ba7b811-9dad-11d1-80b4-00c04fd430c8", src)
+	w2, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen 2: %v", err)
 	}
 	defer w2.Close()
 
 	if w1.socketPath == w2.socketPath {
-		t.Fatalf("expected distinct socket paths for distinct peerIds, both got %q", w1.socketPath)
+		t.Fatalf("expected distinct socket paths across separate Listen calls, both got %q", w1.socketPath)
 	}
 }
 
 func TestFollowDeliversMultipleEventsOverSameConnection(t *testing.T) {
 	src := &fakeSource{connected: true}
 	src.push("first")
-	w, err := Listen("session-e", "peer-e", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -306,10 +319,42 @@ func TestFollowDeliversMultipleEventsOverSameConnection(t *testing.T) {
 	}
 }
 
+// TestFollowDeliversABurstAsSeparateChunksNotOneJoinedWrite is the
+// regression test for the truncation-exposure fix: several events
+// buffered before a single Poke() must go out as N separately-delimited
+// chunks (DrainBatch), not one blob (the old Drain-based behavior) — see
+// Source.DrainBatch's doc comment. readChunk's "\n\n" framing is what a
+// reader actually relies on to tell chunks apart, regardless of how many
+// underlying network writes or downstream reads happen to combine them,
+// which is why this asserts on the delimited chunks rather than on write
+// counts the test can't observe from the client side of the socket
+// anyway.
+func TestFollowDeliversABurstAsSeparateChunksNotOneJoinedWrite(t *testing.T) {
+	src := &fakeSource{connected: true}
+	src.push("first")
+	src.push("second")
+	src.push("third")
+	w, err := Listen(src)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer w.Close()
+
+	conn := dialFollow(t, w.socketPath)
+	defer conn.Close()
+	w.Poke()
+
+	for _, want := range []string{"first\n\n", "second\n\n", "third\n\n"} {
+		if got := readChunk(t, conn); got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	}
+}
+
 func TestFollowChunksHaveNoRerunTrailer(t *testing.T) {
 	src := &fakeSource{connected: true}
 	src.push("hello")
-	w, err := Listen("session-f", "peer-f", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -326,7 +371,7 @@ func TestFollowChunksHaveNoRerunTrailer(t *testing.T) {
 
 func TestNewWaiterSupersedesFollowConnection(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen("session-g", "peer-g", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -362,7 +407,7 @@ func TestNewWaiterSupersedesFollowConnection(t *testing.T) {
 
 func TestWaitFollowCommandAppendsFollowFlag(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen("session-e", "peer-e", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -389,7 +434,7 @@ func TestWaitFollowCommandAppendsFollowFlag(t *testing.T) {
 // prove no event is ever silently dropped.
 func TestFollowNeverLosesAnEventToRegistrationRace(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen("session-i", "peer-i", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -453,7 +498,7 @@ func TestFollowNeverLosesAnEventToRegistrationRace(t *testing.T) {
 
 func TestDisconnectedSourceReportedImmediately(t *testing.T) {
 	src := &fakeSource{connected: false}
-	w, err := Listen("session-d", "peer-d", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -478,7 +523,7 @@ func (f *fakeSourceWithNote) DisconnectNote() string { return f.note }
 
 func TestDisconnectedSourceNoteIsAppendedWhenSourceProvidesOne(t *testing.T) {
 	src := &fakeSourceWithNote{fakeSource: fakeSource{connected: false}, note: " (revoked — do not reconnect)"}
-	w, err := Listen("session-note", "peer-note", src)
+	w, err := Listen(src)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -513,7 +558,7 @@ func TestListenSweepsStaleSocketsButNeverTouchesALiveOne(t *testing.T) {
 
 	// a real, still-active listener that must survive the sweep untouched.
 	liveSrc := &fakeSource{connected: true}
-	liveWaiter, err := Listen("session-live", "peer-live", liveSrc)
+	liveWaiter, err := Listen(liveSrc)
 	if err != nil {
 		t.Fatalf("listen (live): %v", err)
 	}
@@ -527,7 +572,7 @@ func TestListenSweepsStaleSocketsButNeverTouchesALiveOne(t *testing.T) {
 
 	// a fresh Listen() call — the thing that actually triggers a sweep.
 	triggerSrc := &fakeSource{connected: true}
-	triggerWaiter, err := Listen("session-trigger", "peer-trigger", triggerSrc)
+	triggerWaiter, err := Listen(triggerSrc)
 	if err != nil {
 		t.Fatalf("listen (sweep trigger): %v", err)
 	}

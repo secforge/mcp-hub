@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/secforge/mcp-hub/internal/hubconn"
+	"github.com/secforge/mcp-hub/internal/wire"
 )
 
 // httpPeer implements hubsession.Peer directly, buffering delivered events
@@ -72,6 +73,21 @@ func (p *httpPeer) Deliver(event any) {
 	close(p.woken)
 	p.woken = make(chan struct{})
 	p.mu.Unlock()
+}
+
+// Close implements hubsession.Peer — see its doc comment. httpPeer has no
+// real transport to sever (it's an in-process buffer, not a socket), so
+// this delivers a synthetic error event instead, which surfaces through
+// the next hub_receive/hub_wait exactly like any other server-sent
+// error. Known simplification: the httpHub that owns this peer (see
+// hub.go) has no background loop watching for this the way wsserver's
+// peer does, so nothing here clears hub.p — a subsequent hub_send against
+// this now-superseded connection will still nominally reach the session
+// under a peerID it no longer actually owns, until an explicit
+// hub_disconnect. Full disconnect-detection for this in-process path is
+// a separate gap, not solved here.
+func (p *httpPeer) Close(code int, reason string) {
+	p.Deliver(wire.NewError(reason))
 }
 
 // Drain returns and clears everything buffered so far, without blocking.

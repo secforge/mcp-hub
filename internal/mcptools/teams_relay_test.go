@@ -120,14 +120,14 @@ func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T)
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 
-		own := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "my own echo", "ts1")
+		own := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "my own echo", "ts1", nil, "", "")
 		own.Own = true
 		own.ExternalID = "ext-1"
 		conn.WriteJSON(own)
 
 		time.Sleep(300 * time.Millisecond) // give handleWait time to observe it's not woken yet
 
-		reply := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "their reply", "ts2")
+		reply := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "their reply", "ts2", nil, "", "")
 		conn.WriteJSON(reply)
 
 		for {

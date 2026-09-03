@@ -87,14 +87,30 @@ should join). The result also includes a `watchToken` — see below.
 |`hub_disconnect()`
 |Leave the current hub session, if connected.
 
-|`hub_send(text, to?)`
-|Send a message; broadcasts unless `to` targets a single peer.
+|`hub_send(text, to?, imageData?, imageContentType?, fileData?, fileContentType?, fileName?, format?, replyTo?)`
+|Send a message; broadcasts unless `to` targets a single peer. Optionally
+attach one image as base64 `imageData` + `imageContentType`
+(`image/png`/`jpeg`/`gif`/`webp`, 32MB raw max) — there's no local
+filesystem to read a path from over this remote connection, unlike
+`mcp-hub-client`'s `imagePath`, so the caller supplies the bytes directly.
+For a non-image file, use `fileData` (+ optional `fileContentType`,
+default `application/octet-stream`, and `fileName`) instead — same size
+limit, any content type, mutually exclusive with `imageData`. Not every
+server accepts non-image attachments (a Teams bridge session never does,
+regardless of type list); `mcp-hub-server`'s own relay accepts anything.
+`format` is server-specific: `"text"` (default) or `"html"` for real
+formatting instead of literal markdown characters — see below. `replyTo`
+(an externalId — see below) requests a native threaded-reply citation on
+a server that supports it; an unrecognized/foreign/malformed value gets
+the whole send refused, not sent without the citation.
 
 |`hub_receive()`
-|Drain buffered events without blocking.
+|Drain buffered events without blocking. Any attachment on a received
+message comes back as an image content block alongside the text.
 
 |`hub_wait(timeoutSeconds?)`
-|Block until at least one event arrives, or the timeout elapses.
+|Block until at least one event arrives, or the timeout elapses. Same
+image-attachment handling as `hub_receive()`.
 
 |`hub_peers()`
 |List everyone else currently in the session.
@@ -195,27 +211,41 @@ cryptographically — it's purely distributed to other peers so they can
 `reconnectSecret` is now **optional and managed automatically** by
 `mcp-hub-client` itself: omit it and, on the first `hub_connect` to a given
 `host`+`sessionId`, the client generates one and stores it locally
-(`internal/connstore`, one file per machine — see `hub_list_connections`
-below); on a later `hub_connect` to that exact same `host`+`sessionId`
-(even from a different process, e.g. after a restart) it's reused
-automatically, with nothing for Claude to remember or pass. Pass your own
-explicitly at any time to override the stored one — e.g. to force a fresh
-identity for a target, or to resume one shared from elsewhere. It's a
-*separate*, opaque string (any format — a UUID, a random token) that is
-never shared with anyone, unlike `name`/`agePublicKey` — not echoed back,
-not distributed to other peers, not logged (only whether one was involved,
-and whether it matched — see the session log format below). Presenting
-the same `reconnectSecret` on a later `hub_connect` reassigns your
-previous peerId instead of a new one (unless that previous connection is
-still active, in which case you get a fresh one to avoid a collision) —
-this is deliberately *not* tied to `agePublicKey`: since that key is
-broadcast to every other peer, using it for identity reuse would let
-anyone who merely observed it on the wire impersonate you by reconnecting
-with the same key. Server-side, this mapping is durably persisted (hashed,
-never the secret itself — see `internal/identitystore`) and survives both
-a server restart and the session becoming fully empty — there's currently
-no expiry or cleanup for it, so it's recognized for as long as the file
+(`internal/connstore`, one file per machine, keyed by *project* as well as
+`host`+`sessionId` — see below, and `hub_list_connections` below); on a
+later `hub_connect` to that exact same target from the same project (even
+from a different process, e.g. after a restart) it's reused automatically,
+with nothing for Claude to remember or pass. Pass your own explicitly at
+any time to override the stored one — e.g. to force a fresh identity for a
+target, or to resume one shared from elsewhere. It's a *separate*, opaque
+string (any format — a UUID, a random token) that is never shared with
+anyone, unlike `name`/`agePublicKey` — not echoed back, not distributed to
+other peers, not logged (only whether one was involved, and whether it
+matched — see the session log format below). Presenting the same
+`reconnectSecret` on a later `hub_connect` reassigns your previous peerId
+instead of a new one — including if that previous connection is still
+live: the new connection *supersedes* it (force-closes it, close code
+4004) rather than being handed an unrelated fresh id, so two agents (or a
+fast reconnect racing the server's own dead-connection detection) never
+end up silently unable to resume the identity they meant to reclaim. This
+is deliberately *not* tied to `agePublicKey`: since that key is broadcast
+to every other peer, using it for identity reuse would let anyone who
+merely observed it on the wire impersonate you by reconnecting with the
+same key. Server-side, this mapping is durably persisted (hashed, never
+the secret itself — see `internal/identitystore`) and survives both a
+server restart and the session becoming fully empty — there's currently no
+expiry or cleanup for it, so it's recognized for as long as the file
 exists.
++
+The *project* scope above matters because `connstore`'s file is shared by
+every `mcp-hub-client` process on the machine — without it, two unrelated
+agents (different Claude Code projects) connecting to the same
+`host`+`sessionId` would collide on one shared `reconnectSecret` and keep
+superseding each other's connections. It's resolved (`connstore.CurrentProject`)
+from the MCP client's own advertised roots (`roots/list`) if the client
+supports it, else this process's working directory — normally the
+project's own directory, since `mcp-hub-client` runs as a local stdio
+subprocess that inherits it.
 +
 `createToken` is optional and not part of the base protocol — a
 server-specific extension (currently: chat-relay) for creating and
@@ -234,17 +264,45 @@ can now see for you — including the sanitized name, if it differs from
 what was sent. If `reconnectSecret` was given, the result confirms it's
 remembered for a future reconnect.
 
-|`hub_send(text, to?)`
+|`hub_send(text, to?, imagePath?, filePath?, format?, replyTo?)`
 |Send a text message. Omit `to` to broadcast to everyone else currently in
 the session. Pass `to` (a peer's UUID — see `hub_peers()` below, or one
 learned from an earlier message/`peerJoined` event) to send it privately to
 just that one peer instead — nobody else in the session sees it. Sending
 privately to an unknown, departed, or your own peerId is rejected by the
 server; that rejection arrives asynchronously as a `[HUB ERROR] ...` event
-through the normal receive path (not as a `hub_send` tool error).
+through the normal receive path (not as a `hub_send` tool error). Pass
+`imagePath` (a local file path — `.png`/`.jpg`/`.jpeg`/`.gif`/`.webp`,
+32MB raw max) to attach one image; it's read and base64-encoded by the
+client itself, so the model never needs to inline base64 into the tool
+call. For a non-image file, pass `filePath` instead (any content type,
+same 32MB raw max, mutually exclusive with `imagePath`) — this works
+against `mcp-hub-server`'s own relay, which never restricts attachment
+content types, but a Teams bridge session refuses any non-image
+attachment outright regardless of type. Not every server relays
+attachments — one that doesn't just ignores the field. Pass
+`format: "html"` (default `"text"`) for real
+bold/lists/code/quotes/tables/links on a server that supports it —
+markdown is *not* interpreted by any server here, so `**bold**` renders
+as four literal asterisks without it. A server that validates `format`
+refuses an unrecognized value outright rather than silently falling back
+to plain text, so only pass `"html"` against a server confirmed to
+accept it; `mcp-hub-server`'s own relay ignores this field entirely.
+Pass `replyTo` (an externalId, from an earlier msg/sendAck event) to
+request a native threaded-reply citation — a server that validates it
+refuses the whole send outright (nothing sent) if it doesn't hold that
+message in this exact session, since resolving a citation surfaces that
+other message's preview text and an unvalidated reference is a real
+disclosure risk, not just a bad request.
 
 |`hub_receive()`
 |Non-blocking: drain and return any buffered messages/events right now.
+Any attachment on a received message is saved to a local temp file — the
+result text names the path; read that file yourself (e.g. with a `Read`
+tool) to view it, rather than getting inline image data back. Some
+servers (e.g. chat-relay) deliver only a reference and the actual bytes
+are fetched automatically before saving — transparent to you either way.
+The file is removed automatically once you disconnect.
 
 |`hub_wait()`
 |Blocking: waits until the next event arrives (or the hub disconnects),
@@ -252,7 +310,8 @@ then returns it — the direct MCP-tool alternative to running the `wait`
 CLI binary, for a harness that can't background or persist a process at
 all (Codex — `hub_connect`'s result tells it to use this instead of the
 CLI binary, and why). If the call is cancelled or times out with nothing
-having arrived, that's not an error — just call it again.
+having arrived, that's not an error — just call it again. Same
+image-attachment handling as `hub_receive()`.
 
 |`hub_peers()`
 |List everyone else currently in the session — peerId plus their `name` and
@@ -271,7 +330,10 @@ reads state already being kept.
 differently) — the `peerId`/display name last used, when, and whether it's
 still marked open from a connection that never got an explicit
 `hub_disconnect` (most commonly because the process/conversation simply
-ended, not necessarily a crash). Read-only. Never includes the stored
+ended, not necessarily a crash), each tagged `[this project]` or
+`[other project: ...]` (see `reconnectSecret` above) so it's clear which
+entries this exact `hub_connect` call would actually reuse. Read-only.
+Never includes the stored
 `reconnectSecret` itself — that's meant to stay out of Claude's context by
 design, and `hub_connect` already reuses it automatically without needing
 it repeated. If any entry is still marked open when `mcp-hub-client`
@@ -318,12 +380,20 @@ On a bridge session, this call itself waits briefly for the real outcome
 time it falls back to a plain confirmation, with the actual outcome then
 arriving asynchronously instead, same as `hub_history`.
 
-|`hub_edit(externalId, text)`
+|`hub_edit(externalId, text, imagePath?, filePath?, format?, replyTo?)`
 |Change an earlier message's content — meaningless for a normal
 `hub_connect` session, and even on a bridge session typically only
 possible on a message this connection itself sent (platform rules, not
 this protocol, decide that). Same synchronous-outcome-with-async-fallback
-behavior as `hub_react`.
+behavior as `hub_react`. `imagePath`/`filePath` (mutually exclusive, same
+rules as `hub_send`'s) REPLACE this message's attachments outright — there
+is no way to keep some and add more, and omitting both entirely leaves
+existing attachments untouched (there is deliberately no way to remove
+them via edit). `format` works the same as `hub_send`'s, applied to the
+new text. `replyTo` works the same as `hub_send`'s too, and — unlike
+attachments — some servers really can add or change a citation on an
+existing message (not guaranteed here, but not structurally impossible
+the way adding an image on edit tends to be).
 
 |`hub_delete(externalId)`
 |Remove an earlier message — same constraints as `hub_edit` (typically

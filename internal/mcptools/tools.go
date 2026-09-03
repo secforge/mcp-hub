@@ -2,7 +2,11 @@ package mcptools
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"mime"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +46,15 @@ type Hub struct {
 	waitMu     sync.Mutex
 	waitCancel context.CancelFunc
 	waitGen    uint64
+
+	// attachMu guards attachDir/attachSeq — the local temp directory
+	// received image attachments are saved into (see attachmentDir) and a
+	// counter for unique filenames within it. Separate from mu since it's
+	// touched by handleReceive/handleWait, which don't otherwise need the
+	// conn-state lock.
+	attachMu  sync.Mutex
+	attachDir string
+	attachSeq int
 }
 
 func NewHub() *Hub {
@@ -81,6 +94,40 @@ func startupConnectionsNote() string {
 			"hub_list_connections() to see them.", openCount, plural)
 }
 
+// rootsRequestTimeout bounds how long projectForConnect waits for the MCP
+// client's roots/list reply before falling back to connstore.CurrentProject
+// — RequestRoots itself has no built-in timeout (it just blocks on ctx or a
+// reply), so a client that claims roots support but never actually answers
+// would otherwise hang a connect call indefinitely.
+var rootsRequestTimeout = 2 * time.Second
+
+// projectForConnect resolves the project scope for a connstore.Target,
+// preferring the MCP client's own advertised roots (see mcp-go's
+// server.MCPServer.RequestRoots) over connstore.CurrentProject's
+// $PWD-based fallback — roots is the actual spec mechanism for "what
+// project(s) does the client have open," whereas $PWD is merely what this
+// process happened to inherit at launch, which is usually but not
+// necessarily the same thing. Falls back silently (no error surfaced) if
+// the client has no ClientSession in ctx, doesn't support roots, times
+// out, or reports none — connstore.CurrentProject's own fallback already
+// degrades safely to "" in the worst case.
+func projectForConnect(ctx context.Context) string {
+	mcpServer := server.ServerFromContext(ctx)
+	if mcpServer != nil {
+		rootsCtx, cancel := context.WithTimeout(ctx, rootsRequestTimeout)
+		result, err := mcpServer.RequestRoots(rootsCtx, mcp.ListRootsRequest{
+			Request: mcp.Request{Method: string(mcp.MethodListRoots)},
+		})
+		cancel()
+		if err == nil && len(result.Roots) > 0 {
+			if p := strings.TrimPrefix(result.Roots[0].URI, "file://"); p != "" {
+				return p
+			}
+		}
+	}
+	return connstore.CurrentProject()
+}
+
 // activeConn returns the current connection and its wait socket, or (nil,
 // nil) if not connected.
 func (h *Hub) activeConn() (*hubconn.Conn, *waiter.Waiter) {
@@ -108,6 +155,7 @@ func (h *Hub) clearActiveConn() (*hubconn.Conn, *waiter.Waiter, connstore.Target
 	conn, w, target := h.conn, h.waiter, h.connTarget
 	h.conn, h.waiter, h.connTarget = nil, nil, connstore.Target{}
 	h.mu.Unlock()
+	h.clearAttachDir()
 	return conn, w, target
 }
 
@@ -131,6 +179,7 @@ func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
 	target := h.connTarget
 	h.conn, h.waiter, h.connTarget = nil, nil, connstore.Target{}
 	h.mu.Unlock()
+	h.clearAttachDir()
 	if w != nil {
 		w.Close()
 	}
@@ -264,6 +313,39 @@ func (h *Hub) Register(s *server.MCPServer) {
 			mcp.WithString("to", mcp.Description(
 				"Optional peerId to send this privately to a single peer instead of "+
 					"broadcasting to everyone in the session")),
+			mcp.WithString("imagePath", mcp.Description(
+				"Optional local filesystem path to an image to attach — read and base64-"+
+					"encoded here, not something you inline yourself (saves you the tokens). "+
+					"Only .png, .jpg/.jpeg, .gif, .webp are accepted, up to 32MB raw; anything "+
+					"else is refused before sending. Not every server supports attachments — a "+
+					"server that doesn't will simply ignore this field. Mutually exclusive with "+
+					"filePath — pass at most one")),
+			mcp.WithString("filePath", mcp.Description(
+				"Optional local filesystem path to attach as binary content — any file type, "+
+					"not just images (use imagePath for images against a server, like a Teams "+
+					"bridge, that only accepts those). Read and base64-encoded here, up to 32MB "+
+					"raw. Works against mcp-hub-server's own relay, which never restricts "+
+					"attachment content types; a server that does validate more strictly (e.g. "+
+					"images-only) may refuse a non-image sent this way. Mutually exclusive with "+
+					"imagePath — pass at most one")),
+			mcp.WithString("format", mcp.Description(
+				"Optional, server-specific: how to interpret text — \"text\" (default) or "+
+					"\"html\" for real bold/lists/code/quotes/tables/links instead of literal "+
+					"markdown characters (markdown is NOT interpreted by any server here — "+
+					"\"**bold**\" renders as four literal asterisks unless you use format=\"html\" "+
+					"against a server that supports it). A server that validates this field "+
+					"refuses an unrecognized value outright rather than silently falling back to "+
+					"plain text — only pass \"html\" against a server confirmed to accept it. "+
+					"mcp-hub-server's own relay ignores this field entirely")),
+			mcp.WithString("replyTo", mcp.Description(
+				"Optional, server-specific: the externalId of a message this send should be a "+
+					"threaded reply/citation to (from an earlier msg/sendAck event) — gets native "+
+					"reply UI treatment on a server that supports it, rather than just quoting the "+
+					"text yourself. Must name a message the target server actually holds in this "+
+					"exact session/conversation; a server that validates it refuses the whole send "+
+					"outright (nothing sent) for an unrecognized, foreign, or malformed value, "+
+					"since resolving the citation can surface that message's own preview text. "+
+					"mcp-hub-server's own relay ignores this field entirely")),
 		),
 		h.handleSend,
 	)
@@ -285,7 +367,10 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	s.AddTool(
 		mcp.NewTool("hub_receive",
-			mcp.WithDescription("Drain and return currently buffered hub events without blocking")),
+			mcp.WithDescription("Drain and return currently buffered hub events without blocking. "+
+				"An image attached to a received message is saved to a local temp file, not "+
+				"inlined as base64 — the result names the path; read that file yourself (e.g. "+
+				"with a Read tool) to view it. The file is removed automatically on disconnect")),
 		h.handleReceive,
 	)
 	s.AddTool(
@@ -369,6 +454,29 @@ func (h *Hub) Register(s *server.MCPServer) {
 			mcp.WithString("externalId", mcp.Required(), mcp.Description(
 				"The target message's externalId, from an earlier msg or sendAck event")),
 			mcp.WithString("text", mcp.Required(), mcp.Description("The new message content")),
+			mcp.WithString("imagePath", mcp.Description(
+				"Optional local file path to an image (.png/.jpg/.jpeg/.gif/.webp, 32MB raw max) "+
+					"that REPLACES this message's attachments — there is no way to keep some and "+
+					"add more, or to remove attachments while leaving the text alone. Omit entirely "+
+					"to leave existing attachments exactly as they are; this is different from "+
+					"passing an empty value, which this tool treats the same as omitting it (there "+
+					"is deliberately no way to clear attachments via edit). Mutually exclusive "+
+					"with filePath")),
+			mcp.WithString("filePath", mcp.Description(
+				"Optional local file path to any file (not just images, 32MB raw max) that "+
+					"REPLACES this message's attachments — see hub_send's filePath for the full "+
+					"contract. Same replace-only semantics as imagePath above. Mutually "+
+					"exclusive with imagePath")),
+			mcp.WithString("format", mcp.Description(
+				"Optional, server-specific: how to interpret the new text — \"text\" (default) "+
+					"or \"html\". See hub_send's format parameter for the full contract; applies "+
+					"the same way here")),
+			mcp.WithString("replyTo", mcp.Description(
+				"Optional, server-specific: set/replace this message's threaded reply/citation "+
+					"target (an externalId — see hub_send's replyTo for the full contract). Unlike "+
+					"attachments, most servers can add or change a citation on an existing message "+
+					"even though they cannot add an image on edit — but that is server-specific, "+
+					"not guaranteed here")),
 		),
 		h.handleEdit,
 	)
@@ -499,7 +607,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if agePublicKey != "" && !agekey.Valid(agePublicKey) {
 		return mcp.NewToolResultError("agePublicKey is not a validly formatted age public key"), nil
 	}
-	target := connstore.Target{Host: host, SessionID: sessionID}
+	target := connstore.Target{Host: host, SessionID: sessionID, Project: projectForConnect(ctx)}
 	reconnectSecret := req.GetString("reconnectSecret", "")
 	explicitSecret := reconnectSecret != ""
 	var reusedFromStore bool
@@ -518,7 +626,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %v", err)), nil
 	}
-	w, err := waiter.Listen(sessionID, conn.PeerID(), conn)
+	w, err := waiter.Listen(conn)
 	if err != nil {
 		conn.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("could not start wait socket: %v", err)), nil
@@ -537,7 +645,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	})
 	h.setActiveConn(conn, w, target)
 	_ = connstore.Upsert(connstore.Entry{
-		Host: host, SessionID: sessionID, PeerID: conn.PeerID(), Name: conn.Name(),
+		Host: host, SessionID: sessionID, Project: target.Project, PeerID: conn.PeerID(), Name: conn.Name(),
 		ReconnectSecret: reconnectSecret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
 
@@ -622,14 +730,6 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	)), nil
 }
 
-// teamsRelaySocketSessionID is the fixed sessionID half of the wait
-// socket's filename hash for a teams_relay_connect connection — there's no
-// real sessionId in this flow, only a link, so a constant here (combined
-// with the connection's own peerId, which is what actually varies) is
-// enough to keep the socket path unique per connection the same way a real
-// sessionId does for hub_connect. See waiter.Listen/socketPath.
-const teamsRelaySocketSessionID = "teams-relay"
-
 func (h *Hub) handleTeamsRelayConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if prev, _ := h.activeConn(); prev != nil {
 		if !prev.Connected() {
@@ -650,7 +750,7 @@ func (h *Hub) handleTeamsRelayConnect(ctx context.Context, req mcp.CallToolReque
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %v", err)), nil
 	}
-	w, err := waiter.Listen(teamsRelaySocketSessionID, conn.PeerID(), conn)
+	w, err := waiter.Listen(conn)
 	if err != nil {
 		conn.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("could not start wait socket: %v", err)), nil
@@ -748,6 +848,183 @@ func (h *Hub) handleTeamsRelayConnect(ctx context.Context, req mcp.CallToolReque
 	)), nil
 }
 
+// attachmentExtension picks a file extension to save a received
+// attachment under: the images-only names this predates (kept first
+// since they're a known-good, deterministic mapping — mime.ExtensionsByType
+// can return more than one candidate or an installation-dependent answer
+// for the same type), then a best-effort fallback via the standard
+// library's mime package for any other content type, then ".bin" if even
+// that comes up empty (an unrecognized or missing content type is not a
+// reason to fail the save — a generic byte blob is exactly as usable
+// under a generic extension as under no extension at all).
+func attachmentExtension(contentType string) string {
+	switch contentType {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	}
+	if exts, err := mime.ExtensionsByType(contentType); err == nil && len(exts) > 0 {
+		return exts[0]
+	}
+	return ".bin"
+}
+
+// attachmentDir lazily creates (once per connection) the local temp
+// directory received attachments are saved into — under os.TempDir(),
+// removed entirely by clearAttachDir when the connection tears down. Not
+// created eagerly at connect time, so a session that never receives an
+// attachment never touches disk for this.
+func (h *Hub) attachmentDir() (string, error) {
+	h.attachMu.Lock()
+	defer h.attachMu.Unlock()
+	if h.attachDir != "" {
+		return h.attachDir, nil
+	}
+	dir, err := os.MkdirTemp("", "mcp-hub-attachments-")
+	if err != nil {
+		return "", err
+	}
+	h.attachDir = dir
+	return dir, nil
+}
+
+// clearAttachDir removes the local temp directory (if any) used for the
+// connection that just tore down — called from clearActiveConn and
+// teardownIfCurrent, the two chokepoints every disconnect path (explicit
+// hub_disconnect, automatic dead-connection detection, process Shutdown)
+// already goes through, so saved attachments never outlive the session
+// that received them.
+func (h *Hub) clearAttachDir() {
+	h.attachMu.Lock()
+	dir := h.attachDir
+	h.attachDir = ""
+	h.attachMu.Unlock()
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+}
+
+// resolveAttachment returns a's actual bytes + content type, fetching them
+// via conn.RequestAttachment first if a is the reference form (see
+// wire.Attachment.IsReference) — a chat-relay-style server delivers only a
+// token on the msg/messageEdited itself, not inline bytes; mcp-hub-server's
+// own relay never does this, so this is a no-op fetch-skip for it.
+func (h *Hub) resolveAttachment(conn *hubconn.Conn, a wire.Attachment) (raw []byte, contentType string, err error) {
+	if !a.IsReference() {
+		raw, err = base64.StdEncoding.DecodeString(a.ContentBytes)
+		return raw, a.ContentType, err
+	}
+	ev, ok, err := conn.RequestAttachment(a.Token)
+	if err != nil {
+		return nil, "", fmt.Errorf("attachment request failed: %w", err)
+	}
+	if !ok {
+		return nil, "", fmt.Errorf("no reply to attachment request within %v", hubconn.AckWaitTimeout)
+	}
+	if ev.Kind == "error" {
+		return nil, "", fmt.Errorf("server refused attachment request (code=%s): %s", ev.Code, ev.Text)
+	}
+	raw, err = base64.StdEncoding.DecodeString(ev.AttachmentContentBytes)
+	return raw, ev.AttachmentContentType, err
+}
+
+// saveReceivedAttachments resolves (see resolveAttachment) and writes each
+// attachment found across events — of any content type, not just images —
+// to a local temp file (see attachmentDir), and returns text describing
+// where each one landed, to append to the formatted event text. Unlike
+// the HTTP-MCP endpoint (which has no local-filesystem relationship to a
+// remote caller and so returns inline content blocks instead — an image
+// as ImageContent, anything else as an EmbeddedResource/BlobResourceContents),
+// mcp-hub-client runs right next to the model — handing back a path it
+// can read with its own file tool costs far fewer tokens than embedding
+// base64 in every tool result, especially across a long-running hub_wait
+// loop.
+func (h *Hub) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.Event) string {
+	var b strings.Builder
+	for _, ev := range events {
+		for _, a := range ev.Attachments {
+			raw, contentType, err := h.resolveAttachment(conn, a)
+			if err != nil {
+				fmt.Fprintf(&b, "\n\n[attachment on the message from %s at %s could not be fetched: %v]",
+					ev.PeerID, ev.TS, err)
+				continue
+			}
+			dir, err := h.attachmentDir()
+			if err != nil {
+				fmt.Fprintf(&b, "\n\n[attachment on the message from %s at %s could not be saved locally: %v]",
+					ev.PeerID, ev.TS, err)
+				continue
+			}
+			h.attachMu.Lock()
+			h.attachSeq++
+			seq := h.attachSeq
+			h.attachMu.Unlock()
+			// Prefer the attachment's own filename when it has one (a
+			// generic file benefits far more from this than an image
+			// does) — sanitized to base name only, so a maliciously
+			// path-like server-supplied Name (e.g. "../../etc/passwd")
+			// can't escape attachmentDir. The extension always comes from
+			// the actually-resolved contentType, never from whatever
+			// extension Name happens to carry: a reference-form
+			// attachment's Name reflects the ORIGINAL sender's filename,
+			// but a recoding server (chat-relay decodes and re-encodes
+			// every image) can legitimately serve different bytes under a
+			// different contentType than that name implies — trusting the
+			// name's extension there would mislabel the file actually
+			// written to disk.
+			ext := attachmentExtension(contentType)
+			base := fmt.Sprintf("attachment-%d%s", seq, ext)
+			if a.Name != "" {
+				cleaned := filepath.Base(a.Name)
+				if cleaned != "." && cleaned != string(filepath.Separator) {
+					stem := strings.TrimSuffix(cleaned, filepath.Ext(cleaned))
+					base = fmt.Sprintf("%d-%s%s", seq, stem, ext)
+				}
+			}
+			path := filepath.Join(dir, base)
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				fmt.Fprintf(&b, "\n\n[attachment on the message from %s at %s could not be saved locally: %v]",
+					ev.PeerID, ev.TS, err)
+				continue
+			}
+			fmt.Fprintf(&b, "\n\n[attachment on the message from %s at %s: saved to %s (%s, %d bytes) — "+
+				"read the file to view/use it]", ev.PeerID, ev.TS, path, contentType, len(raw))
+		}
+	}
+	return b.String()
+}
+
+// resultWithReceivedAttachments wraps formatted plus
+// saveReceivedAttachments' output for events into a single text tool
+// result.
+func (h *Hub) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string, events []hubconn.Event) *mcp.CallToolResult {
+	return mcp.NewToolResultText(formatted + h.saveReceivedAttachments(conn, events))
+}
+
+// readAttachmentParam resolves hub_send/hub_edit's imagePath (images
+// only, works against any server that relays attachments — including
+// chat-relay) and filePath (any file, works against mcp-hub-server's own
+// relay, which never validates attachment content types — a server that
+// does, like chat-relay, may refuse a non-image sent this way) into a
+// single attachments slice, erroring if both are given at once rather
+// than silently picking one.
+func readAttachmentParam(req mcp.CallToolRequest) ([]wire.Attachment, error) {
+	imagePath := req.GetString("imagePath", "")
+	filePath := req.GetString("filePath", "")
+	if imagePath != "" && filePath != "" {
+		return nil, fmt.Errorf("pass at most one of imagePath and filePath, not both")
+	}
+	if filePath != "" {
+		return wire.ReadFileAttachment(filePath)
+	}
+	return wire.ReadAttachmentFile(imagePath)
+}
+
 func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
@@ -765,7 +1042,11 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if to != "" && !wire.IsValidID(to) {
 		return mcp.NewToolResultError("to must be a UUID"), nil
 	}
-	ev, ok, err := conn.SendAwaitingAck(text, to)
+	attachments, err := readAttachmentParam(req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	ev, ok, err := conn.SendAwaitingAck(text, to, attachments, req.GetString("format", ""), req.GetString("replyTo", ""))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("send failed: %v", err)), nil
 	}
@@ -831,6 +1112,7 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 	if len(entries) == 0 {
 		return mcp.NewToolResultText("no stored connections"), nil
 	}
+	currentProject := projectForConnect(ctx)
 	lines := make([]string, 0, len(entries))
 	for _, e := range entries {
 		line := fmt.Sprintf("host=%s sessionId=%s peerId=%s", e.Host, e.SessionID, e.PeerID)
@@ -840,6 +1122,11 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		line += fmt.Sprintf(" lastConnectedAt=%s", e.LastConnectedAt.Format(time.RFC3339))
 		if e.Connected {
 			line += " (still marked open)"
+		}
+		if e.Project == currentProject {
+			line += " [this project]"
+		} else if e.Project != "" {
+			line += fmt.Sprintf(" [other project: %s]", e.Project)
 		}
 		lines = append(lines, line)
 	}
@@ -851,7 +1138,8 @@ func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if conn == nil {
 		return mcp.NewToolResultError("not connected"), nil
 	}
-	formatted, connected := conn.Drain()
+	events, connected := conn.DrainEvents()
+	formatted := hubconn.FormatEvents(events)
 	if !connected {
 		h.teardownIfCurrent(conn)
 		// Still surface anything that arrived right before the disconnect
@@ -860,14 +1148,14 @@ func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// bare "hub disconnected" — the caller can always tell the two
 		// apart since disconnected-with-content still ends with the note.
 		if formatted != "" {
-			return mcp.NewToolResultText(formatted + "\n\n" + disconnectedText(conn)), nil
+			return h.resultWithReceivedAttachments(conn, formatted+"\n\n"+disconnectedText(conn), events), nil
 		}
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	if formatted == "" {
 		return mcp.NewToolResultText("no messages"), nil
 	}
-	return mcp.NewToolResultText(formatted), nil
+	return h.resultWithReceivedAttachments(conn, formatted, events), nil
 }
 
 // waitPollInterval is how often handleWait re-checks the buffer while
@@ -941,15 +1229,16 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	defer ticker.Stop()
 	for {
 		if hasEvents, connected := conn.Peek(); hasEvents || !connected {
-			formatted, connected := conn.Drain()
+			events, connected := conn.DrainEvents()
+			formatted := hubconn.FormatEvents(events)
 			if !connected {
 				h.teardownIfCurrent(conn)
 				if formatted == "" {
 					return mcp.NewToolResultText(disconnectedText(conn)), nil
 				}
-				return mcp.NewToolResultText(formatted + "\n\n" + disconnectedText(conn)), nil
+				return h.resultWithReceivedAttachments(conn, formatted+"\n\n"+disconnectedText(conn), events), nil
 			}
-			return mcp.NewToolResultText(waitAgainReminder + formatted), nil
+			return h.resultWithReceivedAttachments(conn, waitAgainReminder+formatted, events), nil
 		}
 		select {
 		case <-innerCtx.Done():
@@ -1091,7 +1380,11 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	ev, ok, err := conn.EditMessageAwaitingAck(externalID, text)
+	attachments, err := readAttachmentParam(req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	ev, ok, err := conn.EditMessageAwaitingAck(externalID, text, attachments, req.GetString("format", ""), req.GetString("replyTo", ""))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("edit request failed: %v", err)), nil
 	}

@@ -46,8 +46,16 @@ func (s *Server) WatchHandler() http.HandlerFunc {
 			if err != nil {
 				return
 			}
-			for _, ev := range events {
-				fmt.Fprintln(w, hubconn.FormatEvent(ev))
+			// FormatEventsBatch, not a per-event FormatEvent loop — see its
+			// doc comment: each event needs its own leading "i/N" marker so
+			// a downstream truncation of this stream (this same endpoint is
+			// what the reference client backgrounds via `curl -N` and
+			// watches through the Monitor tool, the exact pipeline where a
+			// real truncation was observed live) is detectable per event,
+			// not just inferred from a burst-level count that could itself
+			// be the part cut away.
+			for _, chunk := range hubconn.FormatEventsBatch(events) {
+				fmt.Fprintln(w, chunk)
 				fmt.Fprintln(w)
 			}
 			flusher.Flush()

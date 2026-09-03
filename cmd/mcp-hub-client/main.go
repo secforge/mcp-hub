@@ -19,7 +19,7 @@ func main() {
 		os.Exit(runWait(*socket, *follow, os.Stdout, os.Stderr))
 	}
 
-	s := server.NewMCPServer("mcp-hub-client", "0.1.0", server.WithToolCapabilities(false))
+	s := server.NewMCPServer("mcp-hub-client", "0.1.0", server.WithToolCapabilities(false), server.WithRoots())
 	hub := mcptools.NewHub()
 	hub.Register(s)
 	// ServeStdio returns on SIGTERM/SIGINT (it already installs a handler

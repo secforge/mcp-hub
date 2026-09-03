@@ -13,12 +13,20 @@ type fakePeer struct {
 	name         string
 	agePublicKey string
 	received     []any
+	closed       bool
+	closeCode    int
+	closeReason  string
 }
 
 func (f *fakePeer) ID() string           { return f.id }
 func (f *fakePeer) Name() string         { return f.name }
 func (f *fakePeer) AgePublicKey() string { return f.agePublicKey }
 func (f *fakePeer) Deliver(event any)    { f.received = append(f.received, event) }
+func (f *fakePeer) Close(code int, reason string) {
+	f.closed = true
+	f.closeCode = code
+	f.closeReason = reason
+}
 
 // joinFake joins a fakePeer (with the given name/agePublicKey) into s using
 // reconnectSecret to resolve its peerID, and returns it, with .id set to
@@ -145,7 +153,7 @@ func TestJoinReusesPeerIDForSameReconnectSecretAfterLeaving(t *testing.T) {
 	}
 }
 
-func TestJoinAssignsFreshPeerIDWhenSameReconnectSecretStillConnected(t *testing.T) {
+func TestJoinSupersedesWhenSameReconnectSecretStillConnected(t *testing.T) {
 	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
@@ -153,11 +161,44 @@ func TestJoinAssignsFreshPeerIDWhenSameReconnectSecretStillConnected(t *testing.
 
 	first := joinFake(s, "Alice", "", secret, nil)
 	// first never leaves - a second connection presenting the same secret
-	// concurrently must not collide with it.
+	// must take over its identity (supersede), not collide with a fresh one.
 	second := joinFake(s, "Alice", "", secret, nil)
 
-	if second.ID() == first.ID() {
-		t.Fatal("expected a fresh peerID when the previous holder of this reconnectSecret is still connected")
+	if second.ID() != first.ID() {
+		t.Fatalf("expected the second connection to reclaim the same peerID %q by superseding, got %q",
+			first.ID(), second.ID())
+	}
+	if !first.closed {
+		t.Fatal("expected the first (superseded) connection to have been closed")
+	}
+	if first.closeCode != SupersededCloseCode {
+		t.Fatalf("expected close code %d, got %d", SupersededCloseCode, first.closeCode)
+	}
+}
+
+// TestJoinSupersedeDoesNotBroadcastLeaveOrJoin proves the identity is
+// invisible to other peers across a supersede: from a third peer's
+// perspective, the reconnecting identity never left, so it should see
+// neither a peerLeft nor a second peerJoined for it.
+func TestJoinSupersedeDoesNotBroadcastLeaveOrJoin(t *testing.T) {
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir())
+	m := NewManager()
+	s := m.GetOrCreate("session-1")
+	secret := "super-secret-token"
+
+	first := joinFake(s, "Alice", "", secret, nil)
+	bystander := joinFake(s, "Bob", "", "", nil)
+	bystander.received = nil
+
+	joinFake(s, "Alice", "", secret, nil)
+
+	for _, ev := range bystander.received {
+		switch e := ev.(type) {
+		case wire.PeerEvent:
+			if e.PeerID == first.ID() {
+				t.Fatalf("expected no peerJoined/peerLeft for the superseded identity, got %+v", e)
+			}
+		}
 	}
 }
 
@@ -184,10 +225,14 @@ func TestJoinReportsReusedAccurately(t *testing.T) {
 	}
 	_ = p2
 
-	// same secret, but its holder is still connected: fresh ID, reused=false.
-	_, reused = s.Join(secret, func(id string) Peer { return &fakePeer{id: id} }, nil)
-	if reused {
-		t.Fatal("expected reused=false when the secret's previous holder is still connected")
+	// same secret, and its holder is still connected: supersedes, reused=true.
+	var thirdID string
+	_, reused = s.Join(secret, func(id string) Peer { thirdID = id; return &fakePeer{id: id} }, nil)
+	if !reused {
+		t.Fatal("expected reused=true when superseding the secret's still-connected previous holder")
+	}
+	if thirdID != firstID {
+		t.Fatalf("expected the superseding join to reclaim peerID %q, got %q", firstID, thirdID)
 	}
 }
 
@@ -306,6 +351,7 @@ func (b *blockingPeer) Deliver(event any) {
 	b.startedOne.Do(func() { close(b.started) })
 	<-b.unblock
 }
+func (b *blockingPeer) Close(code int, reason string) {}
 
 func TestJoinIsAtomicAgainstConcurrentLeave(t *testing.T) {
 	m := NewManager()
@@ -378,7 +424,7 @@ func TestBroadcastExcludesSender(t *testing.T) {
 	a.received = nil
 	b.received = nil
 
-	s.Broadcast(a, wire.NewBroadcastMsg(a.ID(), "hi", "ts"))
+	s.Broadcast(a, wire.NewBroadcastMsg(a.ID(), "hi", "ts", nil, "", ""))
 
 	if len(a.received) != 0 {
 		t.Fatalf("sender should not receive its own broadcast, got %d", len(a.received))
@@ -396,7 +442,7 @@ func TestDeliverToSendsOnlyToTarget(t *testing.T) {
 	c := joinFake(s, "", "", "", nil)
 	a.received, b.received, c.received = nil, nil, nil
 
-	if err := s.DeliverTo(a, b.ID(), wire.NewDirectedMsg(a.ID(), "psst", "ts")); err != nil {
+	if err := s.DeliverTo(a, b.ID(), wire.NewDirectedMsg(a.ID(), "psst", "ts", nil, "", "")); err != nil {
 		t.Fatalf("DeliverTo: %v", err)
 	}
 
@@ -416,7 +462,7 @@ func TestDeliverToUnknownPeerErrors(t *testing.T) {
 	s := m.GetOrCreate("session-1")
 	a := joinFake(s, "", "", "", nil)
 
-	err := s.DeliverTo(a, "does-not-exist", wire.NewDirectedMsg(a.ID(), "hi", "ts"))
+	err := s.DeliverTo(a, "does-not-exist", wire.NewDirectedMsg(a.ID(), "hi", "ts", nil, "", ""))
 	if err == nil {
 		t.Fatal("expected an error targeting a peer that isn't in the session")
 	}
@@ -428,7 +474,7 @@ func TestDeliverToSelfErrors(t *testing.T) {
 	a := joinFake(s, "", "", "", nil)
 	a.received = nil
 
-	err := s.DeliverTo(a, a.ID(), wire.NewDirectedMsg(a.ID(), "hi", "ts"))
+	err := s.DeliverTo(a, a.ID(), wire.NewDirectedMsg(a.ID(), "hi", "ts", nil, "", ""))
 	if err == nil {
 		t.Fatal("expected an error targeting yourself")
 	}
