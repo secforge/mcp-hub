@@ -352,3 +352,128 @@ func TestDisconnectNoteEmptyForOrdinaryClose(t *testing.T) {
 		t.Fatalf("expected no note for an ordinary close, got %q", got)
 	}
 }
+
+func TestRequestMessageAfterAwaitingReturnsMsgWithAnswers(t *testing.T) {
+	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
+		var m wire.MessageAfter
+		if err := conn.ReadJSON(&m); err != nil {
+			return
+		}
+		if m.Type != wire.TypeMessageAfter || m.Cursor != "cursor-1" {
+			return
+		}
+		conn.WriteJSON(wire.Msg{
+			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1",
+			Historical: true, Cursor: "cursor-2", ExternalID: "ext-1",
+			Answers: &wire.Anchor{Cursor: "cursor-1"},
+		})
+		time.Sleep(2 * time.Second)
+	})
+	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("DialRelay: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "cursor-1"})
+	if err != nil {
+		t.Fatalf("RequestMessageAfterAwaiting: %v", err)
+	}
+	if !ok || ev.Kind != "msg" || ev.Text != "hi" || ev.Answers == nil || ev.Answers.Cursor != "cursor-1" {
+		t.Fatalf("expected the answering msg delivered directly, got ok=%v event=%+v", ok, ev)
+	}
+}
+
+func TestRequestMessageAfterAwaitingReturnsNoMoreMessages(t *testing.T) {
+	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
+		var m wire.MessageAfter
+		if err := conn.ReadJSON(&m); err != nil {
+			return
+		}
+		conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{Cursor: "cursor-1"}))
+		time.Sleep(2 * time.Second)
+	})
+	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("DialRelay: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "cursor-1"})
+	if err != nil {
+		t.Fatalf("RequestMessageAfterAwaiting: %v", err)
+	}
+	if !ok || ev.Kind != "noMoreMessages" || ev.Answers == nil || ev.Answers.Cursor != "cursor-1" {
+		t.Fatalf("expected noMoreMessages delivered directly, got ok=%v event=%+v", ok, ev)
+	}
+}
+
+func TestRequestMessageAfterAwaitingReturnsErrorEvent(t *testing.T) {
+	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
+		var m wire.MessageAfter
+		if err := conn.ReadJSON(&m); err != nil {
+			return
+		}
+		conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "bad anchor", Code: "bad_anchor", Retryable: false})
+		time.Sleep(2 * time.Second)
+	})
+	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("DialRelay: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "garbage"})
+	if err != nil {
+		t.Fatalf("RequestMessageAfterAwaiting: %v", err)
+	}
+	if !ok || ev.Kind != "error" || ev.Code != "bad_anchor" {
+		t.Fatalf("expected bad_anchor error delivered directly, got ok=%v event=%+v", ok, ev)
+	}
+}
+
+func TestOrdinaryLiveMsgIsNotDivertedToMessageAfterClaim(t *testing.T) {
+	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
+		var m wire.MessageAfter
+		if err := conn.ReadJSON(&m); err != nil {
+			return
+		}
+		// An ordinary live msg with no Answers arrives first — must NOT
+		// be diverted to the pending MessageAfter claim, which should
+		// keep waiting until the real answer (with Answers set) shows up.
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "unrelated live", TS: "ts0"})
+		time.Sleep(50 * time.Millisecond)
+		conn.WriteJSON(wire.Msg{
+			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "the answer", TS: "ts1",
+			Historical: true, Answers: &wire.Anchor{Cursor: "cursor-1"},
+		})
+		time.Sleep(2 * time.Second)
+	})
+	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("DialRelay: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "cursor-1"})
+	if err != nil {
+		t.Fatalf("RequestMessageAfterAwaiting: %v", err)
+	}
+	if !ok || ev.Text != "the answer" {
+		t.Fatalf("expected the answer with Answers set, got ok=%v event=%+v", ok, ev)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		events, _ := c.DrainEvents()
+		for _, e := range events {
+			if e.Text == "unrelated live" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected the unrelated live msg to reach the general buffer, never saw it")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

@@ -50,8 +50,8 @@ type Event struct {
 	Private      bool
 	Name         string
 	AgePublicKey string
-	// Historical marks a "msg" delivered in answer to RequestHistory rather
-	// than live traffic — see wire.Msg.Historical.
+	// Historical marks a "msg" delivered in answer to RequestMessageAfterAwaiting
+	// rather than live traffic — see wire.Msg.Historical.
 	Historical bool
 	// Code and Retryable carry a "error" event's machine-readable reason,
 	// if the server set one — see wire.Error.
@@ -91,7 +91,7 @@ type Event struct {
 	ReactionLabel  string
 	ReactionAction string
 	// Cursor carries a "msg"'s own opaque position (see wire.Msg.Cursor —
-	// pass it back as History's before to page further past it), or a
+	// pass it back as a MessageAfter anchor to page further past it), or a
 	// "messageDeleted"'s, for placing its tombstone (see
 	// wire.MessageDeleted.Cursor).
 	Cursor string
@@ -117,14 +117,13 @@ type Event struct {
 	// either the field was absent or unset — the receiving side's own
 	// default ("text").
 	Format string
-	// HistoryCount/HistoryOldest/HistoryNewest carry a "historyComplete"
-	// event's wire.HistoryComplete.Count/Oldest/Newest, if the server set
-	// them — see that type's doc comment. Zero/empty when a server
-	// doesn't set this extension (including every mcp-hub-server, which
-	// has no history concept at all).
-	HistoryCount  int
-	HistoryOldest string
-	HistoryNewest string
+	// Answers carries a "msg" or "noMoreMessages" event's
+	// wire.Msg.Answers/wire.NoMoreMessages.Answers — the exact anchor a
+	// MessageAfter request was sent with, echoed back. Nil for a "msg"
+	// reached any other way (live traffic) — its presence is what
+	// identifies this event as the answer to a specific pull. See
+	// wire.MessageAfter's doc comment.
+	Answers *wire.Anchor
 }
 
 // PeerInfo is what's known about one other peer in the session.
@@ -143,13 +142,12 @@ type Conn struct {
 	expectedPeers int
 	// The fields below are only ever set for a bridge-style session (see
 	// wire.Joined) — zero-valued for every mcp-hub-server connection.
-	latestCursor     *string
-	historyAfter     bool
-	historyLimitMax  int
 	canSend          bool
 	conversationKind string
 	topic            *string
 	systemPeerID     string
+	behind           int
+	behindSince      string
 	// pongWait is snapshotted from the package-level var once, synchronously,
 	// in Dial — never read from the background readLoop goroutine directly.
 	// Reading the mutable package var from that goroutine on every loop
@@ -190,10 +188,9 @@ type Conn struct {
 	lastFrameAt   time.Time
 	// lastSeenCursor is the Cursor of the most recent event delivered into
 	// buffer that carried one (a "msg" or "messageDeleted") — see
-	// LastSeenCursor. Distinct from latestCursor (the server's own newest
-	// cursor as of connect time, in wire.Joined): this is what the model
-	// actually saw through this connection, the input hub_history(after:
-	// ...) needs to catch up on anything that arrived while disconnected.
+	// LastSeenCursor. This is what the model actually saw through this
+	// connection, the anchor hub_catch_up needs to resume from anything
+	// that arrived while disconnected.
 	lastSeenCursor string
 	// lastConsumed/lastAckSent/ackDisabled implement the read-receipt
 	// contract — see LastConsumedCursor, Drain, and ackLoop.
@@ -217,6 +214,14 @@ type Conn struct {
 	// pendingAcks holds at most one outstanding claim per expected ack
 	// kind ("sendAck"/"reactionAck"/"editAck") — see claimNextAck.
 	pendingAcks map[string]*ackClaim
+	// pendingMessageAfter holds at most one outstanding MessageAfter
+	// claim — see RequestMessageAfterAwaiting. Kept separate from
+	// pendingAcks because its answer can arrive as one of three
+	// different Kinds ("msg" with Answers set, "noMoreMessages", or
+	// "error"), and — critically — an ordinary "msg" with no Answers
+	// must NOT be diverted here, unlike pendingAcks' blind kind match;
+	// see tryDivertToClaimLocked.
+	pendingMessageAfter *ackClaim
 }
 
 // ackClaim is a one-shot subscription for the next event matching a
@@ -235,6 +240,19 @@ type ackClaim struct {
 // event (with Code/Retryable) before it closes, which a model actually
 // reading events will see; this note is for the case where that event was
 // missed (e.g. the read that would have surfaced it was itself cut short).
+//
+// 4005 was proposed and reserved for "this connection couldn't keep up
+// with live delivery and was closed deliberately" (see the design doc's
+// backpressure section) but deliberately isn't listed here: chat-relay's
+// author found live, 2026-09-04, that a graceful close frame is itself a
+// write, and the condition 4005 would signal is exactly "writes to this
+// peer don't complete" — so it can never actually be sent for the case it
+// exists to describe. chat-relay's real implementation aborts the raw
+// transport instead (an ordinary close, no code — 1006 or similar), which
+// this client already handles correctly as an unremarkable disconnect:
+// reconnect, then hub_catch_up from the last known position. No client
+// change was needed once that was understood; a genuinely-unreachable
+// code isn't worth carrying a note for.
 var relayCloseNotes = map[int]string{
 	4001: " (revoked — do not reconnect)",
 	4002: " (expired — do not reconnect)",
@@ -386,13 +404,12 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		expectedPeers:    joined.PeerCount,
 		peers:            make(map[string]PeerInfo),
 		pongWait:         snapPongWait,
-		latestCursor:     joined.LatestCursor,
-		historyAfter:     joined.HistoryAfter,
-		historyLimitMax:  joined.HistoryLimitMax,
 		canSend:          joined.CanSend,
 		conversationKind: joined.ConversationKind,
 		topic:            joined.Topic,
 		systemPeerID:     joined.SystemPeerID,
+		behind:           joined.Behind,
+		behindSince:      joined.BehindSince,
 		isBridge:         isBridge,
 		lastFrameKind:    "joined",
 		lastFrameAt:      time.Now(),
@@ -438,34 +455,19 @@ func (c *Conn) ExpectedPeerCount() int { return c.expectedPeers }
 // bridge-style session (see wire.Joined) — nil/zero for every
 // mcp-hub-server connection, since the server never sets these.
 
-// LatestCursor is the cursor of the newest message the server currently
-// holds, or nil if there are none yet (or the server doesn't support
-// history at all).
-func (c *Conn) LatestCursor() *string { return c.latestCursor }
-
-// HistoryAfterSupported reports whether this server accepts a forward-paging
-// RequestHistoryAfter call — see wire.Joined.HistoryAfter. False (including
-// every mcp-hub-server) means only RequestHistory's backward paging is
-// available, which cannot fill a reconnect gap by itself.
-func (c *Conn) HistoryAfterSupported() bool { return c.historyAfter }
-
 // LastSeenCursor is the cursor of the most recent message (or
 // messageDeleted) this connection actually delivered — via Peek/Drain, so
 // through hub_receive/hub_wait — not merely wrote to the underlying
-// socket. Empty if nothing carrying a cursor has been delivered yet. Not
-// bridge-specific like LatestCursor above: it's set from whatever this
-// connection has itself observed, on any server. Report this on disconnect
-// so a reconnecting client knows exactly what to pass hub_history(before:
-// ...) instead of having to have remembered it unprompted.
+// socket. Empty if nothing carrying a cursor has been delivered yet. Set
+// from whatever this connection has itself observed, on any server.
+// Report this on disconnect so a reconnecting client knows exactly what to
+// pass hub_catch_up as an anchor, instead of having to have remembered it
+// unprompted.
 func (c *Conn) LastSeenCursor() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lastSeenCursor
 }
-
-// HistoryLimitMax is the server's cap on a single History request's
-// limit, or zero if the server didn't set one.
-func (c *Conn) HistoryLimitMax() int { return c.historyLimitMax }
 
 // CanSend reports whether sending was permitted as of connect time — not
 // a guarantee for any send made after, since the underlying policy can
@@ -475,6 +477,13 @@ func (c *Conn) CanSend() bool { return c.canSend }
 // ConversationKind and Topic describe what was joined (e.g.
 // "oneOnOne"/"group"/"meeting", and a display name where one exists).
 func (c *Conn) ConversationKind() string { return c.conversationKind }
+
+// Behind/BehindSince report this peer's position relative to the newest
+// message, as of connect — see wire.Joined.Behind/BehindSince. Zero/empty
+// when a server doesn't set this concept (including every
+// mcp-hub-server, and a fresh position with no prior cursor to compare).
+func (c *Conn) Behind() int         { return c.behind }
+func (c *Conn) BehindSince() string { return c.behindSince }
 func (c *Conn) Topic() *string           { return c.topic }
 
 // IsBridge reports whether this connection was made via DialRelay rather
@@ -571,8 +580,22 @@ func (c *Conn) claimNextAck(ackKind string) (result <-chan Event, cancel func())
 // (readLoop) must skip buffering it and firing OnActivity for it entirely
 // when this returns true. Must be called with c.mu held.
 func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
-	if len(c.pendingAcks) == 0 {
-		return false
+	// pendingMessageAfter's match is not a blind Kind lookup like
+	// pendingAcks below — a "msg" only belongs to it when Answers is
+	// actually set (i.e. it's genuinely the answer to a pull), never for
+	// an ordinary live "msg", which must keep flowing to the general
+	// buffer untouched. "noMoreMessages" always belongs to it, since
+	// that Kind has no other meaning on this connection. A generic
+	// "error" is ambiguous with pendingAcks (see below) and handled
+	// together with it, not here.
+	if c.pendingMessageAfter != nil {
+		switch {
+		case ev.Kind == "msg" && ev.Answers != nil, ev.Kind == "noMoreMessages":
+			claim := c.pendingMessageAfter
+			c.pendingMessageAfter = nil
+			claim.result <- ev
+			return true
+		}
 	}
 	if claim, ok := c.pendingAcks[ev.Kind]; ok {
 		delete(c.pendingAcks, ev.Kind)
@@ -585,6 +608,15 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 		// claim active concurrently this is already an edge case (see
 		// claimNextAck's doc comment), so an arbitrary choice (Go map
 		// iteration order) is acceptable rather than correctness-critical.
+		// pendingMessageAfter is included in that pool: an error with no
+		// correlation id is equally ambiguous between an ack claim and a
+		// MessageAfter claim.
+		if c.pendingMessageAfter != nil {
+			claim := c.pendingMessageAfter
+			c.pendingMessageAfter = nil
+			claim.result <- ev
+			return true
+		}
 		for kind, claim := range c.pendingAcks {
 			delete(c.pendingAcks, kind)
 			claim.result <- ev
@@ -747,7 +779,13 @@ func decodeEvent(raw []byte) (Event, bool) {
 		return Event{Kind: "msg", PeerID: m.PeerID, Text: m.Text, TS: m.TS, Private: m.Private,
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
-			Mentions: m.Mentions, MentionedMe: m.MentionedMe}, true
+			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers}, true
+	case wire.TypeNoMoreMessages:
+		var n wire.NoMoreMessages
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "noMoreMessages", Answers: n.Answers}, true
 	case wire.TypeError:
 		var e wire.Error
 		if err := json.Unmarshal(raw, &e); err != nil {
@@ -768,18 +806,6 @@ func decodeEvent(raw []byte) (Event, bool) {
 		return Event{Kind: "peerLeft", PeerID: p.PeerID}, true
 	case wire.TypeRosterComplete:
 		return Event{Kind: "rosterComplete"}, true
-	case wire.TypeHistoryComplete:
-		var hc wire.HistoryComplete
-		if err := json.Unmarshal(raw, &hc); err != nil {
-			return Event{}, false
-		}
-		return Event{Kind: "historyComplete", HistoryCount: hc.Count, HistoryOldest: hc.Oldest, HistoryNewest: hc.Newest}, true
-	case wire.TypeHistoryBegin:
-		var hb wire.HistoryBegin
-		if err := json.Unmarshal(raw, &hb); err != nil {
-			return Event{}, false
-		}
-		return Event{Kind: "historyBegin", HistoryCount: hb.Count, HistoryOldest: hb.Oldest, HistoryNewest: hb.Newest}, true
 	case wire.TypeSendAck:
 		var a wire.SendAck
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -891,28 +917,49 @@ func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format
 	return c.ws.WriteJSON(m)
 }
 
-// RequestHistory asks the server for messages preceding before (a
-// server-defined cursor; empty means "the most recent limit messages") —
-// see wire.History. Not meaningful for mcp-hub-server itself, which has no
-// history concept; for a bridge server backed by a channel with real
-// retained history. The answering burst arrives as ordinary buffered "msg"
-// events (Event.Historical true) terminated by a "historyComplete" event,
-// picked up by a later Peek/Drain like anything else.
-func (c *Conn) RequestHistory(before string, limit int) error {
-	h := wire.NewHistoryRequest(before, limit)
-	h.AckCursor = c.ackCursorForOutbound()
-	return c.ws.WriteJSON(h)
-}
+// RequestMessageAfterAwaiting sends a wire.MessageAfter request for
+// anchor and waits up to AckWaitTimeout for its answer — a "msg" event
+// (Historical true, Answers echoing anchor), a "noMoreMessages" event, or
+// an "error" (typically Code "bad_anchor"). See wire.MessageAfter's doc
+// comment for the full contract, and wire.Anchor's for what belongs in
+// anchor (exactly one of Cursor/At). The returned Event is delivered
+// directly to the caller — it never reaches the general buffer/Peek/
+// Drain path, since the caller that issued this request is already the
+// one waiting on the answer (same reasoning as SendAwaitingAck).
+//
+// At most one MessageAfter call may be outstanding on a Conn at a time;
+// a second call issued before the first resolves replaces the first
+// claim, and the first call's resultCh is abandoned (it will time out
+// rather than receive an answer that instead goes to the second caller).
+// mcp-hub-client's own usage never does this — see the design doc for
+// why catch-up is deliberately sequential, not concurrent, walks — but
+// it's worth stating since the wire itself doesn't forbid concurrent
+// walks (see wire.MessageAfter's doc comment on the server side of that).
+func (c *Conn) RequestMessageAfterAwaiting(anchor wire.Anchor) (Event, bool, error) {
+	ch := make(chan Event, 1)
+	c.mu.Lock()
+	claim := &ackClaim{result: ch}
+	c.pendingMessageAfter = claim
+	c.mu.Unlock()
+	cancel := func() {
+		c.mu.Lock()
+		if c.pendingMessageAfter == claim {
+			c.pendingMessageAfter = nil
+		}
+		c.mu.Unlock()
+	}
+	defer cancel()
 
-// RequestHistoryAfter asks the server for messages strictly after after (a
-// server-defined cursor) — see wire.History.After. Only meaningful when
-// HistoryAfterSupported reports true; the answering burst arrives the same
-// way RequestHistory's does (buffered "msg" events with Historical true,
-// terminated by "historyComplete").
-func (c *Conn) RequestHistoryAfter(after string, limit int) error {
-	h := wire.NewHistoryAfterRequest(after, limit)
-	h.AckCursor = c.ackCursorForOutbound()
-	return c.ws.WriteJSON(h)
+	m := wire.MessageAfter{Type: wire.TypeMessageAfter, Anchor: anchor}
+	if err := c.ws.WriteJSON(m); err != nil {
+		return Event{}, false, err
+	}
+	select {
+	case ev := <-ch:
+		return ev, true, nil
+	case <-time.After(AckWaitTimeout):
+		return Event{}, false, nil
+	}
 }
 
 // React asks the server to add or remove a reaction on an earlier

@@ -136,19 +136,6 @@ func FormatEvent(e Event) string {
 		return fmt.Sprintf("[HUB ERROR] %s", e.Text)
 	case "rosterComplete":
 		return "[hub: initial roster complete — you now know everyone who was already in the session]"
-	case "historyBegin":
-		return fmt.Sprintf("[hub: history burst incoming — server is about to send %d event(s), cursor range "+
-			"%s..%s — if fewer than %d historical messages follow below before something else appears, the "+
-			"rest were lost after they left the server, not because the server sent fewer]",
-			e.HistoryCount, e.HistoryOldest, e.HistoryNewest, e.HistoryCount)
-	case "historyComplete":
-		if e.HistoryCount == 0 && e.HistoryOldest == "" && e.HistoryNewest == "" {
-			return "[hub: history request complete]"
-		}
-		return fmt.Sprintf("[hub: history request complete — server sent %d event(s), cursor range %s..%s — "+
-			"if you did not see exactly %d historical message(s) above, some were lost between the server and "+
-			"this read (not a server-side gap); page again with hub_history(before/after: <the missing edge>) "+
-			"rather than trusting this notification alone]", e.HistoryCount, e.HistoryOldest, e.HistoryNewest, e.HistoryCount)
 	case "sendAck":
 		if e.ActionOK {
 			return fmt.Sprintf("[hub: send acknowledged — it left the building (externalId=%s). "+

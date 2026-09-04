@@ -55,6 +55,13 @@ type Target struct {
 	Project string
 }
 
+// Key returns Target's own unexported map key format — exported so a
+// caller needing a stable string identity for a Target (e.g.
+// mcptools' GetCatchUpCursor/SetCatchUpCursor keys) doesn't have to
+// reimplement or guess at the concatenation this package already uses
+// internally for connections.json's own entries.
+func (t Target) Key() string { return key(t) }
+
 // Entry is what's remembered about one prior connection to a Target.
 type Entry struct {
 	Host            string

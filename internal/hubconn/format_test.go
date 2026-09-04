@@ -296,27 +296,6 @@ func TestFormatEventSendAckNotOK(t *testing.T) {
 	}
 }
 
-func TestFormatEventHistoryCompleteIsPlain(t *testing.T) {
-	got := FormatEvent(Event{Kind: "historyComplete"})
-	if got != "[hub: history request complete]" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatEventHistoryCompleteWithCountsStatesCount(t *testing.T) {
-	got := FormatEvent(Event{Kind: "historyComplete", HistoryCount: 5, HistoryOldest: "c1", HistoryNewest: "c5"})
-	if !strings.Contains(got, "5 event") || !strings.Contains(got, "c1..c5") {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestFormatEventHistoryBeginStatesCount(t *testing.T) {
-	got := FormatEvent(Event{Kind: "historyBegin", HistoryCount: 5, HistoryOldest: "c1", HistoryNewest: "c5"})
-	if !strings.Contains(got, "5 event") || !strings.Contains(got, "c1..c5") {
-		t.Fatalf("got %q", got)
-	}
-}
-
 func TestFormatEventsJoinsMultiple(t *testing.T) {
 	events := []Event{
 		{Kind: "peerJoined", PeerID: "a"},

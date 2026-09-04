@@ -329,7 +329,53 @@ func TestFollowDeliversMultipleEventsOverSameConnection(t *testing.T) {
 // which is why this asserts on the delimited chunks rather than on write
 // counts the test can't observe from the client side of the socket
 // anyway.
+// TestFollowSpacesWritesWithinABurst is the regression test for live-
+// emission pacing: two chunks delivered in the same burst must be
+// separated by at least liveEmissionSpacing, so a downstream layer
+// coalescing anything within its own window cannot merge them — see
+// deliver's own doc comment and the design doc's live-emission-pacing
+// section.
+func TestFollowSpacesWritesWithinABurst(t *testing.T) {
+	orig := liveEmissionSpacing
+	liveEmissionSpacing = 100 * time.Millisecond
+	t.Cleanup(func() { liveEmissionSpacing = orig })
+
+	src := &fakeSource{connected: true}
+	src.push("first")
+	src.push("second")
+	w, err := Listen(src)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer w.Close()
+
+	conn := dialFollow(t, w.socketPath)
+	defer conn.Close()
+	w.Poke()
+
+	start := time.Now()
+	if got := readChunk(t, conn); got != "first\n\n" {
+		t.Fatalf("first chunk: got %q", got)
+	}
+	firstAt := time.Since(start)
+	if got := readChunk(t, conn); got != "second\n\n" {
+		t.Fatalf("second chunk: got %q", got)
+	}
+	secondAt := time.Since(start)
+
+	if firstAt > 50*time.Millisecond {
+		t.Fatalf("expected the first chunk with no delay, took %v", firstAt)
+	}
+	if secondAt-firstAt < liveEmissionSpacing {
+		t.Fatalf("expected at least %v between chunks, got %v", liveEmissionSpacing, secondAt-firstAt)
+	}
+}
+
 func TestFollowDeliversABurstAsSeparateChunksNotOneJoinedWrite(t *testing.T) {
+	orig := liveEmissionSpacing
+	liveEmissionSpacing = time.Millisecond
+	t.Cleanup(func() { liveEmissionSpacing = orig })
+
 	src := &fakeSource{connected: true}
 	src.push("first")
 	src.push("second")
@@ -433,6 +479,10 @@ func TestWaitFollowCommandAppendsFollowFlag(t *testing.T) {
 // closes the gap. This test hammers Poke() concurrently with pushes to
 // prove no event is ever silently dropped.
 func TestFollowNeverLosesAnEventToRegistrationRace(t *testing.T) {
+	orig := liveEmissionSpacing
+	liveEmissionSpacing = 0
+	t.Cleanup(func() { liveEmissionSpacing = orig })
+
 	src := &fakeSource{connected: true}
 	w, err := Listen(src)
 	if err != nil {

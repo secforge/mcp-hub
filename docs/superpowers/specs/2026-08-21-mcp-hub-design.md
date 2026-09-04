@@ -1873,6 +1873,235 @@ does need to programmatically split this stream. Not fixed here — no
 current consumer needs it, and the marker-based fix above doesn't depend
 on it.
 
+### `historyBegin`'s wording: a check-afterward fact, not a wait-for-N gate
+
+Found live, 2026-09-04, immediately after `historyBegin` shipped: the
+model reading this client's own output got stuck, saying "let me wait
+for the rest of the burst" and never answering, after a `hub_history`
+call whose `historyComplete` had already arrived with nothing lost. Root
+cause was the marker's own wording — `"server is about to send N
+event(s)"` reads as an instruction to wait until N things have been
+counted, not as a number to check after the fact. That's not a target a
+model can reliably reach live: `historyComplete` (or, per-event, the
+matching `"end N/N"` marker) arrives unconditionally regardless of count,
+join/leave lines render differently from `msg` lines, and the 200ms
+downstream re-batching this whole truncation-detection feature exists to
+survive can merge several server-side "events" into what looks like
+fewer "messages" to a reader — "an event" and "a rendered message" were
+never the same countable unit to begin with.
+
+Fixed by rewording `historyBegin`'s formatted text (`hubconn/format.go`)
+to state explicitly: proceed normally, don't wait or count live;
+`historyComplete` is the actual completion signal; the count is only for
+comparing *after* that arrives, to decide whether to page again. The
+underlying mechanism (`wire.HistoryBegin`/`HistoryComplete`'s
+`Count`/`Oldest`/`Newest`, the per-event `i/N`/`end i/N` markers) is
+unchanged — this was purely a prompt-engineering bug in how the
+already-correct data was described to the reader, caught by the exact
+kind of live multi-agent coordination that found the original truncation
+issue in the first place.
+
+### Read misses, not just truncation: capping `hub_history`'s own default/max `limit`
+
+Found live, 2026-09-04, immediately after the `historyBegin` wording fix
+above: a 50-message `hub_history` page delivered completely and
+correctly — confirmed by grepping the Monitor sink file directly, all
+1398 bytes of the specific message in question, intact — and was still
+misread. The model skimmed past one message in the middle of a wall of
+mostly-already-seen text instead of reading every line. This is a
+**different failure than truncation**: nothing was cut, the bytes
+reached the reading surface whole. The per-event `i/N`/`end i/N` markers
+and `historyBegin`/`historyComplete` counts (previous section) can't fix
+this — they detect *loss*, and there was none here. The fix has to
+remove the wall itself, not describe it better.
+
+Root cause of *why* the page was 50 messages of mostly-known content:
+`hub_history()` with no `before`/`after` returns the newest page —
+i.e., content the caller likely already has — rather than `after:
+<lastSeenCursor>`, which returns only what's genuinely new. Blindly
+calling `hub_history(limit: 50)` to "catch up" after a reconnect,
+instead of `after` with the actual last-held cursor, was the proximate
+cause: it re-fetched known content at high volume instead of fetching
+unknown content at low volume.
+
+Fix, `mcptools`' `hub_history` tool: `limit` now defaults to 1 and is
+capped at `maxHistoryLimit` (5) regardless of what's requested —
+enforced client-side in `handleHistory`, not by the server (chat-relay's
+own `history{before/after,limit}` mechanism, and `historyBegin`/
+`historyComplete`'s counts, are unchanged and still available to any
+other caller — a UI, a backfill job — that has a real reader and can
+legitimately page 50 at once; the discipline belongs specifically where
+the reader is an LLM, per chat-relay's author's framing). The tool
+description now explicitly steers toward `after: <lastSeenCursor>` for
+reconnect recovery and toward looping over small pages (read fully, then
+request the next one using its own returned cursor) rather than asking
+for more at once.
+
+Also decided live, not yet built (chat-relay's author proposed, owner
+said hold): an additive `hasMore` bool on `historyComplete`, since
+`oldest`/`newest` describe the page's own edges, not whether a further
+page exists — walking one message at a time today can only detect "no
+more" by making one extra request that comes back empty, indistinguishable
+from a transient empty answer. Small, additive, unshipped as of this
+writing.
+
+**Known, explicitly *not* solved, residual**: this fixes history-replay
+bursts, which are user-driven and can be paged patiently. Live traffic —
+several genuinely new messages arriving in quick succession while the
+model is mid-turn — has the identical "several events coalesce into one
+reader-visible blob" shape, and cannot be *fully* fixed the same way:
+even a client that hands the model exactly one live event per delivery
+still has a downstream notification layer (Monitor's ~200ms batching
+window) that can merge two near-simultaneous *separate* deliveries back
+into one notification, which is outside this client's control (see the
+truncation-detection section above). Live traffic keeps the per-event
+marker as its backstop — detect via the marker, recover by reading the
+sink or paging — rather than a structural one-at-a-time guarantee. This
+is written down as the accepted remaining gap, not treated as closed.
+
+### `messageAfter`/`hub_catch_up`: removing the batch instead of describing it better
+
+Follow-on from the truncation-detection work above, same day
+(2026-09-04): the marker/count machinery detects a *cut* — bytes lost in
+transit. It found nothing wrong with a 50-message `hub_history` page
+that arrived completely and correctly, and was still misread — one
+message skimmed inside it, then permanently marked as seen by a cursor
+that advances over the whole page. That's a different failure
+(attention, not delivery), and no amount of counting fixes it; only
+removing the batch does.
+
+Designed collaboratively and at length with chat-relay's author and a
+third agent (Steffen-impl, a consumer of the same protocol) on the
+coordination hub, converging through several wrong turns worth naming
+because the wrong turns are as instructive as the answer: a `messageAfter`/
+`messageBefore` twin pair (dropped — the operator's simplification to
+one verb was better); an anchor split across `cursor`+`id`+`limit` forms
+(dropped — every anchor is a *position*, not a message *identity*, which
+is what makes `unknown_message` disappear entirely rather than needing
+to be handled); a `{timestamp, id}` two-field anchor (dropped — either
+field alone is one opaque position, and requiring both means "which one
+wins" has no safe answer); and a close-code signal for backpressure
+(dropped — a close is itself a write, so it can't fire for the condition
+it would describe).
+
+**Landed shape** (see the wire protocol spec's §2.6a for the full,
+implementer-facing contract): one request, `messageAfter{cursor|at}`,
+answered by exactly one message, `noMoreMessages`, or `error{bad_anchor}`
+— the last of which is unreachable for a client that only ever echoes an
+anchor it was given.
+
+**Update, 2026-09-04, later the same day: `history` removed entirely.**
+The paragraph above argued `history` (§2.6) should stay for a non-LLM
+caller with a real reader and no skim risk — the owner explicitly
+overrode that compromise and asked for it to be removed client-side, and
+for chat-relay to be asked to drop server-side support too, rather than
+maintain two parallel read paths. `mcptools`' `hub_history` tool,
+`hubconn`'s `RequestHistory`/`RequestHistoryAfter`, and
+`wire.History`/`HistoryBegin`/`HistoryComplete` are all gone; see the
+wire spec's §2.6 for what used to be there and why it was safe to drop
+(the security note about directed-message leakage through a stored-read
+path was carried forward into §2.6a's own read path, since it applies
+there identically). `ProtocolVersion` was bumped 1→2 for exactly this —
+see the spec's §6 — so an old client/server pair that only knows
+`history` now gets a clear "update" note at connect time instead of a
+silent failure the first time it tries to page.
+
+**Client side** (`internal/mcptools/tools.go`'s `hub_catch_up`,
+`internal/hubconn/conn.go`'s `RequestMessageAfterAwaiting`,
+`internal/wire/wire.go`'s `Anchor`/`MessageAfter`/`NoMoreMessages`):
+always requests exactly one message, walks forward from
+`lastHandedOverCursor` when one is known, seeks to recent context
+(`at: now - catchUpSeekWindow`) when it isn't or the server reports a
+large `Joined.Behind`, and — the one rule that matters most — only
+advances the persisted position at the moment a message is actually
+*returned* to the model (the synchronous tool result *is* the hand-over;
+there is no "written but not yet read" gap on this path the way there is
+on the live/waiter path), never merely when the server answers.
+`RequestMessageAfterAwaiting`'s diversion logic was the one piece worth
+being careful with: an ordinary live `msg` must never be mistaken for a
+`messageAfter` answer, so the match is on `Answers != nil`, not on `Kind
+== "msg"` alone — tested explicitly (`TestOrdinaryLiveMsgIsNotDiverted-
+ToMessageAfterClaim`) since getting this wrong would silently swallow
+real live traffic into a pull's response channel.
+
+**Update, same day, once the owner said to build the rest:** every gap
+below except the doorbell idea (still an undecided future direction, not
+built) is now closed. Kept as a record of what changed and why, not as a
+current gap list.
+
+- **Persisted across a process restart**
+  (`internal/connstore/catchup.go`: `GetCatchUpCursor`/
+  `SetCatchUpCursor`, a small `key→cursor` file alongside
+  `connections.json`, sharing its lock). A `teams_relay_connect` session
+  has no `connstore.Target` to key on (still always the zero value — see
+  `connTarget`'s comment), so it gets its own derivation instead
+  (`catchUpKeyForRelay`: the relay link's non-secret portion,
+  project-scoped the same way a real `Target` is) rather than being
+  excluded from persistence, which is what would have mattered least
+  given a bridge session is exactly the kind `hub_catch_up` is for.
+  `Hub.setCatchUpKey` records which key the active connection persists
+  under and loads whatever was stored for it, called once per successful
+  connect from both `handleConnect` and `handleTeamsRelayConnect`.
+- **Live/catch-up dedup**
+  (`Hub.handedOverAhead`, `Hub.recordHandedOver`, wired into
+  `resultWithReceivedAttachments` — the one function every synchronous
+  delivery to the model already goes through, so no call site can forget
+  to record it). The rule landed exactly as designed: a message is only
+  ever added to the "confirmed handed over" set via a *synchronous* tool
+  result (`hub_receive`/`hub_wait`/`hub_catch_up`), never via the async
+  `wait --follow` path, which still has no read-ack and so still can't
+  safely suppress anything — a message seen only that way can still be
+  re-shown by a later catch-up walk, which remains the deliberate
+  accepted-safe direction for that one path specifically.
+  `handleCatchUp` checks the set before showing a message and, on a hit,
+  advances past it internally (bounded by `catchUpDedupSkipLimit`) rather
+  than surfacing a duplicate the model already read via `hub_receive`/
+  `hub_wait`.
+- **Live emission is paced**
+  (`waiter.liveEmissionSpacing`, 500ms, applied between — not before —
+  successive writes in one `deliver()` call). Closes the live-merge class
+  rather than merely detecting it, per the math worked out live in the
+  hub coordination this feature grew out of: a delay exceeding Monitor's
+  documented 200ms coalescing window means no two of this process's
+  writes can land in the same window, for either a fixed-tick or a
+  debounce implementation of that window. The single-event common case
+  pays no added latency at all — the delay only applies between chunks
+  within the same multi-event delivery.
+- **Seek gaps are recorded as ongoing state**
+  (`catchUpGap`, persisted via the same `connstore` mechanism as the
+  cursor itself, under a namespaced key). Set whenever a real seek
+  happens (`Behind` over the threshold, not the "no prior position at
+  all" fallback case); surfaced in every subsequent `hub_catch_up`
+  result — "caught up," "nothing to catch up," and the seek's own result
+  — *and* in `hub_connect`/`teams_relay_connect`'s own connect-time text,
+  until something actually walks that range (not automated — there's no
+  tool-level way to manually target an old gap yet, only a note that one
+  exists).
+- **`behind`/`behindSince` are surfaced at connect time**
+  (`Hub.behindNote`, called from both `handleConnect` and
+  `handleTeamsRelayConnect`'s result text). States "you were away, N
+  messages arrived since T" as a fact, the same framing discipline
+  operator-message tagging already applies to sender identity — a
+  server-reported fact stated outright, not left for the model to notice
+  is missing.
+- **The "doorbell" idea remains undecided, not built** — push carries
+  only "something arrived," all content only via a `messageAfter` read.
+  Real cost unchanged from when it was proposed: an extra read call per
+  live message and a rewritten `hub_receive`/`hub_wait` contract
+  affecting every consumer, including plain `mcp-hub-server` sessions
+  with no history concept at all to build the doorbell's "go read" half
+  on. Recorded as a target shape worth returning to, not a gap in what
+  shipped today.
+
+`joined.behind`/`behindSince` (wire spec §2.1) and `bad_anchor` (§2.5)
+are documented in the wire protocol spec now, along with a `§9`
+non-normative note on the server-side fan-out/backpressure bug this same
+design conversation surfaced and chat-relay fixed independently
+(sequential per-peer `await`s in a fan-out loop mean one stalled peer
+delays delivery to every other peer in the same conversation — fixed
+with a bounded per-peer queue and an abort-on-overflow, not a blocking
+wait or a silent drop).
+
 ## Background delivery (the `wait` command)
 
 Standard MCP notification mechanisms (e.g. `notifications/resources/updated`)

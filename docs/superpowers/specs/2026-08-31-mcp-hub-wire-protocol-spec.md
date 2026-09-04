@@ -8,29 +8,29 @@ spec wins; don't replicate the gap on purpose.
 
 ## 0. The one thing to get right first: nothing here is "bridge-only"
 
-Every message type in this protocol — `history`, `reaction`, `edit`,
+Every message type in this protocol — `messageAfter`, `reaction`, `edit`,
 `delete`, `ack`, all their replies — is available on **any** connection,
 plain or bridge. There is no `isBridge` flag on the wire and no
 server-type check anywhere in the client that gates *sending* one of
-these. The client will happily send a `history` or `reaction` request
-over a connection to any server that accepts the initial handshake.
+these. The client will happily send a `messageAfter` or `reaction`
+request over a connection to any server that accepts the initial
+handshake.
 
 What actually varies by server is **which requests get a real answer**:
 
 - `mcp-hub-server`'s own relay (`internal/wsserver`) implements only
   `msg` (broadcast and directed). Every other inbound request type —
-  `history`, `reaction`, `edit`, `delete`, `ack` — is silently dropped
-  (`internal/wsserver/server.go`'s read loop discards anything whose
-  `type` isn't `"msg"`). This is a *deployment's* limited feature set,
-  not a protocol restriction.
+  `messageAfter`, `reaction`, `edit`, `delete`, `ack` — is silently
+  dropped (`internal/wsserver/server.go`'s read loop discards anything
+  whose `type` isn't `"msg"`). This is a *deployment's* limited feature
+  set, not a protocol restriction.
 - A bridge server (chat-relay) implements the rest because it has real
   history, write access, and a reason to track read position.
 
-So: implement whatever subset of this spec makes sense for your server,
-and advertise capability via `Joined` fields (`historyAfter`,
-`historyLimitMax`) where the spec defines one — there is no other
-capability-negotiation mechanism. For everything without a capability
-flag (reactions, edits, deletes, ack), a client has no way to know in
+So: implement whatever subset of this spec makes sense for your server —
+there is no capability-negotiation mechanism beyond `Joined.behind`/
+`behindSince` (§2.1, §2.6a). For everything else (reactions, edits,
+deletes, ack, `messageAfter` itself), a client has no way to know in
 advance whether your server will act on it; it just sends the request
 and waits to see whether an ack/error/no-response follows. Silence is a
 valid answer only in the sense that `mcp-hub-server` today gives none at
@@ -102,13 +102,12 @@ bump — see §6.
 | `serverVersion` | int | yes | This server's protocol version — see §6. |
 | `name` | string | no | Echoed back, post-sanitization. |
 | `agePublicKey` | string | no | Echoed back verbatim. |
-| `latestCursor` | string\|null | no | Newest message cursor this server holds, if any. Bridge-capability field — omit/null if you have no history. |
-| `historyAfter` | bool | no | Capability flag — true only if you implement forward paging (`history.after`, §2.6). Omit or false otherwise. |
-| `historyLimitMax` | int | no | Your cap on a single `history` request's `limit`. Omit/zero if uncapped or you don't implement history. |
 | `canSend` | bool | no | Whether sending is currently permitted — a snapshot, not a guarantee (re-checked per send). |
 | `conversationKind` | string | no | e.g. `"oneOnOne"`, `"group"`, `"meeting"` — free text, not a closed enum. |
 | `topic` | string\|null | no | Display name/topic of what was joined, if applicable. |
 | `systemPeerId` | string | no | This server's own peerId for operator/system-originated messages on this session, if it has one. A client must not hardcode a guessed value (e.g. chat-relay's all-zeros UUID) — treat this field as the only authoritative source, and treat it as absent (no operator concept) when omitted. |
+| `behind` | int | no | How many messages this peer's own last-acked position trails the newest message in this conversation, computed once at connect. `0` states "caught up" as a fact, distinct from omitted (no such concept — including every mcp-hub-server, and a first-ever connection with no prior position to compare). See §2.6a. |
+| `behindSince` | string (RFC 3339, explicit UTC offset) | no, but required alongside `behind` when `behind` is set to a positive value | The timestamp of this peer's last-acked position — what a `messageAfter{at:...}` seek is computed from when the gap is too large to walk. Omitted under the same conditions as `behind`. |
 
 ### 2.2 `msg` (both directions)
 
@@ -120,10 +119,11 @@ bump — see §6.
 | `ts` | string | server→client | server | Timestamp, server-defined format (RFC3339 in `mcp-hub-server`'s case). |
 | `to` | string | no | client→server | Set to request directed (private) delivery to one peerId instead of broadcast. |
 | `private` | bool | no | server→client | Set by the server on a delivered directed message. |
-| `historical` | bool | no | server→client | True if this is answering a `history` request rather than live traffic. |
+| `historical` | bool | no | server→client | True if this is answering a `messageAfter` request (§2.6a) rather than live traffic. |
 | `externalId` | string | no | server→client | Bridge-only concept: this server's own id for the message, correlating it with an earlier `sendAck`. |
 | `own` | bool | no | server→client | True if *this exact connection* sent it. A receiving client's own policy decision whether to treat this as wake-worthy — see §3 for what the reference client does. |
-| `cursor` | string | no | server→client | This message's own opaque position — pass back as `history.before`/`history.after`. |
+| `cursor` | string | no | server→client | This message's own opaque position — pass back as a `messageAfter` anchor (§2.6a). |
+| `answers` | Anchor (see §2.6a) | no | server→client | Present only when this `msg` is the direct answer to a `messageAfter` request — the exact anchor that request was sent with, echoed back verbatim. |
 | `ackCursor` | string | no | client→server | Piggybacked read receipt — see §2.7. |
 | `attachments` | array of Attachment (see below) | no | both | Binary content, inline or by reference. |
 | `format` | string | no | both | How `text` should be interpreted — see below. |
@@ -166,8 +166,9 @@ specific backend's API, not something a client needs to branch on.
 `replyPreview`, when present, is the server's own lossy (formatting
 flattened, possibly truncated) abbreviation of the quoted message's
 text — a fallback for a `replyTo` that names a message outside a
-client's own history, not the authoritative quoted text (use `history`
-around that cursor for that). Server→client only; a client never sets
+client's own history, not the authoritative quoted text (use
+`messageAfter`, §2.6a, around that cursor for that). Server→client only;
+a client never sets
 this on send — the server derives it once it has resolved `replyTo`.
 
 `format`, when present, is `"text"` (the default if omitted — plain,
@@ -364,103 +365,181 @@ closed set — treat `code` as an open string):
   history") — a client can act on that difference (the latter likely
   means "too old to cite, fall back to quoting the text"), but `code`
   alone doesn't carry it.
+- `bad_anchor`, `retryable:false` — a `messageAfter` (§2.6a) request's
+  anchor doesn't decode to a stream position at all. See §2.6a for why
+  this is the *only* error `messageAfter` can produce (no
+  `unknown_message` — a position always has a successor or does not),
+  and why it should be unreachable for a well-behaved client.
 
 ### 2.6 `history` (client → server) / `historyComplete` (server → client)
 
-Request:
+**Removed 2026-09-04.** `history`/`historyBegin`/`historyComplete` (and
+the `Joined.latestCursor`/`historyAfter`/`historyLimitMax` capability
+fields that advertised them) are no longer part of this spec — every
+caller, LLM or not, should use `messageAfter` (§2.6a) instead. This
+reverses an earlier compromise recorded in this section ("kept for any
+other caller") that treated `history` as still-valid for a non-LLM
+reader; the reference client owner decided the batch-paging shape itself
+— not just the LLM-attention failure mode §2.6a was originally built to
+fix — wasn't worth maintaining two parallel read paths for, and asked
+that server-side support be removed too. A server or client still
+speaking `history` after this point is on an old, incompatible protocol
+version — see §6's `ProtocolVersion` bump for how that mismatch now
+surfaces at connect time rather than as a silent failure the first time
+a page is requested.
+
+What `history` did, for context: it paged backward (`before`, exclusive,
+reaching only older messages) or forward (`after`, exclusive, only if the
+server advertised `Joined.historyAfter`) in a batch of up to `limit`
+messages (each `historical: true`), terminated by a `historyComplete`
+frame (optionally preceded by a `historyBegin` frame carrying the same
+`count`/`oldest`/`newest`, so a downstream truncation that cuts the tail
+of a burst — the overwhelmingly common case, confirmed live — didn't
+silently swallow the completion signal too). `messageAfter` replaces all
+of that with a single "next message" primitive that removes the *batch*
+itself, which is what actually mattered: §2.6a's rationale section below
+explains the failure mode (an LLM reader skimming past a message inside
+a complete, correctly-delivered batch) this removal fixes, but nothing
+about "a batch invites skimming" is specific to that one reader type
+either — it's just more visible there.
+
+The security note that used to live here — a server answering `history`
+straight from its message store, filtered only by session/conversation,
+can leak a directed (`to`-targeted) message to a peer who was never its
+recipient, unless the store also records *who a directed message was
+addressed to* and filters on that — still applies verbatim to any server
+implementing `messageAfter`'s own backward-compatible read path, if it
+has one. The fix is the same: store the addressee, filter reads on
+"public, or I'm the sender, or I'm the recipient," and never persist a
+*refused* send (target absent, policy refusal) for a later read to hand
+out — a message the sender was told never went anywhere must not
+reappear for anyone via `messageAfter` either.
+
+### 2.6a `messageAfter` (client → server) / answer (server → client)
+
+Reads exactly one message — the message at the first stream position
+strictly after a given position. Designed, live, 2026-09-04, as the
+minimal replacement for `history`'s batch-paging shape once a real
+incident showed *why* a batch is unsafe for an LLM reader specifically —
+see the rationale at the end of this section before implementing.
+
+Request — exactly one of `cursor`/`at` is set, never both, and neither is
+optional (there is no anchor-less form). Sending neither, or sending
+both, is a malformed request: it doesn't decode to a position, so it
+gets the same answer as any other undecodable anchor — `error{code:
+"bad_anchor"}` — not a default like "the oldest message." A well-behaved
+client should never construct this case; it's specified here only so two
+independent implementations agree on the malformed case too.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `type` | `"history"` | yes | |
-| `before` | string | no | Backward paging — see below. |
-| `after` | string | no | Forward paging — see below. Only send this if the server's `Joined.historyAfter` was true. |
-| `limit` | int | no | Server may cap lower than requested. |
-| `ackCursor` | string | no | Piggybacked read receipt — §2.7. |
+| `type` | `"messageAfter"` | yes | |
+| `cursor` | string | exactly one of `cursor`/`at` | An opaque handle, verbatim from a `msg.cursor` this client already holds. Never parsed, compared, or constructed by the client — see "Why the anchor is a position, not a message identity" below. |
+| `at` | string (RFC 3339, explicit UTC offset — a naive/zoneless timestamp must be refused, not assumed) | exactly one of `cursor`/`at` | A client-chosen instant. "The first message at or after this instant" — inclusive, unlike `cursor`'s exclusive "strictly after." |
 
-Send **at most one** of `before`/`after`. If a server receives both, it
-should prefer `before` and should treat it as a client bug (not
-something to silently paper over) — a well-behaved client never does
-this.
-
-- **`before`** (backward): omitted (with `after` also empty) means "the
-  most recent `limit` messages." Otherwise the page ends strictly
-  before the given cursor — exclusive, so paging further back means
-  repeatedly passing the *oldest* cursor seen so far, never repeating a
-  boundary message. **This can only reach older messages, never newer
-  ones — it cannot be used to fill a reconnect gap.**
-- **`after`** (forward): the page starts strictly after the given
-  cursor — exclusive. This is what a reconnecting client should use to
-  fetch exactly what arrived while it was disconnected, passing the
-  last cursor it actually consumed (see §2.7's `lastConsumed` — this is
-  the same value). Only meaningful if you advertised
-  `Joined.historyAfter: true`.
-
-Response: optionally led by, and always terminated by, a frame stating
-how many `msg` events (each `historical: true`) make up the burst:
+Answer — exactly one of three, and *only* one of the three:
 
 ```json
-{"type": "historyBegin", "count": 5, "oldest": "cursor-1", "newest": "cursor-5"}
-... 5 × msg (historical: true) ...
-{"type": "historyComplete", "count": 5, "oldest": "cursor-1", "newest": "cursor-5"}
+{"type": "msg", ..., "historical": true, "answers": {"cursor": "..."}}
+{"type": "noMoreMessages", "answers": {"cursor": "..."}}
+{"type": "error", "code": "bad_anchor", "retryable": false}
 ```
 
-`historyBegin` is optional (a server may implement `historyComplete`
-alone, as before this addition); `historyComplete` is mandatory and sent
-even for an empty result (`count: 0`, `oldest`/`newest` omitted), so a
-client gets a positive "there is no more" rather than inferring
-completion from a traffic gap. `count`/`oldest`/`newest` are themselves
-optional and additive on both frames — a server may emit bare
-`{"type":"historyComplete"}` as before, and a client that doesn't
-recognize `historyBegin` at all just ignores it like any other unknown
-frame type.
+- The `msg` form is the answer, formatted exactly like any other `msg`
+  (§2.2) — same `attachments`/`format`/`replyTo`/`mentions` fields, same
+  rules — with `historical: true` and `answers` added.
+- `noMoreMessages` means "there is no message at a later position than
+  the one given" — **not an error**, this is the normal, expected way a
+  walk or a seek terminates. `answers` is set here too.
+- `error{code: "bad_anchor"}` means the anchor string doesn't decode to a
+  position at all — a corrupted/garbled `cursor`, or an `at` that fails
+  to parse as an explicit-offset RFC 3339 instant. This is **unreachable
+  for any client that only ever echoes a `cursor` it was actually given
+  and sends a well-formed `at`** — there is no `unknown_message` code,
+  and deliberately so: see below for why a position always has a
+  successor or does not, with nothing for the server to fail to
+  recognize.
 
-**Why both ends carry the same numbers, rather than just one**: confirmed
-live, 2026-09-03 — an agent believed it had received a message that was
-in fact delivered by the server and received intact by its own client's
-socket; the loss was entirely in a display/notification layer sitting
-*above* the wire client, which truncated a multi-message burst to its
-first few lines with no indication anything was cut. A client has no way
-to detect that kind of loss on its own unless it can compare "how many
-did I actually render" against a number the protocol told it to expect.
-A single count sent only at the end doesn't help, because the *cut
-itself* overwhelmingly removes the tail, not the head — a trailing-only
-marker gets truncated away in precisely the scenario it exists to catch.
-`historyBegin` at the head survives a tail cut; `historyComplete` at the
-tail survives the rarer head cut; a client that captures both can also
-catch a cut in the middle by comparing them against each other.
+`answers` is the same `Anchor` shape as the request (`{"cursor": "..."}`
+or `{"at": "..."}`), echoing **the anchor exactly as sent** — not the
+resolved message's own cursor (which is already present as `cursor` on
+the `msg` itself and would tell a client nothing new). This is what lets
+a client tell a pull's answer apart from unrelated live traffic even if a
+downstream layer merges the two into one delivery, and what lets more
+than one walk be correlated if a client ever has more than one in flight.
+
+**Why the anchor is a position, not a message identity.** An earlier
+design iterated through `cursor`/`id`/`{before,after,limit}` forms before
+converging here; the reason worth carrying forward, not just the
+conclusion: a message *identity* (an id) is sparse — it can be deleted,
+malformed, or simply never have existed, and "the next message after
+message M" is only answerable when M does — which is exactly where an
+`unknown_message` error, a lookup, and a whole class of "is this id valid"
+bugs come from. A *position* is total and dense: "the first message at a
+position strictly after P" is answerable for **any** P, including one no
+message currently occupies. `cursor` and `at` are both positions in this
+sense (a cursor is the server's own exact composite position; a bare
+timestamp is a coarser position with no tiebreak, which is what makes the
+inclusive/exclusive difference between them free — see below), so there
+is no "invalid id" case for the server to guard against, and — critically
+for the opacity rule — no way for a client-fabricated `cursor` to name
+"the wrong message," only "some position," because a `cursor` must never
+be fabricated in the first place (see below).
+
+**One ordering rule, not two.** The answer is always "the message at the
+first position **strictly after** the given one" — for a `cursor` this is
+an ordinary exclusive walk; for a bare `at` timestamp T, treat T as the
+position `(T, <before any tiebreak>)`, so "strictly after" naturally
+returns a message *at* T if one exists. One rule produces both the
+exclusive-walk and the inclusive-seek behavior a client needs, with
+nothing to remember about which anchor form gets which rule.
+
+**Opacity, and why it's a *safety* property, not just a style
+preference.** `cursor` is entirely the server's format and precision to
+choose and change — a client must never parse, compare, derive, or
+increment one, only ever hand back a value it was literally given (from
+a `msg.cursor`). This isn't only about forward-compatibility: on a real
+server backing this protocol, message rows are **not** contiguous within
+one conversation (they share a sequence across every conversation on the
+server), so a client doing `cursor + 1` on a numeric-looking handle
+wouldn't merely skip a gap — it would name a message in a *different
+conversation*. `at`, by contrast, is a coordinate the client legitimately
+owns: it's meaningful without the server, and "the first message at or
+after instant T" is well-defined for every T, so there's no equivalent
+hazard in choosing one freely.
+
+**Why this exists at all, and why `historyBegin`/`historyComplete`
+weren't enough**: confirmed live, 2026-09-04 — a 50-message `history`
+page was delivered completely and correctly (verified by reading the raw
+bytes on the client's own reading surface, all present) and was *still*
+misread: one message was skimmed inside the page, its position then
+recorded as "seen" by a cursor that advances over a whole returned page,
+and it would never be re-delivered. Nothing was lost in transit — the
+existing truncation-detection machinery (§2.6, and the client-side
+per-event markers described in the design doc) had nothing to detect,
+because there was no cut. The failure was **attention**, not delivery: a
+reader given a large batch of mostly-already-seen text does not reliably
+read every line. `messageAfter` fixes this at the root by removing the
+batch: a client that only ever asks for and receives one message at a
+time has nothing to skim *inside*, because there is no "inside" — the
+page is exactly the thing it asked for. This is why a well-behaved
+client (see the design doc's `hub_catch_up`) deliberately never requests
+more than one message per call even though this protocol places no such
+limit on the wire itself.
 
 **General rule for any future burst-shaped addition to this protocol**:
-put a count, size, or "read the full copy at X" pointer at the **head**
-of the burst it describes, not only the tail — a real downstream
-truncation observed against this protocol removed the tail of a
-multi-event delivery, not the head. This isn't specific to `history`:
-the reference client (`mcp-hub`) applies the identical idea to *any*
-multi-event delivery over `wait --follow`/`hub_receive`/`hub_wait`, not
-just history bursts — prefixing every batch of more than one event with
-an explicit "delivering N events below" header, since ordinary live
-traffic arriving in a burst (several messages landing before a listener
-catches up) has the exact same undetectable-truncation exposure history
-does, with no protocol-level count to fall back on at all.
-
-**Security note for implementers, from a real incident:** a directed
-`msg` (§2.2, `to` set) is easy to get right on the *delivery* path
-(refuse to broadcast it, deliver only to the target) and easy to get
-wrong on the *history* path, because the two look like unrelated code —
-delivery-time routing state versus a stored-message read query — even
-though `private`/`to` must be enforced identically on both. A server
-that stores messages for `history` and later answers a `history` request
-straight from that store, filtered only by session/conversation, will
-hand a directed message to *any* peer that asks — including one that
-joined after it was sent and was never a party to it. This was found and
-fixed live during this protocol's own bring-up on a second
-implementation: store which peer a directed message was actually
-addressed to, filter `history` on "public, or I'm the sender, or I'm the
-recipient," and make sure a *refused* send (target absent, policy
-refusal) is never persisted for `history` to hand out later — a message
-the sender was told never went anywhere must not reappear for everyone
-via history. Also re-mark the historical copy `private: true` (and,
-ideally, still carry enough to identify the recipient) so a receiving
-client can render it consistently with how it would have looked live.
+a real downstream truncation observed against this protocol's now-removed
+`history` mechanism cut the *tail* of a multi-event delivery, not the
+head — so a count/size/"read the full copy at X" marker belongs at the
+**head** of a burst it describes, not only the tail, if one is ever added
+back. This isn't specific to `history`: the reference client (`mcp-hub`)
+applies the identical idea to *any* multi-event delivery over
+`wait --follow`/`hub_receive`/`hub_wait`, prefixing every batch of more
+than one event with an explicit "delivering N events below" header,
+since ordinary live traffic arriving in a burst (several messages landing
+before a listener catches up) has the exact same undetectable-truncation
+exposure `history` used to, with no protocol-level count to fall back on
+at all.
 
 ### 2.7 `ack` (both directions) — read receipts
 
@@ -471,7 +550,7 @@ the design rationale in `docs/superpowers/specs/2026-08-21-mcp-hub-design.md`'s
 exists.
 
 **Piggybacked form** (preferred): any client→server request
-(`msg`/`reaction`/`edit`/`delete`/`history`) may carry an `ackCursor`
+(`msg`/`reaction`/`edit`/`delete`) may carry an `ackCursor`
 field — "this is the cursor of the last event I've actually consumed."
 Fire-and-forget: **no reply** to a piggybacked receipt, ever. A server
 should just record the position.
@@ -680,21 +759,50 @@ closing, when the close reason is something the model could act on
 signal for the case where the `error` event itself didn't make it
 through in time, not a replacement for it.
 
+**A code was proposed and deliberately dropped, worth recording so it
+isn't re-proposed identically**: 4005 `behind`, for "this connection
+couldn't keep up with live delivery and was closed rather than blocking
+every other peer" (see §8's backpressure guidance below). Found live,
+2026-09-04: a graceful close *is itself a write*, and the condition 4005
+would signal is exactly "writes to this peer don't complete" — so it can
+never actually be sent for the case it exists to describe. The correct
+implementation instead aborts the raw transport (an ordinary close, no
+code — typically surfacing as 1006 to the client) once a per-peer
+outbound queue overflows or a write exceeds its deadline. A client needs
+no special handling for this: it's already just an ordinary disconnect,
+recovered the same way any other one is (reconnect, then `messageAfter`/
+`hub_catch_up` from the last known position) — which is what makes the
+abort acceptable rather than a loss.
+
 ## 6. Versioning
 
-`ProtocolVersion` is currently `1`. The policy: bump it only for a
+`ProtocolVersion` is currently `2`. The policy: bump it only for a
 genuinely breaking change. New optional fields and new event kinds are
 additive and don't need it — `encoding/json` ignores unknown fields on
 decode, and an unrecognized `type` is silently dropped rather than
 erroring. A server should follow the same policy: don't require a
 specific `v` to accept a connection.
 
+`1` → `2` (2026-09-04) is exactly such a breaking change: `history`/
+`historyBegin`/`historyComplete` (§2.6, removed) had no replacement
+fallback left once `messageAfter` (§2.6a) became the only read-catch-up
+path — a client that only knows `history` can no longer be served by a
+server that only knows `messageAfter`, and vice versa. That's the bar for
+a version bump: not "does this add something new" (that's additive, no
+bump) but "does an old peer's request now go unanswered where it used to
+work."
+
 If `Joined.serverVersion` differs from the client's own `ProtocolVersion`,
-the reference client does **not** refuse or alter behavior — it's purely
-informational, surfaced in `hub_connect`'s result text as a hint to the
-user ("consider updating mcp-hub-client" if the server is newer,
-"the server may need updating" if the server is older). There is no
-protocol-level negotiation.
+the reference client does **not** refuse the connection or alter its own
+behavior beyond this — it's surfaced as an explicit note in
+`hub_connect`'s/`teams_relay_connect`'s result text: "tell the user to
+update mcp-hub-client" if the server is newer, "the server may need
+updating" if the server is older. This is the mechanism an incompatible
+peer is expected to be caught by — at connect time, as a clear
+human-actionable instruction, rather than a silent hang or a confusing
+per-request failure discovered only once a client tries to page. There is
+no further protocol-level negotiation beyond this one-shot version
+comparison.
 
 ## 7. Liveness / keepalive
 
@@ -749,6 +857,30 @@ entirely and the join proceeds normally — never mutually exclusive with
 generates or discovers a token on its own — the user supplies one,
 issued out of band (chat-relay: `POST /api/conversations/hub/create-
 tokens`, shown once, only its hash is later stored).
+
+## §9. Server-side fan-out / backpressure guidance (non-normative)
+
+Not part of the wire format — nothing here is observable by a
+well-behaved client — but worth recording as implementer guidance, since
+it was found as a real production bug during this protocol's own
+bring-up on a second implementation: a naive fan-out that sequentially
+`await`s a socket write per peer means **one slow or stalled peer
+delays delivery to every other peer** in the same conversation, because
+the loop can't reach connection N+1 until connection N's write completes
+(or a keepalive eventually kills it — often tens of seconds later). This
+is head-of-line blocking across unrelated peers caused by one peer's own
+problem.
+
+Recommended shape: a per-peer bounded outbound queue; fan-out enqueues a
+message and returns immediately, never awaiting a socket; one writer
+task per connection drains its own queue in order (preserving per-peer
+delivery order — do not spawn one task per message, which can reorder
+under load); on queue overflow or a write exceeding a deadline, **abort
+that one connection's raw transport** rather than blocking the fan-out
+or silently dropping the message from the queue. See §5's note on why a
+dedicated close code for this doesn't work (a close is itself a write)
+and isn't needed (an ordinary abort is already a correctly-handled
+disconnect on the client side).
 
 ## Appendix: reference client's own tuning constants
 

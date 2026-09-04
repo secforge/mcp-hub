@@ -810,51 +810,7 @@ func TestHubWaitNewCallSupersedesInFlightOne(t *testing.T) {
 	}
 }
 
-func TestDisconnectedTextHintsHubHistoryAfterWhenSupported(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, HistoryAfter: true})
-		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-xyz"})
-		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-	}))
-	defer srv.Close()
-
-	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	ctx := context.Background()
-
-	hub := NewHub()
-	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000"}
-	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
-		t.Fatalf("connect failed: err=%v result=%+v", err, res)
-	}
-
-	deadlinePoll(t, func() bool { return hub.conn.LastSeenCursor() == "cursor-xyz" })
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		res, _ := hub.handleReceive(ctx, mcp.CallToolRequest{})
-		if strings.Contains(textOf(res), "disconnected") {
-			if !strings.Contains(textOf(res), `"cursor-xyz"`) || !strings.Contains(textOf(res), "hub_history(after:") {
-				t.Fatalf("expected the disconnect text to hint at hub_history(after: ...) with the last seen cursor, got: %s", textOf(res))
-			}
-			if strings.Contains(textOf(res), "hub_history(before:") {
-				t.Fatalf("must never suggest before for catching up — it pages backward, got: %s", textOf(res))
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("never observed a disconnected result, last: %s", textOf(res))
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func TestDisconnectedTextFallsBackWhenAfterNotSupported(t *testing.T) {
+func TestDisconnectedTextHintsHubCatchUp(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -883,11 +839,8 @@ func TestDisconnectedTextFallsBackWhenAfterNotSupported(t *testing.T) {
 	for {
 		res, _ := hub.handleReceive(ctx, mcp.CallToolRequest{})
 		if strings.Contains(textOf(res), "disconnected") {
-			if !strings.Contains(textOf(res), `"cursor-xyz"`) || !strings.Contains(textOf(res), "does not support hub_history's after") {
-				t.Fatalf("expected the disconnect text to explain after isn't supported, got: %s", textOf(res))
-			}
-			if strings.Contains(textOf(res), "hub_history(before:") || strings.Contains(textOf(res), "hub_history(after:") {
-				t.Fatalf("must not suggest a specific before/after call when after isn't supported and the gap can't be filled, got: %s", textOf(res))
+			if !strings.Contains(textOf(res), `"cursor-xyz"`) || !strings.Contains(textOf(res), "hub_catch_up()") {
+				t.Fatalf("expected the disconnect text to hint at hub_catch_up() with the last seen cursor, got: %s", textOf(res))
 			}
 			return
 		}
@@ -1824,4 +1777,88 @@ func TestDisconnectDetectedAutomaticallyWithoutAnyToolCall(t *testing.T) {
 		c, w := hub.activeConn()
 		return c == nil && w == nil
 	})
+}
+
+// TestSetCatchUpKeyLoadsNothingForAFreshKey proves a key never seen
+// before starts with no position — the common case for a brand-new
+// session.
+func TestSetCatchUpKeyLoadsNothingForAFreshKey(t *testing.T) {
+	hub := NewHub()
+	hub.setCatchUpKey("brand-new-key")
+
+	hub.mu.Lock()
+	got := hub.lastHandedOverCursor
+	hub.mu.Unlock()
+	if got != "" {
+		t.Fatalf("expected no prior position for a fresh key, got %q", got)
+	}
+}
+
+// TestSetCatchUpKeyPersistsAcrossHubInstances proves the whole point of
+// persisting via connstore rather than keeping this in memory only: a
+// SECOND *Hub (standing in for a fresh process after a restart) calling
+// setCatchUpKey with the same key recovers the position the first Hub
+// persisted, rather than starting over.
+func TestSetCatchUpKeyPersistsAcrossHubInstances(t *testing.T) {
+	key := "persist-test-key"
+
+	first := NewHub()
+	first.setCatchUpKey(key)
+	if err := connstore.SetCatchUpCursor(key, "cursor-1"); err != nil {
+		t.Fatalf("SetCatchUpCursor: %v", err)
+	}
+
+	second := NewHub()
+	second.setCatchUpKey(key)
+
+	second.mu.Lock()
+	got := second.lastHandedOverCursor
+	second.mu.Unlock()
+	if got != "cursor-1" {
+		t.Fatalf("expected the second Hub to recover cursor-1 for the same key, got %q", got)
+	}
+}
+
+// TestSetCatchUpKeyIsolatesDifferentKeys proves two different keys never
+// bleed into each other — the stale-cursor-bleed guard the old
+// target-based mechanism used to provide, now provided by key derivation
+// (connstore.Target.Key()/catchUpKeyForRelay) instead of a same-target
+// comparison.
+func TestSetCatchUpKeyIsolatesDifferentKeys(t *testing.T) {
+	if err := connstore.SetCatchUpCursor("key-a", "cursor-1"); err != nil {
+		t.Fatalf("SetCatchUpCursor: %v", err)
+	}
+
+	hub := NewHub()
+	hub.setCatchUpKey("key-b")
+
+	hub.mu.Lock()
+	got := hub.lastHandedOverCursor
+	hub.mu.Unlock()
+	if got != "" {
+		t.Fatalf("expected key-b to have no position of its own, got %q", got)
+	}
+}
+
+// TestCatchUpKeyForRelayIsProjectScopedAndStableAcrossReconnectSecret
+// proves the derivation used for teams_relay_connect sessions: the same
+// link (minus its "#"-delimited secret, which changes meaning nothing —
+// see hubconn.DialRelay) in the same project always derives the same
+// key, and a different project derives a different one — the same
+// collision-avoidance discipline connstore.Target already applies to
+// plain hub_connect sessions.
+func TestCatchUpKeyForRelayIsProjectScopedAndStableAcrossReconnectSecret(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("MCP_HUB_PROJECT_DIR", "/project/a")
+	k1 := catchUpKeyForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-1")
+	k2 := catchUpKeyForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-2")
+	if k1 != k2 {
+		t.Fatalf("expected the same key regardless of the link's secret, got %q vs %q", k1, k2)
+	}
+
+	t.Setenv("MCP_HUB_PROJECT_DIR", "/project/b")
+	k3 := catchUpKeyForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-1")
+	if k3 == k1 {
+		t.Fatalf("expected a different key for a different project, got the same: %q", k3)
+	}
 }

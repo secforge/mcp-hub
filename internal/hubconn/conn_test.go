@@ -62,35 +62,6 @@ func TestDecodeEventCarriesReplyToAndReplyPreview(t *testing.T) {
 	}
 }
 
-func TestDecodeEventCarriesHistoryCompleteCounts(t *testing.T) {
-	hc := wire.HistoryComplete{Type: wire.TypeHistoryComplete, Count: 5, Oldest: "c1", Newest: "c5"}
-	raw, err := json.Marshal(hc)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	ev, ok := DecodeEvent(raw)
-	if !ok {
-		t.Fatal("expected DecodeEvent to succeed")
-	}
-	if ev.Kind != "historyComplete" || ev.HistoryCount != 5 || ev.HistoryOldest != "c1" || ev.HistoryNewest != "c5" {
-		t.Fatalf("unexpected decoded event: %+v", ev)
-	}
-}
-
-func TestDecodeEventCarriesHistoryBegin(t *testing.T) {
-	raw, err := json.Marshal(wire.NewHistoryBegin(5, "c1", "c5"))
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	ev, ok := DecodeEvent(raw)
-	if !ok {
-		t.Fatal("expected DecodeEvent to succeed")
-	}
-	if ev.Kind != "historyBegin" || ev.HistoryCount != 5 || ev.HistoryOldest != "c1" || ev.HistoryNewest != "c5" {
-		t.Fatalf("unexpected decoded event: %+v", ev)
-	}
-}
-
 func TestDecodeEventCarriesMentions(t *testing.T) {
 	m := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "hi @alice", "ts", nil, "", "")
 	m.Mentions = []wire.Mention{{Name: "Alice", ID: "dir-1"}}
@@ -1306,7 +1277,6 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 		historical := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "old news", "ts", nil, "", "")
 		historical.Historical = true
 		conn.WriteJSON(historical)
-		conn.WriteJSON(wire.NewHistoryComplete())
 		conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "nope", Code: "revoked", Retryable: false})
 		conn.WriteJSON(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "ext-1", OK: true})
 		conn.WriteJSON(wire.ReactionChanged{
@@ -1354,9 +1324,6 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 	if !strings.Contains(formatted, "[HUB HISTORY") {
 		t.Fatalf("expected the historical msg to render distinctly, got: %s", formatted)
 	}
-	if !strings.Contains(formatted, "[hub: history request complete]") {
-		t.Fatalf("expected historyComplete to render, got: %s", formatted)
-	}
 	if !strings.Contains(formatted, "code=revoked, retryable=false") {
 		t.Fatalf("expected the error's code/retryable to render, got: %s", formatted)
 	}
@@ -1383,99 +1350,6 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 	}
 }
 
-func TestRequestHistorySendsHistoryMessage(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	gotHistory := make(chan wire.History, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
-		var h wire.History
-		if err := conn.ReadJSON(&h); err == nil {
-			gotHistory <- h
-		}
-		time.Sleep(2 * time.Second)
-	}))
-	defer srv.Close()
-
-	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer c.Close()
-
-	if err := c.RequestHistory("cursor-9", 25); err != nil {
-		t.Fatalf("RequestHistory: %v", err)
-	}
-
-	select {
-	case h := <-gotHistory:
-		if h.Before != "cursor-9" || h.Limit != 25 {
-			t.Fatalf("unexpected history request: %+v", h)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("server never received the history request")
-	}
-}
-
-func TestRequestHistoryAfterSendsAfterField(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	gotHistory := make(chan wire.History, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, HistoryAfter: true})
-		var h wire.History
-		if err := conn.ReadJSON(&h); err == nil {
-			gotHistory <- h
-		}
-		time.Sleep(2 * time.Second)
-	}))
-	defer srv.Close()
-
-	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer c.Close()
-
-	if !c.HistoryAfterSupported() {
-		t.Fatal("expected HistoryAfterSupported to be true when joined.historyAfter is set")
-	}
-	if err := c.RequestHistoryAfter("cursor-9", 25); err != nil {
-		t.Fatalf("RequestHistoryAfter: %v", err)
-	}
-
-	select {
-	case h := <-gotHistory:
-		if h.After != "cursor-9" || h.Before != "" || h.Limit != 25 {
-			t.Fatalf("unexpected history request: %+v", h)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("server never received the history request")
-	}
-}
-
-func TestHistoryAfterSupportedFalseByDefault(t *testing.T) {
-	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer c.Close()
-
-	if c.HistoryAfterSupported() {
-		t.Fatal("expected HistoryAfterSupported to be false against a plain mcp-hub-server")
-	}
-}
 
 func TestReactSendsReactionMessage(t *testing.T) {
 	upgrader := websocket.Upgrader{}
@@ -1764,11 +1638,8 @@ func TestBridgeFieldsOnJoinedFlowThroughToAccessors(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		cursor := "cursor-9"
 		topic := "Support chat"
 		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
-		j.LatestCursor = &cursor
-		j.HistoryLimitMax = 50
 		j.CanSend = true
 		j.ConversationKind = "oneOnOne"
 		j.Topic = &topic
@@ -1784,12 +1655,6 @@ func TestBridgeFieldsOnJoinedFlowThroughToAccessors(t *testing.T) {
 	}
 	defer c.Close()
 
-	if got := c.LatestCursor(); got == nil || *got != "cursor-9" {
-		t.Fatalf("got LatestCursor %v", got)
-	}
-	if c.HistoryLimitMax() != 50 {
-		t.Fatalf("got HistoryLimitMax %d", c.HistoryLimitMax())
-	}
 	if !c.CanSend() {
 		t.Fatal("expected CanSend true")
 	}
@@ -1809,12 +1674,9 @@ func TestBridgeFieldsAreZeroForAnOrdinaryConnect(t *testing.T) {
 	}
 	defer c.Close()
 
-	if got := c.LatestCursor(); got != nil {
-		t.Fatalf("expected nil LatestCursor for mcp-hub-server, got %v", *got)
-	}
-	if c.HistoryLimitMax() != 0 || c.CanSend() || c.ConversationKind() != "" || c.Topic() != nil {
-		t.Fatalf("expected all bridge fields zero, got HistoryLimitMax=%d CanSend=%v "+
-			"ConversationKind=%q Topic=%v", c.HistoryLimitMax(), c.CanSend(), c.ConversationKind(), c.Topic())
+	if c.CanSend() || c.ConversationKind() != "" || c.Topic() != nil {
+		t.Fatalf("expected all bridge fields zero, got CanSend=%v "+
+			"ConversationKind=%q Topic=%v", c.CanSend(), c.ConversationKind(), c.Topic())
 	}
 }
 

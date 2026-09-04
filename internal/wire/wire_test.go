@@ -14,7 +14,7 @@ func TestJoinedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","peerCount":3,"serverVersion":1}` {
+	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","peerCount":3,"serverVersion":2}` {
 		t.Fatalf("unexpected json: %s", got)
 	}
 	typ, err := DecodeType(raw)
@@ -45,12 +45,14 @@ func TestNewJoinedStampsCurrentProtocolVersion(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionIsOne(t *testing.T) {
-	// The explicit baseline: everything shipped before version exchange
-	// existed is retroactively "v1", and absence of a client-sent version
-	// must be treated as v1 too (see wsserver's clientVersion parsing).
-	if ProtocolVersion != 1 {
-		t.Fatalf("got ProtocolVersion %d, want 1", ProtocolVersion)
+func TestProtocolVersionIsCurrent(t *testing.T) {
+	// Bumped 2026-09-04 when History/HistoryBegin/HistoryComplete were
+	// removed in favor of MessageAfter — see ProtocolVersion's doc
+	// comment. A client/server that doesn't send a version at all is
+	// still treated as v1 (see wsserver's clientVersion parsing) — that
+	// baseline is unaffected by this bump.
+	if ProtocolVersion != 2 {
+		t.Fatalf("got ProtocolVersion %d, want 2", ProtocolVersion)
 	}
 }
 
@@ -118,17 +120,11 @@ func TestPeerJoinedIncludesNameAndAgePublicKey(t *testing.T) {
 
 func TestJoinedDecodesBridgeFields(t *testing.T) {
 	raw := []byte(`{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000",` +
-		`"peerCount":0,"serverVersion":1,"latestCursor":"cursor-9","historyLimitMax":50,` +
+		`"peerCount":0,"serverVersion":1,` +
 		`"canSend":true,"conversationKind":"oneOnOne","topic":"Support chat"}`)
 	var j Joined
 	if err := json.Unmarshal(raw, &j); err != nil {
 		t.Fatalf("unmarshal: %v", err)
-	}
-	if j.LatestCursor == nil || *j.LatestCursor != "cursor-9" {
-		t.Fatalf("got LatestCursor %v", j.LatestCursor)
-	}
-	if j.HistoryLimitMax != 50 {
-		t.Fatalf("got HistoryLimitMax %d", j.HistoryLimitMax)
 	}
 	if !j.CanSend {
 		t.Fatal("expected CanSend true")
@@ -144,7 +140,7 @@ func TestJoinedDecodesBridgeFields(t *testing.T) {
 func TestJoinedOmitsBridgeFieldsWhenUnset(t *testing.T) {
 	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
 	raw, _ := json.Marshal(j)
-	for _, field := range []string{"latestCursor", "historyLimitMax", "canSend", "conversationKind", "topic"} {
+	for _, field := range []string{"canSend", "conversationKind", "topic"} {
 		if strings.Contains(string(raw), field) {
 			t.Fatalf("expected %q to be omitted from a plain hub_connect joined, got: %s", field, raw)
 		}
@@ -156,117 +152,6 @@ func TestPeerJoinedOmitsEmptyNameAndAgePublicKey(t *testing.T) {
 	raw, _ := json.Marshal(pe)
 	if got := string(raw); got != `{"type":"peerJoined","peerId":"peer-1"}` {
 		t.Fatalf("expected empty name/agePublicKey to be omitted, got: %s", got)
-	}
-}
-
-func TestHistoryRequestRoundTrip(t *testing.T) {
-	h := NewHistoryRequest("cursor-123", 50)
-	raw, err := json.Marshal(h)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if got := string(raw); got != `{"type":"history","before":"cursor-123","limit":50}` {
-		t.Fatalf("unexpected marshal: %s", got)
-	}
-	var decoded History
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if decoded.Before != "cursor-123" || decoded.Limit != 50 {
-		t.Fatalf("unexpected round trip: %+v", decoded)
-	}
-}
-
-func TestHistoryRequestOmitsEmptyBefore(t *testing.T) {
-	h := NewHistoryRequest("", 50)
-	raw, _ := json.Marshal(h)
-	if got := string(raw); got != `{"type":"history","limit":50}` {
-		t.Fatalf("expected empty before to be omitted, got: %s", got)
-	}
-}
-
-func TestHistoryAfterRequestRoundTrip(t *testing.T) {
-	h := NewHistoryAfterRequest("cursor-123", 50)
-	raw, err := json.Marshal(h)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if got := string(raw); got != `{"type":"history","after":"cursor-123","limit":50}` {
-		t.Fatalf("unexpected marshal: %s", got)
-	}
-	var decoded History
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if decoded.After != "cursor-123" || decoded.Before != "" || decoded.Limit != 50 {
-		t.Fatalf("unexpected round trip: %+v", decoded)
-	}
-}
-
-func TestJoinedDecodesHistoryAfter(t *testing.T) {
-	raw := []byte(`{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000",` +
-		`"peerCount":0,"serverVersion":1,"historyAfter":true}`)
-	var j Joined
-	if err := json.Unmarshal(raw, &j); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !j.HistoryAfter {
-		t.Fatal("expected HistoryAfter true")
-	}
-}
-
-func TestJoinedOmitsHistoryAfterWhenUnset(t *testing.T) {
-	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
-	raw, _ := json.Marshal(j)
-	if strings.Contains(string(raw), "historyAfter") {
-		t.Fatalf("expected historyAfter to be omitted from a plain hub_connect joined, got: %s", raw)
-	}
-}
-
-func TestHistoryCompleteRoundTrip(t *testing.T) {
-	raw, _ := json.Marshal(NewHistoryComplete())
-	if got := string(raw); got != `{"type":"historyComplete"}` {
-		t.Fatalf("unexpected marshal: %s", got)
-	}
-	typ, err := DecodeType(raw)
-	if err != nil || typ != TypeHistoryComplete {
-		t.Fatalf("expected type %q, got %q (err=%v)", TypeHistoryComplete, typ, err)
-	}
-}
-
-func TestHistoryCompleteWithCountsRoundTrip(t *testing.T) {
-	hc := HistoryComplete{Type: TypeHistoryComplete, Count: 3, Oldest: "cursor-1", Newest: "cursor-3"}
-	raw, err := json.Marshal(hc)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var decoded HistoryComplete
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if decoded.Count != 3 || decoded.Oldest != "cursor-1" || decoded.Newest != "cursor-3" {
-		t.Fatalf("unexpected round trip: %+v", decoded)
-	}
-}
-
-func TestHistoryBeginRoundTrip(t *testing.T) {
-	raw, err := json.Marshal(NewHistoryBegin(3, "cursor-1", "cursor-3"))
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var decoded HistoryBegin
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if decoded.Type != TypeHistoryBegin || decoded.Count != 3 || decoded.Oldest != "cursor-1" || decoded.Newest != "cursor-3" {
-		t.Fatalf("unexpected round trip: %+v", decoded)
-	}
-}
-
-func TestHistoryBeginOmitsFieldsWhenEmpty(t *testing.T) {
-	raw, _ := json.Marshal(NewHistoryBegin(0, "", ""))
-	if got := string(raw); got != `{"type":"historyBegin"}` {
-		t.Fatalf("unexpected marshal: %s", got)
 	}
 }
 
@@ -571,6 +456,101 @@ func TestMessageEditedMentionsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMessageAfterCursorRoundTrip(t *testing.T) {
+	raw, err := json.Marshal(NewMessageAfterCursor("cursor-1"))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded MessageAfter
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Type != TypeMessageAfter || decoded.Cursor != "cursor-1" || decoded.At != "" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+	if strings.Contains(string(raw), `"at"`) {
+		t.Fatalf("expected at to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestMessageAfterAtRoundTrip(t *testing.T) {
+	raw, err := json.Marshal(NewMessageAfterAt("2026-09-04T13:00:00Z"))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded MessageAfter
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Type != TypeMessageAfter || decoded.At != "2026-09-04T13:00:00Z" || decoded.Cursor != "" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+	if strings.Contains(string(raw), `"cursor"`) {
+		t.Fatalf("expected cursor to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestNoMoreMessagesRoundTrip(t *testing.T) {
+	raw, err := json.Marshal(NewNoMoreMessages(Anchor{Cursor: "cursor-1"}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded NoMoreMessages
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Type != TypeNoMoreMessages || decoded.Answers == nil || decoded.Answers.Cursor != "cursor-1" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMsgAnswersRoundTrip(t *testing.T) {
+	m := NewOutgoingMsg("hi")
+	m.Answers = &Anchor{Cursor: "cursor-1"}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Msg
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Answers == nil || decoded.Answers.Cursor != "cursor-1" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestMsgOmitsAnswersWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewOutgoingMsg("hi"))
+	if strings.Contains(string(raw), "answers") {
+		t.Fatalf("expected answers to be omitted when unset, got: %s", raw)
+	}
+}
+
+func TestJoinedBehindRoundTrip(t *testing.T) {
+	j := NewJoined("peer-1", 0, "", "")
+	j.Behind = 3
+	j.BehindSince = "2026-09-01T09:12:00Z"
+	raw, err := json.Marshal(j)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Joined
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Behind != 3 || decoded.BehindSince != "2026-09-01T09:12:00Z" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestJoinedOmitsBehindWhenZero(t *testing.T) {
+	raw, _ := json.Marshal(NewJoined("peer-1", 0, "", ""))
+	if strings.Contains(string(raw), "behind") {
+		t.Fatalf("expected behind/behindSince to be omitted when unset, got: %s", raw)
+	}
+}
+
 func TestJoinedSystemPeerIDRoundTrip(t *testing.T) {
 	j := NewJoined("peer-1", 0, "", "")
 	j.SystemPeerID = "00000000-0000-0000-0000-000000000000"
@@ -672,7 +652,7 @@ func TestMessageEditedAttachmentsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestReactionEditDeleteHistoryCarryAckCursor(t *testing.T) {
+func TestReactionEditDeleteCarryAckCursor(t *testing.T) {
 	r := NewReactionRequest("ext-1", "thumbsup", "add")
 	r.AckCursor = "cursor-r"
 	if raw, _ := json.Marshal(r); !strings.Contains(string(raw), `"ackCursor":"cursor-r"`) {
@@ -689,12 +669,6 @@ func TestReactionEditDeleteHistoryCarryAckCursor(t *testing.T) {
 	d.AckCursor = "cursor-d"
 	if raw, _ := json.Marshal(d); !strings.Contains(string(raw), `"ackCursor":"cursor-d"`) {
 		t.Fatalf("expected Delete to carry ackCursor, got: %s", raw)
-	}
-
-	h := NewHistoryRequest("", 10)
-	h.AckCursor = "cursor-h"
-	if raw, _ := json.Marshal(h); !strings.Contains(string(raw), `"ackCursor":"cursor-h"`) {
-		t.Fatalf("expected History to carry ackCursor, got: %s", raw)
 	}
 }
 

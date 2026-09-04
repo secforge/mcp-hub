@@ -34,9 +34,6 @@ const (
 	TypePeerJoined      Type = "peerJoined"
 	TypePeerLeft        Type = "peerLeft"
 	TypeRosterComplete  Type = "rosterComplete"
-	TypeHistory         Type = "history"
-	TypeHistoryBegin    Type = "historyBegin"
-	TypeHistoryComplete Type = "historyComplete"
 	TypeSendAck         Type = "sendAck"
 	TypeReactionChanged Type = "reactionChanged"
 	TypeMessageEdited   Type = "messageEdited"
@@ -50,6 +47,8 @@ const (
 	TypeAck             Type = "ack"
 	TypeAttachment      Type = "attachment"
 	TypeAttachmentData  Type = "attachmentData"
+	TypeMessageAfter    Type = "messageAfter"
+	TypeNoMoreMessages  Type = "noMoreMessages"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -61,7 +60,19 @@ const (
 // (e.g. the "?v=" query param is absent) is treated as version 1 — that is
 // the deliberate, permanent backward-compatible baseline, not a fallback
 // that will later change meaning.
-const ProtocolVersion = 1
+//
+// Bumped to 2 on 2026-09-04 when History/HistoryBegin/HistoryComplete were
+// removed in favor of MessageAfter: a client that only knows how to
+// request `history` can no longer be served (there is nothing left to
+// answer it), and a server that only knows how to answer `history` can no
+// longer serve a client that only knows `messageAfter` (no forward-paging
+// fallback remains either). That's the genuinely-breaking case this
+// mismatch exists to catch — a version-mismatch peer gets a clear
+// "tell the user to update" note at connect time (see handleConnect's and
+// handleTeamsRelayConnect's versionNote) rather than a silent hang or a
+// confusing "server doesn't understand this request" failure the first
+// time it tries to page.
+const ProtocolVersion = 2
 
 type envelope struct {
 	Type Type `json:"type"`
@@ -100,27 +111,18 @@ type Joined struct {
 	// teams_relay_connect) backed by a channel with real history and
 	// send-permission policy — mcp-hub-server never sets any of them, since
 	// none apply to an ordinary hub session.
+	//
+	// LatestCursor/HistoryAfter/HistoryLimitMax (the History request/
+	// response capability-advertisement fields) were removed 2026-09-04
+	// when the History mechanism itself was removed in favor of
+	// MessageAfter (§2.6a) — MessageAfter needs no capability
+	// advertisement at all (no before/after/limit to negotiate, no
+	// "does this server support forward paging" question), which was
+	// part of its own justification. Behind/BehindSince below serve
+	// LatestCursor's original purpose ("how far behind am I") more
+	// directly, computed by the server rather than left for the client
+	// to infer from a bare cursor.
 
-	// LatestCursor is the cursor of the newest message the server
-	// currently holds, or nil if there are none yet (a channel can exist
-	// with nothing in it). Purely informational and opaque: it lets a
-	// model that remembers an earlier cursor from a prior connection tell
-	// whether it's behind without a speculative History request — nothing
-	// on this side compares cursors automatically.
-	LatestCursor *string `json:"latestCursor,omitempty"`
-	// HistoryAfter advertises whether this server supports History.After —
-	// forward paging, for a reconnecting client to fetch exactly what
-	// arrived after the last cursor it saw, rather than paging backward
-	// with Before (which can only reach older messages, never newer ones,
-	// and so cannot fill a reconnect gap). False (the default, including
-	// every mcp-hub-server) means only Before is supported; a client must
-	// fall back to hub_history() with no cursor (the most recent page)
-	// instead, which may not cover the whole gap for a long disconnect.
-	HistoryAfter bool `json:"historyAfter,omitempty"`
-	// HistoryLimitMax is the server's cap on a single History request's
-	// limit — asking for more just returns this many, not an error. Zero
-	// means the server didn't set one (including every mcp-hub-server).
-	HistoryLimitMax int `json:"historyLimitMax,omitempty"`
 	// CanSend reports whether sending is currently permitted in this
 	// conversation. A snapshot at connect time, not a guarantee — it can
 	// go stale mid-session (e.g. an external participant joins), so a
@@ -143,6 +145,26 @@ type Joined struct {
 	// Empty when a server has no such concept (including every
 	// mcp-hub-server, where every peerId is an ordinary participant).
 	SystemPeerID string `json:"systemPeerId,omitempty"`
+	// Behind is how many messages this peer's persisted position (its
+	// own last-acked cursor, server-side) trails the newest message in
+	// this conversation, computed once at connect. Only the server can
+	// answer this — an Anchor/cursor is deliberately opaque to the
+	// client, so a client holding one cannot derive how far behind it
+	// is without walking MessageAfter to find out, which is exactly
+	// what this field lets it avoid. Behind: 0 states "you are caught
+	// up" as a fact at connect time, rather than something inferred
+	// later from an empty MessageAfter answer. Omitted (not zero) when
+	// a server has no such concept — mcp-hub-server and a fresh
+	// connection with no prior position never set it.
+	Behind int `json:"behind,omitempty"`
+	// BehindSince is the timestamp of this peer's last-acked position,
+	// pairing with Behind: Behind says whether to walk (small) or seek
+	// (large) MessageAfter{at:...} from recent context instead;
+	// BehindSince is what a seek is computed from and what labels the
+	// resulting gap (BehindSince..the seek target) as an explicit,
+	// recorded, recoverable-on-demand range rather than a silent loss.
+	// Omitted under the same conditions as Behind.
+	BehindSince string `json:"behindSince,omitempty"`
 }
 
 func NewJoined(peerID string, peerCount int, name, agePublicKey string) Joined {
@@ -230,6 +252,15 @@ type Msg struct {
 	// so a client never needs to know its own directory id to use this.
 	// mcp-hub-server never sets it.
 	MentionedMe bool `json:"mentionedMe,omitempty"`
+	// Answers is set when this Msg is the answer to a MessageAfter
+	// request — the exact Anchor that was sent, echoed back, never the
+	// resolved message's own cursor/identity (which is already present
+	// as Cursor/ExternalID above and would tell a client nothing the
+	// live form doesn't). Nil for a Msg reached any other way (a
+	// broadcast, History, etc.) — its presence is what tells a client
+	// this frame is the reply to a specific pull, not unrelated traffic,
+	// even if a downstream layer merges the two.
+	Answers *Anchor `json:"answers,omitempty"`
 	// Own, for a bridge session, is true when this exact connection is
 	// the one that sent the message. Deliberately a decision for the
 	// receiving client to act on, not the server: whether to skip waking
@@ -565,105 +596,104 @@ func NewRosterComplete() RosterComplete {
 // takes precedence if a server receives both, but a well-behaved client
 // never sends both at once); both are server-defined opaque cursors,
 // exclusive of the boundary message itself.
+// History (before/after/limit paging) and its HistoryBegin/HistoryComplete
+// framing were removed 2026-09-04 in favor of MessageAfter below — see
+// Anchor's doc comment for why a position-based anchor made the whole
+// mechanism (a paging verb, a capability-advertisement flag, a leading
+// marker and a trailing marker for the same burst) unnecessary. A client
+// still speaking the old `history` request type is talking to a protocol
+// version this server/client pair no longer implements; see
+// TypeClientOutdated below for how that is now surfaced.
+
+// Anchor is a position in the message stream — the unifying concept
+// behind MessageAfter, replacing History's before/after/limit/
+// historyBegin/historyComplete/count/hasMore with one operation: "the
+// message at a position strictly after this one." Exactly one field is
+// set, never both:
 //
-// Before pages backward: omitted (with After also empty) means "the most
-// recent Limit messages"; otherwise the page ends strictly before it, so a
-// client pages further back by repeatedly passing the oldest cursor it has
-// seen. This can only reach older messages — never newer ones — so it
-// cannot be used to fill a reconnect gap.
+//   - Cursor is an opaque handle, verbatim from a Msg.Cursor this client
+//     already holds. The client never parses, compares, or constructs
+//     one — format and precision are entirely the server's, and may
+//     change without notice (this server used Firebird's (createdAt, id)
+//     composite at spec time; another server's cursor may look nothing
+//     like that). Handing back a cursor you were given can never name a
+//     message in a different conversation or something that never
+//     existed — the position it names is whatever the server encoded,
+//     and "the next message after it" is answerable regardless of
+//     whether the message at that exact position still exists (compare
+//     Anchor.At below: this is the sparse-identity trap Anchor as a
+//     whole exists to avoid — a cursor is a position, not a message
+//     identity, so a deleted or never-existent message at that position
+//     doesn't make the anchor invalid).
+//   - At is a client-chosen instant, RFC 3339 with an explicit UTC
+//     offset (a naive/zoneless timestamp must be refused, not assumed —
+//     see the wire protocol spec's rationale). Unlike Cursor, this is a
+//     coordinate the client legitimately owns: "the first message at or
+//     after this instant" is well-defined for every instant, including
+//     ones no message occupies, so there is no invalid value to guard
+//     against the way there would be for a fabricated cursor.
 //
-// After pages forward, strictly after the given cursor — the page starts
-// immediately past it, so a client resuming after a disconnect gets
-// exactly what arrived while it was away. Only meaningful when the server
-// advertises support via Joined.HistoryAfter; a server that doesn't
-// support it should be sent Before (or nothing) instead.
-//
-// Limit may be capped server-side to less than requested — a server that
-// does so should advertise the cap elsewhere (e.g. on Joined) so a client
-// isn't left guessing why a page came back smaller than asked.
-type History struct {
-	Type   Type   `json:"type"`
-	Before string `json:"before,omitempty"`
-	After  string `json:"after,omitempty"`
-	Limit  int    `json:"limit"`
-	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
-	AckCursor string `json:"ackCursor,omitempty"`
+// A message answering a MessageAfter request, and NoMoreMessages, both
+// echo the Anchor exactly as sent (not the resolved message's own
+// identity) in their own Answers field — this is what lets a client tell
+// a pull's answer apart from unrelated live traffic even if a
+// downstream notification layer merges the two, and what lets more than
+// one walk be in flight without confusing their replies.
+type Anchor struct {
+	Cursor string `json:"cursor,omitempty"`
+	At     string `json:"at,omitempty"`
 }
 
-func NewHistoryRequest(before string, limit int) History {
-	return History{Type: TypeHistory, Before: before, Limit: limit}
-}
-
-// NewHistoryAfterRequest builds a forward-paging History request — see
-// History.After. Only meaningful against a server that set
-// Joined.HistoryAfter true.
-func NewHistoryAfterRequest(after string, limit int) History {
-	return History{Type: TypeHistory, After: after, Limit: limit}
-}
-
-// HistoryComplete is sent once a History request's answering burst of msg
-// events (each carrying Historical: true) has been fully delivered —
-// including an empty burst, so a client at the start of a conversation
-// gets a positive "there is no more" rather than inferring completion from
-// a gap in traffic. Mirrors RosterComplete's role for the initial roster.
+// MessageAfter requests the message at the first stream position
+// strictly after Anchor — see Anchor's doc comment. Exactly one of
+// Anchor.Cursor/Anchor.At must be set; neither is optional, there is no
+// anchor-less form (an empty/omitted anchor was considered and dropped:
+// every request should declare its intent explicitly rather than rely on
+// an implicit default someone has to remember the meaning of).
 //
-// Count/Oldest/Newest exist so a client can tell a truncated READ apart
-// from a truncated SEND — the server-side burst was complete and correct
-// (verified, live, 2026-09-03: a message a client believed it never
-// received was intact in the server's own store and delivered whole; the
-// loss was entirely in a display/notification layer downstream of this
-// client, one that cut a many-event burst to its first few lines with no
-// indication anything was cut). Without a number to check against, "I
-// only see 4 of the 20 events you say you sent" is not something a client
-// can detect on its own — it just looks like a short but complete answer.
-// All three additive/omitempty: an older client/server that doesn't know
-// them loses nothing it had.
-type HistoryComplete struct {
+// The answer is exactly one of:
+//   - a Msg (Historical: true, Answers set to the anchor as sent) — the
+//     next message;
+//   - NoMoreMessages (Answers set to the anchor as sent) — there is no
+//     message at a later position; not an error, this is the normal,
+//     expected way a walk or seek terminates;
+//   - Error{Code: "bad_anchor"} — the anchor string doesn't decode to a
+//     position at all (a corrupted/garbled Cursor, or an At that fails
+//     to parse as an explicit-offset RFC 3339 instant). This is
+//     unreachable for any client that only ever echoes a Cursor it was
+//     actually given and sends a well-formed At — there is no
+//     "unknown message" case, because a position always has a successor
+//     or does not; nothing for the server to fail to recognize.
+//
+// mcp-hub-server has no history concept and never receives this; History
+// (see above) remains available on any server that supports both, for a
+// caller (a UI, a bulk backfill) that isn't an LLM client and doesn't
+// need the small-page discipline MessageAfter's consumers impose on
+// themselves — see the design doc for why mcp-hub-client's own
+// consumption of this deliberately never requests more than one message
+// per call, even though the wire itself has no such limit.
+type MessageAfter struct {
 	Type Type `json:"type"`
-	// Count is how many msg events this burst delivered (0 for an empty
-	// burst — still sent, not omitted, so "no history" is also
-	// positively confirmed). Compare against however many Historical
-	// events were actually seen since the matching History request; a
-	// mismatch means something between the server and this exact reading
-	// of it was lost, and hub_history(before/after: <the gap>) is how to
-	// recover it, not just re-reading the same notification.
-	Count int `json:"count,omitempty"`
-	// Oldest/Newest are the delivered burst's own cursor range (its
-	// first and last Msg.Cursor, in delivery order) — omitted along with
-	// Count when the burst was empty. A client that already holds a
-	// cursor from further back than Oldest knows this page didn't reach
-	// far enough and should page again with before/after.
-	Oldest string `json:"oldest,omitempty"`
-	Newest string `json:"newest,omitempty"`
+	Anchor
 }
 
-func NewHistoryComplete() HistoryComplete {
-	return HistoryComplete{Type: TypeHistoryComplete}
+func NewMessageAfterCursor(cursor string) MessageAfter {
+	return MessageAfter{Type: TypeMessageAfter, Anchor: Anchor{Cursor: cursor}}
 }
 
-// HistoryBegin is an optional leading counterpart to HistoryComplete, sent
-// (if a server implements it) BEFORE a History request's answering burst
-// of msg events rather than after — same Count/Oldest/Newest fields,
-// known ahead of the loop since the page is materialized before it's
-// streamed out. The reason for a second frame carrying the same
-// information twice: a downstream display/notification layer that
-// truncates a long burst overwhelmingly cuts the TAIL, not the head
-// (confirmed live, 2026-09-03), so a trailing-only marker is truncated
-// away in exactly the scenario it exists to catch. A leading marker
-// survives a tail cut; the trailing HistoryComplete survives a (rarer)
-// head cut; a client holding both can also catch a middle cut by
-// comparing them. Not sent by any server today — additive/optional, so a
-// server that doesn't implement it is unaffected, and a client that
-// doesn't recognize this type ignores it like any other unknown frame.
-type HistoryBegin struct {
-	Type   Type   `json:"type"`
-	Count  int    `json:"count,omitempty"`
-	Oldest string `json:"oldest,omitempty"`
-	Newest string `json:"newest,omitempty"`
+func NewMessageAfterAt(at string) MessageAfter {
+	return MessageAfter{Type: TypeMessageAfter, Anchor: Anchor{At: at}}
 }
 
-func NewHistoryBegin(count int, oldest, newest string) HistoryBegin {
-	return HistoryBegin{Type: TypeHistoryBegin, Count: count, Oldest: oldest, Newest: newest}
+// NoMoreMessages answers a MessageAfter whose anchor has no successor —
+// see MessageAfter's doc comment. Answers echoes the anchor as sent.
+type NoMoreMessages struct {
+	Type    Type    `json:"type"`
+	Answers *Anchor `json:"answers,omitempty"`
+}
+
+func NewNoMoreMessages(answers Anchor) NoMoreMessages {
+	return NoMoreMessages{Type: TypeNoMoreMessages, Answers: &answers}
 }
 
 // Ack is a standalone read receipt — the same information Msg/Reaction/

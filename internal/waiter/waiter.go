@@ -66,6 +66,21 @@ type Waiter struct {
 // unrelated directory used by hublog/identitystore — is commonly set.
 var socketDir = os.TempDir()
 
+// liveEmissionSpacing is the minimum delay between successive writes
+// within one deliver() call to a follow-mode connection — see deliver's
+// use of it. Set to comfortably exceed 2x Monitor's own documented
+// ~200ms stdout-batching window: per the math worked out live,
+// 2026-09-04 (a delay exceeding a coalescing window means no two of this
+// process's writes can share one, for either a fixed-tick or a debounce
+// implementation of that window), this makes pairwise merging of two
+// deliveries from this waiter structurally impossible rather than merely
+// less likely — PROVIDED that 200ms figure is accurate and stable, which
+// is the harness's own documented constant, not something independently
+// measured here. Only applied between multiple chunks in the same
+// delivery; a single event (the ordinary case) is written immediately,
+// with no added latency at all. Var so tests can shrink it.
+var liveEmissionSpacing = 500 * time.Millisecond
+
 // SocketDirForTesting overrides the directory wait sockets are created in
 // (and swept from), returning a restore function. For use by *other*
 // packages' tests that exercise a real Listen() call indirectly (e.g.
@@ -281,7 +296,16 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 		writeAndClose(rw.conn, w.disconnectedMessage())
 		return
 	}
-	for _, c := range chunks {
+	for i, c := range chunks {
+		// liveEmissionSpacing between successive writes in the same
+		// delivery — not before the first, which stays immediate (the
+		// common single-event case pays no latency at all). See its own
+		// doc comment for why this closes, rather than merely reduces,
+		// the downstream-coalescing merge class — provided the harness's
+		// documented batching window is accurate.
+		if i > 0 {
+			time.Sleep(liveEmissionSpacing)
+		}
 		if _, err := rw.conn.Write([]byte(c + "\n\n")); err != nil {
 			rw.conn.Close()
 			return
