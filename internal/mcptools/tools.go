@@ -99,6 +99,23 @@ func NewHub() *Hub {
 	return &Hub{}
 }
 
+// messageStyleNote is appended to the description of every tool that
+// composes outbound message text (hub_send, hub_edit). The other side of a
+// hub session is a chat window — often a real one, via a bridge — where a
+// multi-paragraph answer reads as a wall of text and where markup support
+// varies by platform and may be rendered literally.
+const messageStyleNote = "\n\nSTYLE: keep the message short — a chat turn, not a " +
+	"document. Answer, then stop: no preamble, no restating the question, no summary " +
+	"of what you are about to do. A few sentences is normal; several paragraphs is not. " +
+	"If the full answer really is long, send the conclusion first and offer the detail " +
+	"rather than dumping it unasked. Markup: plain text by default, and at most a light " +
+	"markdown subset — **bold** for a key term, `code` for identifiers/paths/commands, a " +
+	"short dash- or hyphen-prefixed list where items genuinely are a list, and a fenced " +
+	"code block only for actual code or output. Avoid headings, tables, nested lists, " +
+	"blockquotes and emphasis-for-decoration: the receiving platform may not render them, " +
+	"in which case the raw characters show up as noise. Use markup where it removes " +
+	"ambiguity, not to structure a short answer that reads fine as prose."
+
 // startupConnectionsNote returns text to append to hub_connect's own
 // description when connstore has any entry still marked Connected from a
 // prior process — computed once, when Register() runs, i.e. at process
@@ -447,7 +464,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"nothing arrives in time it falls back to a plain confirmation, with the actual "+
 				"outcome then arriving later via wait/hub_receive/hub_wait instead. On a plain "+
 				"hub_connect session this always returns immediately, since mcp-hub-server has no "+
-				"equivalent asynchronous confirmation to wait for"),
+				"equivalent asynchronous confirmation to wait for"+messageStyleNote),
 			mcp.WithString("text", mcp.Required(), mcp.Description("Message text")),
 			mcp.WithString("to", mcp.Description(
 				"Optional peerId to send this privately to a single peer instead of "+
@@ -583,7 +600,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"messages, and that's enforced by the platform, not pre-judged here. Errors if not "+
 				"connected. On a bridge session this call itself waits briefly for the real outcome "+
 				"and reports it directly, falling back to an async confirmation (see hub_react) if "+
-				"nothing arrives in time"),
+				"nothing arrives in time"+messageStyleNote),
 			mcp.WithString("externalId", mcp.Required(), mcp.Description(
 				"The target message's externalId, from an earlier msg or sendAck event")),
 			mcp.WithString("text", mcp.Required(), mcp.Description("The new message content")),
