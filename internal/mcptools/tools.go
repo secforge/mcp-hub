@@ -109,6 +109,57 @@ const messageStyleNote = "\n\nSTYLE: keep the message short — a chat turn, not
 	"If the full answer really is long, send the conclusion first and offer the detail " +
 	"rather than dumping it unasked."
 
+// mentionsToolDescription documents hub_send/hub_edit's "mentions" parameter
+// — a chat-relay extension (see the wire spec's §8), not part of the core
+// wire protocol. Kept in sync with httpmcp's description of the same name.
+const mentionsToolDescription = "Optional, server-specific: real platform-native @-mentions to " +
+	"attach — a chat-relay extension. Each entry sets exactly one of id (the platform's own " +
+	"directory id), peerId (a hub peerId, resolved server-side to that peer's own identity), " +
+	"or name (a display name — refused if ambiguous, never guessed); optionally text, the exact " +
+	"substring already present in this message's own text to turn into the mention (defaults " +
+	"to \"@\" + the resolved display name if omitted). A server that doesn't implement this " +
+	"simply ignores the field; one that does refuses the WHOLE send/edit (not a partial one " +
+	"without the mention) if any entry violates these rules."
+
+// parseMentions decodes the "mentions" tool argument (a JSON array of
+// objects, as delivered by mcp-go's GetArguments) into wire.Mention
+// entries, validating the exactly-one-of id/peerId/name rule client-side
+// — malformed input here is a clear MCP-level error, not something to
+// discover only via an async server refusal. Kept in sync with httpmcp's
+// function of the same name. Nil input is a no-op (no mentions), not an
+// error.
+func parseMentions(raw any) ([]wire.Mention, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("mentions must be an array")
+	}
+	mentions := make([]wire.Mention, 0, len(items))
+	for i, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("mentions[%d] must be an object", i)
+		}
+		id, _ := obj["id"].(string)
+		peerID, _ := obj["peerId"].(string)
+		name, _ := obj["name"].(string)
+		text, _ := obj["text"].(string)
+		set := 0
+		for _, v := range []string{id, peerID, name} {
+			if v != "" {
+				set++
+			}
+		}
+		if set != 1 {
+			return nil, fmt.Errorf("mentions[%d] must set exactly one of id, peerId, or name", i)
+		}
+		mentions = append(mentions, wire.Mention{ID: id, PeerID: peerID, Name: name, Text: text})
+	}
+	return mentions, nil
+}
+
 // startupConnectionsNote returns text to append to hub_connect's own
 // description when connstore has any entry still marked Connected from a
 // prior process — computed once, when Register() runs, i.e. at process
@@ -495,6 +546,18 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"outright (nothing sent) for an unrecognized, foreign, or malformed value, "+
 					"since resolving the citation can surface that message's own preview text. "+
 					"mcp-hub-server's own relay ignores this field entirely")),
+			mcp.WithArray("mentions",
+				mcp.Description(mentionsToolDescription),
+				mcp.Items(map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":     map[string]any{"type": "string"},
+						"peerId": map[string]any{"type": "string"},
+						"name":   map[string]any{"type": "string"},
+						"text":   map[string]any{"type": "string"},
+					},
+				}),
+			),
 		),
 		h.handleSend,
 	)
@@ -620,6 +683,20 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"attachments, most servers can add or change a citation on an existing message "+
 					"even though they cannot add an image on edit — but that is server-specific, "+
 					"not guaranteed here")),
+			mcp.WithArray("mentions",
+				mcp.Description(mentionsToolDescription+" Omitted entirely leaves existing "+
+					"mentions as they are, same as attachments — there is no way to clear mentions "+
+					"via edit either."),
+				mcp.Items(map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":     map[string]any{"type": "string"},
+						"peerId": map[string]any{"type": "string"},
+						"name":   map[string]any{"type": "string"},
+						"text":   map[string]any{"type": "string"},
+					},
+				}),
+			),
 		),
 		h.handleEdit,
 	)
@@ -1226,7 +1303,11 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	ev, ok, err := conn.SendAwaitingAck(text, to, attachments, req.GetString("format", ""), req.GetString("replyTo", ""))
+	mentions, err := parseMentions(req.GetArguments()["mentions"])
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	ev, ok, err := conn.SendAwaitingAck(text, to, attachments, req.GetString("format", ""), req.GetString("replyTo", ""), mentions)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("send failed: %v", err)), nil
 	}
@@ -1701,7 +1782,11 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	ev, ok, err := conn.EditMessageAwaitingAck(externalID, text, attachments, req.GetString("format", ""), req.GetString("replyTo", ""))
+	mentions, err := parseMentions(req.GetArguments()["mentions"])
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	ev, ok, err := conn.EditMessageAwaitingAck(externalID, text, attachments, req.GetString("format", ""), req.GetString("replyTo", ""), mentions)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("edit request failed: %v", err)), nil
 	}

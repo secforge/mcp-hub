@@ -201,11 +201,11 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 			if logger != nil {
 				logger.Append(peerID, m.Text, ts)
 			}
-			session.Broadcast(p, wire.NewBroadcastMsg(peerID, m.Text, ts, m.Attachments, m.Format, m.ReplyTo))
+			session.Broadcast(p, wire.NewBroadcastMsg(peerID, m.Text, ts, m.Attachments, m.Format, m.ReplyTo, m.Mentions))
 			continue
 		}
 
-		if err := session.DeliverTo(p, m.To, wire.NewDirectedMsg(peerID, m.Text, ts, m.Attachments, m.Format, m.ReplyTo)); err != nil {
+		if err := session.DeliverTo(p, m.To, wire.NewDirectedMsg(peerID, m.Text, ts, m.Attachments, m.Format, m.ReplyTo, m.Mentions)); err != nil {
 			conn.WriteJSON(wire.NewError(err.Error()))
 			continue
 		}

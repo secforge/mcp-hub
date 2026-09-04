@@ -57,7 +57,7 @@ func TestProtocolVersionIsCurrent(t *testing.T) {
 }
 
 func TestBroadcastMsgFields(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hello", "2026-08-21T10:00:00Z", nil, "", "")
+	m := NewBroadcastMsg("peer-1", "hello", "2026-08-21T10:00:00Z", nil, "", "", nil)
 	raw, _ := json.Marshal(m)
 	var decoded Msg
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -85,7 +85,7 @@ func TestOutgoingDirectedMsgHasTo(t *testing.T) {
 }
 
 func TestDirectedMsgIsMarkedPrivate(t *testing.T) {
-	m := NewDirectedMsg("peer-1", "hello", "2026-08-21T10:00:00Z", nil, "", "")
+	m := NewDirectedMsg("peer-1", "hello", "2026-08-21T10:00:00Z", nil, "", "", nil)
 	raw, _ := json.Marshal(m)
 	var decoded Msg
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -100,7 +100,7 @@ func TestDirectedMsgIsMarkedPrivate(t *testing.T) {
 }
 
 func TestBroadcastMsgIsNotPrivate(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hello", "ts", nil, "", "")
+	m := NewBroadcastMsg("peer-1", "hello", "ts", nil, "", "", nil)
 	if m.Private {
 		t.Fatal("broadcast messages must not be marked private")
 	}
@@ -279,7 +279,7 @@ func TestAttachmentRequestDataRoundTrip(t *testing.T) {
 
 func TestEditWithAttachmentsRoundTrip(t *testing.T) {
 	attachments := []Attachment{{ContentType: "image/png", ContentBytes: "aGVsbG8="}}
-	e := NewEditRequest("ext-1", "corrected", attachments, "", "")
+	e := NewEditRequest("ext-1", "corrected", attachments, "", "", nil)
 	raw, err := json.Marshal(e)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -435,6 +435,48 @@ func TestMsgOmitsMentionsWhenUnset(t *testing.T) {
 	raw, _ := json.Marshal(NewOutgoingMsg("hi"))
 	if strings.Contains(string(raw), "mentions") || strings.Contains(string(raw), "mentionedMe") {
 		t.Fatalf("expected mentions/mentionedMe to be omitted when unset, got: %s", raw)
+	}
+}
+
+// TestOutgoingMentionRoundTrip covers the client->server outbound-mentions
+// extension's own fields (PeerID, Text) — TestMsgMentionsRoundTrip above
+// only exercises the server->client decode shape (Name/ID).
+func TestOutgoingMentionRoundTrip(t *testing.T) {
+	m := NewOutgoingMsg("hi @Steffen")
+	m.Mentions = []Mention{{PeerID: "550e8400-e29b-41d4-a716-446655440000", Text: "@Steffen"}}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Msg
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Mentions) != 1 || decoded.Mentions[0].PeerID != "550e8400-e29b-41d4-a716-446655440000" ||
+		decoded.Mentions[0].Text != "@Steffen" || decoded.Mentions[0].ID != "" || decoded.Mentions[0].Name != "" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestEditRequestMentionsRoundTrip(t *testing.T) {
+	e := NewEditRequest("ext-1", "corrected @Steffen", nil, "", "", []Mention{{Name: "Steffen"}})
+	raw, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Edit
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded.Mentions) != 1 || decoded.Mentions[0].Name != "Steffen" {
+		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+func TestEditRequestOmitsMentionsWhenUnset(t *testing.T) {
+	raw, _ := json.Marshal(NewEditRequest("ext-1", "corrected", nil, "", "", nil))
+	if strings.Contains(string(raw), "mentions") {
+		t.Fatalf("expected mentions to be omitted when unset, got: %s", raw)
 	}
 }
 
@@ -598,7 +640,7 @@ func TestMsgOmitsFormatWhenUnset(t *testing.T) {
 }
 
 func TestEditFormatRoundTrip(t *testing.T) {
-	e := NewEditRequest("ext-1", "<b>corrected</b>", nil, "html", "")
+	e := NewEditRequest("ext-1", "<b>corrected</b>", nil, "html", "", nil)
 	raw, err := json.Marshal(e)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -628,7 +670,7 @@ func TestMessageEditedFormatRoundTrip(t *testing.T) {
 }
 
 func TestEditOmitsAttachmentsWhenUnset(t *testing.T) {
-	raw, _ := json.Marshal(NewEditRequest("ext-1", "corrected", nil, "", ""))
+	raw, _ := json.Marshal(NewEditRequest("ext-1", "corrected", nil, "", "", nil))
 	if strings.Contains(string(raw), "attachments") {
 		t.Fatalf("expected attachments to be omitted when unset, got: %s", raw)
 	}
@@ -659,7 +701,7 @@ func TestReactionEditDeleteCarryAckCursor(t *testing.T) {
 		t.Fatalf("expected Reaction to carry ackCursor, got: %s", raw)
 	}
 
-	e := NewEditRequest("ext-1", "new text", nil, "", "")
+	e := NewEditRequest("ext-1", "new text", nil, "", "", nil)
 	e.AckCursor = "cursor-e"
 	if raw, _ := json.Marshal(e); !strings.Contains(string(raw), `"ackCursor":"cursor-e"`) {
 		t.Fatalf("expected Edit to carry ackCursor, got: %s", raw)
@@ -673,7 +715,7 @@ func TestReactionEditDeleteCarryAckCursor(t *testing.T) {
 }
 
 func TestMsgHistoricalFlagRoundTrip(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "")
+	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "", nil)
 	m.Historical = true
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -689,7 +731,7 @@ func TestMsgHistoricalFlagRoundTrip(t *testing.T) {
 }
 
 func TestMsgOmitsHistoricalWhenFalse(t *testing.T) {
-	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", ""))
+	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "", nil))
 	if got := string(raw); strings.Contains(got, "historical") {
 		t.Fatalf("expected historical:false to be omitted, got: %s", got)
 	}
@@ -718,7 +760,7 @@ func TestNewErrorOmitsCodeAndRetryable(t *testing.T) {
 }
 
 func TestMsgExternalIDAndOwnRoundTrip(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "")
+	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "", nil)
 	m.ExternalID = "ext-1"
 	m.Own = true
 	raw, err := json.Marshal(m)
@@ -735,7 +777,7 @@ func TestMsgExternalIDAndOwnRoundTrip(t *testing.T) {
 }
 
 func TestMsgOmitsExternalIDAndOwnWhenUnset(t *testing.T) {
-	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", ""))
+	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "", nil))
 	if got := string(raw); strings.Contains(got, "externalId") || strings.Contains(got, "own") {
 		t.Fatalf("expected externalId/own to be omitted, got: %s", got)
 	}
@@ -782,7 +824,7 @@ func TestMessageEditedRoundTrip(t *testing.T) {
 }
 
 func TestMsgCursorRoundTrip(t *testing.T) {
-	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "")
+	m := NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "", nil)
 	m.Cursor = "cursor-123"
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -798,7 +840,7 @@ func TestMsgCursorRoundTrip(t *testing.T) {
 }
 
 func TestMsgOmitsCursorWhenUnset(t *testing.T) {
-	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", ""))
+	raw, _ := json.Marshal(NewBroadcastMsg("peer-1", "hi", "2026-01-01T00:00:00Z", nil, "", "", nil))
 	if got := string(raw); strings.Contains(got, "cursor") {
 		t.Fatalf("expected cursor to be omitted when unset, got: %s", got)
 	}
@@ -873,7 +915,7 @@ func TestReactionRequestRoundTrip(t *testing.T) {
 }
 
 func TestEditRequestRoundTrip(t *testing.T) {
-	e := NewEditRequest("ext-1", "corrected", nil, "", "")
+	e := NewEditRequest("ext-1", "corrected", nil, "", "", nil)
 	raw, err := json.Marshal(e)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

@@ -46,7 +46,7 @@ func TestDecodeEventExportedWrapperMatchesInternalDecode(t *testing.T) {
 }
 
 func TestDecodeEventCarriesReplyToAndReplyPreview(t *testing.T) {
-	m := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "reply text", "ts", nil, "", "")
+	m := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "reply text", "ts", nil, "", "", nil)
 	m.ReplyTo = "ext-orig"
 	m.ReplyPreview = "GT-158 pending item 2/3"
 	raw, err := json.Marshal(m)
@@ -63,7 +63,7 @@ func TestDecodeEventCarriesReplyToAndReplyPreview(t *testing.T) {
 }
 
 func TestDecodeEventCarriesMentions(t *testing.T) {
-	m := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "hi @alice", "ts", nil, "", "")
+	m := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "hi @alice", "ts", nil, "", "", nil)
 	m.Mentions = []wire.Mention{{Name: "Alice", ID: "dir-1"}}
 	m.MentionedMe = true
 	raw, err := json.Marshal(m)
@@ -204,7 +204,7 @@ func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
 		t.Fatalf("expected LastConsumedCursor cursor-1, got %q", c.LastConsumedCursor())
 	}
 
-	if err := c.Send("hello", nil, "", ""); err != nil {
+	if err := c.Send("hello", nil, "", "", nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -248,7 +248,7 @@ func TestAckCursorOmittedBeforeAnythingConsumed(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.Send("hello", nil, "", ""); err != nil {
+	if err := c.Send("hello", nil, "", "", nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -358,7 +358,7 @@ func TestAckReplyRejectionAdoptsServerReportedCursor(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	c.Drain()
-	if err := c.Send("hello", nil, "", ""); err != nil {
+	if err := c.Send("hello", nil, "", "", nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -408,7 +408,7 @@ func TestBadAckCursorErrorDisablesFurtherAcks(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	c.Drain()
-	if err := c.Send("first", nil, "", ""); err != nil {
+	if err := c.Send("first", nil, "", "", nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -892,7 +892,7 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 
 	waitForActivity(t, activity) // a sees b's peerJoined
 
-	if err := b.Send("hello", nil, "", ""); err != nil {
+	if err := b.Send("hello", nil, "", "", nil); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	waitForActivity(t, activity) // a sees the message
@@ -928,7 +928,7 @@ func TestSendWithAttachmentsDeliversThem(t *testing.T) {
 	waitForActivity(t, activity) // a sees b's peerJoined
 
 	attachments := []wire.Attachment{{ContentType: "image/png", ContentBytes: "aGVsbG8="}}
-	if err := b.Send("a picture", attachments, "", ""); err != nil {
+	if err := b.Send("a picture", attachments, "", "", nil); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	waitForActivity(t, activity) // a sees the message
@@ -977,7 +977,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	waitForActivity(t, activityA) // a sees b's peerJoined
 	a.Drain()
 
-	if err := b.SendTo("just for you", a.PeerID(), nil, "", ""); err != nil {
+	if err := b.SendTo("just for you", a.PeerID(), nil, "", "", nil); err != nil {
 		t.Fatalf("sendTo: %v", err)
 	}
 	waitForActivity(t, activityA)
@@ -1004,7 +1004,7 @@ func TestSendToUnknownPeerSurfacesAsErrorEvent(t *testing.T) {
 	a.OnActivity(func() { activity <- struct{}{} })
 	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
 
-	if err := a.SendTo("hello?", "00000000-0000-0000-0000-000000000000", nil, "", ""); err != nil {
+	if err := a.SendTo("hello?", "00000000-0000-0000-0000-000000000000", nil, "", "", nil); err != nil {
 		t.Fatalf("sendTo: %v", err)
 	}
 	waitForActivity(t, activity)
@@ -1274,7 +1274,7 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 		}
 		defer conn.Close()
 		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
-		historical := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "old news", "ts", nil, "", "")
+		historical := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "old news", "ts", nil, "", "", nil)
 		historical.Historical = true
 		conn.WriteJSON(historical)
 		conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "nope", Code: "revoked", Retryable: false})
@@ -1415,7 +1415,7 @@ func TestEditMessageSendsEditMessage(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.EditMessage("ext-1", "corrected", nil, "", ""); err != nil {
+	if err := c.EditMessage("ext-1", "corrected", nil, "", "", nil); err != nil {
 		t.Fatalf("EditMessage: %v", err)
 	}
 
@@ -1455,7 +1455,7 @@ func TestEditMessageSendsAttachments(t *testing.T) {
 	defer c.Close()
 
 	attachments := []wire.Attachment{{ContentType: "image/png", ContentBytes: "aGVsbG8="}}
-	if err := c.EditMessage("ext-1", "corrected", attachments, "", ""); err != nil {
+	if err := c.EditMessage("ext-1", "corrected", attachments, "", "", nil); err != nil {
 		t.Fatalf("EditMessage: %v", err)
 	}
 
@@ -1494,7 +1494,7 @@ func TestSendWithReplyToSetsField(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.Send("reply text", nil, "", "ext-orig"); err != nil {
+	if err := c.Send("reply text", nil, "", "ext-orig", nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -1533,7 +1533,7 @@ func TestEditMessageSendsReplyTo(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.EditMessage("ext-1", "corrected", nil, "", "ext-orig"); err != nil {
+	if err := c.EditMessage("ext-1", "corrected", nil, "", "ext-orig", nil); err != nil {
 		t.Fatalf("EditMessage: %v", err)
 	}
 

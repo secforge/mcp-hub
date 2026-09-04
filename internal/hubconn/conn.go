@@ -895,12 +895,13 @@ func (c *Conn) ackCursorForOutbound() string {
 	return c.lastConsumed
 }
 
-func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo string) error {
+func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) error {
 	m := wire.NewOutgoingMsg(text)
 	m.AckCursor = c.ackCursorForOutbound()
 	m.Attachments = attachments
 	m.Format = format
 	m.ReplyTo = replyTo
+	m.Mentions = mentions
 	return c.ws.WriteJSON(m)
 }
 
@@ -908,12 +909,13 @@ func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo 
 // server processes this asynchronously: a delivery failure (e.g. an unknown
 // or departed peer) does not surface as a returned error here, but as a
 // buffered "error" event picked up by a later Peek/Drain.
-func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format, replyTo string) error {
+func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) error {
 	m := wire.NewOutgoingDirectedMsg(text, peerID)
 	m.AckCursor = c.ackCursorForOutbound()
 	m.Attachments = attachments
 	m.Format = format
 	m.ReplyTo = replyTo
+	m.Mentions = mentions
 	return c.ws.WriteJSON(m)
 }
 
@@ -982,8 +984,8 @@ func (c *Conn) React(externalID, reaction, action string) error {
 // (or an "error" event on refusal), like React. attachments, if non-nil,
 // replaces the message's attachments (always the inline form — see
 // wire.Edit.Attachments); pass nil to leave existing attachments alone.
-func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachment, format, replyTo string) error {
-	e := wire.NewEditRequest(externalID, text, attachments, format, replyTo)
+func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) error {
+	e := wire.NewEditRequest(externalID, text, attachments, format, replyTo, mentions)
 	e.AckCursor = c.ackCursorForOutbound()
 	return c.ws.WriteJSON(e)
 }
@@ -1024,20 +1026,20 @@ var AckWaitTimeout = 5 * time.Second
 // succeed or fail later, reported the normal way via wait/hub_receive/
 // hub_wait, exactly as before this existed. Returns (Event{}, false, err)
 // only if the write itself failed locally.
-func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, format, replyTo string) (Event, bool, error) {
+func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) (Event, bool, error) {
 	if !c.isBridge {
 		if to == "" {
-			return Event{}, false, c.Send(text, attachments, format, replyTo)
+			return Event{}, false, c.Send(text, attachments, format, replyTo, mentions)
 		}
-		return Event{}, false, c.SendTo(text, to, attachments, format, replyTo)
+		return Event{}, false, c.SendTo(text, to, attachments, format, replyTo, mentions)
 	}
 	resultCh, cancel := c.claimNextAck("sendAck")
 	defer cancel()
 	var err error
 	if to == "" {
-		err = c.Send(text, attachments, format, replyTo)
+		err = c.Send(text, attachments, format, replyTo, mentions)
 	} else {
-		err = c.SendTo(text, to, attachments, format, replyTo)
+		err = c.SendTo(text, to, attachments, format, replyTo, mentions)
 	}
 	if err != nil {
 		return Event{}, false, err
@@ -1073,13 +1075,13 @@ func (c *Conn) ReactAwaitingAck(externalID, reaction, action string) (Event, boo
 // EditMessageAwaitingAck is EditMessage, but — only for a bridge
 // connection — waits up to AckWaitTimeout for its own "editAck"/"error"
 // outcome. See SendAwaitingAck for the full contract; identical shape.
-func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wire.Attachment, format, replyTo string) (Event, bool, error) {
+func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) (Event, bool, error) {
 	if !c.isBridge {
-		return Event{}, false, c.EditMessage(externalID, text, attachments, format, replyTo)
+		return Event{}, false, c.EditMessage(externalID, text, attachments, format, replyTo, mentions)
 	}
 	resultCh, cancel := c.claimNextAck("editAck")
 	defer cancel()
-	if err := c.EditMessage(externalID, text, attachments, format, replyTo); err != nil {
+	if err := c.EditMessage(externalID, text, attachments, format, replyTo, mentions); err != nil {
 		return Event{}, false, err
 	}
 	select {

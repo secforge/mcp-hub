@@ -321,3 +321,53 @@ func TestDisconnectThenReconnectWorks(t *testing.T) {
 	callTool(t, ctx, s, s.handleDisconnect, map[string]any{})
 	callTool(t, ctx, s, s.handleConnect, map[string]any{}) // must not error "already connected"
 }
+
+func TestSendWithMentionsIsRelayedToOtherPeer(t *testing.T) {
+	s, mcpServer := newTestServer(t)
+	ctxA := ctxFor(mcpServer, "mcp-a")
+	ctxB := ctxFor(mcpServer, "mcp-b")
+
+	callTool(t, ctxA, s, s.handleConnect, map[string]any{"name": "Alice"})
+	sessionID := s.hubFor("mcp-a").session().ID()
+	callTool(t, ctxB, s, s.handleConnect, map[string]any{"sessionId": sessionID, "name": "Bob"})
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		// Exactly one of id/peerId/name per entry — see parseMentions and
+		// chat-relay's own confirmed rule (never two).
+		"text":     "hi @Bob",
+		"mentions": []any{map[string]any{"id": "dir-1"}},
+	}
+	if res, err := s.handleSend(ctxA, req); err != nil || res.IsError {
+		t.Fatalf("send failed: err=%v result=%+v", err, res)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	received := callTool(t, ctxB, s, s.handleReceive, map[string]any{})
+	if !strings.Contains(received, "mentions=dir-1") {
+		t.Fatalf("expected the relayed mention to render, got %q", received)
+	}
+}
+
+func TestSendRejectsMentionWithoutExactlyOneIdentifier(t *testing.T) {
+	s, mcpServer := newTestServer(t)
+	ctxA := ctxFor(mcpServer, "mcp-a")
+	callTool(t, ctxA, s, s.handleConnect, map[string]any{"name": "Alice"})
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"text":     "hi",
+		"mentions": []any{map[string]any{}},
+	}
+	res, err := s.handleSend(ctxA, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected a client-side validation error, got: %+v", res)
+	}
+	tc, ok := res.Content[0].(mcp.TextContent)
+	if !ok || !strings.Contains(tc.Text, "exactly one") {
+		t.Fatalf("expected an exactly-one error message, got: %+v", res.Content)
+	}
+}

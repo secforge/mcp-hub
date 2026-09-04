@@ -194,9 +194,31 @@ func NewError(message string) Error {
 }
 
 // Mention is one @-mention on a Msg/MessageEdited — see Msg.Mentions.
+//
+// Server -> client (decoding an existing message): only Name/ID are ever
+// populated this direction (PeerID/Text always empty) — ID is the sending
+// platform's own directory id, opaque here, not a hub peerId.
+//
+// Client -> server (chat-relay's outbound-mentions extension, not part of
+// the core wire protocol — see the wire spec's §8): requests a real
+// platform-native @-mention be attached to an outgoing Msg/Edit. Exactly
+// one of ID, PeerID, or Name identifies who to mention — ID is the
+// platform's own directory id, PeerID is a hub peerId (resolved
+// server-side to that peer's own identity, so a client never needs to
+// know its own directory id), Name is a display name (refused if
+// ambiguous, never guessed at). Sending zero or more than one of the
+// three is a malformed entry. Text, if set, is the exact substring
+// already present in the outgoing message's own Text to turn into the
+// mention; omitted, it defaults to "@" + the resolved display name. A
+// server implementing this refuses the WHOLE send (bad_request) rather
+// than deliver it without the requested mention on any violation of
+// these rules — a mention that silently becomes plain text would tell a
+// sender somebody was notified when nobody was.
 type Mention struct {
-	Name string `json:"name,omitempty"`
-	ID   string `json:"id"`
+	Name   string `json:"name,omitempty"`
+	ID     string `json:"id,omitempty"`
+	PeerID string `json:"peerId,omitempty"`
+	Text   string `json:"text,omitempty"`
 }
 
 type Msg struct {
@@ -239,12 +261,18 @@ type Msg struct {
 	// information, so a client surfacing both may want to avoid saying it
 	// twice.
 	ReplyPreview string `json:"replyPreview,omitempty"`
-	// Mentions lists who this message @-mentions, if any — a server
-	// extension (chat-relay), absent (nil, not an empty slice) when the
-	// message mentions no one. Each entry's ID is the sending platform's
-	// own directory id (opaque here — this package doesn't validate its
-	// form, same as PeerID/ExternalID), not a hub peerId; there is no
-	// wire-level way to resolve one into the other.
+	// Mentions, server->client, lists who this message @-mentions, if any
+	// — a server extension (chat-relay), absent (nil, not an empty slice)
+	// when the message mentions no one. Each entry's ID is the sending
+	// platform's own directory id (opaque here — this package doesn't
+	// validate its form, same as PeerID/ExternalID), not a hub peerId;
+	// there is no wire-level way to resolve one into the other.
+	//
+	// Client->server, a client may set this on an outgoing send to
+	// request real platform-native @-mentions be attached — see
+	// Mention's doc comment for the full request-side contract (exactly
+	// one of ID/PeerID/Name per entry, optional Text, refuse-whole-send
+	// on any violation).
 	Mentions []Mention `json:"mentions,omitempty"`
 	// MentionedMe is true when the receiving connection's own identity is
 	// among Mentions — computed per conversation (all connections on the
@@ -547,14 +575,14 @@ func NewOutgoingDirectedMsg(text, to string) Msg {
 }
 
 // NewBroadcastMsg is what the server sends to other session members.
-func NewBroadcastMsg(peerID, text, ts string, attachments []Attachment, format, replyTo string) Msg {
-	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts, Attachments: attachments, Format: format, ReplyTo: replyTo}
+func NewBroadcastMsg(peerID, text, ts string, attachments []Attachment, format, replyTo string, mentions []Mention) Msg {
+	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts, Attachments: attachments, Format: format, ReplyTo: replyTo, Mentions: mentions}
 }
 
 // NewDirectedMsg is what the server sends to the single targeted peer for a
 // private message.
-func NewDirectedMsg(peerID, text, ts string, attachments []Attachment, format, replyTo string) Msg {
-	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts, Private: true, Attachments: attachments, Format: format, ReplyTo: replyTo}
+func NewDirectedMsg(peerID, text, ts string, attachments []Attachment, format, replyTo string, mentions []Mention) Msg {
+	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts, Private: true, Attachments: attachments, Format: format, ReplyTo: replyTo, Mentions: mentions}
 }
 
 type PeerEvent struct {
@@ -861,10 +889,15 @@ type Edit struct {
 	// preview text — an unvalidated cross-conversation reference is a
 	// disclosure risk, not just a bad request. Empty means "not a reply."
 	ReplyTo string `json:"replyTo,omitempty"`
+	// Mentions requests real platform-native @-mentions on the new Text —
+	// see Mention's doc comment for the full client->server contract.
+	// Absent (nil) means "leave existing mentions as they are," same as
+	// Attachments — there is no way to clear mentions via Edit either.
+	Mentions []Mention `json:"mentions,omitempty"`
 }
 
-func NewEditRequest(externalID, text string, attachments []Attachment, format, replyTo string) Edit {
-	return Edit{Type: TypeEdit, ExternalID: externalID, Text: text, Attachments: attachments, Format: format, ReplyTo: replyTo}
+func NewEditRequest(externalID, text string, attachments []Attachment, format, replyTo string, mentions []Mention) Edit {
+	return Edit{Type: TypeEdit, ExternalID: externalID, Text: text, Attachments: attachments, Format: format, ReplyTo: replyTo, Mentions: mentions}
 }
 
 // ReactionAck and EditAck confirm a Reaction/Edit request was actually

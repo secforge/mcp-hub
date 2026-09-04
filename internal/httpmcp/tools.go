@@ -32,6 +32,57 @@ const messageStyleNote = "\n\nSTYLE: keep the message short — a chat turn, not
 	"If the full answer really is long, send the conclusion first and offer the detail " +
 	"rather than dumping it unasked."
 
+// mentionsToolDescription documents hub_send's "mentions" parameter — a
+// chat-relay extension (see the wire spec's §8), not part of the core
+// wire protocol. Kept in sync with mcptools' description of the same name.
+const mentionsToolDescription = "Optional, server-specific: real platform-native @-mentions to " +
+	"attach — a chat-relay extension. Each entry sets exactly one of id (the platform's own " +
+	"directory id), peerId (a hub peerId, resolved server-side to that peer's own identity), " +
+	"or name (a display name — refused if ambiguous, never guessed); optionally text, the exact " +
+	"substring already present in this send's own text to turn into the mention (defaults to " +
+	"\"@\" + the resolved display name if omitted). A server that doesn't implement this simply " +
+	"ignores the field; one that does refuses the WHOLE send (not a partial send without the " +
+	"mention) if any entry violates these rules."
+
+// parseMentions decodes the "mentions" tool argument (a JSON array of
+// objects, as delivered by mcp-go's GetArguments) into wire.Mention
+// entries, validating the exactly-one-of id/peerId/name rule client-side
+// — malformed input here is a clear MCP-level error, not something to
+// discover only via an async server refusal. Kept in sync with mcptools'
+// function of the same name. Nil input is a no-op (no mentions), not an
+// error.
+func parseMentions(raw any) ([]wire.Mention, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("mentions must be an array")
+	}
+	mentions := make([]wire.Mention, 0, len(items))
+	for i, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("mentions[%d] must be an object", i)
+		}
+		id, _ := obj["id"].(string)
+		peerID, _ := obj["peerId"].(string)
+		name, _ := obj["name"].(string)
+		text, _ := obj["text"].(string)
+		set := 0
+		for _, v := range []string{id, peerID, name} {
+			if v != "" {
+				set++
+			}
+		}
+		if set != 1 {
+			return nil, fmt.Errorf("mentions[%d] must set exactly one of id, peerId, or name", i)
+		}
+		mentions = append(mentions, wire.Mention{ID: id, PeerID: peerID, Name: name, Text: text})
+	}
+	return mentions, nil
+}
+
 // Register adds hub_connect, hub_disconnect, hub_send, hub_receive,
 // hub_wait, and hub_peers to mcpServer.
 func (s *Server) Register(mcpServer *server.MCPServer) {
@@ -89,6 +140,18 @@ func (s *Server) Register(mcpServer *server.MCPServer) {
 					"threaded reply/citation to. Must name a message the target server actually "+
 					"holds in this exact conversation; a server that validates it refuses the "+
 					"whole send outright for an unrecognized, foreign, or malformed value")),
+			mcp.WithArray("mentions",
+				mcp.Description(mentionsToolDescription),
+				mcp.Items(map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":     map[string]any{"type": "string"},
+						"peerId": map[string]any{"type": "string"},
+						"name":   map[string]any{"type": "string"},
+						"text":   map[string]any{"type": "string"},
+					},
+				}),
+			),
 		),
 		s.handleSend,
 	)
@@ -173,14 +236,18 @@ func (s *Server) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 	format := req.GetString("format", "")
 	replyTo := req.GetString("replyTo", "")
+	mentions, err := parseMentions(req.GetArguments()["mentions"])
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	ts := time.Now().UTC().Format(time.RFC3339)
 	if to := req.GetString("to", ""); to != "" {
-		if err := hubSession.DeliverTo(peer, to, wire.NewDirectedMsg(peer.ID(), text, ts, attachments, format, replyTo)); err != nil {
+		if err := hubSession.DeliverTo(peer, to, wire.NewDirectedMsg(peer.ID(), text, ts, attachments, format, replyTo, mentions)); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return mcp.NewToolResultText("sent"), nil
 	}
-	hubSession.Broadcast(peer, wire.NewBroadcastMsg(peer.ID(), text, ts, attachments, format, replyTo))
+	hubSession.Broadcast(peer, wire.NewBroadcastMsg(peer.ID(), text, ts, attachments, format, replyTo, mentions))
 	return mcp.NewToolResultText("sent"), nil
 }
 

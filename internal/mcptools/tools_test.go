@@ -1862,3 +1862,55 @@ func TestCatchUpKeyForRelayIsProjectScopedAndStableAcrossReconnectSecret(t *test
 		t.Fatalf("expected a different key for a different project, got the same: %q", k3)
 	}
 }
+
+func TestParseMentionsNilIsANoOp(t *testing.T) {
+	mentions, err := parseMentions(nil)
+	if err != nil || mentions != nil {
+		t.Fatalf("expected (nil, nil), got (%v, %v)", mentions, err)
+	}
+}
+
+func TestParseMentionsAcceptsEachIdentifierKind(t *testing.T) {
+	raw := []any{
+		map[string]any{"id": "dir-1"},
+		map[string]any{"peerId": "550e8400-e29b-41d4-a716-446655440000"},
+		map[string]any{"name": "Steffen", "text": "@Steffen"},
+	}
+	mentions, err := parseMentions(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(mentions) != 3 || mentions[0].ID != "dir-1" ||
+		mentions[1].PeerID != "550e8400-e29b-41d4-a716-446655440000" ||
+		mentions[2].Name != "Steffen" || mentions[2].Text != "@Steffen" {
+		t.Fatalf("unexpected mentions: %+v", mentions)
+	}
+}
+
+func TestParseMentionsRejectsZeroIdentifiers(t *testing.T) {
+	_, err := parseMentions([]any{map[string]any{"text": "@nobody"}})
+	if err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("expected an exactly-one error, got: %v", err)
+	}
+}
+
+func TestParseMentionsRejectsTwoIdentifiers(t *testing.T) {
+	_, err := parseMentions([]any{map[string]any{"id": "dir-1", "name": "Steffen"}})
+	if err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("expected an exactly-one error, got: %v", err)
+	}
+}
+
+func TestParseMentionsRejectsNonArray(t *testing.T) {
+	_, err := parseMentions("not an array")
+	if err == nil {
+		t.Fatal("expected an error for a non-array mentions value")
+	}
+}
+
+func TestParseMentionsRejectsNonObjectEntry(t *testing.T) {
+	_, err := parseMentions([]any{"not an object"})
+	if err == nil {
+		t.Fatal("expected an error for a non-object mentions entry")
+	}
+}

@@ -424,7 +424,7 @@ func TestBroadcastExcludesSender(t *testing.T) {
 	a.received = nil
 	b.received = nil
 
-	s.Broadcast(a, wire.NewBroadcastMsg(a.ID(), "hi", "ts", nil, "", ""))
+	s.Broadcast(a, wire.NewBroadcastMsg(a.ID(), "hi", "ts", nil, "", "", nil))
 
 	if len(a.received) != 0 {
 		t.Fatalf("sender should not receive its own broadcast, got %d", len(a.received))
@@ -442,7 +442,7 @@ func TestDeliverToSendsOnlyToTarget(t *testing.T) {
 	c := joinFake(s, "", "", "", nil)
 	a.received, b.received, c.received = nil, nil, nil
 
-	if err := s.DeliverTo(a, b.ID(), wire.NewDirectedMsg(a.ID(), "psst", "ts", nil, "", "")); err != nil {
+	if err := s.DeliverTo(a, b.ID(), wire.NewDirectedMsg(a.ID(), "psst", "ts", nil, "", "", nil)); err != nil {
 		t.Fatalf("DeliverTo: %v", err)
 	}
 
@@ -462,7 +462,7 @@ func TestDeliverToUnknownPeerErrors(t *testing.T) {
 	s := m.GetOrCreate("session-1")
 	a := joinFake(s, "", "", "", nil)
 
-	err := s.DeliverTo(a, "does-not-exist", wire.NewDirectedMsg(a.ID(), "hi", "ts", nil, "", ""))
+	err := s.DeliverTo(a, "does-not-exist", wire.NewDirectedMsg(a.ID(), "hi", "ts", nil, "", "", nil))
 	if err == nil {
 		t.Fatal("expected an error targeting a peer that isn't in the session")
 	}
@@ -474,7 +474,7 @@ func TestDeliverToSelfErrors(t *testing.T) {
 	a := joinFake(s, "", "", "", nil)
 	a.received = nil
 
-	err := s.DeliverTo(a, a.ID(), wire.NewDirectedMsg(a.ID(), "hi", "ts", nil, "", ""))
+	err := s.DeliverTo(a, a.ID(), wire.NewDirectedMsg(a.ID(), "hi", "ts", nil, "", "", nil))
 	if err == nil {
 		t.Fatal("expected an error targeting yourself")
 	}

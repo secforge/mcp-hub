@@ -121,14 +121,14 @@ func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T)
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 
-		own := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "my own echo", "ts1", nil, "", "")
+		own := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "my own echo", "ts1", nil, "", "", nil)
 		own.Own = true
 		own.ExternalID = "ext-1"
 		conn.WriteJSON(own)
 
 		time.Sleep(300 * time.Millisecond) // give handleWait time to observe it's not woken yet
 
-		reply := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "their reply", "ts2", nil, "", "")
+		reply := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "their reply", "ts2", nil, "", "", nil)
 		conn.WriteJSON(reply)
 
 		for {
@@ -363,6 +363,117 @@ func TestHubEditSendsEditRequest(t *testing.T) {
 		}
 		if e.ExternalID != "ext-1" || e.Text != "corrected" {
 			t.Fatalf("unexpected edit request on the wire: %+v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the edit request")
+	}
+}
+
+func TestHubSendWithMentionsSendsMentionsOnTheWire(t *testing.T) {
+	link, gotRaw := startRelayTestServerCapturingClientMessages(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
+	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	orig := hubconn.AckWaitTimeout
+	hubconn.AckWaitTimeout = 200 * time.Millisecond
+	defer func() { hubconn.AckWaitTimeout = orig }()
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{
+		"text": "hi @Steffen",
+		"mentions": []any{
+			map[string]any{"peerId": "550e8400-e29b-41d4-a716-446655440000", "text": "@Steffen"},
+		},
+	}
+	res, err := hub.handleSend(ctx, sendReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_send failed: err=%v result=%+v", err, res)
+	}
+
+	select {
+	case raw := <-gotRaw:
+		var m wire.Msg
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("unmarshal sent msg: %v", err)
+		}
+		if len(m.Mentions) != 1 || m.Mentions[0].PeerID != "550e8400-e29b-41d4-a716-446655440000" || m.Mentions[0].Text != "@Steffen" {
+			t.Fatalf("unexpected mentions on the wire: %+v", m.Mentions)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the send")
+	}
+}
+
+func TestHubSendRejectsMentionWithoutExactlyOneIdentifier(t *testing.T) {
+	link, _ := startRelayTestServer(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
+	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	sendReq := mcp.CallToolRequest{}
+	sendReq.Params.Arguments = map[string]any{
+		"text": "hi",
+		"mentions": []any{
+			map[string]any{"peerId": "550e8400-e29b-41d4-a716-446655440000", "name": "Steffen"},
+		},
+	}
+	res, err := hub.handleSend(ctx, sendReq)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(textOf(res), "exactly one") {
+		t.Fatalf("expected a client-side validation error for two identifiers set, got: %+v", res)
+	}
+}
+
+func TestHubEditWithMentionsSendsMentionsOnTheWire(t *testing.T) {
+	link, gotRaw := startRelayTestServerCapturingClientMessages(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
+	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	orig := hubconn.AckWaitTimeout
+	hubconn.AckWaitTimeout = 200 * time.Millisecond
+	defer func() { hubconn.AckWaitTimeout = orig }()
+
+	editReq := mcp.CallToolRequest{}
+	editReq.Params.Arguments = map[string]any{
+		"externalId": "ext-1",
+		"text":       "corrected @Steffen",
+		"mentions":   []any{map[string]any{"name": "Steffen"}},
+	}
+	res, err := hub.handleEdit(ctx, editReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_edit failed: err=%v result=%+v", err, res)
+	}
+
+	select {
+	case raw := <-gotRaw:
+		var e wire.Edit
+		if err := json.Unmarshal(raw, &e); err != nil {
+			t.Fatalf("unmarshal sent edit: %v", err)
+		}
+		if len(e.Mentions) != 1 || e.Mentions[0].Name != "Steffen" {
+			t.Fatalf("unexpected mentions on the wire: %+v", e.Mentions)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received the edit request")
@@ -1024,7 +1135,7 @@ func TestCatchUpSkipsMessageAlreadyHandedOverViaHubReceive(t *testing.T) {
 
 		// Live traffic: a message the model will see via hub_receive
 		// BEFORE ever calling hub_catch_up.
-		live := wire.NewBroadcastMsg("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "seen live first", "ts-live", nil, "", "")
+		live := wire.NewBroadcastMsg("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "seen live first", "ts-live", nil, "", "", nil)
 		live.Cursor = "cursor-live-1"
 		live.ExternalID = "ext-live-1"
 		conn.WriteJSON(live)

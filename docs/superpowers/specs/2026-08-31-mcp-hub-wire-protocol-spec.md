@@ -858,6 +858,52 @@ generates or discovers a token on its own — the user supplies one,
 issued out of band (chat-relay: `POST /api/conversations/hub/create-
 tokens`, shown once, only its hash is later stored).
 
+**Outbound `mentions` on `msg`/`edit` (chat-relay).** A client may set
+`mentions` (an array of `Mention`, §2.2's table — same field a client
+receives on an incoming `msg`/`messageEdited`, reused here for the
+request direction) to request real platform-native @-mentions be
+attached to an outgoing send or edit:
+
+```json
+{"type": "msg", "text": "... @Steffen Heil ...",
+ "mentions": [{"name": "Steffen Heil", "text": "@Steffen Heil"}]}
+```
+
+Each entry sets **exactly one** of:
+
+- `id` — the sending platform's own directory id for who to mention.
+- `peerId` — a hub `peerId`; the server resolves it to that peer's own
+  identity, so a client never needs to know its own directory id.
+- `name` — a display name; refused if ambiguous, never guessed at.
+
+`text`, if set, is the exact substring already present in the outgoing
+`text` to turn into the mention — omitted, it defaults to `"@"` +
+the resolved display name. A server implementing this refuses the
+**whole** send/edit (`error{code: "bad_request"}`) rather than deliver
+it without the requested mention, on any of: zero or more than one
+identifier set on an entry, the named person not a current participant
+of this conversation (never looked up in a wider directory), an
+ambiguous `name`, or a `text` substring not actually present in the
+message. Deliberate: a mention that silently becomes plain text tells a
+sender somebody was notified when nobody was — refuse outright rather
+than degrade quietly, the same posture this spec already takes for
+`replyTo`.
+
+A server that doesn't implement this simply ignores the field (additive,
+per §6) — `mcp-hub-server`'s own relay is exactly this case: it neither
+validates nor interprets `mentions` either direction, only threads it
+through to other local peers unmodified, same as it already does for
+`format`/`replyTo`. The reference client sends this as `hub_send`'s/
+`hub_edit`'s `mentions` parameter, validating the exactly-one-identifier
+rule client-side before ever writing to the wire (a clear MCP-level
+error beats an async `bad_request` refusal for a mistake this cheap to
+catch locally) — but does not otherwise interpret the field, and applies
+the same security note as `history`/`messageAfter`'s own read paths: a
+server resolving `peerId`/`name` must check the resolved identity is
+actually a participant of *this* conversation, not merely known to the
+server anywhere, to avoid an unauthenticated hub session enabling
+directory enumeration or cross-conversation targeting.
+
 ## §9. Server-side fan-out / backpressure guidance (non-normative)
 
 Not part of the wire format — nothing here is observable by a
