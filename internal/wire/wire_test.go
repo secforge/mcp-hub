@@ -14,7 +14,7 @@ func TestJoinedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","peerCount":3,"serverVersion":2}` {
+	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","peerCount":3,"serverVersion":3}` {
 		t.Fatalf("unexpected json: %s", got)
 	}
 	typ, err := DecodeType(raw)
@@ -46,13 +46,12 @@ func TestNewJoinedStampsCurrentProtocolVersion(t *testing.T) {
 }
 
 func TestProtocolVersionIsCurrent(t *testing.T) {
-	// Bumped 2026-09-04 when History/HistoryBegin/HistoryComplete were
-	// removed in favor of MessageAfter — see ProtocolVersion's doc
+	// Bumped 2026-09-08 for Joined.Features — see ProtocolVersion's doc
 	// comment. A client/server that doesn't send a version at all is
 	// still treated as v1 (see wsserver's clientVersion parsing) — that
 	// baseline is unaffected by this bump.
-	if ProtocolVersion != 2 {
-		t.Fatalf("got ProtocolVersion %d, want 2", ProtocolVersion)
+	if ProtocolVersion != 3 {
+		t.Fatalf("got ProtocolVersion %d, want 3", ProtocolVersion)
 	}
 }
 
@@ -590,29 +589,6 @@ func TestJoinedOmitsBehindWhenZero(t *testing.T) {
 	raw, _ := json.Marshal(NewJoined("peer-1", 0, "", ""))
 	if strings.Contains(string(raw), "behind") {
 		t.Fatalf("expected behind/behindSince to be omitted when unset, got: %s", raw)
-	}
-}
-
-func TestJoinedSystemPeerIDRoundTrip(t *testing.T) {
-	j := NewJoined("peer-1", 0, "", "")
-	j.SystemPeerID = "00000000-0000-0000-0000-000000000000"
-	raw, err := json.Marshal(j)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var decoded Joined
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if decoded.SystemPeerID != "00000000-0000-0000-0000-000000000000" {
-		t.Fatalf("unexpected round trip: %+v", decoded)
-	}
-}
-
-func TestJoinedOmitsSystemPeerIDWhenUnset(t *testing.T) {
-	raw, _ := json.Marshal(NewJoined("peer-1", 0, "", ""))
-	if strings.Contains(string(raw), "systemPeerId") {
-		t.Fatalf("expected systemPeerId to be omitted when unset, got: %s", raw)
 	}
 }
 

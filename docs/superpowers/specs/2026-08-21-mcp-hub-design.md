@@ -799,6 +799,212 @@ local process). Full rationale, rejected alternatives, and design details:
 
 ## Chat-relay bridge support (`teams_relay_connect`, `hub_history`)
 
+**Update, 2026-09-07: `teams_relay_connect` merged into `hub_connect`.**
+Requested directly by the project owner, after a long live hub discussion
+(coordinating with chat-relay's author and a third party, "rsint") that
+also surfaced three other fixes landed the same day — recorded together
+here since they were found and built in one pass:
+
+- **The merge itself**: `hub_connect` now takes either `host`/`sessionId`
+  (the original path, described below and unchanged internally) or `link`
+  (what `teams_relay_connect` used to be, also unchanged internally —
+  `handleConnect`/`handleTeamsRelayConnect` still exist as separate Go
+  methods with their own full test coverage; only the MCP tool surface
+  merged, via a small `handleHubConnect` dispatcher that requires exactly
+  one of host/link and calls straight through). No behavioral change to
+  either path — same identity/persistence model each, same result text.
+- **Read-receipt truthfulness fix**: found live, while designing a
+  "confirm you read this" tool — `hubconn.Conn`'s standalone `ack`
+  (`ackLoop`) used to fire based on `Drain`/`DrainBatch`/`DrainEvents`,
+  which `waiter`'s follow-mode delivery and one-shot `wait` also use to
+  write events to the wait socket. Neither confirms a model actually read
+  anything, only that this process wrote bytes onward — so a bridge
+  server's own delivery-tracking field (e.g. chat-relay's `Joined.Behind`,
+  computed from its stored ack cursor) could report "nothing behind" for
+  a reader that had read nothing, a genuine false all-clear (confirmed
+  live: chat-relay's own `behind: 0` was traced to exactly this). Fixed
+  by moving the consumed-marking out of every drain and into a new
+  explicit `Conn.MarkConsumed`, called only from
+  `mcptools.Hub.resultWithReceivedAttachments` — the same synchronous
+  hand-over boundary `recordHandedOver` already relies on.
+- **`hub_confirm(cursor)`**: a new tool — a model-issued read receipt,
+  the primitive the whole discussion converged on. Sends an immediate
+  standalone `ack` and advances/persists this session's catch-up
+  position to `cursor`, without re-delivering anything. Only meant to be
+  called with a cursor from a message that arrived genuinely intact —
+  confirming a truncated one would make the loss unrecoverable, since
+  catch-up dedup would then silently skip it forever.
+- **`handedOverAhead` now persists**: this live/catch-up dedup set (see
+  below) used to be in-memory only, reset by every `setCatchUpKey` call
+  (i.e. every reconnect), which is exactly why a reconnect after a drop
+  re-presented messages `hub_catch_up` should have silently skipped as
+  already seen. Now persisted alongside the catch-up cursor itself, in
+  the same `connstore` catchup file under a namespaced key
+  (`saveHandedOverAhead`/`loadHandedOverAhead`).
+
+A few more items landed the same day, after this section was first written:
+
+- **Periodic confirm reminder**: `hub_confirm` only helps if the model
+  actually calls it. `hubconn.Conn` now runs a `confirmReminderLoop`
+  (`confirmReminderInterval`, 5 minutes) that, whenever something has been
+  delivered but never confirmed (`lastSeenCursor != lastConsumed`),
+  injects a synthetic `confirmReminder` event. Deliberately worded as a
+  cross-check rather than a value to echo — it names the last cursor
+  delivered and asks the model to independently state what it actually
+  has complete and contiguous (which may be earlier) and whether anything
+  since was cut off, rather than just asking it to paste the offered
+  cursor back into `hub_confirm`. This wording was itself refined live,
+  after chat-relay's author pointed out the echo risk. Also fixed the
+  same day: `hub_confirm` used to leave stale `handedOverAhead` entries
+  behind forever, since nothing else ever walks back far enough to reach
+  and clean them up; it now clears the set (in-memory and persisted) on
+  every confirm, which is safe since anything it held is at-or-before the
+  new watermark and would never be re-walked anyway.
+- **Gap retrieval (`hub_catch_up(gap: true)`)**: the seek-gap left behind
+  whenever `hub_catch_up` jumps forward instead of walking (see "Skipping
+  ahead" below) used to be purely informational — mentioned in a
+  persistent note on every catch-up/connect, but with no way to actually
+  fetch what fell inside it. `catchUpGap` now also records an
+  `AnchorCursor`, so `hub_catch_up(gap: true)` can walk the gap directly:
+  one message at a time, same dedup/skip-loop shape as ordinary catch-up,
+  anchored on `AnchorCursor` once available or the original `From`
+  timestamp before that. It closes the gap (clearing the persisted
+  record) once the walk reaches `noMoreMessages` or a retrieved message's
+  own timestamp reaches the gap's `To` — the latter is a best-effort
+  string comparison of RFC3339 timestamps, safe-direction only (worst
+  case it walks a little further than strictly needed, never loses
+  anything). Gap-walking is independent of the normal catch-up position,
+  so retrieving a gap never interferes with ordinary catch-up progress.
+
+**Update, 2026-09-08.** Two more items landed the same day, plus one
+fix, from a live design discussion the project owner (as the hub's own
+"SYSTEM account" peer) started and coordinated with chat-relay's author
+and customer-portal:
+
+- **decodeEvent leniency fix**: `hubconn.decodeEvent`'s `TypeMsg` case
+  used to reject *any* `"msg"` with an invalid `PeerID`, including a
+  legitimate peerless system message (e.g. chat-relay's "chat renamed"
+  notification, sender null). That silent decode failure — not a
+  claim-matching bug — is why `RequestMessageAfterAwaiting` always timed
+  out on exactly such a message: the event never survived decoding to
+  reach the pending claim. Root-caused by customer-portal via strace.
+  Fixed to only reject a *non-empty* invalid PeerID. Also fixed the
+  matching gap this surfaced: `handleCatchUpGap`'s dedup branch used to
+  only read `handedOverAhead`, never prune it (unlike the ordinary
+  walk's mirror branch), so a session doing most of its gap retrieval
+  through repeated `hub_catch_up(gap: true)` calls accumulated dead
+  entries without bound.
+- **Truncation-detection end marker**: every delivered `"msg"` now closes
+  with `[end cursor=...]` echoing the same cursor its opening line named
+  — a cut partway through is now directly detectable (the closing marker
+  is simply absent) instead of inferred from context.
+- **`hub_send`/`hub_edit`'s `confirmCursor` parameter**: an optional
+  cursor the model can pass to state explicitly what it has actually
+  read, folding hub_confirm's exact effect (a genuine standalone ack,
+  not a silent piggyback) into the send/edit call instead of a separate
+  round trip. The existing automatic piggybacked ack (from this client's
+  own delivery bookkeeping) is unchanged and doesn't advance
+  `hub_catch_up`'s persisted position — only an explicit confirm
+  (`hub_confirm` itself, or now this parameter) does that.
+- **Standalone-ack `Behind` count**: chat-relay's server can now reply to
+  a standalone ack with how many messages remain after the position just
+  confirmed (`wire.Ack.Behind`, a `*int` — nil means the server didn't
+  send one, not zero). Unlike `Joined.Behind` (measured from whatever the
+  server's own ack cursor happened to be at connect time), this is
+  measured from a position the model itself chose. `Conn.ConfirmReceived`
+  now waits for and returns it. First gated on `isBridge` (only wait on a
+  bridge/link connection) — wrong, caught live by chat-relay's author:
+  whether a server answers is a per-SERVER capability, not a
+  per-connection-form one, and their own server answers on a plain
+  `hub_connect` session exactly the same as on a bridge link (this
+  client's own coordination-hub session is exactly such a connection, so
+  the wrong gate silently dropped the count precisely where it was
+  needed). Fixed to a per-connection probe instead
+  (`Conn.ackReplyMisses`): every `ConfirmReceived` call waits until
+  `ackReplyMissThreshold` (2) consecutive calls have each gotten nothing
+  back within `AckWaitTimeout` — only then do later calls on the same
+  Conn skip waiting, and any reply that does arrive resets the streak to
+  0. Chat-relay's own same-day follow-up: an earlier version ratcheted
+  on a single miss, which turns one transient slow/lost reply into a
+  permanent, silent "this server never answers" conclusion for the
+  connection's whole remaining life — the same "capability inferred from
+  an absence" shape as everything else caught today. `hub_confirm`/
+  `hub_send`/`hub_edit`'s result text states the count when present.
+- **`wire.Joined.Features`** (protocol version 3): the server now
+  declares its supported capabilities explicitly instead of a client
+  inferring them at runtime — the project owner's direct instruction,
+  reinforcing the exact same "never infer a capability from silence"
+  principle the `ackReplyMisses` fix above was still working around.
+  `Features` is `map[string]json.RawMessage`, keyed by feature name, each
+  value carrying that feature's own parameters (empty `{}` when it has
+  none — e.g. `attachments: {maxRawBytes, maxFrameBytes, imagesOnly}`).
+  Absence of a key means unsupported; a nil `Features` map entirely means
+  a pre-v3 server, where nothing is known either way — these two stay
+  distinguishable (`Conn.FeaturesDeclared()` vs `Conn.HasFeature(name)`),
+  never conflated. `ConfirmReceived` now prefers this over its own probe:
+  a declared "no" skips waiting immediately and permanently (certain, no
+  probing needed); a declared "yes" always waits, since the server has
+  promised a reply; only an undeclared `Features` object falls back to
+  `ackReplyMisses`. Chat-relay's own hub session declares `messageAfter`,
+  `ackReplies`, and `attachments`; its bridge session adds
+  `rosterReadAt`, `mentions`, `reactions`, `edit`, `delete`, `replyTo`,
+  and `attachments.imagesOnly` — reactions/edit/delete deliberately not
+  declared on a hub session, since that path drops them. `serverVersion`
+  itself stays the coarse "can we talk at all" floor (3 means "this
+  server declares features") and is no longer the vehicle for individual
+  capabilities — an additive feature needs no further version bump.
+- **`systemPeerId`/`IsOperator` removed** entirely, at the project
+  owner's direct instruction: `wire.Joined.SystemPeerID`,
+  `Conn.SystemPeerID()`, `hubconn.Event.IsOperator`, and `FormatEvent`'s
+  " OPERATOR (...)" tag are all gone. A message from the session's
+  system/operator peer now renders exactly like any other peer's — no
+  special trust framing based on which peerId sent it.
+- **connstore rewritten**: one file (`state.json`, replacing
+  `connections.json`+`catchup.json`), hierarchical Go maps instead of a
+  concatenated string key, no backward-compatible read path at all — all
+  at the project owner's direct instruction ("put everything into one
+  json file... structure the keys hierarchically, do not append them...
+  do not keep backwards compatible code"), which also superseded the
+  same-day `|`-separator readability fix above (itself now removed along
+  with its legacy-NUL-byte fallback). Two top-level maps, `hubs` and
+  `teams` — a plain `hub_connect` session has connstore-managed identity
+  (peerId, reconnectSecret) on top of catch-up state; a
+  `teams_relay_connect` session's identity is caller-managed, so
+  connstore only ever holds its catch-up state, under its own identity
+  (`TeamsID`: the link's stable non-secret portion + project). Nesting
+  order is **project outermost** in both — also the project owner's own
+  call ("shouldn't the main key be the project, because every project
+  has its own connections?"): the question a human reading the file
+  actually has ("what does this project have") is now one contiguous
+  block, not scattered across every host/sessionId/link a machine has
+  ever seen. Below project, Host+SessionID combine into one space-joined
+  key line rather than a further nesting level — another of the project
+  owner's own follow-ups ("the url and the session could be combined by
+  a space"): a hub session's host+sessionId together name one
+  connection, with nothing meaningful to look up by Host alone. Final
+  shape: `hubs: project -> "host sessionId" -> entry`, `teams: project
+  -> linkTarget -> entry`. `catchUp` (cursor/gap/ahead) is nested
+  directly under each entry rather than a separate
+  namespaced-string-keyed store; `handedOverAhead` is a plain JSON
+  array, not a map re-encoded as a JSON string inside a string value.
+  `connstore.CatchUpID` is a small union type (`Hub *Target` /
+  `Teams *TeamsID`) that `mcptools.Hub` keeps a single field of, replacing
+  the old bare opaque string key, so catch-up logic never has to branch
+  on connection kind at its call sites. The real `connections.json`/
+  `catchup.json` on the machine this was built on were migrated by hand
+  into `state.json` (a one-time, throwaway script — not shipped code)
+  and deleted; every `mcp-hub-client` process on the machine was killed
+  so none could keep writing the old files, per the project owner's own
+  instruction.
+- **`Entry.Topic`/`TeamsEntry.Topic`**: when the server sets
+  `wire.Joined.Topic` (the conversation's own display name — a bridge-
+  session-only field, e.g. a Teams chat's title), it's now written to
+  connstore too, at the project owner's own request ("if the name of the
+  conversation is known to the mcp, it should write that too") —
+  distinct from `Name`, which is this connection's OWN peer display
+  name, not what conversation it's in. Surfaced in `hub_list_connections`
+  output when present.
+
 A second connect path, for a server that bridges into a real chat platform
 (the motivating case: a "chat-relay" project mirroring a bot account's
 Microsoft Teams conversations) rather than being an `mcp-hub-server`.

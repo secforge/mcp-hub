@@ -47,7 +47,7 @@ type RelayDialOptions struct {
 // detection as Dial via finishHandshake — a relay connection is otherwise
 // an ordinary Conn once established.
 func DialRelay(link string, opts RelayDialOptions) (*Conn, error) {
-	snapPongWait, snapWriteWait, snapAckIdleInterval := pongWait, writeWait, ackIdleInterval
+	snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval := pongWait, writeWait, ackIdleInterval, confirmReminderInterval
 
 	target, secret, ok := strings.Cut(link, "#")
 	if !ok || secret == "" {
@@ -68,5 +68,5 @@ func DialRelay(link string, opts RelayDialOptions) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return finishHandshake(ws, snapPongWait, snapWriteWait, snapAckIdleInterval, true)
+	return finishHandshake(ws, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval, true)
 }

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"sync"
@@ -16,6 +17,45 @@ import (
 	"github.com/secforge/mcp-hub/internal/agekey"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
+
+// SystemPeerIDOperator and SystemPeerIDSystem are the two fixed,
+// well-known peerIds a server uses for its own operator/system-
+// originated messages — restored 2026-09-08 alongside Event.IsOperator
+// (see its own doc comment): the project owner's instruction was to
+// stop advertising which one to expect (wire.Joined.SystemPeerID,
+// removed), not to stop recognizing them ("Operator 000000 and system
+// fffff must be supported") — they're constants a client checks
+// directly. SystemPeerIDOperator (the Nil UUID) is the human running
+// the server; SystemPeerIDSystem (all-Fs) is an automated, server-
+// generated message — a bridge/link session's own HMAC-derived peer IDs
+// force a v4 nibble, so all-Fs can never collide with a real one.
+const (
+	SystemPeerIDOperator = "00000000-0000-0000-0000-000000000000"
+	SystemPeerIDSystem   = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+)
+
+// debugEnabled gates debugf below — off by default, so normal operation
+// never pays for or leaks this. Added 2026-09-07 to chase a live bug
+// report (hub_catch_up(gap: true) timing out repeatedly, anchor never
+// advancing) that static code reading couldn't pin down: whether the
+// server's answer to a MessageAfter request is actually reaching
+// RequestMessageAfterAwaiting's waiting channel. Read once at package
+// init rather than on every call, since it's an operator toggle, not
+// something that changes mid-process.
+var debugEnabled = os.Getenv("MCP_HUB_DEBUG") != ""
+
+// debugf writes a timestamped diagnostic line to stderr when
+// MCP_HUB_DEBUG is set — never to stdout, which mcp-hub-client's own
+// stdio MCP transport uses for protocol framing. A no-op otherwise, so
+// this is safe to leave in permanently rather than ripping out once the
+// current investigation concludes.
+func debugf(format string, args ...any) {
+	if !debugEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[hubconn debug %s] "+format+"\n",
+		append([]any{time.Now().Format(time.RFC3339Nano)}, args...)...)
+}
 
 // pongWait bounds how long we'll go without hearing anything at all — data
 // or a ping — from wsserver (which pings every 30s, wsserver.pingPeriod)
@@ -40,6 +80,11 @@ var (
 	// position that hasn't been reported yet — see Conn.ackLoop. Var so
 	// tests can shorten it.
 	ackIdleInterval = 60 * time.Second
+	// confirmReminderInterval is how often confirmReminderLoop checks for
+	// something delivered live but never confirmed via hub_confirm (or an
+	// intervening hub_receive/hub_wait/hub_catch_up) — see that method's
+	// doc comment. Var so tests can shorten it.
+	confirmReminderInterval = 5 * time.Minute
 )
 
 type Event struct {
@@ -64,6 +109,12 @@ type Event struct {
 	// ack kinds: "did the action this connection asked for succeed."
 	ExternalID string
 	ActionOK   bool
+	// Behind carries a standalone ack's reply's own wire.Ack.Behind, if
+	// the server sent one — see that field's doc comment. Nil on every
+	// other event kind, and on an "ack" from a server that doesn't send
+	// it; never zero-as-absent, since a genuine "0 behind" is meaningful
+	// and must stay distinguishable from "not sent."
+	Behind *int
 	// ReplyTo/ReplyPreview carry a "msg"/"messageEdited"'s reply
 	// reference, if any — see wire.Msg.ReplyTo/ReplyPreview. Empty (not a
 	// distinguishable "absent" vs. "empty string") when this message
@@ -74,11 +125,14 @@ type Event struct {
 	// any — see wire.Msg.Mentions/wire.Msg.MentionedMe.
 	Mentions    []wire.Mention
 	MentionedMe bool
-	// IsOperator is true when this event's PeerID equals the session's
-	// wire.Joined.SystemPeerID (see Conn.SystemPeerID) — set here, not
-	// decoded from the frame itself, since a frame has no way to declare
-	// its own authority. Only meaningful together with a non-empty
-	// PeerID; false whenever a server has no SystemPeerID concept at all.
+	// IsOperator is true when this event's PeerID is one of the two
+	// well-known system/operator constants (SystemPeerIDHub,
+	// SystemPeerIDBridge) — restored 2026-09-08 after a same-day removal
+	// went too far: the project owner's actual instruction was to stop
+	// advertising which constant to expect on the wire (wire.Joined used
+	// to carry a SystemPeerID field for this), not to stop recognizing
+	// the constants at all. They're well-known and fixed, so a client
+	// checks directly rather than needing to be told.
 	IsOperator bool
 	// Own marks a "msg" this exact connection sent — see wire.Msg.Own. Also
 	// used on "reactionChanged" for the same purpose — see wire.ReactionChanged.Own.
@@ -145,9 +199,17 @@ type Conn struct {
 	canSend          bool
 	conversationKind string
 	topic            *string
-	systemPeerID     string
 	behind           int
 	behindSince      string
+	// features/featuresDeclared hold wire.Joined.Features, if the server
+	// sent one at all — see that field's doc comment. featuresDeclared
+	// distinguishes "no Features field sent" (pre-v3, nothing known)
+	// from "Features sent but this key absent" (definitively
+	// unsupported) — both look identical as a missing map entry
+	// otherwise. Immutable after construction, same as the other Joined-
+	// derived fields above; not under mu.
+	features         map[string]json.RawMessage
+	featuresDeclared bool
 	// pongWait is snapshotted from the package-level var once, synchronously,
 	// in Dial — never read from the background readLoop goroutine directly.
 	// Reading the mutable package var from that goroutine on every loop
@@ -164,6 +226,11 @@ type Conn struct {
 	// spawned.
 	ackIdleInterval time.Duration
 
+	// confirmReminderInterval is snapshotted the same way and for the
+	// same reason as ackIdleInterval above — read only by
+	// confirmReminderLoop, captured before it's spawned.
+	confirmReminderInterval time.Duration
+
 	// isBridge is true only for a connection made via DialRelay — set once
 	// during construction, read only after Dial/DialRelay has returned, so
 	// (like peerID/name/etc. above) it needs no locking: the happens-before
@@ -173,6 +240,25 @@ type Conn struct {
 
 	mu         sync.Mutex
 	buffer     []Event
+	// ackReplyMisses counts CONSECUTIVE ConfirmReceived calls that waited
+	// for a standalone ack's reply and got nothing back within
+	// AckWaitTimeout — added 2026-09-08, correcting an earlier isBridge-
+	// based gate that chat-relay's author caught live: whether a server
+	// replies to a standalone ack with a Behind count (see wire.Ack.
+	// Behind) is a per-SERVER capability, not a per-connection-form one —
+	// chat-relay answers on a plain hub_connect session (host+sessionId)
+	// exactly the same as on a bridge link, so gating on isBridge dropped
+	// the count precisely where this client's own coordination-hub
+	// session (a plain hub_connect against chat-relay) needed it. A
+	// counter, not a one-shot bool: ratcheting to "never wait again"
+	// after a single miss turns one slow or lost reply into a permanent,
+	// silent conclusion for the connection's whole remaining life — a
+	// capability inferred from one absence, the same failure shape as
+	// everything else caught today. Reset to 0 by any reply that DOES
+	// arrive; once it reaches ackReplyMissThreshold, later confirms skip
+	// waiting entirely until a genuine ack reply resets it — reconnect
+	// gets a fresh Conn and starts at 0 again either way.
+	ackReplyMisses int
 	closed     bool
 	closeCode  int       // set from the WebSocket close frame's code, if any — see DisconnectNote
 	timedOut   bool      // set when the connection was dropped by our own pongWait deadline, not a close frame — see DisconnectNote
@@ -340,7 +426,7 @@ type DialOptions struct {
 func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 	// Snapshot once, synchronously, before any goroutine is spawned — see
 	// the pongWait field's doc comment on Conn for why.
-	snapPongWait, snapWriteWait, snapAckIdleInterval := pongWait, writeWait, ackIdleInterval
+	snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval := pongWait, writeWait, ackIdleInterval, confirmReminderInterval
 
 	base, err := normalizeHost(host)
 	if err != nil {
@@ -368,7 +454,7 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return finishHandshake(ws, snapPongWait, snapWriteWait, snapAckIdleInterval, false)
+	return finishHandshake(ws, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval, false)
 }
 
 // finishHandshake reads the server's initial "joined" message off an
@@ -377,7 +463,7 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 // reach an open *websocket.Conn (a normalized host+sessionId URL with no
 // custom headers, vs. an arbitrary caller-supplied URL with an
 // Authorization/etc. header) and in isBridge, which DialRelay passes true.
-func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdleInterval time.Duration, isBridge bool) (*Conn, error) {
+func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval time.Duration, isBridge bool) (*Conn, error) {
 	_, raw, err := ws.ReadMessage()
 	if err != nil {
 		ws.Close()
@@ -396,24 +482,26 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 	ws.SetReadDeadline(time.Now().Add(snapPongWait))
 
 	c := &Conn{
-		ws:               ws,
-		peerID:           joined.PeerID,
-		name:             joined.Name,
-		agePublicKey:     joined.AgePublicKey,
-		serverVersion:    joined.ServerVersion,
-		expectedPeers:    joined.PeerCount,
-		peers:            make(map[string]PeerInfo),
-		pongWait:         snapPongWait,
-		canSend:          joined.CanSend,
-		conversationKind: joined.ConversationKind,
-		topic:            joined.Topic,
-		systemPeerID:     joined.SystemPeerID,
-		behind:           joined.Behind,
-		behindSince:      joined.BehindSince,
-		isBridge:         isBridge,
-		lastFrameKind:    "joined",
-		lastFrameAt:      time.Now(),
-		ackIdleInterval:  snapAckIdleInterval,
+		ws:                      ws,
+		peerID:                  joined.PeerID,
+		name:                    joined.Name,
+		agePublicKey:            joined.AgePublicKey,
+		serverVersion:           joined.ServerVersion,
+		expectedPeers:           joined.PeerCount,
+		peers:                   make(map[string]PeerInfo),
+		pongWait:                snapPongWait,
+		canSend:                 joined.CanSend,
+		conversationKind:        joined.ConversationKind,
+		topic:                   joined.Topic,
+		behind:                  joined.Behind,
+		behindSince:             joined.BehindSince,
+		features:                joined.Features,
+		featuresDeclared:        joined.Features != nil,
+		isBridge:                isBridge,
+		lastFrameKind:           "joined",
+		lastFrameAt:             time.Now(),
+		ackIdleInterval:         snapAckIdleInterval,
+		confirmReminderInterval: snapConfirmReminderInterval,
 	}
 	ws.SetPingHandler(func(appData string) error {
 		ws.SetReadDeadline(time.Now().Add(snapPongWait))
@@ -424,6 +512,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 	})
 	go c.readLoop()
 	go c.ackLoop()
+	go c.confirmReminderLoop()
 	return c, nil
 }
 
@@ -441,10 +530,20 @@ func (c *Conn) AgePublicKey() string { return c.agePublicKey }
 // Compare against wire.ProtocolVersion to tell if this client is behind.
 func (c *Conn) ServerVersion() int { return c.serverVersion }
 
-// SystemPeerID is the server's operator/system peerId for this session, if
-// it has one — see wire.Joined.SystemPeerID. Empty when the server doesn't
-// set this concept (including every mcp-hub-server).
-func (c *Conn) SystemPeerID() string { return c.systemPeerID }
+// FeaturesDeclared reports whether the server sent a Features object at
+// all (see wire.Joined.Features) — false for a pre-v3 server, where
+// nothing is known about individual capabilities either way and a
+// runtime fallback (e.g. ConfirmReceived's ackReplyMisses probe) is the
+// only way to find out.
+func (c *Conn) FeaturesDeclared() bool { return c.featuresDeclared }
+
+// HasFeature reports whether the server explicitly declared support for
+// the named feature — meaningless (always false) when FeaturesDeclared
+// is false, since a pre-v3 server has said nothing either way.
+func (c *Conn) HasFeature(name string) bool {
+	_, ok := c.features[name]
+	return ok
+}
 
 // ExpectedPeerCount is how many peers were already in the session at join
 // time, as reported by the server's "joined" message — i.e. how many
@@ -484,7 +583,7 @@ func (c *Conn) ConversationKind() string { return c.conversationKind }
 // mcp-hub-server, and a fresh position with no prior cursor to compare).
 func (c *Conn) Behind() int         { return c.behind }
 func (c *Conn) BehindSince() string { return c.behindSince }
-func (c *Conn) Topic() *string           { return c.topic }
+func (c *Conn) Topic() *string      { return c.topic }
 
 // IsBridge reports whether this connection was made via DialRelay rather
 // than Dial — a bridge-style session where a write action (send/react/
@@ -593,8 +692,20 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 		case ev.Kind == "msg" && ev.Answers != nil, ev.Kind == "noMoreMessages":
 			claim := c.pendingMessageAfter
 			c.pendingMessageAfter = nil
+			debugf("tryDivertToClaimLocked: matched claim=%p kind=%q cursor=%q answers=%+v",
+				claim, ev.Kind, ev.Cursor, ev.Answers)
 			claim.result <- ev
 			return true
+		default:
+			// A pending MessageAfter claim exists but this event doesn't
+			// match it — e.g. a live "msg" with no Answers arriving while
+			// a gap/catch-up walk is waiting. Logged because the claim
+			// falling through here, unresolved, is exactly the failure
+			// mode under investigation 2026-09-07 (a MessageAfter answer
+			// silently not reaching its waiter) if it ever fires for an
+			// event that was actually meant to be that answer.
+			debugf("tryDivertToClaimLocked: pending claim=%p NOT matched by kind=%q cursor=%q answers=%+v — falling through to buffer",
+				c.pendingMessageAfter, ev.Kind, ev.Cursor, ev.Answers)
 		}
 	}
 	if claim, ok := c.pendingAcks[ev.Kind]; ok {
@@ -645,6 +756,18 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 			// than one it already has.
 			c.lastAckSent = ev.Cursor
 		}
+		// A caller that wants this specific reply (currently only
+		// ConfirmReceived, to surface a server's optional Behind count —
+		// added 2026-09-08) registers a claim first via claimNextAck.
+		// The bookkeeping above still applies unconditionally either
+		// way; only the delivery differs — a claimed reply falls through
+		// to tryDivertToClaimLocked below instead of being discarded
+		// here, same as every other ack kind's claim path. ackLoop's own
+		// background standalone acks never register a claim, so they
+		// keep being silently discarded exactly as before.
+		if _, claimed := c.pendingAcks["ack"]; claimed {
+			return false
+		}
 		return true
 	}
 	if ev.Kind == "error" && (ev.Code == "bad_ack" || ev.Code == "bad_ack_cursor") {
@@ -664,6 +787,87 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 		return true
 	}
 	return false
+}
+
+// ConfirmReceived sends an immediate standalone read receipt (wire.Ack)
+// for cursor and marks it as this connection's consumed boundary — the
+// same lastConsumed/lastAckSent state ackLoop's idle timer and Send's
+// piggybacking already read (see MarkConsumed's doc comment). Unlike
+// those, which a caller drives from its own drain, this is a caller
+// asserting the boundary directly: for mcp-hub-client, the model itself,
+// via hub_confirm, since nothing else in this client's async delivery
+// paths (wait --follow, one-shot wait) can honestly claim the model read
+// anything. Sent immediately rather than waiting for ackLoop's idle tick
+// — a caller invoking this wants the receipt to land now, not on the
+// next timer.
+//
+// ackReplyMissThreshold bounds ackReplyMisses — see its own doc comment
+// for why this is a streak, not a single miss: a transient slow/lost
+// reply must not read as "this server never answers" for the rest of
+// the connection's life. Var so tests can shorten the number of stalls
+// they need to pay to exercise the ratchet, the same pattern
+// ackIdleInterval/confirmReminderInterval already use for their own
+// tunables.
+var ackReplyMissThreshold = 2
+
+// Returns the server's reported Behind count from its reply, if one
+// arrives — added 2026-09-08, chat-relay's own server-side extension
+// (see wire.Ack.Behind's doc comment for why this count is worth having:
+// it's measured from the position the model itself just asserted, not
+// one inherited from connect time). Waits for a reply per connection to
+// find out whether the server sends one at all — see ackReplyMisses's
+// doc comment for why that's a per-connection probe (tolerating a few
+// consecutive misses before giving up) rather than an isBridge check or
+// a single-miss ratchet. nil, nil is the normal, expected result once
+// that probe has concluded the server doesn't reply — not an error.
+func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
+	c.MarkConsumed([]Event{{Cursor: cursor}})
+	// Prefer the server's own explicit declaration (wire.Joined.Features,
+	// added 2026-09-08) over the runtime probe below whenever it's
+	// available — chat-relay's author, live: "never infer a capability
+	// from silence at runtime." A declared "no" is certain and permanent
+	// for this connection's life, so it skips waiting without ever
+	// needing to probe; a declared "yes" always waits, since the server
+	// has already promised a reply. Only an UNDECLARED Features object
+	// (a pre-v3 server, where nothing is known either way) falls back to
+	// ackReplyMisses's own probe-and-ratchet.
+	var skipWait bool
+	if c.featuresDeclared {
+		skipWait = !c.HasFeature("ackReplies")
+	} else {
+		c.mu.Lock()
+		skipWait = c.ackReplyMisses >= ackReplyMissThreshold
+		c.mu.Unlock()
+	}
+	if skipWait {
+		if err := c.ws.WriteJSON(wire.NewAck(cursor)); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		c.lastAckSent = cursor
+		c.mu.Unlock()
+		return nil, nil
+	}
+	resultCh, cancel := c.claimNextAck("ack")
+	defer cancel()
+	if err := c.ws.WriteJSON(wire.NewAck(cursor)); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.lastAckSent = cursor
+	c.mu.Unlock()
+	select {
+	case ev := <-resultCh:
+		c.mu.Lock()
+		c.ackReplyMisses = 0
+		c.mu.Unlock()
+		return ev.Behind, nil
+	case <-time.After(AckWaitTimeout):
+		c.mu.Lock()
+		c.ackReplyMisses++
+		c.mu.Unlock()
+		return nil, nil
+	}
 }
 
 // ackLoop periodically sends a standalone read receipt (wire.Ack) if
@@ -697,6 +901,53 @@ func (c *Conn) ackLoop() {
 	}
 }
 
+// confirmReminderLoop periodically checks whether anything has been seen
+// (lastSeenCursor) beyond what's actually been confirmed via a genuine
+// synchronous hand-over (lastConsumed — see MarkConsumed's doc comment
+// for why that's a deliberately narrower signal than "written to a
+// socket"), and if so, injects a client-generated reminder event asking
+// the model to call hub_confirm. Requested directly by the project owner,
+// 2026-09-07, after a long hub discussion converged on exactly this
+// primitive as the only thing that can close the delivery-vs-consumption
+// gap: everything else (a timer alone, N+1-arrival, delivery hooks)
+// observes this client's own writes, not whether a model actually read
+// anything.
+//
+// Built as an ordinary buffered Event rather than a side channel
+// specifically so it flows through the exact same delivery paths
+// (wait --follow, hub_receive, hub_wait) as any other event — including
+// FormatEventsBatch's own i/N markers when it happens to land bundled
+// with others. Deliberately generated here, client-locally, and never
+// from a wire frame: per the hub discussion's own security refinement, a
+// line instructing the model to advance its own confirmed position must
+// never be something a peer could produce, or it becomes silent loss
+// reintroduced through the front door. Never carries its own Cursor —
+// only Text, holding the cursor to suggest confirming — so this event is
+// never itself mistaken for a confirmed hand-over by
+// recordHandedOver/MarkConsumed, which key entirely off Event.Cursor.
+func (c *Conn) confirmReminderLoop() {
+	ticker := time.NewTicker(c.confirmReminderInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return
+		}
+		seen, consumed := c.lastSeenCursor, c.lastConsumed
+		if seen == "" || seen == consumed {
+			c.mu.Unlock()
+			continue
+		}
+		c.buffer = append(c.buffer, Event{Kind: "confirmReminder", Text: seen})
+		f := c.onActivity
+		c.mu.Unlock()
+		if f != nil {
+			f()
+		}
+	}
+}
+
 func (c *Conn) readLoop() {
 	for {
 		_, raw, err := c.ws.ReadMessage()
@@ -721,6 +972,7 @@ func (c *Conn) readLoop() {
 		}
 		ev, ok := decodeEvent(raw)
 		if !ok {
+			debugf("readLoop: decodeEvent failed, dropping frame raw=%s", raw)
 			continue
 		}
 		c.mu.Lock()
@@ -733,7 +985,7 @@ func (c *Conn) readLoop() {
 			c.mu.Unlock()
 			continue
 		}
-		if ev.PeerID != "" && c.systemPeerID != "" && ev.PeerID == c.systemPeerID {
+		if ev.PeerID == SystemPeerIDOperator || ev.PeerID == SystemPeerIDSystem {
 			ev.IsOperator = true
 		}
 		c.buffer = append(c.buffer, ev)
@@ -773,7 +1025,15 @@ func decodeEvent(raw []byte) (Event, bool) {
 	switch typ {
 	case wire.TypeMsg:
 		var m wire.Msg
-		if err := json.Unmarshal(raw, &m); err != nil || !wire.IsValidID(m.PeerID) {
+		// PeerID is normally a real peer's UUID, but a system/relay-level
+		// notification (e.g. chat-relay's "chat renamed" event) can be a
+		// "msg" with no PeerID at all — that is a legitimate, peerless
+		// message, not a malformed one, and must not be confused with a
+		// garbage non-UUID id, which IS rejected. Silently dropping the
+		// peerless case here once caused a real bug: a MessageAfter answer
+		// landing on exactly such a message never reached the pending
+		// claim, so RequestMessageAfterAwaiting always timed out on it.
+		if err := json.Unmarshal(raw, &m); err != nil || (m.PeerID != "" && !wire.IsValidID(m.PeerID)) {
 			return Event{}, false
 		}
 		return Event{Kind: "msg", PeerID: m.PeerID, Text: m.Text, TS: m.TS, Private: m.Private,
@@ -864,7 +1124,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		// doc comment: on OK false it's the position the server actually
 		// holds, to be adopted rather than treated as confirmation of what
 		// was sent.
-		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK}, true
+		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK, Behind: a.Behind}, true
 	case wire.TypeAttachmentData:
 		var a wire.AttachmentData
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -941,8 +1201,10 @@ func (c *Conn) RequestMessageAfterAwaiting(anchor wire.Anchor) (Event, bool, err
 	ch := make(chan Event, 1)
 	c.mu.Lock()
 	claim := &ackClaim{result: ch}
+	prev := c.pendingMessageAfter
 	c.pendingMessageAfter = claim
 	c.mu.Unlock()
+	debugf("RequestMessageAfterAwaiting: anchor=%+v claim=%p replacing-prev=%v", anchor, claim, prev != nil)
 	cancel := func() {
 		c.mu.Lock()
 		if c.pendingMessageAfter == claim {
@@ -954,12 +1216,17 @@ func (c *Conn) RequestMessageAfterAwaiting(anchor wire.Anchor) (Event, bool, err
 
 	m := wire.MessageAfter{Type: wire.TypeMessageAfter, Anchor: anchor}
 	if err := c.ws.WriteJSON(m); err != nil {
+		debugf("RequestMessageAfterAwaiting: claim=%p write error: %v", claim, err)
 		return Event{}, false, err
 	}
 	select {
 	case ev := <-ch:
+		debugf("RequestMessageAfterAwaiting: claim=%p resolved kind=%q cursor=%q answers=%+v",
+			claim, ev.Kind, ev.Cursor, ev.Answers)
 		return ev, true, nil
 	case <-time.After(AckWaitTimeout):
+		debugf("RequestMessageAfterAwaiting: claim=%p timed out after %s waiting for anchor=%+v",
+			claim, AckWaitTimeout, anchor)
 		return Event{}, false, nil
 	}
 }
@@ -1275,20 +1542,43 @@ func (c *Conn) DrainBatch() (chunks []string, connected bool) {
 
 // DrainEvents is Drain without the text formatting — for a caller (like
 // mcptools' image-rendering path) that needs the raw Event.Attachments
-// rather than FormatEvents' text-only rendering. Same consumed-boundary
-// semantics as Drain; the two must not both be called on the same batch.
+// rather than FormatEvents' text-only rendering. Unlike Drain/DrainBatch's
+// older behavior, this does NOT by itself mark anything as consumed for
+// the read-receipt system — see MarkConsumed's doc comment for why that
+// boundary moved out of every drain and into an explicit call a caller
+// makes only once it's certain the model actually received the result
+// (not merely that bytes left this process for a socket).
 func (c *Conn) DrainEvents() (events []Event, connected bool) {
 	c.mu.Lock()
 	events = c.buffer
 	c.buffer = nil
 	connected = !c.closed
+	c.mu.Unlock()
+	return events, connected
+}
+
+// MarkConsumed records the given events' cursors as delivered to the
+// model, for the read-receipt system (ack piggybacking, and ackLoop's
+// idle-triggered standalone ack) — moved out of Drain/DrainBatch/
+// DrainEvents themselves and into this explicit call, found live,
+// 2026-09-07: those three are also what waiter's follow-mode delivery
+// and one-shot `wait` use to write events to the wait socket, neither of
+// which confirms a model ever read anything — only that this process
+// wrote bytes onward. Marking "consumed" at drain time meant a standalone
+// ack (and hence a bridge server's own delivery-tracking field, e.g.
+// chat-relay's Behind) reported truthfully on "reached this process,"
+// not on "reached the model," while claiming the latter. Call this only
+// from a genuinely synchronous hand-over — an MCP tool result the model
+// is about to receive directly, mirroring mcptools.Hub.recordHandedOver's
+// identical reasoning and sharing its call site.
+func (c *Conn) MarkConsumed(events []Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, e := range events {
 		if e.Cursor != "" {
 			c.lastConsumed = e.Cursor
 		}
 	}
-	c.mu.Unlock()
-	return events, connected
 }
 
 // LastConsumedCursor is the cursor of the most recent event actually

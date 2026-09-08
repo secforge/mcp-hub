@@ -1498,9 +1498,10 @@ func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 		t.Fatalf("expected no note with an empty store, got: %s", note)
 	}
 
-	if err := connstore.Upsert(connstore.Entry{
-		Host: "wss://a", SessionID: "550e8400-e29b-41d4-a716-446655440000", Connected: true,
-	}); err != nil {
+	if err := connstore.Upsert(
+		connstore.Target{Host: "wss://a", SessionID: "550e8400-e29b-41d4-a716-446655440000"},
+		connstore.Entry{Connected: true},
+	); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -1779,58 +1780,63 @@ func TestDisconnectDetectedAutomaticallyWithoutAnyToolCall(t *testing.T) {
 	})
 }
 
-// TestSetCatchUpKeyLoadsNothingForAFreshKey proves a key never seen
+// TestSetCatchUpKeyLoadsNothingForAFreshKey proves an identity never seen
 // before starts with no position — the common case for a brand-new
 // session.
 func TestSetCatchUpKeyLoadsNothingForAFreshKey(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	hub := NewHub()
-	hub.setCatchUpKey("brand-new-key")
+	hub.setCatchUpKey(connstore.HubCatchUpID(connstore.Target{Host: "wss://brand-new", SessionID: "550e8400-e29b-41d4-a716-446655440000"}))
 
 	hub.mu.Lock()
 	got := hub.lastHandedOverCursor
 	hub.mu.Unlock()
 	if got != "" {
-		t.Fatalf("expected no prior position for a fresh key, got %q", got)
+		t.Fatalf("expected no prior position for a fresh identity, got %q", got)
 	}
 }
 
 // TestSetCatchUpKeyPersistsAcrossHubInstances proves the whole point of
 // persisting via connstore rather than keeping this in memory only: a
 // SECOND *Hub (standing in for a fresh process after a restart) calling
-// setCatchUpKey with the same key recovers the position the first Hub
-// persisted, rather than starting over.
+// setCatchUpKey with the same identity recovers the position the first
+// Hub persisted, rather than starting over.
 func TestSetCatchUpKeyPersistsAcrossHubInstances(t *testing.T) {
-	key := "persist-test-key"
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	target := connstore.Target{Host: "wss://persist-test", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	id := connstore.HubCatchUpID(target)
 
 	first := NewHub()
-	first.setCatchUpKey(key)
-	if err := connstore.SetCatchUpCursor(key, "cursor-1"); err != nil {
-		t.Fatalf("SetCatchUpCursor: %v", err)
+	first.setCatchUpKey(id)
+	if err := connstore.SetCatchUp(target, connstore.CatchUpState{Cursor: "cursor-1"}); err != nil {
+		t.Fatalf("SetCatchUp: %v", err)
 	}
 
 	second := NewHub()
-	second.setCatchUpKey(key)
+	second.setCatchUpKey(id)
 
 	second.mu.Lock()
 	got := second.lastHandedOverCursor
 	second.mu.Unlock()
 	if got != "cursor-1" {
-		t.Fatalf("expected the second Hub to recover cursor-1 for the same key, got %q", got)
+		t.Fatalf("expected the second Hub to recover cursor-1 for the same identity, got %q", got)
 	}
 }
 
-// TestSetCatchUpKeyIsolatesDifferentKeys proves two different keys never
-// bleed into each other — the stale-cursor-bleed guard the old
-// target-based mechanism used to provide, now provided by key derivation
-// (connstore.Target.Key()/catchUpKeyForRelay) instead of a same-target
-// comparison.
+// TestSetCatchUpKeyIsolatesDifferentKeys proves two different identities
+// never bleed into each other — the stale-cursor-bleed guard the old
+// target-based mechanism used to provide, now provided by connstore's
+// own hierarchical keying instead of a same-target comparison.
 func TestSetCatchUpKeyIsolatesDifferentKeys(t *testing.T) {
-	if err := connstore.SetCatchUpCursor("key-a", "cursor-1"); err != nil {
-		t.Fatalf("SetCatchUpCursor: %v", err)
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	targetA := connstore.Target{Host: "wss://key-a", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	if err := connstore.SetCatchUp(targetA, connstore.CatchUpState{Cursor: "cursor-1"}); err != nil {
+		t.Fatalf("SetCatchUp: %v", err)
 	}
 
 	hub := NewHub()
-	hub.setCatchUpKey("key-b")
+	targetB := connstore.Target{Host: "wss://key-b", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	hub.setCatchUpKey(connstore.HubCatchUpID(targetB))
 
 	hub.mu.Lock()
 	got := hub.lastHandedOverCursor
@@ -1840,26 +1846,26 @@ func TestSetCatchUpKeyIsolatesDifferentKeys(t *testing.T) {
 	}
 }
 
-// TestCatchUpKeyForRelayIsProjectScopedAndStableAcrossReconnectSecret
+// TestCatchUpIDForRelayIsProjectScopedAndStableAcrossReconnectSecret
 // proves the derivation used for teams_relay_connect sessions: the same
 // link (minus its "#"-delimited secret, which changes meaning nothing —
 // see hubconn.DialRelay) in the same project always derives the same
-// key, and a different project derives a different one — the same
+// identity, and a different project derives a different one — the same
 // collision-avoidance discipline connstore.Target already applies to
 // plain hub_connect sessions.
-func TestCatchUpKeyForRelayIsProjectScopedAndStableAcrossReconnectSecret(t *testing.T) {
+func TestCatchUpIDForRelayIsProjectScopedAndStableAcrossReconnectSecret(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("MCP_HUB_PROJECT_DIR", "/project/a")
-	k1 := catchUpKeyForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-1")
-	k2 := catchUpKeyForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-2")
-	if k1 != k2 {
-		t.Fatalf("expected the same key regardless of the link's secret, got %q vs %q", k1, k2)
+	id1 := catchUpIDForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-1")
+	id2 := catchUpIDForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-2")
+	if *id1.Teams != *id2.Teams {
+		t.Fatalf("expected the same identity regardless of the link's secret, got %+v vs %+v", *id1.Teams, *id2.Teams)
 	}
 
 	t.Setenv("MCP_HUB_PROJECT_DIR", "/project/b")
-	k3 := catchUpKeyForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-1")
-	if k3 == k1 {
-		t.Fatalf("expected a different key for a different project, got the same: %q", k3)
+	id3 := catchUpIDForRelay(ctx, "wss://relay.example/relay/join?c=abc#secret-1")
+	if *id3.Teams == *id1.Teams {
+		t.Fatalf("expected a different identity for a different project, got the same: %+v", *id3.Teams)
 	}
 }
 
@@ -1912,5 +1918,63 @@ func TestParseMentionsRejectsNonObjectEntry(t *testing.T) {
 	_, err := parseMentions([]any{"not an object"})
 	if err == nil {
 		t.Fatal("expected an error for a non-object mentions entry")
+	}
+}
+
+func TestHubConnectRejectsBothHostAndLink(t *testing.T) {
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"host": "ws://localhost:8765", "link": "wss://relay.example/join?c=abc#secret"}
+	res, err := hub.handleHubConnect(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(textOf(res), "exactly one") {
+		t.Fatalf("expected an exactly-one error for both host and link set, got: %+v", res)
+	}
+}
+
+func TestHubConnectRejectsNeitherHostNorLink(t *testing.T) {
+	hub := NewHub()
+	res, err := hub.handleHubConnect(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(textOf(res), "exactly one") {
+		t.Fatalf("expected an exactly-one error for neither host nor link set, got: %+v", res)
+	}
+}
+
+func TestHubConnectDispatchesToHostPath(t *testing.T) {
+	url := startTestServer(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"host": url, "sessionId": "550e8400-e29b-41d4-a716-446655440000"}
+	res, err := hub.handleHubConnect(ctx, req)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if !strings.Contains(textOf(res), "Connected as peer") {
+		t.Fatalf("expected a normal hub_connect result, got: %s", textOf(res))
+	}
+}
+
+func TestHubConnectDispatchesToLinkPath(t *testing.T) {
+	link, _ := startRelayTestServer(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
+	res, err := hub.handleHubConnect(ctx, req)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if !strings.Contains(textOf(res), "chat-relay bridge session") {
+		t.Fatalf("expected a bridge-session result, got: %s", textOf(res))
 	}
 }

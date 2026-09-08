@@ -594,6 +594,26 @@ reconnect (a stable per-peer identity, not the live connection) — the
 whole point is that a client that drops and resumes has still read what
 it read.
 
+**What "consumed" means is entirely up to the client — this server
+cannot verify it, only record whatever position it's told.** Found live,
+2026-09-07: a client whose async delivery path (e.g. a background
+`wait`-style process) writes an event to a local socket has no way to
+know whether whatever's reading that socket actually processed the
+event, only that this process wrote it onward — so an ack sent
+automatically at that point records "reached this client," not "reached
+whatever consumes on the other end of it," while the field's own name
+implies the latter. `mcp-hub-client` used to send its standalone ack on
+exactly this weaker signal (see the design doc's chat-relay-bridge-
+support section, "Update, 2026-09-07"); fixed by gating it on a
+genuinely synchronous hand-over instead, and — for the harder case where
+most delivery IS async by design — adding `hub_confirm`, a tool the
+model calls itself once it has actually seen a message, so the ack this
+server receives is model-issued by construction. A server relying on the
+ack cursor for anything stronger than "the client's process received
+this" (e.g. `Joined.Behind`, §2.1/§2.6a) should keep that distinction in
+mind: it's honest about delivery, not about a human or model actually
+having read the content.
+
 ### 2.8 Reactions / edits / deletes (client → server) and their echoes
 
 Requests:

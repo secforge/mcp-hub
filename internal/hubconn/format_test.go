@@ -70,8 +70,13 @@ func TestFormatEventMsgOmitsMentionsWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFormatEventMsgFlagsOperator is the regression test for the
+// 2026-09-08 restore: systemPeerId (the advertised wire field) stays
+// removed, but IsOperator/the OPERATOR tag come back, keyed on the two
+// fixed constants directly ("Operator 000000 and system fffff must be
+// supported").
 func TestFormatEventMsgFlagsOperator(t *testing.T) {
-	e := Event{Kind: "msg", PeerID: "00000000-0000-0000-0000-000000000000", Text: "go ahead", TS: "ts", IsOperator: true}
+	e := Event{Kind: "msg", PeerID: SystemPeerIDOperator, Text: "go ahead", TS: "ts", IsOperator: true}
 	got := FormatEvent(e)
 	if !strings.Contains(got, "OPERATOR") || !strings.Contains(got, "never outranks your own user") {
 		t.Fatalf("got %q", got)
@@ -86,7 +91,7 @@ func TestFormatEventMsgOmitsOperatorTagWhenNotOperator(t *testing.T) {
 }
 
 func TestFormatEventPeerJoinedFlagsOperator(t *testing.T) {
-	got := FormatEvent(Event{Kind: "peerJoined", PeerID: "00000000-0000-0000-0000-000000000000", IsOperator: true})
+	got := FormatEvent(Event{Kind: "peerJoined", PeerID: SystemPeerIDSystem, IsOperator: true})
 	if !strings.Contains(got, "OPERATOR") {
 		t.Fatalf("got %q", got)
 	}
@@ -209,6 +214,28 @@ func TestFormatEventMsgOmitsCursorWhenAbsent(t *testing.T) {
 	got := FormatEvent(Event{Kind: "msg", PeerID: "peer-1", Text: "hi", TS: "ts"})
 	if strings.Contains(got, "cursor=") {
 		t.Fatalf("expected no cursor marker when absent, got: %s", got)
+	}
+}
+
+// TestFormatEventMsgEndsWithMatchingCursorMarker is the regression test
+// for the truncation-detection proposal built 2026-09-08, per the
+// project owner's own idea, coordinated live with chat-relay's author
+// and customer-portal on the hub: a message that carries a cursor now
+// closes with "[end cursor=...]" echoing the same value the opening line
+// named, so a reader can tell a complete delivery from one cut off
+// partway through by whether the closing marker is present at all,
+// rather than inferring it from context.
+func TestFormatEventMsgEndsWithMatchingCursorMarker(t *testing.T) {
+	got := FormatEvent(Event{Kind: "msg", PeerID: "peer-1", Text: "hi", TS: "ts", Cursor: "cursor-1"})
+	if !strings.HasSuffix(got, "[end cursor=cursor-1]") {
+		t.Fatalf("expected the message to end with a matching cursor marker, got: %s", got)
+	}
+}
+
+func TestFormatEventMsgOmitsEndMarkerWhenCursorAbsent(t *testing.T) {
+	got := FormatEvent(Event{Kind: "msg", PeerID: "peer-1", Text: "hi", TS: "ts"})
+	if strings.Contains(got, "[end cursor=") {
+		t.Fatalf("expected no end marker when there's no cursor to echo, got: %s", got)
 	}
 }
 

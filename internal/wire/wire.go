@@ -72,7 +72,16 @@ const (
 // handleTeamsRelayConnect's versionNote) rather than a silent hang or a
 // confusing "server doesn't understand this request" failure the first
 // time it tries to page.
-const ProtocolVersion = 2
+//
+// Bumped to 3 on 2026-09-08 for Joined.Features — not a breaking wire
+// change by itself (an older client already ignores an unknown field),
+// but the project owner's own call, live with chat-relay's author: a
+// client has to know to LOOK for Features before declaring one does any
+// good, so the version bump itself is what tells a client "check for
+// this mechanism" — 3 is a floor meaning "this server declares its
+// features," after which an individual additive feature needs no
+// further bump.
+const ProtocolVersion = 3
 
 type envelope struct {
 	Type Type `json:"type"`
@@ -134,17 +143,6 @@ type Joined struct {
 	// applicable or not set by the server.
 	ConversationKind string  `json:"conversationKind,omitempty"`
 	Topic            *string `json:"topic,omitempty"`
-	// SystemPeerID, if set, is the peerId a server uses for its own
-	// operator/system-originated messages on this session (chat-relay:
-	// always the all-zeros UUID, but a client must not hardcode that —
-	// this field is the authoritative source, and the value is otherwise
-	// only a server-side convention). Every peerId is server-assigned —
-	// no inbound client frame ever carries one — so a msg/messageEdited
-	// whose PeerID equals this one is reliably the server's own operator
-	// channel, not something a peer could spoof by claiming the same id.
-	// Empty when a server has no such concept (including every
-	// mcp-hub-server, where every peerId is an ordinary participant).
-	SystemPeerID string `json:"systemPeerId,omitempty"`
 	// Behind is how many messages this peer's persisted position (its
 	// own last-acked cursor, server-side) trails the newest message in
 	// this conversation, computed once at connect. Only the server can
@@ -165,6 +163,59 @@ type Joined struct {
 	// recorded, recoverable-on-demand range rather than a silent loss.
 	// Omitted under the same conditions as Behind.
 	BehindSince string `json:"behindSince,omitempty"`
+	// Features declares this server's supported capabilities explicitly
+	// — added 2026-09-08 (ProtocolVersion 3, a floor meaning "this server
+	// declares its features" — an individual feature needs no version
+	// bump after that, since a client already knows to look), at the
+	// project owner's direction: replaces inferring a capability from
+	// runtime behavior (e.g. hubconn.Conn's ackReplyMisses probe, which a
+	// server that doesn't set this field at all still falls back to).
+	// Keyed by feature name, each value an object carrying that
+	// feature's own parameters (empty {} when it has none) — an object
+	// rather than a bare list of strings, since some features carry
+	// numbers/flags a client needs (attachments' size caps). Absence of
+	// a named key means unsupported; a nil/omitted Features map itself
+	// means "this server predates the mechanism, nothing is known" —
+	// these two are deliberately distinguishable (see
+	// hubconn.Conn.FeaturesDeclared), never conflated. A flag states
+	// what the server DOES; it is never an instruction to the client.
+	// Removed in the same change that removes the feature it names —
+	// never left describing a capability that no longer exists.
+	Features map[string]json.RawMessage `json:"features,omitempty"`
+}
+
+// AttachmentsFeature is Features["attachments"]'s own parameter shape —
+// see Joined.Features.
+type AttachmentsFeature struct {
+	MaxRawBytes   int  `json:"maxRawBytes,omitempty"`
+	MaxFrameBytes int  `json:"maxFrameBytes,omitempty"`
+	// ImagesOnly is set by a bridge session whose platform only accepts
+	// image attachments (see hub_send's imagePath/filePath split) —
+	// absent (false) for a server that accepts any content type.
+	ImagesOnly bool `json:"imagesOnly,omitempty"`
+}
+
+// HasFeature reports whether j declares support for the named feature —
+// see Features's doc comment for why absence means unsupported, and why
+// that's different from j.Features being nil entirely (a pre-v3 server,
+// where nothing is known either way).
+func (j Joined) HasFeature(name string) bool {
+	_, ok := j.Features[name]
+	return ok
+}
+
+// AttachmentsFeature decodes Features["attachments"]'s own parameters,
+// if the server declared that feature at all.
+func (j Joined) AttachmentsFeature() (AttachmentsFeature, bool) {
+	raw, ok := j.Features["attachments"]
+	if !ok {
+		return AttachmentsFeature{}, false
+	}
+	var af AttachmentsFeature
+	if err := json.Unmarshal(raw, &af); err != nil {
+		return AttachmentsFeature{}, false
+	}
+	return af, true
 }
 
 func NewJoined(peerID string, peerCount int, name, agePublicKey string) Joined {
@@ -741,6 +792,20 @@ type Ack struct {
 	Type      Type   `json:"type"`
 	AckCursor string `json:"ackCursor,omitempty"`
 	OK        bool   `json:"ok,omitempty"`
+	// Behind, on a server's REPLY to a standalone ack (never meaningful
+	// on the outbound request), is how many messages remain after the
+	// position just acknowledged — added 2026-09-08, chat-relay's own
+	// server-side extension: unlike Joined.Behind (measured from
+	// whatever the server's own ack cursor happened to be at connect
+	// time), this is measured from the position the model itself just
+	// asserted, which is the one count in this system whose basis the
+	// model chose rather than inherited. A pointer, not a plain int with
+	// omitempty like Joined.Behind: unlike there, a genuine "0 behind"
+	// reply here is worth stating explicitly ("you are fully caught up
+	// from where you confirmed"), so this must distinguish that from a
+	// server that simply doesn't send the field at all. Nil means
+	// unknown/unsupported, not zero.
+	Behind *int `json:"behind,omitempty"`
 }
 
 func NewAck(ackCursor string) Ack {

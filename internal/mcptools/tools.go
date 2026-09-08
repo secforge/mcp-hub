@@ -3,7 +3,6 @@ package mcptools
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"mime"
 	"os"
@@ -46,21 +45,21 @@ type Hub struct {
 	// just "the newest position seen". See handleCatchUp for the full
 	// rationale (advance-only-on-hand-over, not on-fetch).
 	//
-	// Persisted via connstore.GetCatchUpCursor/SetCatchUpCursor, keyed by
-	// catchUpKey (below) — durable across a process restart, which a
-	// plain in-memory field wouldn't be. catchUpKey, not connTarget, is
-	// what a plain hub_connect session AND a teams_relay_connect session
-	// (which has no connstore.Target at all — see connTarget's own
-	// comment) can both derive a stable identity from; see
-	// setCatchUpKey and catchUpKeyForRelay.
+	// Persisted via connstore.CatchUpID.Get/Set, keyed by catchUpID
+	// (below) — durable across a process restart, which a plain
+	// in-memory field wouldn't be. catchUpID, not connTarget, is what a
+	// plain hub_connect session AND a teams_relay_connect session (which
+	// has no connstore.Target at all — see connTarget's own comment) can
+	// both derive a stable identity from; see setCatchUpKey and
+	// catchUpKeyForRelay.
 	lastHandedOverCursor string
-	// catchUpKey is the current connection's stable identity for
+	// catchUpID is the current connection's stable identity for
 	// lastHandedOverCursor's persistence — set once per successful
 	// connect via setCatchUpKey, which also loads whatever was
-	// previously persisted for it. Empty means "nothing to key
-	// persistence on" (not connected, or a connection kind that hasn't
-	// called setCatchUpKey).
-	catchUpKey string
+	// previously persisted for it. The zero value (Valid() false) means
+	// "nothing to key persistence on" (not connected, or a connection
+	// kind that hasn't called setCatchUpKey).
+	catchUpID connstore.CatchUpID
 	// handedOverAhead is the set of Msg.Cursor values confirmed handed
 	// to the model — via a synchronous tool result (hub_receive/
 	// hub_wait/hub_catch_up, anything routed through
@@ -72,10 +71,11 @@ type Hub struct {
 	// showing a duplicate. Entries are pruned as handleCatchUp's walk
 	// reaches and consumes them; an entry the walk never reaches (a
 	// message only ever seen via hub_receive/hub_wait, never followed by
-	// a catch-up call that walks past it) is not otherwise pruned —
-	// bounded by ordinary usage, not by an enforced cap, since unlike
-	// lastHandedOverCursor this isn't persisted and resets every process
-	// restart anyway.
+	// a catch-up call that walks past it) is not otherwise pruned by
+	// that path — but it IS persisted (connstore.CatchUpState.Ahead,
+	// alongside Cursor/Gap) and fully cleared on every hub_confirm, so
+	// it stays bounded by traffic since the last confirm rather than by
+	// the whole conversation's history.
 	handedOverAhead map[string]bool
 
 	// waitMu, waitCancel, and waitGen let a new handleWait call supersede
@@ -120,6 +120,27 @@ const mentionsToolDescription = "Optional, server-specific: real platform-native
 	"to \"@\" + the resolved display name if omitted). A server that doesn't implement this " +
 	"simply ignores the field; one that does refuses the WHOLE send/edit (not a partial one " +
 	"without the mention) if any entry violates these rules."
+
+// confirmCursorToolDescription documents hub_send/hub_edit's optional
+// "confirmCursor" parameter — built 2026-09-08, the project owner's own
+// proposal ("part 1"), coordinated live with chat-relay's author and
+// customer-portal: rather than this client silently computing what to
+// acknowledge from its own lastConsumed bookkeeping on every outbound
+// send, the model can state explicitly what it has actually read,
+// exactly the deliberate act hub_confirm already requires — this just
+// folds it into the send/edit call instead of a separate round trip.
+const confirmCursorToolDescription = "Optional: the cursor of the last message you have actually " +
+	"read complete and intact, if you want to confirm it as part of this call — has exactly the " +
+	"same effect as calling hub_confirm(cursor) first, just without the extra round trip: sends a " +
+	"genuine read receipt and advances this session's persisted catch-up position, so a later " +
+	"hub_catch_up or reconnect resumes from here. Every send/edit already piggybacks a read " +
+	"receipt automatically from this client's own delivery bookkeeping regardless of this field — " +
+	"that part isn't new. What this adds is a deliberate, explicit statement of what YOU confirm " +
+	"having read, which is what actually advances hub_catch_up's position (the automatic " +
+	"piggyback doesn't). On a server that reports it, the result also states how many messages " +
+	"remain after the position you confirmed. Only pass a cursor from a message you actually " +
+	"received complete — see hub_confirm's own guidance on what \"complete\" means and why " +
+	"confirming a truncated one is unsafe."
 
 // parseMentions decodes the "mentions" tool argument (a JSON array of
 // objects, as delivered by mcp-go's GetArguments) into wire.Mention
@@ -176,7 +197,7 @@ func startupConnectionsNote() string {
 	}
 	var openCount int
 	for _, e := range entries {
-		if e.Connected {
+		if e.Entry.Connected {
 			openCount++
 		}
 	}
@@ -227,80 +248,146 @@ func projectForConnect(ctx context.Context) string {
 	return connstore.CurrentProject()
 }
 
-// catchUpKeyForRelay derives a stable hub_catch_up persistence key for a
+// catchUpIDForRelay derives connstore's persistence identity for a
 // teams_relay_connect session — connstore has no Target for one (see
 // connTarget's comment: bridge-session identity/reconnectSecret has
-// never been connstore's to track), so this borrows connstore.Target's
-// own key format for a value it does have: the link's own non-secret
-// portion (everything before the "#"-delimited secret — see
-// hubconn.DialRelay's identical split), which names the same
-// conversation across every reconnect to it, the same way Host+SessionID
-// names the same mcp-hub-server session across reconnects. Project-scoped
-// the same way a real Target is (see connstore.CurrentProject), so two
-// different agents on the same machine connected to two different
-// conversations — or the same conversation from two different project
-// directories — never collide. The "relay:" prefix keeps this key space
-// disjoint from any real hub_connect Target that happens to share the
-// same link string as its Host (not a realistic collision, cheap to rule
-// out anyway).
-func catchUpKeyForRelay(ctx context.Context, link string) string {
+// never been connstore's to track), so this uses connstore.TeamsID
+// instead: the link's own non-secret portion (everything before the
+// "#"-delimited secret — see hubconn.DialRelay's identical split), which
+// names the same conversation across every reconnect to it, the same way
+// Host+SessionID names the same mcp-hub-server session across
+// reconnects. Project-scoped the same way a real Target is (see
+// connstore.CurrentProject), so two different agents on the same machine
+// connected to two different conversations — or the same conversation
+// from two different project directories — never collide.
+func catchUpIDForRelay(ctx context.Context, link string) connstore.CatchUpID {
 	target, _, _ := strings.Cut(link, "#")
-	return connstore.Target{Host: "relay:" + target, Project: projectForConnect(ctx)}.Key()
+	return connstore.TeamsCatchUpID(connstore.TeamsID{LinkTarget: target, Project: projectForConnect(ctx)})
 }
 
-// catchUpGap is a persisted record of a seek's abandoned range — see
-// setCatchUpGap/getCatchUpGap. Recorded as ongoing STATE, not a one-time
-// notice: a seek's skipped range doesn't stop existing once the call
-// that performed it returns, so any later "am I caught up" check (a
-// fresh hub_catch_up call, a fresh hub_connect) should keep saying so
-// until something actually walks that range, not just the one time it
-// happened.
-type catchUpGap struct {
-	From string `json:"from"`
-	To   string `json:"to"`
+// setCatchUpGap persists {from, to} as id's current abandoned range,
+// overwriting whatever was recorded before (including any retrieval
+// progress a previous gap had — a fresh seek means a fresh, unretrieved
+// range). Recorded as ongoing STATE, not a one-time notice: a seek's
+// skipped range doesn't stop existing once the call that performed it
+// returns, so any later "am I caught up" check (a fresh hub_catch_up
+// call, a fresh hub_connect) should keep saying so until something
+// actually walks that range, not just the one time it happened.
+//
+// From/To are both timestamps (RFC3339) — From is where the abandoned
+// range starts (Conn.BehindSince() at the time of the seek), To is where
+// it ends (the seek's own landing point, so everything from there
+// onward is already covered by ordinary hub_catch_up).
+func setCatchUpGap(id connstore.CatchUpID, from, to string) {
+	saveCatchUpGap(id, connstore.GapState{From: from, To: to})
 }
 
-// catchUpGapKey namespaces a gap record's persistence key away from the
-// cursor's own key (catchUpKey itself) — both live in the same
-// key→string store (connstore's catchup.go), so they need distinct keys
-// to avoid colliding.
-func catchUpGapKey(key string) string {
-	if key == "" {
-		return ""
-	}
-	return "gap:" + key
-}
-
-// setCatchUpGap persists {from, to} as key's current abandoned range,
-// overwriting whatever was recorded before — see catchUpGap's doc
-// comment on why this is meant to persist rather than be cleared after
-// one mention.
-func setCatchUpGap(key, from, to string) {
-	if key == "" {
+// saveCatchUpGap persists g as id's current gap record — an empty g (the
+// zero value) clears it, since loadCatchUpGap already treats a blank
+// From as "no gap recorded."
+func saveCatchUpGap(id connstore.CatchUpID, g connstore.GapState) {
+	if !id.Valid() {
 		return
 	}
-	data, err := json.Marshal(catchUpGap{From: from, To: to})
-	if err != nil {
-		return
+	cs, _ := id.Get()
+	if g.From == "" {
+		cs.Gap = nil
+	} else {
+		cs.Gap = &g
 	}
-	_ = connstore.SetCatchUpCursor(catchUpGapKey(key), string(data))
+	_ = id.Set(cs)
 }
 
-// getCatchUpGap returns key's currently-recorded abandoned range, if
-// any.
-func getCatchUpGap(key string) (from, to string, ok bool) {
-	if key == "" {
-		return "", "", false
+// clearCatchUpGap removes id's gap record — called once
+// handleCatchUpGap's walk has retrieved everything in the range (a
+// "noMoreMessages" answer, or a message whose own timestamp reaches To).
+func clearCatchUpGap(id connstore.CatchUpID) {
+	saveCatchUpGap(id, connstore.GapState{})
+}
+
+// loadCatchUpGap returns id's full currently-recorded gap record, if
+// any — including retrieval progress (AnchorCursor), unlike
+// getCatchUpGap below which only surfaces the display-facing From/To.
+// AnchorCursor is the actual retrieval progress once
+// hub_catch_up(gap: true) has walked at least one message into the
+// range — see handleCatchUpGap. Empty until then, meaning "resume via
+// At: From" (a coarse, inclusive seek); once set, retrieval switches to
+// the message's own opaque Cursor for precision, the same
+// walk-forward-by-cursor logic the ordinary (non-gap) walk already uses.
+func loadCatchUpGap(id connstore.CatchUpID) (connstore.GapState, bool) {
+	cs, ok := id.Get()
+	if !ok || cs.Gap == nil || cs.Gap.From == "" {
+		return connstore.GapState{}, false
 	}
-	raw, exists := connstore.GetCatchUpCursor(catchUpGapKey(key))
-	if !exists {
-		return "", "", false
-	}
-	var g catchUpGap
-	if err := json.Unmarshal([]byte(raw), &g); err != nil || g.From == "" {
+	return *cs.Gap, true
+}
+
+// getCatchUpGap returns id's currently-recorded abandoned range, if
+// any — the display-facing half of loadCatchUpGap, for callers (the
+// connect/catch-up note text) that only care about From/To, not
+// retrieval progress.
+func getCatchUpGap(id connstore.CatchUpID) (from, to string, ok bool) {
+	g, ok := loadCatchUpGap(id)
+	if !ok {
 		return "", "", false
 	}
 	return g.From, g.To, true
+}
+
+// setCatchUpCursor persists cursor as id's hub_catch_up position,
+// preserving id's existing gap/ahead state (a read-modify-write of the
+// whole connstore.CatchUpState, not a standalone key, now that the three
+// used to live under separate namespaced keys in one string-keyed
+// store — see connstore's package doc comment for the 2026-09-08
+// rewrite).
+func setCatchUpCursor(id connstore.CatchUpID, cursor string) {
+	if !id.Valid() {
+		return
+	}
+	cs, _ := id.Get()
+	cs.Cursor = cursor
+	_ = id.Set(cs)
+}
+
+// saveHandedOverAhead persists ahead (a snapshot, not a delta) under id,
+// overwriting whatever was recorded before. Found live, 2026-09-07,
+// coordinating with chat-relay's author and a third party on the hub:
+// handedOverAhead used to be purely in-memory, reset to nil by every
+// setCatchUpKey call (i.e. every reconnect — see its own comment), which
+// is exactly why a reconnect after a drop re-presented messages
+// hub_catch_up should have silently skipped as already seen. Persisting
+// it makes the skip survive a reconnect the same way lastHandedOverCursor
+// already does. Safe to do independently of any live-delivery marker
+// work: this set is only ever populated by recordHandedOver, itself only
+// reachable via resultWithReceivedAttachments — a genuinely synchronous
+// hand-over — so nothing async/best-effort ever enters it. A no-op on
+// the zero CatchUpID.
+func saveHandedOverAhead(id connstore.CatchUpID, ahead map[string]bool) {
+	if !id.Valid() {
+		return
+	}
+	cursors := make([]string, 0, len(ahead))
+	for c := range ahead {
+		cursors = append(cursors, c)
+	}
+	cs, _ := id.Get()
+	cs.Ahead = cursors
+	_ = id.Set(cs)
+}
+
+// loadHandedOverAhead returns id's persisted set, or nil if there isn't
+// one (a fresh id, or one whose set has emptied out entirely — see
+// saveHandedOverAhead).
+func loadHandedOverAhead(id connstore.CatchUpID) map[string]bool {
+	cs, ok := id.Get()
+	if !ok || len(cs.Ahead) == 0 {
+		return nil
+	}
+	ahead := make(map[string]bool, len(cs.Ahead))
+	for _, c := range cs.Ahead {
+		ahead[c] = true
+	}
+	return ahead
 }
 
 // activeConn returns the current connection and its wait socket, or (nil,
@@ -320,38 +407,43 @@ func (h *Hub) setActiveConn(conn *hubconn.Conn, w *waiter.Waiter, target connsto
 	h.mu.Unlock()
 }
 
-// setCatchUpKey records key as the current connection's stable identity
+// setCatchUpKey records id as the current connection's stable identity
 // for hub_catch_up's persisted position, and loads whatever was
 // previously stored under it (nothing, for a first-ever connection to
 // this identity) — called once per successful connect, after
-// setActiveConn, with a key derived from the connection's own stable
-// identity: connstore.Target.Key() for a plain hub_connect session, or
-// catchUpKeyForRelay's derivation for a teams_relay_connect session
-// (which has no connstore.Target at all — see connTarget's own comment).
+// setActiveConn, with an identity derived from the connection's own
+// stable identity: connstore.HubCatchUpID(target) for a plain
+// hub_connect session, or catchUpIDForRelay's derivation for a
+// teams_relay_connect session (which has no connstore.Target at all —
+// see connTarget's own comment).
 //
-// Every call resets lastHandedOverCursor to match key, even when key is
+// Every call resets lastHandedOverCursor to match id, even when id is
 // unchanged from before — reconnecting re-reads the persisted value
 // rather than trusting whatever's already in memory, so a second
 // process/session sharing the same identity (or this same process after
 // an external edit to the store) can't silently diverge from what's on
-// disk. An empty key (a connection kind that doesn't call this at all)
-// leaves catchUpKey/lastHandedOverCursor at their zero values, and
+// disk. The zero CatchUpID (a connection kind that doesn't call this at
+// all) leaves catchUpID/lastHandedOverCursor at their zero values, and
 // handleCatchUp treats that the same as "nothing recorded yet."
-func (h *Hub) setCatchUpKey(key string) {
+func (h *Hub) setCatchUpKey(id connstore.CatchUpID) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.catchUpKey = key
+	h.catchUpID = id
 	h.lastHandedOverCursor = ""
 	// handedOverAhead's entries are cursors witnessed live for THIS
-	// connection's message stream — carrying them into a new key (a
-	// different conversation entirely) would be the same stale-cursor-
-	// bleed hazard the old target-based reset guarded against, just one
-	// map over.
+	// connection's message stream — carrying them into a DIFFERENT
+	// identity (a different conversation entirely) would be the same
+	// stale-cursor-bleed hazard the old target-based reset guarded
+	// against, just one map over. So start from nil, then load whatever
+	// this exact identity persisted (see saveHandedOverAhead) — a
+	// reconnect to the SAME conversation restores the set, a switch to a
+	// different one starts clean.
 	h.handedOverAhead = nil
-	if key != "" {
-		if cursor, ok := connstore.GetCatchUpCursor(key); ok {
-			h.lastHandedOverCursor = cursor
+	if id.Valid() {
+		if cs, ok := id.Get(); ok {
+			h.lastHandedOverCursor = cs.Cursor
 		}
+		h.handedOverAhead = loadHandedOverAhead(id)
 	}
 }
 
@@ -421,88 +513,79 @@ func disconnectedText(conn *hubconn.Conn) string {
 func (h *Hub) Register(s *server.MCPServer) {
 	s.AddTool(
 		mcp.NewTool("hub_connect",
-			mcp.WithDescription("Connect to an mcp-hub-server session"+startupConnectionsNote()),
-			mcp.WithString("host", mcp.Required(),
-				mcp.Description("Server base address, e.g. ws://localhost:8765 (the "+
-					"sessionId is appended as a path segment automatically)")),
+			mcp.WithDescription("Connect to a hub session — either a plain mcp-hub-server session "+
+				"(pass host) or a chat-relay-style bridge session via a link a user was given, e.g. "+
+				"one issued for a specific Microsoft Teams conversation (pass link). Pass EXACTLY "+
+				"ONE of host/link, never both. Once connected, hub_send/hub_receive/hub_wait/"+
+				"hub_peers/hub_catch_up all work the same way regardless of which was used"+
+				startupConnectionsNote()),
+			mcp.WithString("host", mcp.Description(
+				"Server base address for a plain mcp-hub-server session, e.g. ws://localhost:8765 "+
+					"(the sessionId is appended as a path segment automatically). Mutually exclusive "+
+					"with link — omit this entirely when connecting via a bridge link instead")),
 			mcp.WithString("sessionId", mcp.Description(
-				"UUID identifying the session to join. Omit to start a brand new "+
-					"session — a UUID will be generated and returned; you must then "+
+				"Only meaningful with host. UUID identifying the session to join. Omit to start a "+
+					"brand new session — a UUID will be generated and returned; you must then "+
 					"share it with whoever else should join")),
-			mcp.WithString("name", mcp.Description(
-				"Optional untrusted display name shown alongside the server log and "+
-					"reported to other peers (sanitized server-side: control characters "+
-					"stripped, length capped)")),
 			mcp.WithString("agePublicKey", mcp.Description(
-				"Optional age (https://age-encryption.org) public key ('age1...'), "+
-					"format-validated but otherwise untouched by the hub — it's distributed "+
-					"to other peers (via hub_peers()) so they can encrypt to you; the hub "+
-					"itself never uses it cryptographically. This is DIFFERENT from "+
-					"reconnectSecret: agePublicKey is visible to every other peer in the "+
-					"session, so it must never be used to grant identity/peerId reuse — "+
-					"anyone who saw it could then impersonate you. Use reconnectSecret for that")),
-			mcp.WithString("reconnectSecret", mcp.Description(
-				"Optional — omit it and this client manages it for you: on the first "+
-					"connect to a given host+sessionId it generates and stores one "+
-					"automatically; on a later connect to that same host+sessionId (even "+
-					"from a different process, e.g. after a restart) it's reused "+
-					"automatically, reassigning your previous peerId with nothing for you "+
-					"to remember or pass. Presenting the exact same reconnectSecret on a "+
-					"later hub_connect reassigns your previous peerId instead of a new one, "+
-					"so you're recognized as the same participant across a dropped "+
-					"connection, a server restart, or even the whole session having "+
-					"emptied out and later been reconstituted — as long as that previous "+
-					"connection isn't still active (which would get you a fresh peerId "+
-					"instead, to avoid a collision). Pass your own explicitly to override "+
-					"the stored one — e.g. to force a fresh identity for this target, or to "+
-					"resume one from elsewhere (another machine, a value the user gave you)")),
+				"Only meaningful with host. Optional age (https://age-encryption.org) public key "+
+					"('age1...'), format-validated but otherwise untouched by the hub — it's "+
+					"distributed to other peers (via hub_peers()) so they can encrypt to you; the "+
+					"hub itself never uses it cryptographically. This is DIFFERENT from "+
+					"reconnectSecret: agePublicKey is visible to every other peer in the session, "+
+					"so it must never be used to grant identity/peerId reuse — anyone who saw it "+
+					"could then impersonate you. Use reconnectSecret for that")),
 			mcp.WithString("createToken", mcp.Description(
-				"Optional, and not part of the base mcp-hub protocol — a server-specific "+
-					"extension (e.g. chat-relay) for creating and claiming a brand-new "+
-					"sessionId in this same handshake, for a server that refuses an unknown "+
-					"sessionId by design rather than creating one on first connect. Only "+
-					"meaningful when sessionId doesn't already exist on the target server — "+
-					"if it does, this is ignored and the join proceeds normally. The user "+
-					"gives you this token (it's a capability, shown once when issued); this "+
-					"tool never generates or discovers one on its own")),
-		),
-		h.handleConnect,
-	)
-	s.AddTool(
-		mcp.NewTool("teams_relay_connect",
-			mcp.WithDescription("Connect to a chat-relay bridge session via a link a user was given "+
-				"(e.g. one issued for a specific Microsoft Teams conversation) — the "+
-				"chat-relay-specific counterpart to hub_connect, for a server that bridges into a "+
-				"real chat platform rather than being an mcp-hub-server. Once connected, hub_send/"+
-				"hub_receive/hub_wait/hub_peers all work the same way as for a normal hub_connect "+
-				"session"),
-			mcp.WithString("link", mcp.Required(), mcp.Description(
-				"The exact opaque link string the user was given, unmodified — do not parse, "+
-					"reformat, or strip anything from it yourself. Keep the exact string around: "+
-					"reconnecting after a drop presents this same link again, alongside the same "+
-					"reconnectSecret")),
+				"Only meaningful with host, and not part of the base mcp-hub protocol — a "+
+					"server-specific extension (e.g. chat-relay) for creating and claiming a "+
+					"brand-new sessionId in this same handshake, for a server that refuses an "+
+					"unknown sessionId by design rather than creating one on first connect. Only "+
+					"meaningful when sessionId doesn't already exist on the target server — if it "+
+					"does, this is ignored and the join proceeds normally. The user gives you this "+
+					"token (it's a capability, shown once when issued); this tool never generates "+
+					"or discovers one on its own")),
+			mcp.WithString("link", mcp.Description(
+				"The exact opaque link string a user was given for a bridge session, unmodified — "+
+					"do not parse, reformat, or strip anything from it yourself. Keep the exact "+
+					"string around: reconnecting after a drop presents this same link again, "+
+					"alongside the same reconnectSecret. Mutually exclusive with host — omit this "+
+					"entirely when connecting to a plain mcp-hub-server instead")),
 			mcp.WithString("name", mcp.Description(
-				"Optional untrusted display name. Depending on the bridge, this may be for its own "+
-					"logs/audit only and never made visible to anyone on the other side of the "+
-					"bridge (e.g. a chat-relay conversation) — don't assume it functions as an "+
-					"in-conversation display name unless told otherwise")),
-			mcp.WithString("reconnectSecret", mcp.Required(), mcp.Description(
-				"Required — any string you choose to remember, e.g. a UUID; generate one yourself "+
-					"if the user hasn't given you one to reuse. Unlike hub_connect's version, this "+
-					"does not identify a peer — a bridge link already fixes which conversation you "+
-					"get. Instead it authorizes resuming after a dropped connection: many such links "+
-					"are single-use, so presenting the exact same link again after it's already been "+
-					"used only works if paired with the same reconnectSecret from the original "+
-					"connect (within whatever window the bridge grants — commonly on the order of "+
-					"hours, not indefinite). Omit this and you may not be able to resume at all after "+
-					"a drop")),
+				"Optional untrusted display name. With host, shown alongside the server log and "+
+					"reported to other peers (sanitized server-side: control characters stripped, "+
+					"length capped). With link, depending on the bridge this may be for its own "+
+					"logs/audit only and never made visible to anyone on the other side — don't "+
+					"assume it functions as an in-conversation display name unless told otherwise")),
+			mcp.WithString("reconnectSecret", mcp.Description(
+				"With host: optional — omit it and this client manages it for you: on the first "+
+					"connect to a given host+sessionId it generates and stores one automatically; "+
+					"on a later connect to that same host+sessionId (even from a different process, "+
+					"e.g. after a restart) it's reused automatically, reassigning your previous "+
+					"peerId with nothing for you to remember or pass. Presenting the exact same "+
+					"reconnectSecret on a later hub_connect reassigns your previous peerId instead "+
+					"of a new one, so you're recognized as the same participant across a dropped "+
+					"connection, a server restart, or even the whole session having emptied out and "+
+					"later been reconstituted — as long as that previous connection isn't still "+
+					"active (which would get you a fresh peerId instead, to avoid a collision). Pass "+
+					"your own explicitly to override the stored one — e.g. to force a fresh identity "+
+					"for this target, or to resume one from elsewhere (another machine, a value the "+
+					"user gave you).\n"+
+					"With link: REQUIRED — any string you choose to remember, e.g. a UUID; generate "+
+					"one yourself if the user hasn't given you one to reuse. Unlike the host path's "+
+					"version, this does not identify a peer — a bridge link already fixes which "+
+					"conversation you get. Instead it authorizes resuming after a dropped connection: "+
+					"many such links are single-use, so presenting the exact same link again after "+
+					"it's already been used only works if paired with the same reconnectSecret from "+
+					"the original connect (within whatever window the bridge grants — commonly on "+
+					"the order of hours, not indefinite). Omit this and you may not be able to "+
+					"resume at all after a drop")),
 		),
-		h.handleTeamsRelayConnect,
+		h.handleHubConnect,
 	)
 	s.AddTool(
 		mcp.NewTool("hub_send",
 			mcp.WithDescription("Send a text message to the current hub session. On a bridge "+
-				"session (e.g. via teams_relay_connect), this call itself waits briefly for the "+
+				"session (e.g. via hub_connect's link form), this call itself waits briefly for the "+
 				"real outcome — the send actually being accepted, or refused — and reports it "+
 				"directly rather than a bare confirmation that doesn't mean the send succeeded; if "+
 				"nothing arrives in time it falls back to a plain confirmation, with the actual "+
@@ -558,6 +641,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 					},
 				}),
 			),
+			mcp.WithString("confirmCursor", mcp.Description(confirmCursorToolDescription)),
 		),
 		h.handleSend,
 	)
@@ -569,7 +653,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	s.AddTool(
 		mcp.NewTool("hub_list_connections",
 			mcp.WithDescription("List every host+sessionId this client has connected to "+
-				"before (via hub_connect — not teams_relay_connect, which manages identity "+
+				"before (via hub_connect's host form — not its link form, which manages identity "+
 				"differently), with the peerId and display name last used and whether it's "+
 				"still marked open from a previous connect that never got an explicit "+
 				"hub_disconnect. Read-only, no side effects. Never includes reconnectSecret "+
@@ -623,15 +707,51 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"more than a small threshold (or have no prior position recorded for this process — "+
 				"see the tool's own known-limitations note), this seeks to recent context first "+
 				"rather than walking a potentially huge backlog message-by-message; the skipped "+
-				"range isn't lost, just not walked through by this call. Errors if not connected."),
+				"range isn't lost, just not walked through by this call — pass gap: true to retrieve "+
+				"it later. Errors if not connected."),
+			mcp.WithBoolean("gap", mcp.Description(
+				"If true, retrieve the RECORDED SKIPPED RANGE from an earlier seek (see the connect/"+
+					"catch-up note about one) instead of continuing from your normal position — the "+
+					"two are independent, so gap retrieval never re-delivers or interferes with what "+
+					"you've already read normally, and vice versa. Same one-message-per-call contract "+
+					"as ordinary hub_catch_up: call repeatedly until it reports the gap fully "+
+					"retrieved. If there's no recorded gap for this session, reports that and does "+
+					"nothing. Ignored if false or omitted (the default, ordinary behavior)")),
 		),
 		h.handleCatchUp,
+	)
+	s.AddTool(
+		mcp.NewTool("hub_confirm",
+			mcp.WithDescription("Explicitly confirm you received a message INTACT, by its cursor — "+
+				"for when you've been reading mostly via wait --follow (or the wait CLI's one-shot "+
+				"mode), where nothing else tells this session that a live-delivered message was "+
+				"actually handed to you, as opposed to merely written to a socket you may not have "+
+				"read from yet. Advances this session's persisted catch-up position to cursor and "+
+				"sends an immediate read receipt on the wire. Unlike hub_receive/hub_wait/"+
+				"hub_catch_up, this does NOT return or re-deliver any message content — it only "+
+				"marks a position you already saw as confirmed, so a later hub_catch_up (including "+
+				"after a reconnect) resumes from here instead of re-walking everything back to your "+
+				"last synchronous call. Only pass a cursor from a message whose body you actually "+
+				"received COMPLETE — if it looked truncated, cut off, or otherwise wrong, do NOT "+
+				"confirm it; call hub_catch_up instead so the position stays put and a later walk "+
+				"can re-deliver it properly. Calling this periodically while reading mostly via "+
+				"wait --follow bounds how much gets re-walked after a drop, without needing to make "+
+				"a synchronous hub_receive/hub_wait call just to checkpoint. On a server that "+
+				"reports it, the result also states how many messages remain after the position "+
+				"you confirmed. Errors if not connected."),
+			mcp.WithString("cursor", mcp.Required(), mcp.Description(
+				"The opaque cursor of the last message you received intact — copy it verbatim from "+
+					"that message's own \"cursor=...\" field, rendered inline wherever a message is "+
+					"delivered. Everything at or before this position is marked confirmed handed "+
+					"over; never construct, guess, or advance this value yourself.")),
+		),
+		h.handleConfirmReceived,
 	)
 	s.AddTool(
 		mcp.NewTool("hub_react",
 			mcp.WithDescription("Add or remove a reaction on an earlier message — not meaningful for "+
 				"an ordinary hub_connect session, but for a bridge session (e.g. via "+
-				"teams_relay_connect) backed by a platform with write access. Errors if not "+
+				"hub_connect's link form) backed by a platform with write access. Errors if not "+
 				"connected. On a bridge session this call itself waits briefly for the real "+
 				"outcome (acknowledged, or refused) and reports it directly; if nothing arrives in "+
 				"time it falls back to a plain confirmation that the request was sent, with the "+
@@ -650,7 +770,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	s.AddTool(
 		mcp.NewTool("hub_edit",
 			mcp.WithDescription("Change an earlier message's content — not meaningful for an ordinary "+
-				"hub_connect session, but for a bridge session (e.g. via teams_relay_connect) backed "+
+				"hub_connect session, but for a bridge session (e.g. via hub_connect's link form) backed "+
 				"by a platform with write access. Typically only possible on a message this "+
 				"connection itself sent — platform rules usually restrict editing to your own "+
 				"messages, and that's enforced by the platform, not pre-judged here. Errors if not "+
@@ -697,13 +817,14 @@ func (h *Hub) Register(s *server.MCPServer) {
 					},
 				}),
 			),
+			mcp.WithString("confirmCursor", mcp.Description(confirmCursorToolDescription)),
 		),
 		h.handleEdit,
 	)
 	s.AddTool(
 		mcp.NewTool("hub_delete",
 			mcp.WithDescription("Remove an earlier message — not meaningful for an ordinary "+
-				"hub_connect session, but for a bridge session (e.g. via teams_relay_connect) backed "+
+				"hub_connect session, but for a bridge session (e.g. via hub_connect's link form) backed "+
 				"by a platform with write access. Typically only possible on a message this "+
 				"connection itself sent, same as hub_edit; enforced by the platform, not pre-judged "+
 				"here. This is a genuine deletion, not an edit to empty text — the platform renders "+
@@ -797,6 +918,32 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 	)
 }
 
+// handleHubConnect is hub_connect's registered handler — the merge point
+// for what used to be two separate tools (hub_connect and
+// teams_relay_connect), requested directly by the project owner,
+// 2026-09-07: one tool, dispatching on which of host/link was given,
+// rather than two tools a caller has to choose between up front. The two
+// original implementations (handleConnect for host, handleTeamsRelayConnect
+// for link) are kept as-is, including their own extensive test coverage —
+// only the tool-facing surface merges; the Go-level split stays, since the
+// two paths' identity/persistence models are different enough (see
+// hub_connect's own tool description) that collapsing the internals too
+// would risk conflating them.
+func (h *Hub) handleHubConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	host := req.GetString("host", "")
+	link := req.GetString("link", "")
+	switch {
+	case host != "" && link != "":
+		return mcp.NewToolResultError("specify exactly one of host or link, not both"), nil
+	case host != "":
+		return h.handleConnect(ctx, req)
+	case link != "":
+		return h.handleTeamsRelayConnect(ctx, req)
+	default:
+		return mcp.NewToolResultError("specify exactly one of host or link"), nil
+	}
+}
+
 func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	if prev, _ := h.activeConn(); prev != nil {
 		if !prev.Connected() {
@@ -864,9 +1011,13 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		}
 	})
 	h.setActiveConn(conn, w, target)
-	h.setCatchUpKey(target.Key())
-	_ = connstore.Upsert(connstore.Entry{
-		Host: host, SessionID: sessionID, Project: target.Project, PeerID: conn.PeerID(), Name: conn.Name(),
+	h.setCatchUpKey(connstore.HubCatchUpID(target))
+	topic := ""
+	if t := conn.Topic(); t != nil {
+		topic = *t
+	}
+	_ = connstore.Upsert(target, connstore.Entry{
+		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic,
 		ReconnectSecret: reconnectSecret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
 
@@ -984,9 +1135,13 @@ func (h *Hub) handleTeamsRelayConnect(ctx context.Context, req mcp.CallToolReque
 		}
 	})
 	h.setActiveConn(conn, w, connstore.Target{})
-	h.setCatchUpKey(catchUpKeyForRelay(ctx, link))
+	catchUpID := catchUpIDForRelay(ctx, link)
+	h.setCatchUpKey(catchUpID)
+	if t := conn.Topic(); t != nil && *t != "" {
+		_ = connstore.SetTeamsTopic(*catchUpID.Teams, *t)
+	}
 
-	waitBlock := buildWaitBlock(ctx, w, "reconnect via teams_relay_connect with the same link and reconnectSecret")
+	waitBlock := buildWaitBlock(ctx, w, "reconnect via hub_connect with the same link and reconnectSecret")
 
 	var rosterNote string
 	if n := conn.ExpectedPeerCount(); n == 0 {
@@ -1017,7 +1172,7 @@ func (h *Hub) handleTeamsRelayConnect(ctx context.Context, req mcp.CallToolReque
 		"expected, not a bug, and won't succeed on retry; peerJoined/peerLeft reflect real " +
 		"conversation membership changes, not other clients connecting; and this link may be " +
 		"single-use — hold onto the exact link and reconnectSecret you used here, since " +
-		"resuming after a drop means presenting both again via teams_relay_connect, not just " +
+		"resuming after a drop means presenting both again via hub_connect, not just " +
 		"the link alone."
 
 	conversationNote := ""
@@ -1050,10 +1205,9 @@ func (h *Hub) handleTeamsRelayConnect(ctx context.Context, req mcp.CallToolReque
 
 // behindNote surfaces wire.Joined.Behind/BehindSince, when a server set
 // them, as an explicit connect-time statement rather than something a
-// model has to notice is missing — the same reasoning as operator-message
-// framing (see formatOperatorTag in hubconn/format.go): a server-reported
-// fact should be stated, not left to be inferred or discovered later.
-// Empty when a server didn't set Behind (including every mcp-hub-server).
+// model has to notice is missing — a server-reported fact should be
+// stated, not left to be inferred or discovered later. Empty when a
+// server didn't set Behind (including every mcp-hub-server).
 func (h *Hub) behindNote(conn *hubconn.Conn) string {
 	note := ""
 	if conn.Behind() > 0 {
@@ -1069,9 +1223,9 @@ func (h *Hub) behindNote(conn *hubconn.Conn) string {
 		}
 	}
 	h.mu.Lock()
-	key := h.catchUpKey
+	id := h.catchUpID
 	h.mu.Unlock()
-	if from, to, ok := getCatchUpGap(key); ok {
+	if from, to, ok := getCatchUpGap(id); ok {
 		note += fmt.Sprintf("\nAlso still on record: an earlier catch-up seek skipped the range %s "+
 			"to %s rather than walk it. Not lost — still on the server — but this tool has no way "+
 			"to manually target that range; mention it if it matters for the current task.", from, to)
@@ -1234,11 +1388,14 @@ func (h *Hub) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.Event
 // saveReceivedAttachments' output for events into a single text tool
 // result. Every synchronous delivery of events to the model (hub_receive,
 // hub_wait, hub_catch_up) goes through this one function, which is
-// exactly why recordHandedOver lives here rather than being called
-// separately at each site — one place that can't be forgotten at a new
-// call site later.
+// exactly why recordHandedOver and conn.MarkConsumed both live here
+// rather than being called separately at each site — one place that
+// can't be forgotten at a new call site later. See MarkConsumed's doc
+// comment for why the wire-level read-receipt boundary needs the same
+// synchronous-hand-over guarantee recordHandedOver already relies on.
 func (h *Hub) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string, events []hubconn.Event) *mcp.CallToolResult {
 	h.recordHandedOver(events)
+	conn.MarkConsumed(events)
 	return mcp.NewToolResultText(formatted + h.saveReceivedAttachments(conn, events))
 }
 
@@ -1251,7 +1408,7 @@ func (h *Hub) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string
 // notification path — IS the delivery, not a best-effort guess at one.
 func (h *Hub) recordHandedOver(events []hubconn.Event) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	changed := false
 	for _, e := range events {
 		if e.Cursor == "" {
 			continue
@@ -1260,6 +1417,20 @@ func (h *Hub) recordHandedOver(events []hubconn.Event) {
 			h.handedOverAhead = make(map[string]bool)
 		}
 		h.handedOverAhead[e.Cursor] = true
+		changed = true
+	}
+	var id connstore.CatchUpID
+	var snapshot map[string]bool
+	if changed {
+		id = h.catchUpID
+		snapshot = make(map[string]bool, len(h.handedOverAhead))
+		for c := range h.handedOverAhead {
+			snapshot[c] = true
+		}
+	}
+	h.mu.Unlock()
+	if changed {
+		saveHandedOverAhead(id, snapshot)
 	}
 }
 
@@ -1307,6 +1478,14 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	behindNote := ""
+	if confirmCursor := req.GetString("confirmCursor", ""); confirmCursor != "" {
+		behind, err := h.confirmCursor(conn, confirmCursor)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("confirmCursor failed: %v", err)), nil
+		}
+		behindNote = formatBehindNote(behind)
+	}
 	ev, ok, err := conn.SendAwaitingAck(text, to, attachments, req.GetString("format", ""), req.GetString("replyTo", ""), mentions)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("send failed: %v", err)), nil
@@ -1316,17 +1495,17 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		// event on refusal) arrived in time — report it directly rather
 		// than a bare "sent" that doesn't actually confirm anything on a
 		// bridge session. See hubconn.Conn.SendAwaitingAck.
-		return mcp.NewToolResultText(hubconn.FormatEvent(ev)), nil
+		return mcp.NewToolResultText(hubconn.FormatEvent(ev) + behindNote), nil
 	}
 	if !conn.IsBridge() {
 		if to == "" {
-			return mcp.NewToolResultText("sent"), nil
+			return mcp.NewToolResultText("sent" + behindNote), nil
 		}
-		return mcp.NewToolResultText("sent (private)"), nil
+		return mcp.NewToolResultText("sent (private)" + behindNote), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf(
 		"sent — no acknowledgement within %v; check wait/hub_receive/hub_wait for the actual "+
-			"outcome (a sendAck or an error) rather than assuming this succeeded", hubconn.AckWaitTimeout,
+			"outcome (a sendAck or an error) rather than assuming this succeeded%s", hubconn.AckWaitTimeout, behindNote,
 	)), nil
 }
 
@@ -1375,19 +1554,22 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 	}
 	currentProject := projectForConnect(ctx)
 	lines := make([]string, 0, len(entries))
-	for _, e := range entries {
-		line := fmt.Sprintf("host=%s sessionId=%s peerId=%s", e.Host, e.SessionID, e.PeerID)
-		if e.Name != "" {
-			line += fmt.Sprintf(" name=%q", e.Name)
+	for _, le := range entries {
+		line := fmt.Sprintf("host=%s sessionId=%s peerId=%s", le.Target.Host, le.Target.SessionID, le.Entry.PeerID)
+		if le.Entry.Name != "" {
+			line += fmt.Sprintf(" name=%q", le.Entry.Name)
 		}
-		line += fmt.Sprintf(" lastConnectedAt=%s", e.LastConnectedAt.Format(time.RFC3339))
-		if e.Connected {
+		if le.Entry.Topic != "" {
+			line += fmt.Sprintf(" topic=%q", le.Entry.Topic)
+		}
+		line += fmt.Sprintf(" lastConnectedAt=%s", le.Entry.LastConnectedAt.Format(time.RFC3339))
+		if le.Entry.Connected {
 			line += " (still marked open)"
 		}
-		if e.Project == currentProject {
+		if le.Target.Project == currentProject {
 			line += " [this project]"
-		} else if e.Project != "" {
-			line += fmt.Sprintf(" [other project: %s]", e.Project)
+		} else if le.Target.Project != "" {
+			line += fmt.Sprintf(" [other project: %s]", le.Target.Project)
 		}
 		lines = append(lines, line)
 	}
@@ -1570,12 +1752,11 @@ const catchUpSeekWindow = 10 * time.Minute
 // permanently marked as seen and never re-delivered — this is what
 // actually happened live, 2026-09-04, in a 50-message hub_history page.
 //
-// lastHandedOverCursor is persisted (connstore.GetCatchUpCursor/
-// SetCatchUpCursor, keyed by catchUpKey — see setCatchUpKey) and
-// survives a process restart, for both a plain hub_connect session and a
-// teams_relay_connect one (see catchUpKeyForRelay for the latter's key
-// derivation, since connstore has no Target for a bridge session at
-// all).
+// lastHandedOverCursor is persisted (connstore.CatchUpID.Get/Set, keyed
+// by catchUpID — see setCatchUpKey) and survives a process restart, for
+// both a plain hub_connect session and a teams_relay_connect one (see
+// catchUpIDForRelay for the latter's identity derivation, since
+// connstore has no Target for a bridge session at all).
 //
 // NOT YET IMPLEMENTED: dedup of a live message that arrived (and
 // was shown) while a gap was still open — the day's "suppress only if it
@@ -1607,9 +1788,16 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 
+	if req.GetBool("gap", false) {
+		h.mu.Lock()
+		catchUpIDNow := h.catchUpID
+		h.mu.Unlock()
+		return h.handleCatchUpGap(conn, catchUpIDNow)
+	}
+
 	h.mu.Lock()
 	cursor := h.lastHandedOverCursor
-	catchUpKeyNow := h.catchUpKey
+	catchUpIDNow := h.catchUpID
 	h.mu.Unlock()
 
 	// Included in every terminal "you're done" message below, not just
@@ -1617,9 +1805,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// just because this particular call didn't create or mention it, and
 	// "caught up" claimed without it would be exactly the "acted on
 	// incomplete as if complete" failure this whole feature exists to
-	// avoid. See catchUpGap's doc comment.
+	// avoid. See setCatchUpGap's doc comment.
 	gapNote := ""
-	if from, to, ok := getCatchUpGap(catchUpKeyNow); ok {
+	if from, to, ok := getCatchUpGap(catchUpIDNow); ok {
 		gapNote = fmt.Sprintf("\n[hub: note — an earlier catch-up seek also skipped %s to %s, "+
 			"still on the server but not walked by this tool]", from, to)
 	}
@@ -1634,9 +1822,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		anchor = wire.Anchor{At: seekAt}
 		if conn.Behind() > catchUpSeekThreshold {
 			h.mu.Lock()
-			key := h.catchUpKey
+			id := h.catchUpID
 			h.mu.Unlock()
-			setCatchUpGap(key, conn.BehindSince(), seekAt)
+			setCatchUpGap(id, conn.BehindSince(), seekAt)
 			seekNote = fmt.Sprintf(
 				"You were %d messages behind — seeking to recent context (%s) instead of walking the "+
 					"whole backlog. Everything before that point is not lost, just not fetched here: "+
@@ -1686,9 +1874,14 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				h.mu.Lock()
 				h.lastHandedOverCursor = ev.Cursor
 				delete(h.handedOverAhead, ev.Cursor)
-				key := h.catchUpKey
+				id := h.catchUpID
+				snapshot := make(map[string]bool, len(h.handedOverAhead))
+				for c := range h.handedOverAhead {
+					snapshot[c] = true
+				}
 				h.mu.Unlock()
-				_ = connstore.SetCatchUpCursor(key, ev.Cursor)
+				setCatchUpCursor(id, ev.Cursor)
+				saveHandedOverAhead(id, snapshot)
 				anchor = wire.Anchor{Cursor: ev.Cursor}
 				continue
 			}
@@ -1701,9 +1894,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			if ev.Cursor != "" {
 				h.mu.Lock()
 				h.lastHandedOverCursor = ev.Cursor
-				key := h.catchUpKey
+				id := h.catchUpID
 				h.mu.Unlock()
-				_ = connstore.SetCatchUpCursor(key, ev.Cursor)
+				setCatchUpCursor(id, ev.Cursor)
 			}
 			formatted := seekNote + hubconn.FormatEvent(ev) +
 				"\n\n[hub: more may remain — call hub_catch_up again; you'll be told \"caught up\" once " +
@@ -1716,6 +1909,222 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	return mcp.NewToolResultText(seekNote + fmt.Sprintf(
 		"[hub: skipped %d already-seen message(s) without finding a new one — call hub_catch_up "+
 			"again to continue]", catchUpDedupSkipLimit)), nil
+}
+
+// handleCatchUpGap implements hub_catch_up(gap: true) — retrieving a
+// previously-recorded seek's skipped range, requested directly by the
+// project owner, 2026-09-07: until this existed, getCatchUpGap's note
+// was purely informational (see handleCatchUp's gapNote) — the range was
+// "still on the server" in name only, since nothing in this client could
+// actually walk back into it. This can, independently of the ordinary
+// (non-gap) walk: it reads its own persisted position (catchUpGap.
+// AnchorCursor, falling back to the coarser catchUpGap.From timestamp
+// until the first message is retrieved) rather than
+// Hub.lastHandedOverCursor, so retrieving the gap never re-delivers or
+// otherwise interferes with normal hub_catch_up progress, and vice
+// versa. Same bound=1, same dedup-skip-loop shape as the ordinary walk,
+// for the identical reason (see handleCatchUp's own doc comment on why
+// a returned result is never a batch).
+//
+// Closing condition: a "noMoreMessages" answer, or a retrieved message
+// whose own TS reaches catchUpGap.To (the seek's landing point) — from
+// there on, ordinary hub_catch_up already covers everything, so
+// continuing to walk the gap would just re-deliver what normal catch-up
+// already has (or will). TS comparison is best-effort string comparison
+// (both are RFC3339 UTC on this client's own side; a server's own
+// message TS format may vary) — if it's ever wrong, the failure mode is
+// walking a little further than strictly needed, not losing anything.
+func (h *Hub) handleCatchUpGap(conn *hubconn.Conn, id connstore.CatchUpID) (*mcp.CallToolResult, error) {
+	gap, ok := loadCatchUpGap(id)
+	if !ok {
+		return mcp.NewToolResultText(
+			"no recorded gap for this session — nothing to retrieve. hub_catch_up (without gap: " +
+				"true) resumes normal reading.",
+		), nil
+	}
+
+	anchor := wire.Anchor{At: gap.From}
+	if gap.AnchorCursor != "" {
+		anchor = wire.Anchor{Cursor: gap.AnchorCursor}
+	}
+
+	for skipped := 0; skipped < catchUpDedupSkipLimit; skipped++ {
+		ev, ok, err := conn.RequestMessageAfterAwaiting(anchor)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("gap retrieval failed: %v", err)), nil
+		}
+		if !ok {
+			return mcp.NewToolResultText(
+				"gap retrieval request timed out waiting for the server — call " +
+					"hub_catch_up(gap: true) again to retry",
+			), nil
+		}
+		switch ev.Kind {
+		case "noMoreMessages":
+			clearCatchUpGap(id)
+			return mcp.NewToolResultText(fmt.Sprintf(
+				"[hub: gap fully retrieved — nothing more between %s and %s. Normal hub_catch_up "+
+					"already covers everything from here onward]", gap.From, gap.To,
+			)), nil
+		case "error":
+			return mcp.NewToolResultError(
+				fmt.Sprintf("gap retrieval refused (code=%s, retryable=%t): %s", ev.Code, ev.Retryable, ev.Text),
+			), nil
+		case "msg":
+			h.mu.Lock()
+			alreadyHandedOver := ev.Cursor != "" && h.handedOverAhead[ev.Cursor]
+			h.mu.Unlock()
+			reachedEnd := gap.To != "" && ev.TS != "" && ev.TS >= gap.To
+			if alreadyHandedOver {
+				// Same reasoning as the ordinary walk's dedup branch —
+				// already shown to the model via a synchronous call, so
+				// advance past it silently rather than re-present it. Also
+				// prunes the entry the same way the ordinary walk's own
+				// dedup branch already does — found live, 2026-09-08,
+				// coordinating with chat-relay's author and customer-portal
+				// on the hub: this branch used to leave the entry in
+				// handedOverAhead forever (only the ordinary walk's mirror
+				// branch pruned), so a session doing most of its gap
+				// retrieval through repeated hub_catch_up(gap: true) calls
+				// (as happened live while chasing the decodeEvent bug)
+				// accumulated dead entries without bound.
+				h.mu.Lock()
+				delete(h.handedOverAhead, ev.Cursor)
+				aheadID := h.catchUpID
+				snapshot := make(map[string]bool, len(h.handedOverAhead))
+				for c := range h.handedOverAhead {
+					snapshot[c] = true
+				}
+				h.mu.Unlock()
+				saveHandedOverAhead(aheadID, snapshot)
+				if reachedEnd {
+					clearCatchUpGap(id)
+					return mcp.NewToolResultText(fmt.Sprintf(
+						"[hub: gap fully retrieved (the remainder was already shown to you earlier) — "+
+							"nothing more between %s and %s]", gap.From, gap.To,
+					)), nil
+				}
+				gap.AnchorCursor = ev.Cursor
+				saveCatchUpGap(id, gap)
+				anchor = wire.Anchor{Cursor: ev.Cursor}
+				continue
+			}
+			gap.AnchorCursor = ev.Cursor
+			if reachedEnd {
+				clearCatchUpGap(id)
+			} else {
+				saveCatchUpGap(id, gap)
+			}
+			formatted := hubconn.FormatEvent(ev)
+			if reachedEnd {
+				formatted += fmt.Sprintf(
+					"\n\n[hub: gap fully retrieved — this was the last message between %s and %s]",
+					gap.From, gap.To,
+				)
+			} else {
+				formatted += fmt.Sprintf(
+					"\n\n[hub: more of the gap (%s to %s) may remain — call hub_catch_up(gap: true) "+
+						"again to continue retrieving it]", gap.From, gap.To,
+				)
+			}
+			return h.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
+		default:
+			return mcp.NewToolResultError(fmt.Sprintf("unexpected gap retrieval response kind %q", ev.Kind)), nil
+		}
+	}
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"[hub: skipped %d already-seen message(s) in the gap without finding a new one — call "+
+			"hub_catch_up(gap: true) again to continue]", catchUpDedupSkipLimit)), nil
+}
+
+// handleConfirmReceived implements hub_confirm — a model-issued read
+// receipt, the primitive converged on live, 2026-09-07, coordinating with
+// chat-relay's author and a third party on the hub: nothing in this
+// client's async delivery paths (wait --follow, one-shot wait) can
+// honestly claim the model read a message, only that this process wrote
+// it onward (see hubconn.Conn.MarkConsumed's doc comment) — so ackLoop's
+// automatic receipt and the server-side Behind/behindSince it can feed
+// both report on delivery, not consumption, no matter how truthfully
+// this client tries to compute them otherwise. A tool the model calls
+// itself closes that gap by construction: the call can only originate
+// once the model has actually seen cursor.
+func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	conn, _ := h.activeConn()
+	if conn == nil {
+		return mcp.NewToolResultError("not connected"), nil
+	}
+	if !conn.Connected() {
+		h.teardownIfCurrent(conn)
+		return mcp.NewToolResultText(disconnectedText(conn)), nil
+	}
+	cursor, err := req.RequireString("cursor")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	behind, err := h.confirmCursor(conn, cursor)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("confirm failed: %v", err)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"confirmed handed over up to %q — persisted; a future hub_catch_up or reconnect resumes "+
+			"from here instead of re-walking anything at or before it%s", cursor, formatBehindNote(behind),
+	)), nil
+}
+
+// formatBehindNote renders a standalone ack's reported Behind count, if
+// the server sent one — see wire.Ack.Behind and Conn.ConfirmReceived's
+// doc comments. nil (the common case against a server that doesn't
+// support this) renders nothing; the caller shouldn't imply a count that
+// was never actually answered.
+func formatBehindNote(behind *int) string {
+	if behind == nil {
+		return ""
+	}
+	if *behind == 0 {
+		return " — you are fully caught up from this position"
+	}
+	return fmt.Sprintf(" — %d message(s) remain after this position", *behind)
+}
+
+// confirmCursor is hub_confirm's actual effect, factored out so
+// hub_send/hub_edit can offer the exact same guarantee inline via their
+// own optional confirmCursor parameter — built 2026-09-08, the project
+// owner's own proposal ("part 1"), coordinated live with chat-relay's
+// author and customer-portal: rather than the client silently
+// auto-computing what to acknowledge from its own lastConsumed
+// bookkeeping on every outbound send, the model can state explicitly
+// what it has actually read, the same deliberate act hub_confirm already
+// requires — this just saves the round trip of calling hub_confirm
+// separately before sending. Sends a genuine standalone ack (via
+// conn.ConfirmReceived), not a piggybacked one — chat-relay's own note:
+// a piggybacked receipt is fire-and-forget by design and never answers
+// with a pending count, where a standalone one does.
+func (h *Hub) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
+	behind, err := conn.ConfirmReceived(cursor)
+	if err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	h.lastHandedOverCursor = cursor
+	// handedOverAhead's entries exist to dedup a walk that hasn't reached
+	// them yet — but a confirm jump moves the walk's own starting point
+	// straight past all of them without ever waking on any individual
+	// one (unlike hub_catch_up's own dedup loop, which deletes each
+	// entry as it walks over it — see below). Left alone, every entry
+	// recorded before this confirm becomes permanently orphaned: nothing
+	// will ever walk back far enough to clean it up, and it just grows
+	// the persisted set forever. Clearing it here is safe by the same
+	// reasoning as everywhere else in this design — anything it held is
+	// now at-or-before the new watermark, so a future walk starting from
+	// cursor would never have reached those entries anyway; worst case a
+	// genuinely-newer entry gets dropped too, costing one avoidable
+	// duplicate later, not a loss.
+	h.handedOverAhead = nil
+	id := h.catchUpID
+	h.mu.Unlock()
+	setCatchUpCursor(id, cursor)
+	saveHandedOverAhead(id, nil)
+	return behind, nil
 }
 
 func (h *Hub) handleReact(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1786,22 +2195,30 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	behindNote := ""
+	if confirmCursor := req.GetString("confirmCursor", ""); confirmCursor != "" {
+		behind, err := h.confirmCursor(conn, confirmCursor)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("confirmCursor failed: %v", err)), nil
+		}
+		behindNote = formatBehindNote(behind)
+	}
 	ev, ok, err := conn.EditMessageAwaitingAck(externalID, text, attachments, req.GetString("format", ""), req.GetString("replyTo", ""), mentions)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("edit request failed: %v", err)), nil
 	}
 	if ok {
-		return mcp.NewToolResultText(hubconn.FormatEvent(ev)), nil
+		return mcp.NewToolResultText(hubconn.FormatEvent(ev) + behindNote), nil
 	}
 	if !conn.IsBridge() {
 		return mcp.NewToolResultText(
 			"edit request sent — confirmation (or a refusal) will arrive via wait/hub_receive/" +
-				"hub_wait, not from this call",
+				"hub_wait, not from this call" + behindNote,
 		), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf(
 		"edit request sent — no acknowledgement within %v; check wait/hub_receive/hub_wait for "+
-			"the actual outcome rather than assuming this succeeded", hubconn.AckWaitTimeout,
+			"the actual outcome rather than assuming this succeeded%s", hubconn.AckWaitTimeout, behindNote,
 	)), nil
 }
 

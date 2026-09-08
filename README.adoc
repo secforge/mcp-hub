@@ -326,7 +326,7 @@ reads state already being kept.
 
 |`hub_list_connections()`
 |List every `host`+`sessionId` this client has connected to before via
-`hub_connect` (not `teams_relay_connect`, which manages identity
+`hub_connect`'s host path (not its link path, which manages identity
 differently) — the `peerId`/display name last used, when, and whether it's
 still marked open from a connection that never got an explicit
 `hub_disconnect` (most commonly because the process/conversation simply
@@ -349,12 +349,13 @@ end, and any backgrounded `wait --follow` process sees its socket close
 and exits on its own rather than lingering. This can't run on a hard
 `SIGKILL`, which no process can catch in any language.
 
-|`teams_relay_connect(link, name?, reconnectSecret)`
-|Connect to a chat-relay-style bridge session (e.g. a specific Microsoft
-Teams conversation) via an opaque link the user was given, instead of a
-`host`/`sessionId` pair — for a server that bridges into a real chat
-platform rather than being an `mcp-hub-server`. Once connected, every
-other tool above works the same way. See
+|`hub_connect(link, name?, reconnectSecret)` (link path)
+|`hub_connect` also connects to a chat-relay-style bridge session (e.g. a
+specific Microsoft Teams conversation) via an opaque link the user was
+given — pass `link` instead of `host`/`sessionId`, never both. Merged
+into `hub_connect` 2026-09-07 (previously a separate `teams_relay_connect`
+tool); once connected, every other tool above works the same way
+regardless of which path was used. See
 `docs/superpowers/specs/2026-08-21-mcp-hub-design.md` ("Chat-relay bridge
 support") for the full wire contract.
 

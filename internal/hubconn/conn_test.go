@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,6 +95,44 @@ func TestDecodeEventMessageEditedCarriesReplyTo(t *testing.T) {
 	}
 	if ev.ReplyTo != "ext-orig" || ev.ReplyPreview != "preview text" {
 		t.Fatalf("unexpected decoded event: %+v", ev)
+	}
+}
+
+// TestDecodeEventAcceptsPeerlessSystemMsg is the regression test for the
+// bug found live, 2026-09-07/08, coordinating with chat-relay's author
+// and customer-portal on the hub: decodeEvent used to require
+// wire.IsValidID(m.PeerID) unconditionally, rejecting a legitimate
+// peerless system "msg" (e.g. chat-relay's "chat renamed" event, sender
+// null) as garbage. That silent decode failure — not a claim-matching
+// bug in tryDivertToClaimLocked, the first (wrong) theory — is why a
+// RequestMessageAfterAwaiting call answered by exactly such a message
+// always timed out: the event never survived decoding to reach the
+// pending claim at all. An empty PeerID must decode cleanly; a non-empty
+// garbage one must still be rejected (see the sibling test below).
+func TestDecodeEventAcceptsPeerlessSystemMsg(t *testing.T) {
+	m := wire.Msg{Type: wire.TypeMsg, PeerID: "", Text: "— chat renamed —", TS: "ts1", Historical: true,
+		Cursor: "cursor-1", Answers: &wire.Anchor{Cursor: "cursor-0"}}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	ev, ok := DecodeEvent(raw)
+	if !ok {
+		t.Fatal("expected DecodeEvent to accept a peerless system msg")
+	}
+	if ev.PeerID != "" || ev.Text != "— chat renamed —" || ev.Answers == nil {
+		t.Fatalf("unexpected decoded event: %+v", ev)
+	}
+}
+
+func TestDecodeEventStillRejectsInvalidNonEmptyPeerID(t *testing.T) {
+	m := wire.Msg{Type: wire.TypeMsg, PeerID: "not-a-uuid", Text: "hi", TS: "ts1"}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, ok := DecodeEvent(raw); ok {
+		t.Fatal("expected DecodeEvent to reject a malformed non-empty PeerID")
 	}
 }
 
@@ -197,9 +236,11 @@ func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if _, connected := c.Drain(); !connected {
+	events, connected := c.DrainEvents()
+	if !connected {
 		t.Fatal("expected still connected")
 	}
+	c.MarkConsumed(events)
 	if c.LastConsumedCursor() != "cursor-1" {
 		t.Fatalf("expected LastConsumedCursor cursor-1, got %q", c.LastConsumedCursor())
 	}
@@ -262,6 +303,553 @@ func TestAckCursorOmittedBeforeAnythingConsumed(t *testing.T) {
 	}
 }
 
+// TestDrainDoesNotMarkConsumed is the regression test for the read-receipt
+// truthfulness bug found live, 2026-09-07 (coordinating with chat-relay's
+// author and a third party on the hub): Drain/DrainBatch/DrainEvents used
+// to mark events consumed as a side effect, which meant waiter's
+// follow-mode delivery and one-shot `wait` — neither of which confirms a
+// model read anything, only that this process wrote bytes onward — could
+// trigger a standalone ack that a bridge server (e.g. chat-relay) then
+// stored as proof of delivery to the model. Draining alone must never
+// move LastConsumedCursor; only an explicit MarkConsumed call may.
+func TestDrainDoesNotMarkConsumed(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for c.LastSeenCursor() != "cursor-1" {
+		if time.Now().After(deadline) {
+			t.Fatal("never saw cursor-1 buffered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if _, connected := c.Drain(); !connected {
+		t.Fatal("expected still connected")
+	}
+	if got := c.LastConsumedCursor(); got != "" {
+		t.Fatalf("Drain must not mark anything consumed by itself, got LastConsumedCursor %q", got)
+	}
+}
+
+// TestMarkConsumedSetsLastConsumedCursor proves the explicit path works —
+// the counterpart to TestDrainDoesNotMarkConsumed above.
+func TestMarkConsumedSetsLastConsumedCursor(t *testing.T) {
+	c := &Conn{}
+	c.MarkConsumed([]Event{{Cursor: "cursor-1"}, {Cursor: "cursor-2"}})
+	if got := c.LastConsumedCursor(); got != "cursor-2" {
+		t.Fatalf("expected LastConsumedCursor cursor-2 (the last event's), got %q", got)
+	}
+}
+
+// TestConfirmReminderFiresWhenSeenPastConsumed proves the periodic nudge
+// (requested directly by the project owner, 2026-09-07) actually injects a
+// buffered event once something has been seen live but never confirmed via
+// a synchronous call.
+func TestConfirmReminderFiresWhenSeenPastConsumed(t *testing.T) {
+	origInterval := confirmReminderInterval
+	confirmReminderInterval = 30 * time.Millisecond
+	defer func() { confirmReminderInterval = origInterval }()
+
+	url := startTestServer(t)
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// Drain the connect-time rosterComplete out of the way first, so it
+	// doesn't get mistaken below for the reminder this test is waiting on.
+	rosterDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if hasEvents, _ := c.Peek(); hasEvents {
+			break
+		}
+		if time.Now().After(rosterDeadline) {
+			t.Fatal("never saw the connect-time rosterComplete")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.DrainEvents()
+
+	c.mu.Lock()
+	c.lastSeenCursor = "cursor-live-1"
+	c.mu.Unlock()
+
+	var found *Event
+	deadline := time.Now().Add(2 * time.Second)
+	for found == nil {
+		if hasEvents, _ := c.Peek(); hasEvents {
+			events, _ := c.DrainEvents()
+			for i := range events {
+				if events[i].Kind == "confirmReminder" {
+					found = &events[i]
+					break
+				}
+			}
+		}
+		if found == nil {
+			if time.Now().After(deadline) {
+				t.Fatal("confirmReminderLoop never injected a reminder event")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if found.Text != "cursor-live-1" {
+		t.Fatalf("expected the reminder to carry cursor-live-1, got %q", found.Text)
+	}
+	if found.Cursor != "" {
+		t.Fatalf("expected the reminder event to carry no Cursor of its own, got %q", found.Cursor)
+	}
+}
+
+// TestConfirmReminderDoesNotFireWhenNothingUnconfirmed proves the reminder
+// stays silent once MarkConsumed catches up to lastSeenCursor — the
+// "don't cost a model turn when nothing needs confirming" requirement from
+// the hub design discussion.
+func TestConfirmReminderDoesNotFireWhenNothingUnconfirmed(t *testing.T) {
+	origInterval := confirmReminderInterval
+	confirmReminderInterval = 30 * time.Millisecond
+	defer func() { confirmReminderInterval = origInterval }()
+
+	url := startTestServer(t)
+	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	c.mu.Lock()
+	c.lastSeenCursor = "cursor-live-1"
+	c.mu.Unlock()
+	c.MarkConsumed([]Event{{Cursor: "cursor-live-1"}})
+
+	time.Sleep(150 * time.Millisecond)
+
+	events, _ := c.DrainEvents()
+	for _, e := range events {
+		if e.Kind == "confirmReminder" {
+			t.Fatalf("expected no reminder once lastSeenCursor is fully confirmed, got: %+v", events)
+		}
+	}
+}
+
+func TestConfirmReceivedSendsImmediateAckAndMarksConsumed(t *testing.T) {
+	orig := AckWaitTimeout
+	AckWaitTimeout = 100 * time.Millisecond
+	defer func() { AckWaitTimeout = orig }()
+
+	upgrader := websocket.Upgrader{}
+	gotAck := make(chan wire.Ack, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		for {
+			var raw json.RawMessage
+			if err := conn.ReadJSON(&raw); err != nil {
+				return
+			}
+			typ, err := wire.DecodeType(raw)
+			if err != nil || typ != wire.TypeAck {
+				continue
+			}
+			var a wire.Ack
+			json.Unmarshal(raw, &a)
+			gotAck <- a
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if _, err := c.ConfirmReceived("cursor-9"); err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+	if got := c.LastConsumedCursor(); got != "cursor-9" {
+		t.Fatalf("expected LastConsumedCursor cursor-9, got %q", got)
+	}
+
+	select {
+	case a := <-gotAck:
+		if a.AckCursor != "cursor-9" {
+			t.Fatalf("expected an immediate standalone ack for cursor-9, got %+v", a)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("never received the standalone ack — ConfirmReceived should send immediately, not wait for the idle timer")
+	}
+}
+
+// TestConfirmReceivedRatchetsToNoWaitAfterConsecutiveMisses is the
+// regression test for the per-server probe design (built 2026-09-08,
+// correcting an earlier isBridge-based gate chat-relay's author caught
+// live, then refined again the same day per their own follow-up: a
+// single miss must not permanently conclude "this server never
+// answers" — see ackReplyMisses's doc comment). Against a server that
+// never replies to a standalone ack at all (mcp-hub-server itself is
+// exactly such a server), ackReplyMissThreshold consecutive calls must
+// each pay the AckWaitTimeout stall; only once that many misses have
+// happened in a row does a later call skip waiting.
+func TestConfirmReceivedRatchetsToNoWaitAfterConsecutiveMisses(t *testing.T) {
+	origTimeout := AckWaitTimeout
+	AckWaitTimeout = 50 * time.Millisecond
+	defer func() { AckWaitTimeout = origTimeout }()
+	origThreshold := ackReplyMissThreshold
+	ackReplyMissThreshold = 2
+	defer func() { ackReplyMissThreshold = origThreshold }()
+
+	url := startTestServer(t)
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	for i := 0; i < ackReplyMissThreshold; i++ {
+		behind, err := c.ConfirmReceived("cursor-miss")
+		if err != nil {
+			t.Fatalf("ConfirmReceived (miss %d): %v", i, err)
+		}
+		if behind != nil {
+			t.Fatalf("expected behind=nil on miss %d, got %v", i, *behind)
+		}
+	}
+
+	start := time.Now()
+	behind, err := c.ConfirmReceived("cursor-after-threshold")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ConfirmReceived (after threshold): %v", err)
+	}
+	if behind != nil {
+		t.Fatalf("expected behind=nil, got %v", *behind)
+	}
+	if elapsed > 25*time.Millisecond {
+		t.Fatalf("expected the call past the threshold to skip waiting entirely, took %v", elapsed)
+	}
+}
+
+// TestConfirmReceivedDoesNotRatchetOnASingleTransientMiss is the direct
+// regression test for chat-relay's follow-up correction: one lost/slow
+// reply must not disable waiting for the rest of the connection's life.
+// A miss followed by a genuine reply must reset the streak — proven here
+// by driving ackReplyMissThreshold down to 1 (any single further miss
+// would immediately ratchet) and showing a successful reply in between
+// keeps a later miss paying its own wait rather than skipping it.
+func TestConfirmReceivedDoesNotRatchetOnASingleTransientMiss(t *testing.T) {
+	origThreshold := ackReplyMissThreshold
+	ackReplyMissThreshold = 1
+	defer func() { ackReplyMissThreshold = origThreshold }()
+
+	var mu sync.Mutex
+	reply := false
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		for {
+			var raw json.RawMessage
+			if err := conn.ReadJSON(&raw); err != nil {
+				return
+			}
+			mu.Lock()
+			shouldReply := reply
+			mu.Unlock()
+			if shouldReply {
+				var a wire.Ack
+				json.Unmarshal(raw, &a)
+				behind := 1
+				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: a.AckCursor, OK: true, Behind: &behind})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	origTimeout := AckWaitTimeout
+	AckWaitTimeout = 50 * time.Millisecond
+	defer func() { AckWaitTimeout = origTimeout }()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// A genuine reply (server answers this time) resets the streak.
+	mu.Lock()
+	reply = true
+	mu.Unlock()
+	if behind, err := c.ConfirmReceived("cursor-1"); err != nil || behind == nil || *behind != 1 {
+		t.Fatalf("expected a real reply to reset the streak, got behind=%v err=%v", behind, err)
+	}
+
+	// A later miss (server goes quiet) must pay its own wait rather than
+	// having been pre-ratcheted by anything earlier.
+	mu.Lock()
+	reply = false
+	mu.Unlock()
+	start := time.Now()
+	if _, err := c.ConfirmReceived("cursor-2"); err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 25*time.Millisecond {
+		t.Fatalf("expected this miss to actually wait (not be skipped due to a stale ratchet), took %v", elapsed)
+	}
+}
+
+// TestConfirmReceivedOnPlainConnReturnsBehindFromReply proves the actual
+// bug chat-relay caught: their server replies to a standalone ack on a
+// PLAIN hub_connect session (host+sessionId), same as on a bridge link —
+// this client's own coordination-hub session is exactly such a
+// connection, so gating the wait on isBridge silently dropped the count
+// precisely where it was needed.
+func TestConfirmReceivedOnPlainConnReturnsBehindFromReply(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		var raw json.RawMessage
+		if err := conn.ReadJSON(&raw); err != nil {
+			return
+		}
+		behind := 2
+		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: true, Behind: &behind})
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	behind, err := c.ConfirmReceived("cursor-1")
+	if err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+	if behind == nil || *behind != 2 {
+		t.Fatalf("expected behind=2 on a plain connection whose server replies, got %v", behind)
+	}
+}
+
+// TestConfirmReceivedSkipsWaitImmediatelyWhenFeatureDeclaredUnsupported
+// is the regression test for the Features-based fast path (built
+// 2026-09-08, superseding the probe for any server that declares at
+// all): a server whose "joined" carries a Features object without
+// "ackReplies" is known, with certainty, not to answer — so even the
+// very FIRST ConfirmReceived call must skip waiting, unlike the
+// undeclared case which always pays one probe first.
+func TestConfirmReceivedSkipsWaitImmediatelyWhenFeatureDeclaredUnsupported(t *testing.T) {
+	orig := AckWaitTimeout
+	AckWaitTimeout = 50 * time.Millisecond
+	defer func() { AckWaitTimeout = orig }()
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		j.Features = map[string]json.RawMessage{"messageAfter": json.RawMessage("{}")}
+		conn.WriteJSON(j)
+		for {
+			var raw json.RawMessage
+			if err := conn.ReadJSON(&raw); err != nil {
+				return
+			}
+			// Deliberately never replies to the ack — proves this path
+			// doesn't need a reply to know not to wait for one.
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if !c.FeaturesDeclared() {
+		t.Fatal("expected FeaturesDeclared() true")
+	}
+	if c.HasFeature("ackReplies") {
+		t.Fatal("expected HasFeature(\"ackReplies\") false")
+	}
+
+	start := time.Now()
+	behind, err := c.ConfirmReceived("cursor-1")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+	if behind != nil {
+		t.Fatalf("expected behind=nil, got %v", *behind)
+	}
+	if elapsed > 25*time.Millisecond {
+		t.Fatalf("expected the very first call to skip waiting (declared, not probed), took %v", elapsed)
+	}
+}
+
+// TestConfirmReceivedWaitsWhenFeatureDeclaredSupported proves the other
+// half: a server that declares "ackReplies" is trusted to answer, so
+// ConfirmReceived waits for and returns its reply — the mirror of the
+// unsupported case above.
+func TestConfirmReceivedWaitsWhenFeatureDeclaredSupported(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		j.Features = map[string]json.RawMessage{"ackReplies": json.RawMessage("{}")}
+		conn.WriteJSON(j)
+		var raw json.RawMessage
+		if err := conn.ReadJSON(&raw); err != nil {
+			return
+		}
+		behind := 4
+		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: true, Behind: &behind})
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if !c.HasFeature("ackReplies") {
+		t.Fatal("expected HasFeature(\"ackReplies\") true")
+	}
+
+	behind, err := c.ConfirmReceived("cursor-1")
+	if err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+	if behind == nil || *behind != 4 {
+		t.Fatalf("expected behind=4, got %v", behind)
+	}
+}
+
+// TestFeaturesDeclaredFalseWhenServerOmitsFeatures proves a pre-v3
+// server (no Features field at all in "joined") is distinguishable from
+// one that declared an empty features set — the undeclared case is what
+// falls back to the ackReplyMisses probe.
+func TestFeaturesDeclaredFalseWhenServerOmitsFeatures(t *testing.T) {
+	url := startTestServer(t)
+	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if c.FeaturesDeclared() {
+		t.Fatal("expected FeaturesDeclared() false for a server that never sent Features")
+	}
+	if c.HasFeature("ackReplies") {
+		t.Fatal("expected HasFeature to be false when nothing was declared")
+	}
+}
+
+// TestConfirmReceivedOnBridgeReturnsBehindFromReply is the regression
+// test for chat-relay's server-side extension (found live, 2026-09-08):
+// a standalone ack's reply can carry a Behind count measured from the
+// position just confirmed. On a bridge connection, ConfirmReceived must
+// wait for and surface it.
+func TestConfirmReceivedOnBridgeReturnsBehindFromReply(t *testing.T) {
+	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
+		var raw json.RawMessage
+		if err := conn.ReadJSON(&raw); err != nil {
+			return
+		}
+		behind := 3
+		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: true, Behind: &behind})
+		time.Sleep(2 * time.Second)
+	})
+	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("DialRelay: %v", err)
+	}
+	defer c.Close()
+
+	behind, err := c.ConfirmReceived("cursor-1")
+	if err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+	if behind == nil || *behind != 3 {
+		t.Fatalf("expected behind=3, got %v", behind)
+	}
+}
+
+// TestConfirmReceivedOnBridgeReturnsNilWhenServerDoesNotReply proves the
+// graceful-fallback half: a bridge server that never answers a
+// standalone ack at all (predating chat-relay's extension, or simply not
+// implementing it) still resolves ConfirmReceived — after AckWaitTimeout
+// — with behind=nil, not an error or a hang.
+func TestConfirmReceivedOnBridgeReturnsNilWhenServerDoesNotReply(t *testing.T) {
+	orig := AckWaitTimeout
+	AckWaitTimeout = 100 * time.Millisecond
+	defer func() { AckWaitTimeout = orig }()
+
+	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
+		time.Sleep(2 * time.Second)
+	})
+	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("DialRelay: %v", err)
+	}
+	defer c.Close()
+
+	behind, err := c.ConfirmReceived("cursor-1")
+	if err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+	if behind != nil {
+		t.Fatalf("expected behind=nil when the server never replies, got %v", *behind)
+	}
+}
+
 func TestAckLoopSendsStandaloneAckWhenIdleAndConsumedMoved(t *testing.T) {
 	origAckIdleInterval := ackIdleInterval
 	ackIdleInterval = 50 * time.Millisecond
@@ -308,7 +896,8 @@ func TestAckLoopSendsStandaloneAckWhenIdleAndConsumedMoved(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	c.Drain()
+	events, _ := c.DrainEvents()
+	c.MarkConsumed(events)
 
 	select {
 	case a := <-gotAck:
@@ -699,7 +1288,12 @@ func TestDialCapturesServerVersion(t *testing.T) {
 	}
 }
 
-func TestSystemPeerIDCapturedFromJoined(t *testing.T) {
+// TestMsgFromSystemConstantsIsMarkedOperator is the regression test for
+// the 2026-09-08 restore: readLoop must flag IsOperator by checking the
+// PeerID against the two fixed constants directly (SystemPeerIDOperator,
+// SystemPeerIDSystem) — not any advertised wire field, which stays
+// removed — and leave an ordinary peer's message unmarked.
+func TestMsgFromSystemConstantsIsMarkedOperator(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -707,42 +1301,10 @@ func TestSystemPeerIDCapturedFromJoined(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
-		j.SystemPeerID = "00000000-0000-0000-0000-000000000000"
-		conn.WriteJSON(j)
-		for {
-			var raw json.RawMessage
-			if err := conn.ReadJSON(&raw); err != nil {
-				return
-			}
-		}
-	}))
-	defer srv.Close()
-
-	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer c.Close()
-	if c.SystemPeerID() != "00000000-0000-0000-0000-000000000000" {
-		t.Fatalf("got SystemPeerID %q, want the all-zeros uuid", c.SystemPeerID())
-	}
-}
-
-func TestMsgFromSystemPeerIsMarkedOperator(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		j := wire.NewJoined("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 0, "", "")
-		j.SystemPeerID = "00000000-0000-0000-0000-000000000000"
-		conn.WriteJSON(j)
-		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "00000000-0000-0000-0000-000000000000", Text: "go ahead", TS: "ts1"})
-		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440000", Text: "ordinary peer", TS: "ts2"})
+		conn.WriteJSON(wire.NewJoined("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 0, "", ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: SystemPeerIDOperator, Text: "go ahead", TS: "ts1"})
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: SystemPeerIDSystem, Text: "auto note", TS: "ts2"})
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440000", Text: "ordinary peer", TS: "ts3"})
 		for {
 			var raw json.RawMessage
 			if err := conn.ReadJSON(&raw); err != nil {
@@ -761,21 +1323,24 @@ func TestMsgFromSystemPeerIsMarkedOperator(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	var events []Event
-	for len(events) < 2 {
+	for len(events) < 3 {
 		if time.Now().After(deadline) {
 			t.Fatalf("only saw %d events before timeout", len(events))
 		}
 		ev, _ := c.DrainEvents()
 		events = append(events, ev...)
-		if len(events) < 2 {
+		if len(events) < 3 {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
 	if !events[0].IsOperator {
-		t.Fatalf("expected the system-peer msg to be marked IsOperator, got: %+v", events[0])
+		t.Fatalf("expected the operator-constant msg to be marked IsOperator, got: %+v", events[0])
 	}
-	if events[1].IsOperator {
-		t.Fatalf("expected the ordinary-peer msg to NOT be marked IsOperator, got: %+v", events[1])
+	if !events[1].IsOperator {
+		t.Fatalf("expected the system-constant msg to be marked IsOperator, got: %+v", events[1])
+	}
+	if events[2].IsOperator {
+		t.Fatalf("expected the ordinary-peer msg to NOT be marked IsOperator, got: %+v", events[2])
 	}
 }
 

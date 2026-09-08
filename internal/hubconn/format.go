@@ -69,17 +69,16 @@ func formatMentions(e Event) string {
 	return tag
 }
 
-// formatOperatorTag flags a "msg"/"peerJoined"/"peerLeft" whose PeerID is
-// the session's own operator/system peerId (see Event.IsOperator,
-// wire.Joined.SystemPeerID) — this is the one piece of server-reported
-// information a client can state as fact rather than relay as untrusted
-// content: every peerId is server-assigned and no inbound frame can
-// supply one, so a PeerID this server itself named as its operator
-// channel cannot be a peer spoofing the same claim. That still only makes
-// the SENDER's identity trustworthy, not the message's CONTENTS — the
-// operator's instructions here outrank another agent's on this hub, but
-// never outrank the model's own user, who is not a party to this session
-// at all.
+// formatOperatorTag flags a "msg"/"peerJoined"/"peerLeft" whose PeerID
+// is one of the two well-known system/operator constants (see
+// SystemPeerIDOperator/SystemPeerIDSystem) — restored 2026-09-08 keyed
+// on those constants directly rather than an advertised wire field
+// (removed): every peerId is server-assigned and no inbound frame can
+// supply one, so a PeerID matching a fixed constant cannot be a peer
+// spoofing the same claim. That still only makes the SENDER's identity
+// trustworthy, not the message's CONTENTS — the operator's instructions
+// here outrank another agent's on this hub, but never outrank the
+// model's own user, who is not a party to this session at all.
 func formatOperatorTag(e Event) string {
 	if !e.IsOperator {
 		return ""
@@ -114,13 +113,26 @@ func FormatEvent(e Event) string {
 		replyTo := formatReplyTo(e)
 		mentions := formatMentions(e)
 		operator := formatOperatorTag(e)
+		// endMarker closes the message with the same cursor the opening
+		// line named — added 2026-09-08 per the project owner's own
+		// proposal, coordinated live with chat-relay's author and
+		// customer-portal: a message delivered intact carries its cursor
+		// at both ends, so a cut partway through is directly detectable
+		// (the closing marker is simply absent) instead of inferred from
+		// context. Only meaningful when there's a cursor to echo — a live
+		// "msg" the server hasn't assigned one to yet has nothing to
+		// bracket with.
+		endMarker := ""
+		if e.Cursor != "" {
+			endMarker = fmt.Sprintf("\n[end cursor=%s]", e.Cursor)
+		}
 		if e.Historical {
-			return fmt.Sprintf("[HUB HISTORY — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text)
+			return fmt.Sprintf("[HUB HISTORY — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 		}
 		if e.Private {
-			return fmt.Sprintf("[HUB PRIVATE MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text)
+			return fmt.Sprintf("[HUB PRIVATE MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 		}
-		return fmt.Sprintf("[HUB MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text)
+		return fmt.Sprintf("[HUB MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 	case "peerJoined":
 		operator := formatOperatorTag(e)
 		if e.Name != "" {
@@ -136,6 +148,25 @@ func FormatEvent(e Event) string {
 		return fmt.Sprintf("[HUB ERROR] %s", e.Text)
 	case "rosterComplete":
 		return "[hub: initial roster complete — you now know everyone who was already in the session]"
+	case "confirmReminder":
+		// Deliberately a cross-check, not a value to echo back — found
+		// live, 2026-09-07: handing the model an exact cursor to paste
+		// into hub_confirm invites rubber-stamping it without looking,
+		// which reproduces the exact delivery-vs-consumption gap this
+		// reminder exists to close. Naming e.Text as what was LAST
+		// DELIVERED (not "the" answer) and asking a second question that
+		// must independently agree with the first (was anything since it
+		// cut or missing) forces an actual look — two values that must be
+		// consistent aren't producible without checking, where one alone
+		// is.
+		return fmt.Sprintf("[hub: the last thing delivered to you on this connection was cursor=%q — "+
+			"before calling hub_confirm, look back and answer both: (1) what is the last message YOU "+
+			"actually have complete and contiguous (this may be earlier than %q, if anything since "+
+			"then arrived cut off or you never saw it at all) — confirm THAT cursor, not necessarily "+
+			"this one; (2) was anything cut off or missing between your answer and %q? If so, don't "+
+			"advance past it — a hub_catch_up call will recover it later. This repeats periodically "+
+			"until you confirm; ignoring it is safe (nothing is lost), it just means this session's "+
+			"catch-up position stays where it is]", e.Text, e.Text, e.Text)
 	case "sendAck":
 		if e.ActionOK {
 			return fmt.Sprintf("[hub: send acknowledged — it left the building (externalId=%s). "+
