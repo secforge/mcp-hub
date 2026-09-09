@@ -1104,8 +1104,15 @@ func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T)
 	if !strings.Contains(textOf(res), "No other peers are in this session yet") {
 		t.Fatalf("expected a-no-existing-peers note, got: %s", textOf(res))
 	}
-	if strings.Contains(textOf(res), "display name") || strings.Contains(textOf(res), "age public key") {
-		t.Fatalf("expected no identity note when neither name nor agePublicKey was given, got: %s", textOf(res))
+	// Nothing is claimed about what other peers can SEE when neither a
+	// name nor a key was given — there is nothing for them to see. The
+	// missing name is still remarked on, since a peer everyone reads as a
+	// bare UUID is a cost worth naming.
+	if strings.Contains(textOf(res), "can see your") {
+		t.Fatalf("expected no visible-identity note when neither name nor agePublicKey was given, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), "without a display name") {
+		t.Fatalf("expected the missing name to be remarked on, got: %s", textOf(res))
 	}
 
 	hubB := NewHub()
@@ -1855,3 +1862,50 @@ func TestParseMentionsRejectsNonObjectEntry(t *testing.T) {
 
 
 
+
+// Connecting with no display name leaves every other peer looking at a
+// UUID, so the result says so rather than letting it pass unremarked.
+func TestConnectWithoutANameSaysWhatThatCosts(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": hubLink(url, sessionID)}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if !strings.Contains(textOf(res), "without a display name") {
+		t.Fatalf("expected the result to name the cost of connecting anonymously, got: %s", textOf(res))
+	}
+}
+
+func TestConnectWithANameDoesNotNagAboutIt(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440001"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": hubLink(url, sessionID), "name": "Claude Code (mcp-hub)"}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	text := textOf(res)
+	if strings.Contains(text, "without a display name") {
+		t.Fatalf("expected no nag when a name was given, got: %s", text)
+	}
+	// The name is not asserted to come back here: this test's server is
+	// wsserver, which reads a name only from a query parameter, and the
+	// client no longer sends one. What matters is that passing a name
+	// stops the nag, and that nothing renders a half-formed sentence when
+	// the server echoes nothing.
+	if strings.Contains(text, "can see your .") {
+		t.Fatalf("expected no half-formed identity sentence, got: %s", text)
+	}
+}

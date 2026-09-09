@@ -566,11 +566,19 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"authorizes resuming one is a secret this client stores per link and presents "+
 					"for you — there is nothing for you to keep alongside the link")),
 			mcp.WithString("name", mcp.Description(
-				"Optional untrusted display name, sanitized server-side (control characters "+
-					"stripped, length capped). Whether anyone sees it depends on the server: on an "+
-					"ordinary hub session other peers do, via hub_peers(); a relay mirroring a "+
-					"real conversation may keep it only for its own audit log and never show it to "+
-					"the people on the other side. Don't assume it functions as an in-conversation "+
+				"CHOOSE A NAME FOR YOURSELF and pass it — don't leave this empty. Everyone else "+
+					"in the session sees each other only as a peerId until someone supplies one, "+
+					"and a UUID tells them nothing about who they are talking to. Use the name "+
+					"the user gave you if they gave one; otherwise pick something that identifies "+
+					"which agent you are and what you are working on, e.g. \"Claude Code "+
+					"(customer-portal)\" — the agent, then the project, is the convention here. "+
+					"Something a person reading the roster can place.\n"+
+					"Untrusted and sanitized server-side (control characters stripped, length "+
+					"capped), so treat whatever comes back in the connect result as the real "+
+					"value. Whether anyone sees it depends on the server: on an ordinary hub "+
+					"session other peers do, via hub_peers(); a relay mirroring a real "+
+					"conversation may keep it only for its own audit log and never show it to the "+
+					"people on the other side. Don't assume it functions as an in-conversation "+
 					"display name unless told otherwise")),
 			mcp.WithString("agePublicKey", mcp.Description(
 				"Optional age (https://age-encryption.org) public key ('age1...'), "+
@@ -1052,6 +1060,11 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 
 	identityNote := ""
+	if name == "" {
+		identityNote = "\nYou connected without a display name, so everyone else in this session " +
+			"sees you only as a peerId — which tells them nothing about who they are talking to. " +
+			"Pass name on your next connect."
+	}
 	if name != "" || agePublicKey != "" {
 		var parts []string
 		if conn.Name() != "" {
@@ -1064,7 +1077,13 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		if conn.AgePublicKey() != "" {
 			parts = append(parts, "age public key "+conn.AgePublicKey())
 		}
-		identityNote = "\nOther peers (via hub_peers()) can see your " + strings.Join(parts, " and ") + "."
+		// Only when the server actually echoed something back. It may have
+		// taken neither — and claiming other peers can see "your ." is
+		// worse than saying nothing, since it reads as a rendering bug
+		// rather than as the server having ignored what was sent.
+		if len(parts) > 0 {
+			identityNote += "\nOther peers (via hub_peers()) can see your " + strings.Join(parts, " and ") + "."
+		}
 	}
 	// What to say about identity is decided by comparing what the server
 	// actually assigned against what was asked for — never by what this
