@@ -358,7 +358,7 @@ func (w *Waiter) Close() error {
 
 // disconnectNoter is implemented by a Source that can explain why the
 // connection died beyond an ordinary drop (currently *hubconn.Conn, for a
-// bridge server's close code signaling a dead credential — see
+// teams relay's close code signaling a dead credential — see
 // hubconn.Conn.DisconnectNote). Checked via an interface, not a direct
 // hubconn dependency, since Source is meant to stay generic.
 type disconnectNoter interface {

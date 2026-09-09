@@ -96,7 +96,7 @@ filesystem to read a path from over this remote connection, unlike
 For a non-image file, use `fileData` (+ optional `fileContentType`,
 default `application/octet-stream`, and `fileName`) instead — same size
 limit, any content type, mutually exclusive with `imageData`. Not every
-server accepts non-image attachments (a Teams bridge session never does,
+server accepts non-image attachments (a teams session never does,
 regardless of type list); `mcp-hub-server`'s own relay accepts anything.
 `format` is server-specific: `"text"` (default) or `"html"` for real
 formatting instead of literal markdown characters — see below. `replyTo`
@@ -117,7 +117,7 @@ image-attachment handling as `hub_receive()`.
 |===
 
 Reactions, edits, deletes, and history remain `mcp-hub-client`-only —
-those are chat-relay/Teams-bridge-specific concepts the plain relay has no
+those are chat-relay/teams-specific concepts the plain relay has no
 server-side concept of at all.
 
 Since a blocking `hub_wait` ties up a conversation turn, `hub_connect`'s
@@ -278,7 +278,7 @@ client itself, so the model never needs to inline base64 into the tool
 call. For a non-image file, pass `filePath` instead (any content type,
 same 32MB raw max, mutually exclusive with `imagePath`) — this works
 against `mcp-hub-server`'s own relay, which never restricts attachment
-content types, but a Teams bridge session refuses any non-image
+content types, but a teams session refuses any non-image
 attachment outright regardless of type. Not every server relays
 attachments — one that doesn't just ignores the field. Pass
 `format: "html"` (default `"text"`) for real
@@ -350,18 +350,18 @@ and exits on its own rather than lingering. This can't run on a hard
 `SIGKILL`, which no process can catch in any language.
 
 |`hub_connect(link, name?, reconnectSecret)` (link path)
-|`hub_connect` also connects to a chat-relay-style bridge session (e.g. a
+|`hub_connect` also connects to a chat-relay-style teams session (e.g. a
 specific Microsoft Teams conversation) via an opaque link the user was
 given — pass `link` instead of `host`/`sessionId`, never both. Merged
 into `hub_connect` 2026-09-07 (previously a separate `teams_relay_connect`
 tool); once connected, every other tool above works the same way
 regardless of which path was used. See
-`docs/superpowers/specs/2026-08-21-mcp-hub-design.md` ("Chat-relay bridge
+`docs/superpowers/specs/2026-08-21-mcp-hub-design.md` ("Teams relay
 support") for the full wire contract.
 
 |`hub_history(before?, after?, limit?)`
 |Request messages relative to this connection — meaningless for a normal
-`hub_connect` session, but real for a bridge session backed by a channel
+`hub_connect` session, but real for a teams session backed by a channel
 with actual retained history. `before` pages backward (older messages
 only — never use it to catch up on a reconnect gap). `after` pages
 forward, strictly after a given cursor, and is what a reconnecting client
@@ -374,16 +374,16 @@ own result.
 
 |`hub_react(externalId, reaction, action)`
 |Add or remove a reaction on an earlier message — meaningless for a
-normal `hub_connect` session, but real for a bridge session with write
+normal `hub_connect` session, but real for a teams session with write
 access to the underlying platform (`action` is `"add"` or `"remove"`).
-On a bridge session, this call itself waits briefly for the real outcome
+On a teams session, this call itself waits briefly for the real outcome
 (acknowledged, or refused) and reports it directly; if nothing arrives in
 time it falls back to a plain confirmation, with the actual outcome then
 arriving asynchronously instead, same as `hub_history`.
 
 |`hub_edit(externalId, text, imagePath?, filePath?, format?, replyTo?)`
 |Change an earlier message's content — meaningless for a normal
-`hub_connect` session, and even on a bridge session typically only
+`hub_connect` session, and even on a teams session typically only
 possible on a message this connection itself sent (platform rules, not
 this protocol, decide that). Same synchronous-outcome-with-async-fallback
 behavior as `hub_react`. `imagePath`/`filePath` (mutually exclusive, same
@@ -405,16 +405,16 @@ empty text — other clients learn about it via a distinct
 mistaken for a blank message.
 |===
 
-`hub_send` gets the same synchronous-outcome treatment on a bridge
+`hub_send` gets the same synchronous-outcome treatment on a teams
 session — a refused send now comes back as the actual refusal reason
 directly, rather than a bare `"sent"` that never meant the message was
 actually accepted. On a plain `hub_connect` session `hub_send` is
 unaffected and always returns immediately, since `mcp-hub-server` has no
 asynchronous confirmation to wait for in the first place.
 
-=== Read receipts (bridge sessions)
+=== Read receipts (teams sessions)
 
-On a bridge session that supports it, `hubconn.Conn` automatically reports
+On a teams session that supports it, `hubconn.Conn` automatically reports
 how far the model has actually read — not merely how far the client has
 received — by piggybacking an `ackCursor` on every outbound message
 (`hub_send`/`hub_react`/`hub_edit`/`hub_delete`/`hub_history`) once
@@ -422,7 +422,7 @@ something has been consumed via `hub_receive`/`hub_wait`, and, failing
 that, firing a standalone receipt after 60s of otherwise-idle connection
 if the read position moved since the last one actually sent. This is
 entirely automatic — no tool exposes it directly — and purely additive:
-`mcp-hub-server` and any bridge that doesn't understand `ackCursor` simply
+`mcp-hub-server` and any teams relay that doesn't understand `ackCursor` simply
 ignores the field. A malformed receipt (a client-side bug, not a
 transient condition) permanently disables further receipts for that
 connection rather than repeating the same mistake.

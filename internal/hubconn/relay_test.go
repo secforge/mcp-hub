@@ -2,6 +2,7 @@ package hubconn
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,6 +30,16 @@ func startRelayTestServer(t *testing.T, onConnected func(*websocket.Conn)) (wsUR
 		}
 		defer conn.Close()
 		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		// Declares that it answers each action with its own ack, and that
+		// it replies to a standalone ack too — what makes waiting for
+		// either worthwhile.
+		joined.Features = map[string]json.RawMessage{
+			"actionAcks": json.RawMessage("{}"),
+			"ackReplies": json.RawMessage("{}"),
+			"reactions":  json.RawMessage("{}"),
+			"edit":       json.RawMessage("{}"),
+			"delete":     json.RawMessage("{}"),
+		}
 		raw, _ := json.Marshal(joined)
 		if err := conn.WriteMessage(websocket.TextMessage, raw); err != nil {
 			return
@@ -47,14 +58,14 @@ func startRelayTestServer(t *testing.T, onConnected func(*websocket.Conn)) (wsUR
 
 func TestSendAwaitingAckOnPlainConnDoesNotWait(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
-	if c.IsBridge() {
-		t.Fatal("expected a plain Dial connection to report IsBridge() false")
+	if c.WantsActionAcks() {
+		t.Fatal("expected a server declaring no actionAcks feature to report WantsActionAcks() false")
 	}
 	start := time.Now()
 	ev, ok, err := c.SendAwaitingAck("hello", "", nil, "", "", nil)
@@ -70,7 +81,7 @@ func TestSendAwaitingAckOnPlainConnDoesNotWait(t *testing.T) {
 	}
 }
 
-func TestSendAwaitingAckReturnsSendAckOnBridge(t *testing.T) {
+func TestSendAwaitingAckReturnsSendAckOnTeamsSession(t *testing.T) {
 	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
 		var m wire.Msg
 		if err := conn.ReadJSON(&m); err != nil {
@@ -79,9 +90,9 @@ func TestSendAwaitingAckReturnsSendAckOnBridge(t *testing.T) {
 		conn.WriteJSON(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "ext-1", OK: true})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -103,9 +114,9 @@ func TestSendAwaitingAckReturnsErrorEventOnRefusal(t *testing.T) {
 		conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "refused", Code: "send_refused", Retryable: false})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -132,9 +143,9 @@ func TestSendAwaitingAckTimesOutWithoutStealingLaterEvents(t *testing.T) {
 		conn.WriteJSON(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "ext-late", OK: true})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -175,9 +186,9 @@ func TestClaimNextAckDoesNotStealUnrelatedEvents(t *testing.T) {
 		conn.WriteJSON(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "ext-1", OK: true})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -206,7 +217,7 @@ func TestClaimNextAckDoesNotStealUnrelatedEvents(t *testing.T) {
 	}
 }
 
-func TestDeleteMessageAwaitingAckReturnsDeleteAckOnBridge(t *testing.T) {
+func TestDeleteMessageAwaitingAckReturnsDeleteAckOnTeamsSession(t *testing.T) {
 	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
 		var d wire.Delete
 		if err := conn.ReadJSON(&d); err != nil {
@@ -215,9 +226,9 @@ func TestDeleteMessageAwaitingAckReturnsDeleteAckOnBridge(t *testing.T) {
 		conn.WriteJSON(wire.DeleteAck{Type: wire.TypeDeleteAck, ExternalID: d.ExternalID, OK: true})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -232,7 +243,7 @@ func TestDeleteMessageAwaitingAckReturnsDeleteAckOnBridge(t *testing.T) {
 
 func TestDeleteMessageOnPlainConnDoesNotWait(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -254,34 +265,34 @@ func TestDeleteMessageOnPlainConnDoesNotWait(t *testing.T) {
 	}
 }
 
-func TestDialRelaySplitsFragmentAndSendsHeaders(t *testing.T) {
+func TestDialSplitsFragmentAndSendsHeaders(t *testing.T) {
 	base, headers := startRelayTestServer(t, nil)
 	link := base + "#the-link-secret"
 
-	c, err := DialRelay(link, RelayDialOptions{ReconnectSecret: "resume-me", Name: "tester"})
+	c, err := Dial(link, DialOptions{ReconnectSecret: "resume-me", Name: "tester"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
 	if got := headers.Get("Authorization"); got != "Bearer the-link-secret" {
 		t.Fatalf("expected Authorization header with the link secret, got %q", got)
 	}
-	if got := headers.Get("Reconnect-Secret"); got != "resume-me" {
-		t.Fatalf("expected Reconnect-Secret header, got %q", got)
+	if got := headers.Get("Agent-Secret"); got != "resume-me" {
+		t.Fatalf("expected Agent-Secret header, got %q", got)
 	}
 	if got := headers.Get("Agent-Name"); got != "tester" {
 		t.Fatalf("expected Agent-Name header, got %q", got)
 	}
 }
 
-func TestDialRelayOmitsAgentNameHeaderWhenNameEmpty(t *testing.T) {
+func TestDialOmitsAgentNameHeaderWhenNameEmpty(t *testing.T) {
 	base, headers := startRelayTestServer(t, nil)
 	link := base + "#the-link-secret"
 
-	c, err := DialRelay(link, RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link, DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -290,14 +301,50 @@ func TestDialRelayOmitsAgentNameHeaderWhenNameEmpty(t *testing.T) {
 	}
 }
 
-func TestDialRelayRejectsLinkWithoutFragment(t *testing.T) {
-	if _, err := DialRelay("wss://example.com/relay/join?c=abc", RelayDialOptions{ReconnectSecret: "x"}); err == nil {
+func TestDialSendsAgentIDHeaderWhenKnown(t *testing.T) {
+	base, headers := startRelayTestServer(t, nil)
+	link := base + "#the-link-secret"
+
+	c, err := Dial(link, DialOptions{
+		ReconnectSecret: "resume-me",
+		AgentID:         "550e8400-e29b-41d4-a716-446655440042",
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if got := headers.Get("Agent-Id"); got != "550e8400-e29b-41d4-a716-446655440042" {
+		t.Fatalf("expected the previously assigned peerId in Agent-Id, got %q", got)
+	}
+}
+
+// A first-ever connect has no identity to ask for, so the header must be
+// absent rather than empty — a server rejects an Agent-Id it cannot
+// verify, which an empty value would trip.
+func TestDialOmitsAgentIDHeaderWhenUnknown(t *testing.T) {
+	base, headers := startRelayTestServer(t, nil)
+	link := base + "#the-link-secret"
+
+	c, err := Dial(link, DialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if _, present := (*headers)["Agent-Id"]; present {
+		t.Fatalf("expected no Agent-Id header at all on a first connect, got %q", headers.Get("Agent-Id"))
+	}
+}
+
+func TestDialRejectsLinkWithoutFragment(t *testing.T) {
+	if _, err := Dial("wss://example.com/relay/join?c=abc", DialOptions{ReconnectSecret: "x"}); err == nil {
 		t.Fatal("expected an error for a link with no #-delimited secret")
 	}
 }
 
-func TestDialRelayRejectsEmptyReconnectSecret(t *testing.T) {
-	if _, err := DialRelay("wss://example.com/relay/join?c=abc#secret", RelayDialOptions{}); err == nil {
+func TestDialRejectsEmptyReconnectSecret(t *testing.T) {
+	if _, err := Dial("wss://example.com/relay/join?c=abc#secret", DialOptions{}); err == nil {
 		t.Fatal("expected an error when reconnectSecret is empty")
 	}
 }
@@ -308,9 +355,9 @@ func TestDisconnectNoteReflectsKnownRelayCloseCode(t *testing.T) {
 	})
 	link := base + "#the-link-secret"
 
-	c, err := DialRelay(link, RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link, DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -335,9 +382,9 @@ func TestDisconnectNoteEmptyForOrdinaryClose(t *testing.T) {
 	})
 	link := base + "#the-link-secret"
 
-	c, err := DialRelay(link, RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link, DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -369,9 +416,9 @@ func TestRequestMessageAfterAwaitingReturnsMsgWithAnswers(t *testing.T) {
 		})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -393,9 +440,9 @@ func TestRequestMessageAfterAwaitingReturnsNoMoreMessages(t *testing.T) {
 		conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{Cursor: "cursor-1"}))
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -417,9 +464,9 @@ func TestRequestMessageAfterAwaitingReturnsErrorEvent(t *testing.T) {
 		conn.WriteJSON(wire.Error{Type: wire.TypeError, Message: "bad anchor", Code: "bad_anchor", Retryable: false})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -449,9 +496,9 @@ func TestOrdinaryLiveMsgIsNotDivertedToMessageAfterClaim(t *testing.T) {
 		})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -475,5 +522,86 @@ func TestOrdinaryLiveMsgIsNotDivertedToMessageAfterClaim(t *testing.T) {
 			t.Fatal("expected the unrelated live msg to reach the general buffer, never saw it")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A server declaring actionAcks but not reactions/edit/delete used to get
+// the request anyway, followed by a full AckWaitTimeout spent waiting for
+// an answer it had already said it would not give. Two fields, two
+// questions: reactions/edit/delete decide whether to send, actionAcks
+// decides whether to wait.
+func TestWriteActionsAreRefusedWhenTheServerDeclaresThemUnsupported(t *testing.T) {
+	base, _ := startRelayTestServer(t, nil)
+	c, err := Dial(base+"#the-link-secret", DialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	// Declaring actionAcks says an answer is worth waiting for; it says
+	// nothing about which actions exist. Strip those three and each one
+	// must be refused rather than sent.
+	c.mu.Lock()
+	for _, f := range []string{"reactions", "edit", "delete"} {
+		delete(c.features, f)
+	}
+	c.mu.Unlock()
+	for _, tc := range []struct {
+		action string
+		call   func() error
+	}{
+		{"reactions", func() error { return c.React("ext-1", "👍", "add") }},
+		{"edit", func() error { return c.EditMessage("ext-1", "new", nil, "", "", nil) }},
+		{"delete", func() error { return c.DeleteMessage("ext-1") }},
+	} {
+		start := time.Now()
+		err := tc.call()
+		if err == nil {
+			t.Fatalf("%s: expected a refusal, got none", tc.action)
+		}
+		if !strings.Contains(err.Error(), tc.action) {
+			t.Fatalf("%s: expected the error to name the missing feature, got: %v", tc.action, err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("%s: expected an immediate refusal, took %v", tc.action, elapsed)
+		}
+	}
+}
+
+// The same actions must still go out against a server that declares them.
+func TestWriteActionsAreSentWhenTheServerDeclaresThem(t *testing.T) {
+	got := make(chan string, 3)
+	base, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
+		for {
+			var m map[string]any
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			got <- fmt.Sprint(m["type"])
+		}
+	})
+	c, err := Dial(base+"#the-link-secret", DialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+	if err := c.React("ext-1", "👍", "add"); err != nil {
+		t.Fatalf("React: %v", err)
+	}
+	if err := c.EditMessage("ext-1", "new", nil, "", "", nil); err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	if err := c.DeleteMessage("ext-1"); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	for _, want := range []string{"reaction", "edit", "delete"} {
+		select {
+		case kind := <-got:
+			if kind != want {
+				t.Fatalf("expected a %q request to reach the server, got %q", want, kind)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected a %q request to reach the server, nothing arrived", want)
+		}
 	}
 }

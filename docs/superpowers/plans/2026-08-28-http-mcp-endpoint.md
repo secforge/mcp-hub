@@ -1657,7 +1657,7 @@ to find the right place to insert a new section (alongside the existing descript
 
 Insert a new section near the existing description of `mcp-hub-server`, covering:
 - `mcp-hub-server` now also serves a Streamable-HTTP MCP endpoint at `/mcp`, in addition to its existing websocket relay at `/{sessionId}` — no configuration changes to existing deployments required.
-- Tool set: `hub_connect` (optionally creating a new session), `hub_disconnect`, `hub_send`, `hub_receive`, `hub_wait`, `hub_peers` — a deliberate subset of `mcp-hub-client`'s tools; reactions/edit/delete/history remain `mcp-hub-client`-only (bridge-specific, not something the plain relay understands).
+- Tool set: `hub_connect` (optionally creating a new session), `hub_disconnect`, `hub_send`, `hub_receive`, `hub_wait`, `hub_peers` — a deliberate subset of `mcp-hub-client`'s tools; reactions/edit/delete/history remain `mcp-hub-client`-only (teams-specific, not something the plain relay understands).
 - Async notification: `hub_connect`'s result includes a `watchToken`; `GET /watch?token=<token>&follow=1` (e.g. `curl -N`) streams that peer's events live, for clients (in particular, Claude Code backgrounding the curl call and watching it via Monitor) that want to avoid tying up a turn in a blocking `hub_wait`.
 - No new auth — matches the existing websocket endpoint.
 

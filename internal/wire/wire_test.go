@@ -117,7 +117,7 @@ func TestPeerJoinedIncludesNameAndAgePublicKey(t *testing.T) {
 	}
 }
 
-func TestJoinedDecodesBridgeFields(t *testing.T) {
+func TestJoinedDecodesTeamsFields(t *testing.T) {
 	raw := []byte(`{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000",` +
 		`"peerCount":0,"serverVersion":1,` +
 		`"canSend":true,"conversationKind":"oneOnOne","topic":"Support chat"}`)
@@ -136,7 +136,7 @@ func TestJoinedDecodesBridgeFields(t *testing.T) {
 	}
 }
 
-func TestJoinedOmitsBridgeFieldsWhenUnset(t *testing.T) {
+func TestJoinedOmitsTeamsFieldsWhenUnset(t *testing.T) {
 	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
 	raw, _ := json.Marshal(j)
 	for _, field := range []string{"canSend", "conversationKind", "topic"} {

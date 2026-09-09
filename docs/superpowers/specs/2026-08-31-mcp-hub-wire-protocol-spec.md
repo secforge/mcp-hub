@@ -6,11 +6,11 @@ Go source (`internal/wire`, `internal/hubconn`, `internal/wsserver`)
 disagrees with it, that's marked explicitly as a **known gap**, and the
 spec wins; don't replicate the gap on purpose.
 
-## 0. The one thing to get right first: nothing here is "bridge-only"
+## 0. The one thing to get right first: nothing here is "teams-only"
 
 Every message type in this protocol — `messageAfter`, `reaction`, `edit`,
 `delete`, `ack`, all their replies — is available on **any** connection,
-plain or bridge. There is no `isBridge` flag on the wire and no
+plain or teams. There is no connection-kind flag on the wire and no
 server-type check anywhere in the client that gates *sending* one of
 these. The client will happily send a `messageAfter` or `reaction`
 request over a connection to any server that accepts the initial
@@ -24,46 +24,91 @@ What actually varies by server is **which requests get a real answer**:
   dropped (`internal/wsserver/server.go`'s read loop discards anything
   whose `type` isn't `"msg"`). This is a *deployment's* limited feature
   set, not a protocol restriction.
-- A bridge server (chat-relay) implements the rest because it has real
+- A teams relay (chat-relay) implements the rest because it has real
   history, write access, and a reason to track read position.
 
-So: implement whatever subset of this spec makes sense for your server —
-there is no capability-negotiation mechanism beyond `Joined.behind`/
-`behindSince` (§2.1, §2.6a). For everything else (reactions, edits,
-deletes, ack, `messageAfter` itself), a client has no way to know in
-advance whether your server will act on it; it just sends the request
-and waits to see whether an ack/error/no-response follows. Silence is a
-valid answer only in the sense that `mcp-hub-server` today gives none at
-all — a real implementation should not do that; see §5.
+So: implement whatever subset of this spec makes sense for your server,
+and **declare that subset** in `Joined.features` (§2.1a). That is the
+capability mechanism — a client reads it instead of discovering your
+limits by sending a request and watching for silence. A server that
+declares nothing forces exactly that guessing, and silence is
+indistinguishable from a slow answer, so a request may be dropped or
+waited on pointlessly; `mcp-hub-server` does this today and a new
+implementation should not copy it (see §5).
 
 ## 1. Handshake
 
-**URL:** `{scheme}://{host}/{sessionId}?v={protocolVersion}&name={name}&agePublicKey={key}&reconnectSecret={secret}`
+Everything a client knows about itself travels in **request headers**,
+never in the URL. A credential in a query string lands in access logs,
+proxy logs and shell history; the fields below include two, so the
+carrier is part of the contract rather than a preference.
+
+A client sends **every** field it has on **every** connection. It does
+not decide per-server which are relevant, and it must not infer anything
+from the shape of the address it was given — that address is opaque to
+it. A server ignores what it does not use.
+
+**URL:** `{scheme}://{host}/{path}`, with the credential in the fragment
+(see `Authorization` below).
 
 - `scheme`: `ws`/`wss` only. (The client also accepts `http`/`https` on
   the *host* it's given and rewrites them to `ws`/`wss` — that's a
   client-side convenience, not part of the wire contract.)
-- `sessionId` (path segment, required): must match
+- `path`: whatever the server issued. A client never parses it, and a
+  server must not require it to. `mcp-hub-server` currently addresses a
+  session by a UUID path segment matching
   `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`
-  (a standard UUID string, case-insensitive). `mcp-hub-server` rejects an
-  invalid one with a plain HTTP 400 *before* the websocket upgrade.
-- `v` (query, optional): the client's `ProtocolVersion`. Currently
-  always `1` if sent. Absent is treated as version 1 — the permanent
-  backward-compatible default, not a fallback that will later change
-  meaning. A server may log a mismatch; it must not refuse the
-  connection over it (see §6).
-- `name` (query, optional): free-text display name. `mcp-hub-server`
+  (case-insensitive) and rejects an invalid one with HTTP 400 *before*
+  the upgrade.
+- `Authorization: Bearer {credential}` — the part of the link after the
+  `#`. A URL fragment is by definition never transmitted, so a client
+  moving it into this header is what keeps the credential out of the
+  server's own request line and every log along the way. A link with no
+  fragment, or an empty one, is refused by the client before it dials.
+- `Agent-Secret` (**required**): the secret that reclaims this client's
+  identity. The client manages it — mints one on a first connect, stores
+  it per target, and presents the same one every time. It is never
+  chosen, held, or passed by whatever is driving the client. A server
+  must refuse a connection without one: handing out an identity that has
+  no secret behind it means it can never be reclaimed, so the next
+  connect is a different participant to the server, to its peers, and to
+  its own read position — a silent degradation nobody chooses.
+- `Agent-Id` (optional): the peerId this client was last assigned here,
+  sent only when it has one. It is a **request** to be given that
+  identity back, authorized by `Agent-Secret` — never an assertion to be
+  trusted alone, since an identity header honoured without the secret is
+  impersonation of any peer whose id someone has seen. Three cases, and
+  no others: verified → that identity, displacing any live connection
+  holding it (see §4); present but unverifiable → **refuse the join**,
+  before the upgrade, with one message for unknown/absent/wrong so a
+  caller cannot enumerate a session's peers; absent → assign a fresh
+  identity. A server must not fall back to searching its peers for a
+  matching secret: that makes the id decorative and reintroduces a
+  per-candidate key-derivation cost on the handshake path.
+- `Agent-Name` (optional): free-text display name. `mcp-hub-server`
   sanitizes it (strips control characters, caps length at 64 runes) and
-  echoes back the sanitized form in `Joined.name` — a client should
-  treat whatever comes back as authoritative, not what it sent.
-- `agePublicKey` (query, optional): must be a well-formed age recipient
-  string — bech32, human-readable part `"age"`, 7–90 chars total, valid
-  checksum. `mcp-hub-server` rejects a malformed one with HTTP 400
-  *before* upgrade. Never parsed or used cryptographically server-side —
-  purely distributed to other peers as-is.
-- `reconnectSecret` (query, optional at the wire level — see §4 for why
-  the client always sends one anyway): any string, capped at 256 runes.
-  Longer is rejected with HTTP 400 before upgrade.
+  echoes back the sanitized form in `Joined.name` — a client should treat
+  whatever comes back as authoritative, not what it sent.
+- `Agent-Age-Public-Key` (optional): a well-formed age recipient string —
+  bech32, human-readable part `"age"`, 7–90 chars, valid checksum.
+  Rejected with HTTP 400 before upgrade if malformed. Never parsed or
+  used cryptographically server-side, purely redistributed to other
+  peers. Deliberately **not** an identity credential: every peer can see
+  it, so granting identity reuse on it would let anyone who saw it
+  impersonate its owner.
+- `Hub-Protocol-Version` (optional): the client's `ProtocolVersion`
+  (currently `3`). A server may log a mismatch; it must not refuse the
+  connection over it (see §6).
+- `Hub-Create-Token` (optional): a capability for creating and claiming a
+  session in this same handshake, for a server that refuses an unknown
+  session rather than creating one on first connect.
+- `Hub-Topic` (optional): a display name for a session being created.
+  Meaningless on a join.
+
+**Known gap:** `mcp-hub-server` does not yet read any of these headers or
+require a secret — it still takes `v`, `name`, `agePublicKey` and
+`reconnectSecret` as query parameters, credential included. The spec
+wins; don't replicate that.
 
 **After a successful upgrade**, the server sends exactly one `Joined`
 message (§2.1) before anything else. The client reads exactly one
@@ -103,11 +148,50 @@ bump — see §6.
 | `name` | string | no | Echoed back, post-sanitization. |
 | `agePublicKey` | string | no | Echoed back verbatim. |
 | `canSend` | bool | no | Whether sending is currently permitted — a snapshot, not a guarantee (re-checked per send). |
-| `conversationKind` | string | no | e.g. `"oneOnOne"`, `"group"`, `"meeting"` — free text, not a closed enum. |
+| `conversationKind` | string | no | e.g. `"oneOnOne"`, `"group"`, `"meeting"`, `"channel"` — free text, not a closed enum. Send it only for a conversation mirrored from a real chat platform; omit it entirely for an ordinary hub session, so its presence alone distinguishes the two. |
 | `topic` | string\|null | no | Display name/topic of what was joined, if applicable. |
-| `systemPeerId` | string | no | This server's own peerId for operator/system-originated messages on this session, if it has one. A client must not hardcode a guessed value (e.g. chat-relay's all-zeros UUID) — treat this field as the only authoritative source, and treat it as absent (no operator concept) when omitted. |
+| `features` | object | no | This server's declared capabilities — see §2.1a. |
 | `behind` | int | no | How many messages this peer's own last-acked position trails the newest message in this conversation, computed once at connect. `0` states "caught up" as a fact, distinct from omitted (no such concept — including every mcp-hub-server, and a first-ever connection with no prior position to compare). See §2.6a. |
 | `behindSince` | string (RFC 3339, explicit UTC offset) | no, but required alongside `behind` when `behind` is set to a positive value | The timestamp of this peer's last-acked position — what a `messageAfter{at:...}` seek is computed from when the gap is too large to walk. Omitted under the same conditions as `behind`. |
+
+### 2.1a `features` — capability declaration
+
+`joined.features` is how a server states what it can do, so a client never
+has to infer a capability from runtime behaviour or from the shape of the
+address it dialled. It is keyed by feature name, each value an object
+carrying that feature's own parameters — `{}` when it has none:
+
+```json
+"features": {"messageAfter": {}, "ackReplies": {}, "attachments": {"maxRawBytes": 33554432}}
+```
+
+Three states, all distinguishable, and a client must not conflate them:
+
+- a **named key present** — supported;
+- a **key absent** while `features` itself is present — not supported;
+- **`features` omitted entirely** — this server predates the mechanism and
+  nothing is known either way. A client may then probe or refuse, but must
+  not read absence as a "no".
+
+A flag states what the server *does*. It is never an instruction to the
+client, and a server must not send one to request client behaviour.
+
+| Feature | Parameters | Means |
+|---|---|---|
+| `messageAfter` | — | Answers `messageAfter` requests (§2.6a). Without it, a client cannot catch up and must say so rather than wait. |
+| `ackReplies` | — | Replies to a *standalone* `ack` (§2.7) with its own `ack` carrying `behind`. |
+| `actionAcks` | — | Answers a write action with its own ack — `sendAck` for `msg`, and `reactionAck`/`editAck`/`deleteAck` for whichever of `reactions`/`edit`/`delete` are also declared. Which acks exist follows from those features; this one says only that waiting for an ack is worthwhile at all. |
+| `rosterReadAt` | — | Reports per-peer read positions in the roster. |
+| `mentions` | — | Accepts `mentions` on `msg`/`edit` and resolves them to platform-native @-mentions. |
+| `attachments` | `maxRawBytes`, `maxFrameBytes` int; `imagesOnly` bool | Accepts attachments, within those limits. `imagesOnly` refuses anything but an image. |
+| `reactions` | — | Accepts `reaction` requests. |
+| `edit` | — | Accepts `edit` requests. |
+| `delete` | — | Accepts `delete` requests. |
+| `replyTo` | — | Accepts `replyTo` on `msg`/`edit` and renders a native threaded citation. |
+
+Adding a feature needs no version bump — a client at protocol 3 or above
+already knows to look. A feature name is removed in the same change that
+removes the capability it names, never left describing something gone.
 
 ### 2.2 `msg` (both directions)
 
@@ -120,7 +204,7 @@ bump — see §6.
 | `to` | string | no | client→server | Set to request directed (private) delivery to one peerId instead of broadcast. |
 | `private` | bool | no | server→client | Set by the server on a delivered directed message. |
 | `historical` | bool | no | server→client | True if this is answering a `messageAfter` request (§2.6a) rather than live traffic. |
-| `externalId` | string | no | server→client | Bridge-only concept: this server's own id for the message, correlating it with an earlier `sendAck`. |
+| `externalId` | string | no | server→client | Teams-only concept: this server's own id for the message, correlating it with an earlier `sendAck`. |
 | `own` | bool | no | server→client | True if *this exact connection* sent it. A receiving client's own policy decision whether to treat this as wake-worthy — see §3 for what the reference client does. |
 | `cursor` | string | no | server→client | This message's own opaque position — pass back as a `messageAfter` anchor (§2.6a). |
 | `answers` | Anchor (see §2.6a) | no | server→client | Present only when this `msg` is the direct answer to a `messageAfter` request — the exact anchor that request was sent with, echoed back verbatim. |
@@ -138,7 +222,7 @@ usable as the target of `reaction`/`edit`/`delete` on the quoted message,
 not just a display reference. Server→client, it's set on a delivered
 `msg`/`messageEdited` when that message is a reply (absent, not null/
 empty, when it isn't — an edit never changes what a message replies to,
-so a bridge server should carry the same value through on
+so a teams relay should carry the same value through on
 `messageEdited` too, not just the original `msg`). Client→server, a
 client may set it on an outgoing `msg`/`edit` to request a threaded
 citation; a server that supports this should validate it strictly —
@@ -249,7 +333,7 @@ server→client depends on the server:
   using `token`. A client can tell the shapes apart by whether `token`
   is set and `contentBytes` is absent.
 
-**Teams-bridge sessions specifically** (as opposed to a bridge server's
+**Teams sessions specifically** (as opposed to a teams relay's
 *hub* sessions, which follow the general rule above) still refuse any
 non-image `attachments` entry outright — enforced independently of
 whatever content-type list a server's hub sessions accept, so widening
@@ -294,7 +378,7 @@ failure — never served raw as a fallback).
 A plain broadcast (`to` omitted) is never echoed back to its own sender
 by `mcp-hub-server`'s relay logic (broadcast excludes the sender) — if
 your server does the same, don't expect the sender to see its own `msg`
-come back; `sendAck` (§2.8) exists for exactly this gap on a bridge that
+come back; `sendAck` (§2.8) exists for exactly this gap on a teams relay that
 *can't* deliver synchronously.
 
 ### 2.3 `peerJoined` / `peerLeft` (server → client)
@@ -329,10 +413,10 @@ request and keep the connection open. Known codes in use today (not a
 closed set — treat `code` as an open string):
 
 - `send_refused` / `reaction_refused` / `edit_refused` / `delete_refused`
-  — a bridge-side policy gate refused the action (`retryable:false`
+  — a policy gate on the teams relay refused the action (`retryable:false`
   typically — check the specific server's semantics, this spec doesn't
   mandate retryability per code).
-- `invalid_credential` — relay auth failure (bridge-specific, not part
+- `invalid_credential` — relay auth failure (teams-specific, not part
   of the plain-session handshake in §1).
 - `bad_ack` / `bad_ack_cursor` — ack-subsystem-specific: a standalone
   `ack` with no cursor, or a cursor that won't decode/parse.
@@ -595,20 +679,18 @@ whole point is that a client that drops and resumes has still read what
 it read.
 
 **What "consumed" means is entirely up to the client — this server
-cannot verify it, only record whatever position it's told.** Found live,
-2026-09-07: a client whose async delivery path (e.g. a background
-`wait`-style process) writes an event to a local socket has no way to
-know whether whatever's reading that socket actually processed the
-event, only that this process wrote it onward — so an ack sent
-automatically at that point records "reached this client," not "reached
-whatever consumes on the other end of it," while the field's own name
-implies the latter. `mcp-hub-client` used to send its standalone ack on
-exactly this weaker signal (see the design doc's chat-relay-bridge-
-support section, "Update, 2026-09-07"); fixed by gating it on a
-genuinely synchronous hand-over instead, and — for the harder case where
-most delivery IS async by design — adding `hub_confirm`, a tool the
-model calls itself once it has actually seen a message, so the ack this
-server receives is model-issued by construction. A server relying on the
+cannot verify it, only record whatever position it's told.** A client
+whose async delivery path (e.g. a background `wait`-style process)
+writes an event to a local socket has no way to know whether whatever's
+reading that socket actually processed the event, only that this process
+wrote it onward — so an ack sent automatically at that point records
+"reached this client," not "reached whatever consumes on the other end
+of it," while the field's own name implies the latter. `mcp-hub-client`
+therefore gates its standalone ack on a genuinely synchronous hand-over,
+and — for the harder case where most delivery IS async by design —
+offers `hub_confirm`, a tool the model calls itself once it has actually
+seen a message, so the ack this server receives is model-issued by
+construction. A server relying on the
 ack cursor for anything stronger than "the client's process received
 this" (e.g. `Joined.Behind`, §2.1/§2.6a) should keep that distinction in
 mind: it's honest about delivery, not about a human or model actually
@@ -741,7 +823,7 @@ substitutes for it. `mcp-hub-server` never sends this (a plain
 - The mapping should survive a server restart and even the session
   becoming fully empty — a reconnect months later with the same secret
   should still reclaim the same `peerId`, unless you deliberately expire
-  it (bridge-specific link/session lifetimes are your own policy, not
+  it (teams-specific link/session lifetimes are your own policy, not
   part of this identity contract).
 
 ## 5. Close codes
@@ -751,9 +833,9 @@ substitutes for it. `mcp-hub-server` never sends this (a plain
 | 1000 (NormalClosure) | Deliberate, clean disconnect by either side | No note surfaced — this is the expected, unremarkable case. The reference client sends this with description `"client disconnect"` on every intentional close (e.g. `hub_disconnect`). |
 | 1001 (GoingAway) | Also treated as an ordinary, expected close | Same as 1000 — no note. |
 | 1006 (AbnormalClosure) | No close frame received at all — network death, crash, or (historically, now fixed client-side) a close frame written but not flushed before the underlying connection was torn down | Surfaced to the model/caller as "connection assumed dead" plus (if a read timeout, not a close frame, triggered it) how long since the last frame seen. |
-| 4001 | Bridge-specific: credential revoked | Client surfaces "(revoked — do not reconnect)". |
-| 4002 | Bridge-specific: credential/link expired | Client surfaces "(expired — do not reconnect)". |
-| 4003 | Bridge-specific: the underlying conversation became unavailable | Client surfaces "(conversation unavailable — do not reconnect)". |
+| 4001 | Teams-specific: credential revoked | Client surfaces "(revoked — do not reconnect)". |
+| 4002 | Teams-specific: credential/link expired | Client surfaces "(expired — do not reconnect)". |
+| 4003 | Teams-specific: the underlying conversation became unavailable | Client surfaces "(conversation unavailable — do not reconnect)". |
 | 4004 | A new connection presented the same `reconnectSecret` while this one was still live, and took over (superseded) rather than being assigned a fresh, unrelated peerId | Client surfaces "(connection closed, code N)" (no specific-case guidance yet — this is new) — **do not treat this as a signal to avoid reconnecting**, unlike 4001–4003: the identity is alive and well on the connection that superseded this one, this is simply not that connection anymore. |
 | any other non-1000/1001 code | Generic | Client surfaces "(connection closed, code N)" — no specific guidance. |
 
@@ -771,7 +853,7 @@ rather than picked independently.
 
 `mcp-hub-server`'s relay sends 4004 when `hubsession.Session.Join`
 supersedes a still-live identity (see §4 below) — the one core-protocol
-case in this table, not a bridge-only convention like 4001–4003.
+case in this table, not a teams-only convention like 4001–4003.
 
 A server should always prefer sending an `error` event (§2.5) before
 closing, when the close reason is something the model could act on
@@ -841,7 +923,7 @@ comparison.
   (e.g. some .NET WebSocket options' default legacy keepalive mode)
   looks like activity to a naive prober but **does not** satisfy this
   client's liveness check. This cost real debugging time in practice —
-  a bridge implementer whose framework's keepalive was PONG-only chased
+  a teams relay implementer whose framework's keepalive was PONG-only chased
   the resulting drops through several wrong hypotheses (nginx timeouts,
   the client's own margin, an orphaned socket) before finding this.
   Send real, unsolicited-from-the-server PINGs if you want the client to
@@ -961,5 +1043,5 @@ built against this same reference:
 | `pongWait` (server) | 100s | Server's inactivity deadline for the client. |
 | `writeWait` | 10s | Deadline for writing a single control frame. |
 | `ackIdleInterval` | 60s | How long the client waits, otherwise idle, before firing a standalone `ack`. |
-| `AckWaitTimeout` | 5s | How long a bridge-session tool call (`hub_react`/`hub_edit`/etc.) waits for its own ack before falling back to "sent, outcome pending." |
+| `AckWaitTimeout` | 5s | How long a teams-session tool call (`hub_react`/`hub_edit`/etc.) waits for its own ack before falling back to "sent, outcome pending." |
 | `closeFlushGrace` | 200ms | How long the client waits after writing its own close frame before tearing down the connection, to dodge the write/close race described in §5. |

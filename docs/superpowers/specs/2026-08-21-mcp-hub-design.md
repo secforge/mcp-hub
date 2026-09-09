@@ -790,14 +790,14 @@ changes to the websocket path, `mcp-hub-client`'s stdio mode, or its
 `hub_connect`/`hub_disconnect`/`hub_send`/`hub_receive`/`hub_wait`/`hub_peers`
 — a deliberate subset matching only what the plain relay understands
 server-side (no reactions/edit/delete/history, which are
-chat-relay/Teams-bridge-specific). `hub_connect`'s result includes a
+chat-relay/teams-specific). `hub_connect`'s result includes a
 `watchToken`; `GET /watch?token=<token>&follow=1` streams that peer's
 events live via `http.Flusher`, for `curl -N`-based async monitoring
 (the same purpose as `wait --follow`, for a remote HTTP client with no
 local process). Full rationale, rejected alternatives, and design details:
 `docs/superpowers/specs/2026-08-28-http-mcp-endpoint-design.md`.
 
-## Chat-relay bridge support (`teams_relay_connect`, `hub_history`)
+## Teams relay support (`teams_relay_connect`, `hub_history`)
 
 **Update, 2026-09-07: `teams_relay_connect` merged into `hub_connect`.**
 Requested directly by the project owner, after a long live hub discussion
@@ -818,8 +818,8 @@ here since they were found and built in one pass:
   (`ackLoop`) used to fire based on `Drain`/`DrainBatch`/`DrainEvents`,
   which `waiter`'s follow-mode delivery and one-shot `wait` also use to
   write events to the wait socket. Neither confirms a model actually read
-  anything, only that this process wrote bytes onward — so a bridge
-  server's own delivery-tracking field (e.g. chat-relay's `Joined.Behind`,
+  anything, only that this process wrote bytes onward — so a teams
+  relay's own delivery-tracking field (e.g. chat-relay's `Joined.Behind`,
   computed from its stored ack cursor) could report "nothing behind" for
   a reader that had read nothing, a genuine false all-clear (confirmed
   live: chat-relay's own `behind: 0` was traced to exactly this). Fixed
@@ -946,7 +946,7 @@ and customer-portal:
   probing needed); a declared "yes" always waits, since the server has
   promised a reply; only an undeclared `Features` object falls back to
   `ackReplyMisses`. Chat-relay's own hub session declares `messageAfter`,
-  `ackReplies`, and `attachments`; its bridge session adds
+  `ackReplies`, and `attachments`; its teams session adds
   `rosterReadAt`, `mentions`, `reactions`, `edit`, `delete`, `replyTo`,
   and `attachments.imagesOnly` — reactions/edit/delete deliberately not
   declared on a hub session, since that path drops them. `serverVersion`
@@ -997,7 +997,7 @@ and customer-portal:
   so none could keep writing the old files, per the project owner's own
   instruction.
 - **`Entry.Topic`/`TeamsEntry.Topic`**: when the server sets
-  `wire.Joined.Topic` (the conversation's own display name — a bridge-
+  `wire.Joined.Topic` (the conversation's own display name — a teams-
   session-only field, e.g. a Teams chat's title), it's now written to
   connstore too, at the project owner's own request ("if the name of the
   conversation is known to the mcp, it should write that too") —
@@ -1030,14 +1030,14 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   query parameter, for the identical log-exposure reason (this is *not*
   the same field/purpose as `hub_connect`'s `reconnectSecret`: it doesn't
   identify a peer — a link already fixes which conversation a connection
-  belongs to — it authorizes *resuming* after a drop, since a bridge link
+  belongs to — it authorizes *resuming* after a drop, since a teams link
   may be single-use and the same spent link only works again if paired
   with the same `reconnectSecret` presented at the original connect,
-  within whatever window the bridge grants). `name` is optional and sent
-  as a third header, `Agent-Name: <name>`, if given — a bridge server is
-  not obligated to make it visible on the other side of the bridge (in the
+  within whatever window the teams relay grants). `name` is optional and sent
+  as a third header, `Agent-Name: <name>`, if given — a teams relay is
+  not obligated to make it visible on the other side of it (in the
   motivating case, it's audit-only: every client on a link posts under the
-  bridge's own bot identity in Teams, so `name` never appears in the
+  teams relay's own bot identity in Teams, so `name` never appears in the
   conversation itself).
 
   Implemented as `hubconn.DialRelay` (`internal/hubconn/relay.go`),
@@ -1047,15 +1047,14 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   loop, buffering, keepalive, and disconnect detection either path uses.
   A relay connection is an ordinary `Conn` after that point, including
   reusing `hub_send`/`hub_receive`/`hub_wait`/`hub_peers` unmodified — this
-  is why the bridge's peer ids must stay UUID-shaped (the design
-  discussion settled on the bridge deriving synthetic per-link
-  HMAC-derived UUIDs for real participant identities, rather than this
-  client relaxing `decodeEvent`'s UUID validation to accommodate them).
+  is why the teams relay's peer ids must stay UUID-shaped (it derives
+  synthetic per-link HMAC-derived UUIDs for real participant identities,
+  rather than this client relaxing `decodeEvent`'s UUID validation to
+  accommodate them).
 
-  Two protocol differences a bridge session must handle, agreed during
-  design:
+  Two protocol differences a teams session must handle:
   - **A directed `hub_send` (`to`) must be refused with an `error` event,
-    never silently delivered as a broadcast** — a bridge with no
+    never silently delivered as a broadcast** — a teams relay with no
     peer-to-peer delivery (everything goes into one shared conversation)
     would otherwise disclose a message its sender believed was private.
     Confirmed as already correct with no client changes needed: the read
@@ -1088,9 +1087,9 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   machine-readable reason, e.g. `"revoked"`, `"invalid_credential"`,
   `"conversation_unavailable"`, `"unavailable"`) and `Retryable` (whether
   retrying could succeed — `"unavailable"` is the one transient case in
-  the agreed starting set). Deliberately, per the bridge side's own
+  the agreed starting set). Deliberately, per the teams relay's own
   security reasoning: an *unverified* credential and a *revoked* one both
-  answer `invalid_credential` — a bridge server that distinguished them
+  answer `invalid_credential` — a teams relay that distinguished them
   would let anyone probing link ids learn which ones were ever real,
   turning the handshake into an enumeration oracle for a bearer
   capability. Only a secret that verifies earns a precise reason.
@@ -1102,13 +1101,13 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
 - **`hub_history(before?, limit?)`** — requests messages predating this
   connection, meaningless for an ordinary `hub_connect` session (a peer
   only ever sees events from when it joined forward — there was never a
-  history concept to draw on here) but real for a bridge backed by a
+  history concept to draw on here) but real for a teams relay backed by a
   channel with actual retained history. Sends `wire.History`
   (`{"type":"history","before":...,"limit":...}`) via the new
   `Conn.RequestHistory` and returns immediately with a confirmation — the
   requested messages themselves arrive asynchronously through the normal
   `wait`/`hub_receive`/`hub_wait` path, not as this call's own result,
-  since a bridge may take a moment to fetch what could be a large page.
+  since a teams relay may take a moment to fetch what could be a large page.
   `before` is an opaque, server-defined cursor and *exclusive* (the page
   ends strictly before it — this avoids an off-by-one where paging
   backward would repeat the same boundary message on every page); omitted
@@ -1145,7 +1144,7 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   `hub_history(after: ...)` call to make — or, when it doesn't, says so
   plainly instead of suggesting `before` (which would silently do the
   wrong thing). The connect-time hint mirrors this same branch. This is a
-  wire-protocol addition that only does anything once a bridge server
+  wire-protocol addition that only does anything once a teams relay
   (e.g. chat-relay) implements `After`/`HistoryAfter` on its own side —
   `mcp-hub-server`'s own relay has no history concept at all.
 
@@ -1175,7 +1174,7 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   identically, so the client permanently disables further receipts on
   that connection rather than repeat the mistake). These two codes are
   deliberately ack-subsystem-specific, not the generic `bad_cursor`/
-  `bad_request` a bridge server may also use for unrelated requests (a
+  `bad_request` a teams relay may also use for unrelated requests (a
   malformed reaction, a history request naming both `before` and
   `after`) — error events carry no correlation id, so reacting to the
   generic codes would have let one unrelated malformed request silently
@@ -1186,7 +1185,7 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   error path) risk
   being stolen by an unrelated pending `claimNextAck`. mcp-hub-server
   ignores `ackCursor` entirely (unrecognized field, silently dropped by
-  `encoding/json`) — this only does anything once a bridge server (e.g.
+  `encoding/json`) — this only does anything once a teams relay (e.g.
   chat-relay) implements it server-side.
 
 - **`sendAck` — confirms a send reached its destination, immediately.**
@@ -1203,8 +1202,8 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   landing two real messages in a real conversation. `sendAck`
   (`wire.SendAck`/`TypeSendAck`, `{"type":"sendAck","externalId":...,
   "ok":true}`) fixes this at the protocol level: sent right after the
-  bridge server's own send actually succeeds (or fails), correlating via
-  `externalId` (the bridge's own id for the sent message) with the
+  teams relay's own send actually succeeds (or fails), correlating via
+  `externalId` (the teams relay's own id for the sent message) with the
   canonical `msg` that still arrives later, exactly once, through the
   normal path — deliberately not a `msg` itself, so nothing is
   double-counted and no cursor needs to be fabricated. Decoded into
@@ -1237,9 +1236,9 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
     way to know they were the *same* message short of matching text and
     timing, which isn't a real answer once more than one send is in
     flight.
-  - `Own` is `true` when *this exact connection* — not "the bridge's bot
+  - `Own` is `true` when *this exact connection* — not "the teams relay's bot
     identity" — sent the message. A message sent by a different
-    connection to the same bridge account, or through the bridge's own
+    connection to the same teams relay account, or through the teams relay's own
     agent API, arrives without the flag: it's genuine new information to
     this connection even though it also originates from the bot.
   - **The actual suppression lives entirely client-side**, in
@@ -1330,7 +1329,7 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
     is real information; silently dropping it because the *who* is
     missing would repeat exactly the failure mode (four of five real bugs
     found this session presented as silence) that motivated `sendAck`,
-    the fan-out log line, and surfacing `joined`'s bridge fields in the
+    the fan-out log line, and surfacing `joined`'s teams fields in the
     first place.
   - `wire.MessageEdited` (`{"type":"messageEdited","externalId":...,
     "text":...,"ts":...,"own":...}`) — also decode-only. `Text` is the
@@ -1445,7 +1444,7 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
 
 - **Making `hub_send`/`hub_react`/`hub_edit` report their own real outcome
   synchronously, instead of a bare "sent" that doesn't mean anything on a
-  bridge session.** Raised as a direct question after the write side
+  teams session.** Raised as a direct question after the write side
   landed: `handleSend` returned `"sent"` the moment the local websocket
   write succeeded, saying nothing about whether chat-relay's server (or
   Graph) actually accepted the message — the real answer arrived later,
@@ -1570,7 +1569,7 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   `TestHubDeleteSendsDeleteRequestAndFallsBackOnTimeout`,
   `TestHubDeleteErrorsWhenNotConnected` (`internal/mcptools`).
 
-- **Bridge-only fields on `joined`**: `LatestCursor` (`*string`, nil if the
+- **Teams-only fields on `joined`**: `LatestCursor` (`*string`, nil if the
   conversation has no messages yet), `HistoryLimitMax` (`int`), `CanSend`
   (`bool`), `ConversationKind` (`string`, e.g. `"oneOnOne"`/`"group"`/
   `"meeting"`), `Topic` (`*string`). All zero-valued for every
@@ -1581,7 +1580,7 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   `ConversationKind()`, `Topic()`). This was a deliberate second pass, not
   part of the original design: the first cut only confirmed unknown
   `joined` fields decode without error (true, and necessary for
-  forward-compatibility — a bridge server can ship these before a client
+  forward-compatibility — a teams relay can ship these before a client
   supports them) but stopped there, which missed the actual point.
   "Decodes without crashing" only matters if the data then reaches the
   thing meant to act on it — here, the model reading `teams_relay_connect`'s
@@ -1671,7 +1670,7 @@ unchanged.
 `mcp-hub-server`'s own relay (`wsserver`) now threads `Attachments` through
 `wire.NewBroadcastMsg`/`NewDirectedMsg` rather than dropping them on
 re-encode — plain hub-to-hub sessions can exchange images too, not just a
-chat-relay bridge. This also meant giving the websocket connection an
+teams session. This also meant giving the websocket connection an
 actual `SetReadLimit` (16MB) for the first time — previously undocumented
 as a real gap (see Explicit non-goals below), but an attachment-sized
 message made an unbounded read frame a much more practical
@@ -1699,7 +1698,7 @@ live message stays identical to the same message replayed from history —
 but the harder constraint is that a Teams-relayed image never exists as
 inline bytes in a `msg` at all; it's fetched from Graph, recoded, and
 stored, so token-fetch is the only mechanism that works for both the hub
-case and the Teams-bridge case. `contentType` on the reference (and on
+case and the teams case. `contentType` on the reference (and on
 the fetched reply) is the *recoded* copy's type, not whatever the
 original sender attached — every image is decoded and re-encoded before
 being served, to a peer exactly as to a browser; a recode failure means
@@ -1847,7 +1846,7 @@ The images-only restriction on the original attachment feature was
 deliberate at the time (matching chat-relay's own images-only allowlist),
 but the user asked for arbitrary binary files on hub sessions specifically
 — "not teams," i.e. `mcp-hub-server`'s own relay and its clients, leaving
-the Teams bridge's stricter, independently-owned rules untouched.
+the teams relay's stricter, independently-owned rules untouched.
 Coincidentally, chat-relay's author was designing the identical feature
 server-side in the same conversation window and asked for input on the
 client-side shape before implementing — genuine live coordination, not
@@ -1856,7 +1855,7 @@ a shape chosen in isolation and hoped to match.
 New wire-package functions, parallel to the existing images-only ones
 rather than replacing them (`ReadAttachmentFile`/`NewAttachmentFromData`
 still enforce the images allowlist unchanged, for `imagePath`/`imageData`
-against a server — like a Teams bridge — that only accepts those):
+against a server — like a teams relay — that only accepts those):
 `ReadFileAttachment`/`NewFileAttachmentFromData` accept any content type,
 deriving it from the file extension via the standard library's `mime`
 package (falling back to `application/octet-stream` rather than refusing
@@ -2244,7 +2243,7 @@ current gap list.
   (`catchUpKeyForRelay`: the relay link's non-secret portion,
   project-scoped the same way a real `Target` is) rather than being
   excluded from persistence, which is what would have mattered least
-  given a bridge session is exactly the kind `hub_catch_up` is for.
+  given a teams session is exactly the kind `hub_catch_up` is for.
   `Hub.setCatchUpKey` records which key the active connection persists
   under and loads whatever was stored for it, called once per successful
   connect from both `handleConnect` and `handleTeamsRelayConnect`.

@@ -3,18 +3,21 @@ package hubconn
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/gorilla/websocket"
 
 	"github.com/secforge/mcp-hub/internal/agekey"
+	"github.com/secforge/mcp-hub/internal/sanitize"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -27,7 +30,7 @@ import (
 // fffff must be supported") — they're constants a client checks
 // directly. SystemPeerIDOperator (the Nil UUID) is the human running
 // the server; SystemPeerIDSystem (all-Fs) is an automated, server-
-// generated message — a bridge/link session's own HMAC-derived peer IDs
+// generated message — a teams session's own HMAC-derived peer IDs
 // force a v4 nibble, so all-Fs can never collide with a real one.
 const (
 	SystemPeerIDOperator = "00000000-0000-0000-0000-000000000000"
@@ -126,12 +129,9 @@ type Event struct {
 	Mentions    []wire.Mention
 	MentionedMe bool
 	// IsOperator is true when this event's PeerID is one of the two
-	// well-known system/operator constants (SystemPeerIDHub,
-	// SystemPeerIDBridge) — restored 2026-09-08 after a same-day removal
-	// went too far: the project owner's actual instruction was to stop
-	// advertising which constant to expect on the wire (wire.Joined used
-	// to carry a SystemPeerID field for this), not to stop recognizing
-	// the constants at all. They're well-known and fixed, so a client
+	// well-known system/operator constants (SystemPeerIDOperator,
+	// SystemPeerIDSystem). Which constant to expect is deliberately not
+	// advertised on the wire — they are well-known and fixed, so a client
 	// checks directly rather than needing to be told.
 	IsOperator bool
 	// Own marks a "msg" this exact connection sent — see wire.Msg.Own. Also
@@ -194,7 +194,7 @@ type Conn struct {
 	agePublicKey  string
 	serverVersion int
 	expectedPeers int
-	// The fields below are only ever set for a bridge-style session (see
+	// The fields below are only ever set for a teams session (see
 	// wire.Joined) — zero-valued for every mcp-hub-server connection.
 	canSend          bool
 	conversationKind string
@@ -231,33 +231,27 @@ type Conn struct {
 	// confirmReminderLoop, captured before it's spawned.
 	confirmReminderInterval time.Duration
 
-	// isBridge is true only for a connection made via DialRelay — set once
-	// during construction, read only after Dial/DialRelay has returned, so
-	// (like peerID/name/etc. above) it needs no locking: the happens-before
-	// edge is the same construct-then-return-then-use pattern the rest of
-	// this immutable-after-construction group already relies on.
-	isBridge bool
+	// How a connection was dialled is deliberately not recorded here: it
+	// is a fact about the credential, never about what the server can do,
+	// and both forms are opaque links carrying the same fields anyway.
+	// Everything behavioural comes from the server's own declaration —
+	// see features/HasFeature.
 
 	mu         sync.Mutex
 	buffer     []Event
 	// ackReplyMisses counts CONSECUTIVE ConfirmReceived calls that waited
 	// for a standalone ack's reply and got nothing back within
-	// AckWaitTimeout — added 2026-09-08, correcting an earlier isBridge-
-	// based gate that chat-relay's author caught live: whether a server
-	// replies to a standalone ack with a Behind count (see wire.Ack.
-	// Behind) is a per-SERVER capability, not a per-connection-form one —
-	// chat-relay answers on a plain hub_connect session (host+sessionId)
-	// exactly the same as on a bridge link, so gating on isBridge dropped
-	// the count precisely where this client's own coordination-hub
-	// session (a plain hub_connect against chat-relay) needed it. A
-	// counter, not a one-shot bool: ratcheting to "never wait again"
+	// AckWaitTimeout. Whether a server answers a standalone ack with a
+	// Behind count (see wire.Ack.Behind) is a per-SERVER capability, so
+	// it can only be probed when the server declares nothing at all.
+	//
+	// A counter, not a one-shot bool: ratcheting to "never wait again"
 	// after a single miss turns one slow or lost reply into a permanent,
-	// silent conclusion for the connection's whole remaining life — a
-	// capability inferred from one absence, the same failure shape as
-	// everything else caught today. Reset to 0 by any reply that DOES
-	// arrive; once it reaches ackReplyMissThreshold, later confirms skip
-	// waiting entirely until a genuine ack reply resets it — reconnect
-	// gets a fresh Conn and starts at 0 again either way.
+	// silent conclusion for the connection's whole remaining life. Reset
+	// to 0 by any reply that DOES arrive; once it reaches
+	// ackReplyMissThreshold, later confirms skip waiting entirely until a
+	// genuine ack reply resets it — reconnect gets a fresh Conn and
+	// starts at 0 again either way.
 	ackReplyMisses int
 	closed     bool
 	closeCode  int       // set from the WebSocket close frame's code, if any — see DisconnectNote
@@ -278,6 +272,16 @@ type Conn struct {
 	// connection, the anchor hub_catch_up needs to resume from anything
 	// that arrived while disconnected.
 	lastSeenCursor string
+	// liveUnconfirmed records that something carrying a cursor has been
+	// live-delivered into buffer with no genuine hand-over since — the
+	// only condition confirmReminderLoop fires on. It has to be a flag
+	// rather than a comparison of lastSeenCursor against lastConsumed:
+	// cursors are opaque, so equality is the only test they permit, and
+	// the two positions legitimately diverge whenever a synchronous path
+	// (hub_catch_up especially) hands over a cursor the live read loop
+	// never saw — which would leave them unequal forever and the reminder
+	// firing on every tick.
+	liveUnconfirmed bool
 	// lastConsumed/lastAckSent/ackDisabled implement the read-receipt
 	// contract — see LastConsumedCursor, Drain, and ackLoop.
 	//   - lastConsumed: cursor of the most recent event actually returned
@@ -316,8 +320,8 @@ type ackClaim struct {
 	result chan Event // buffered, size 1; written to exactly once
 }
 
-// relayCloseNotes maps close codes a bridge server (e.g. a Teams-relay
-// bridge) may use to signal a dead credential rather than ordinary network
+// relayCloseNotes maps close codes a teams relay may use to signal a
+// dead credential rather than ordinary network
 // trouble, agreed as: 4001 revoked, 4002 expired, 4003 the link's
 // conversation became unavailable (e.g. the bot was removed from it).
 // mcp-hub-server itself never sends any of these — a plain drop from it
@@ -374,87 +378,165 @@ func (c *Conn) DisconnectNote() string {
 	return ""
 }
 
-// DialOptions carries the optional, untrusted-to-everyone-else identity a
-// client presents on connect.
+// maxNameRunes and maxTopicRunes bound the free-text header values this
+// client sends. A server applies its own limits regardless; these exist so
+// an over-long value is trimmed here rather than becoming a request some
+// proxy rejects for header size, with no indication of which field did it.
+const (
+	maxNameRunes  = 64
+	maxTopicRunes = 256
+)
+
+// DialOptions carries what a client presents on connect. Every field is
+// sent on every connection, as a request header — a client does not
+// decide per-server which are relevant, and never infers anything from
+// the shape of the link it was handed. A server ignores what it does not
+// use.
 type DialOptions struct {
-	// Name is a free-text display name shown alongside logs and reported to
-	// other peers. The server sanitizes it (control characters stripped,
-	// length capped) before relaying it or writing it to the log — treat
-	// whatever comes back in Conn.Name() as the authoritative value.
-	Name string
-	// AgePublicKey is an age (https://age-encryption.org) recipient string.
-	// It is validated for correct bech32 format (agekey.Valid) — both here
-	// and again server-side — but never parsed, decoded, or used
-	// cryptographically by the hub in any way; it is only distributed to
-	// other peers so they can encrypt to this one, entirely outside the
-	// hub's involvement. It does NOT affect peerId reuse — see
-	// ReconnectSecret — because it's broadcast to every other peer in the
-	// session, so keying identity off it would let anyone who saw it
-	// impersonate that peer on reconnect.
-	AgePublicKey string
-	// ReconnectSecret, if given, is never distributed to anyone — only this
-	// client and the server ever see it. If a peer previously connected to
-	// this same still-alive session with this exact secret, it is
-	// reassigned that same peerId (see hubsession.Session.Join), as long as
-	// that previous connection isn't still active; otherwise it's simply
-	// remembered for a future reconnect. Any string works — a UUID, a
-	// random token, whatever the caller wants to remember and present again
-	// later.
+	// ReconnectSecret is REQUIRED. It is what reclaims this client's
+	// identity on a later connect, and a server refuses a connection
+	// without one: an identity with no secret behind it can never be
+	// reclaimed, so the next connect is a different participant to the
+	// server, to its peers and to its own read position — degradation
+	// that shows up as lost continuity rather than as an error.
+	//
+	// It belongs to the client, not to whoever is driving it: minted on a
+	// first connect, stored per link, and presented unchanged every time.
 	ReconnectSecret string
-	// CreateToken, if given, is sent as the X-Hub-Create-Token header — a
-	// chat-relay extension (not part of the base wire protocol: an unknown
-	// server simply never looks at it, per the protocol's own "unknown
-	// fields are ignored" rule) letting a client create and claim a
-	// brand-new session in one handshake, for a server that 404s an
-	// unknown sessionId by design rather than creating one on first
-	// connect (mcp-hub-server's own behavior). Sent as a header rather
-	// than a query parameter deliberately: a query string ends up in
-	// plaintext in a reverse proxy's access log, a header does not. Only
-	// meaningful when sessionID doesn't already exist on the target
-	// server — an existing session is joined normally and the token is
-	// ignored.
+	// AgentID is the peerId this client was last assigned here, sent only
+	// when there is one. It REQUESTS that identity back, authorized by
+	// ReconnectSecret — never an assertion a server should trust alone,
+	// since an identity header honoured without the secret is
+	// impersonation of any peer whose id someone has seen. A server that
+	// cannot verify the pair refuses the connection rather than quietly
+	// assigning a different identity, so the answer to "who am I" is
+	// always the peerId in the server's own joined message.
+	AgentID string
+	// Name is a free-text display name. The server sanitizes it (control
+	// characters stripped, length capped) before relaying it or logging
+	// it — treat whatever comes back in Conn.Name() as authoritative.
+	// What it is VISIBLE to varies by server: on a hub session other peers
+	// see it; a teams relay may keep it for its own audit log and never
+	// show it in the conversation.
+	Name string
+	// AgePublicKey is an age (https://age-encryption.org) recipient
+	// string, validated for bech32 format (agekey.Valid) here and again
+	// server-side, but never parsed or used cryptographically by a hub —
+	// only redistributed to other peers so they can encrypt to this one.
+	//
+	// Deliberately NOT an identity credential: every peer in the session
+	// can see it, so granting peerId reuse on it would let anyone who saw
+	// it impersonate its owner. ReconnectSecret, which no peer ever sees,
+	// is what identity rests on.
+	AgePublicKey string
+	// CreateToken is a capability for creating and claiming a session in
+	// this same handshake, for a server that refuses an unknown session
+	// rather than creating one on first connect. Only meaningful when the
+	// link names a session that doesn't exist yet; an existing one is
+	// joined normally and this is ignored.
 	CreateToken string
+	// Topic names a session being created. Meaningless on a join.
+	Topic string
 }
 
-// Dial connects to host+"/"+sessionID (e.g. "ws://localhost:8765" joining
-// session "550e8400-..." dials "ws://localhost:8765/550e8400-..."), which
-// auto-joins the session as part of the websocket handshake — no separate
-// join message is sent. host is validated/normalized first (see
-// normalizeHost) so a common mistake like using https:// or including a
-// path fails with a clear message instead of an opaque dial error. Starts a
-// background read loop on success.
-func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
+// Dial connects to a link — the whole address, exactly as it was issued,
+// which a client never parses, reformats or reasons about. Everything
+// before the "#" is dialled verbatim; the fragment is the credential and
+// travels as "Authorization: Bearer", never in the request line. A URL
+// fragment is by definition not transmitted, which is what keeps that
+// credential out of the server's access log, any proxy in front of it,
+// and this client's own logs — by construction rather than by remembering
+// to redact it.
+//
+// Joining happens as part of the websocket handshake; no separate join
+// message is sent. Starts a background read loop on success.
+func Dial(link string, opts DialOptions) (*Conn, error) {
 	// Snapshot once, synchronously, before any goroutine is spawned — see
 	// the pongWait field's doc comment on Conn for why.
 	snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval := pongWait, writeWait, ackIdleInterval, confirmReminderInterval
 
-	base, err := normalizeHost(host)
-	if err != nil {
-		return nil, err
+	target, credential, _ := strings.Cut(link, "#")
+	if target == "" || credential == "" {
+		// A fragmentless link names nothing: the credential IS what
+		// identifies the session, so there is no address left to dial
+		// without it. Refused here rather than dialled, since a server
+		// applying the same rule would refuse it anyway, less clearly.
+		return nil, fmt.Errorf("link must carry its #-delimited credential — pass the link exactly as it was issued")
+	}
+	if opts.ReconnectSecret == "" {
+		return nil, fmt.Errorf("reconnectSecret is required")
 	}
 	if opts.AgePublicKey != "" && !agekey.Valid(opts.AgePublicKey) {
 		return nil, fmt.Errorf("agePublicKey is not a validly formatted age public key")
 	}
-	target := base + "/" + sessionID + "?v=" + strconv.Itoa(wire.ProtocolVersion)
-	if opts.Name != "" {
-		target += "&name=" + url.QueryEscape(opts.Name)
+
+	// A header value carrying a control character does not travel as
+	// written: it produces a request the server cannot parse, which comes
+	// back as an unexplained refusal rather than as anything naming the
+	// cause. Free text gets the control characters stripped, the way a
+	// server would strip them anyway. A credential is refused instead —
+	// silently mangling one turns a typo into an authentication failure,
+	// which is a far worse thing to debug than being told the value is
+	// malformed.
+	for field, value := range map[string]string{
+		"link credential": credential,
+		"reconnectSecret": opts.ReconnectSecret,
+		"agentId":         opts.AgentID,
+		"createToken":     opts.CreateToken,
+	} {
+		if strings.ContainsFunc(value, unicode.IsControl) {
+			return nil, fmt.Errorf("%s contains a control character, which cannot be sent in a request header", field)
+		}
+	}
+
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+credential)
+	header.Set("Agent-Secret", opts.ReconnectSecret)
+	header.Set("Hub-Protocol-Version", strconv.Itoa(wire.ProtocolVersion))
+	if opts.AgentID != "" {
+		header.Set("Agent-Id", opts.AgentID)
+	}
+	if name := sanitize.Text(opts.Name, maxNameRunes); name != "" {
+		header.Set("Agent-Name", name)
 	}
 	if opts.AgePublicKey != "" {
-		target += "&agePublicKey=" + url.QueryEscape(opts.AgePublicKey)
+		header.Set("Agent-Age-Public-Key", opts.AgePublicKey)
 	}
-	if opts.ReconnectSecret != "" {
-		target += "&reconnectSecret=" + url.QueryEscape(opts.ReconnectSecret)
-	}
-	var header http.Header
 	if opts.CreateToken != "" {
-		header = http.Header{}
-		header.Set("X-Hub-Create-Token", opts.CreateToken)
+		header.Set("Hub-Create-Token", opts.CreateToken)
 	}
-	ws, _, err := websocket.DefaultDialer.Dial(target, header)
+	if topic := sanitize.Text(opts.Topic, maxTopicRunes); topic != "" {
+		header.Set("Hub-Topic", topic)
+	}
+
+	ws, err := dialWS(target, header)
 	if err != nil {
 		return nil, err
 	}
-	return finishHandshake(ws, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval, false)
+	return finishHandshake(ws, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval)
+}
+
+// dialWS opens the WebSocket and, when the server answers with anything
+// other than an upgrade, names the status it actually sent. The library
+// reports every non-101 response as the same opaque "bad handshake", which
+// makes a deliberate refusal — 403 for a credential a server won't honour,
+// 404 for a session it doesn't have — indistinguishable from an
+// unreachable host. Those need different fixes, so the caller has to be
+// able to tell them apart.
+func dialWS(target string, header http.Header) (*websocket.Conn, error) {
+	ws, resp, err := websocket.DefaultDialer.Dial(target, header)
+	if err == nil {
+		return ws, nil
+	}
+	if resp == nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if said := strings.TrimSpace(string(body)); said != "" {
+		return nil, fmt.Errorf("%w — server answered %s: %s", err, resp.Status, said)
+	}
+	return nil, fmt.Errorf("%w — server answered %s", err, resp.Status)
 }
 
 // finishHandshake reads the server's initial "joined" message off an
@@ -462,8 +544,10 @@ func Dial(host, sessionID string, opts DialOptions) (*Conn, error) {
 // the tail shared by Dial and DialRelay, which differ only in how they
 // reach an open *websocket.Conn (a normalized host+sessionId URL with no
 // custom headers, vs. an arbitrary caller-supplied URL with an
-// Authorization/etc. header) and in isBridge, which DialRelay passes true.
-func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval time.Duration, isBridge bool) (*Conn, error) {
+// Authorization/etc. header). Nothing downstream of here differs between
+// the two: everything behavioural comes from the server's declared
+// features, never from which of them dialled.
+func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval time.Duration) (*Conn, error) {
 	_, raw, err := ws.ReadMessage()
 	if err != nil {
 		ws.Close()
@@ -497,7 +581,6 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		behindSince:             joined.BehindSince,
 		features:                joined.Features,
 		featuresDeclared:        joined.Features != nil,
-		isBridge:                isBridge,
 		lastFrameKind:           "joined",
 		lastFrameAt:             time.Now(),
 		ackIdleInterval:         snapAckIdleInterval,
@@ -551,7 +634,7 @@ func (c *Conn) HasFeature(name string) bool {
 func (c *Conn) ExpectedPeerCount() int { return c.expectedPeers }
 
 // The accessors below only ever return a non-zero/non-nil value for a
-// bridge-style session (see wire.Joined) — nil/zero for every
+// teams session (see wire.Joined) — nil/zero for every
 // mcp-hub-server connection, since the server never sets these.
 
 // LastSeenCursor is the cursor of the most recent message (or
@@ -585,14 +668,21 @@ func (c *Conn) Behind() int         { return c.behind }
 func (c *Conn) BehindSince() string { return c.behindSince }
 func (c *Conn) Topic() *string      { return c.topic }
 
-// IsBridge reports whether this connection was made via DialRelay rather
-// than Dial — a bridge-style session where a write action (send/react/
-// edit) gets an asynchronous ack/error rather than mcp-hub-server's
-// synchronous-enough plain send. Callers use this to decide whether
-// claimNextAck is worth using at all: waiting on it against a plain
-// mcp-hub-server connection, which never sends an ack of any kind, would
-// just be a pure timeout tax on every send for no benefit.
-func (c *Conn) IsBridge() bool { return c.isBridge }
+// WantsActionAcks reports whether this server answers a write action
+// (send/react/edit/delete) with its own asynchronous sendAck/reactionAck/
+// editAck/deleteAck, making claimNextAck worth using: waiting for one from
+// a server that never sends any is a pure timeout tax on every send.
+//
+// Answered only from the server's own declaration — the "actionAcks"
+// feature. No fallback to how the connection was dialled, and no runtime
+// probe: a server that declares nothing gets the same answer as one that
+// declares it doesn't do this, because a client cannot honestly
+// distinguish "won't" from "can't" without being told.
+//
+// A DIFFERENT feature from "ackReplies", which covers a standalone
+// hub_confirm ack's Behind count. A server can answer those while sending
+// no per-action acks at all, so the two must not be conflated.
+func (c *Conn) WantsActionAcks() bool { return c.HasFeature("actionAcks") }
 
 // RosterComplete reports whether the server's "rosterComplete" event — sent
 // once it has finished delivering this peer's initial roster — has been
@@ -772,7 +862,7 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 	}
 	if ev.Kind == "error" && (ev.Code == "bad_ack" || ev.Code == "bad_ack_cursor") {
 		// bad_ack/bad_ack_cursor are specific to the ack subsystem — unlike
-		// the generic bad_cursor/bad_request a bridge server may also use
+		// the generic bad_cursor/bad_request a teams relay may also use
 		// for unrelated requests (a malformed reaction, a history request
 		// naming both before and after), which must never trip this: error
 		// events carry no correlation id, so a generic code can't be
@@ -811,26 +901,20 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 var ackReplyMissThreshold = 2
 
 // Returns the server's reported Behind count from its reply, if one
-// arrives — added 2026-09-08, chat-relay's own server-side extension
-// (see wire.Ack.Behind's doc comment for why this count is worth having:
-// it's measured from the position the model itself just asserted, not
-// one inherited from connect time). Waits for a reply per connection to
-// find out whether the server sends one at all — see ackReplyMisses's
-// doc comment for why that's a per-connection probe (tolerating a few
-// consecutive misses before giving up) rather than an isBridge check or
-// a single-miss ratchet. nil, nil is the normal, expected result once
-// that probe has concluded the server doesn't reply — not an error.
+// arrives (see wire.Ack.Behind's doc comment for why this count is worth
+// having: it's measured from the position the model itself just
+// asserted, not one inherited from connect time). nil, nil is a normal,
+// expected result — a server that doesn't answer standalone acks is not
+// an error.
 func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	c.MarkConsumed([]Event{{Cursor: cursor}})
-	// Prefer the server's own explicit declaration (wire.Joined.Features,
-	// added 2026-09-08) over the runtime probe below whenever it's
-	// available — chat-relay's author, live: "never infer a capability
-	// from silence at runtime." A declared "no" is certain and permanent
-	// for this connection's life, so it skips waiting without ever
-	// needing to probe; a declared "yes" always waits, since the server
-	// has already promised a reply. Only an UNDECLARED Features object
-	// (a pre-v3 server, where nothing is known either way) falls back to
-	// ackReplyMisses's own probe-and-ratchet.
+	// The server's own declaration (wire.Joined.Features) settles this
+	// whenever it's available: never infer a capability from silence at
+	// runtime. A declared "no" is certain for this connection's life, so
+	// it skips waiting without probing at all; a declared "yes" always
+	// waits, since the server has promised a reply. Only an UNDECLARED
+	// Features map — nothing known either way — falls back to
+	// ackReplyMisses's probe-and-ratchet.
 	var skipWait bool
 	if c.featuresDeclared {
 		skipWait = !c.HasFeature("ackReplies")
@@ -901,17 +985,16 @@ func (c *Conn) ackLoop() {
 	}
 }
 
-// confirmReminderLoop periodically checks whether anything has been seen
-// (lastSeenCursor) beyond what's actually been confirmed via a genuine
-// synchronous hand-over (lastConsumed — see MarkConsumed's doc comment
-// for why that's a deliberately narrower signal than "written to a
+// confirmReminderLoop periodically checks whether anything live-delivered
+// is still awaiting a genuine synchronous hand-over (liveUnconfirmed —
+// see its field comment for why this can't be a comparison of
+// lastSeenCursor against lastConsumed, and MarkConsumed's for why
+// "hand-over" is a deliberately narrower signal than "written to a
 // socket"), and if so, injects a client-generated reminder event asking
-// the model to call hub_confirm. Requested directly by the project owner,
-// 2026-09-07, after a long hub discussion converged on exactly this
-// primitive as the only thing that can close the delivery-vs-consumption
-// gap: everything else (a timer alone, N+1-arrival, delivery hooks)
-// observes this client's own writes, not whether a model actually read
-// anything.
+// the model to call hub_confirm. This is the only primitive that can
+// close the delivery-vs-consumption gap: everything else (a timer alone,
+// N+1-arrival, delivery hooks) observes this client's own writes, not
+// whether a model actually read anything.
 //
 // Built as an ordinary buffered Event rather than a side channel
 // specifically so it flows through the exact same delivery paths
@@ -934,8 +1017,8 @@ func (c *Conn) confirmReminderLoop() {
 			c.mu.Unlock()
 			return
 		}
-		seen, consumed := c.lastSeenCursor, c.lastConsumed
-		if seen == "" || seen == consumed {
+		seen := c.lastSeenCursor
+		if seen == "" || !c.liveUnconfirmed {
 			c.mu.Unlock()
 			continue
 		}
@@ -991,6 +1074,7 @@ func (c *Conn) readLoop() {
 		c.buffer = append(c.buffer, ev)
 		if ev.Cursor != "" {
 			c.lastSeenCursor = ev.Cursor
+			c.liveUnconfirmed = true
 		}
 		switch ev.Kind {
 		case "peerJoined":
@@ -1234,12 +1318,33 @@ func (c *Conn) RequestMessageAfterAwaiting(anchor wire.Anchor) (Event, bool, err
 // React asks the server to add or remove a reaction on an earlier
 // message, identified by externalID — see wire.Reaction. action is "add"
 // or "remove". Not meaningful for mcp-hub-server, which silently ignores
-// any message type it doesn't recognize; for a bridge server with write
+// any message type it doesn't recognize; for a teams relay with write
 // access to the underlying platform. Success/failure arrives
 // asynchronously as a "reactionAck" (or an "error" event on refusal),
 // picked up by a later Peek/Drain like anything else — this call only
 // confirms the request was sent.
+// requireAction refuses a write action the server has said nothing about
+// supporting, before anything is written to the socket. Two fields answer
+// two different questions: "reactions"/"edit"/"delete" say whether the
+// request is worth SENDING, and "actionAcks" says whether an answer is
+// worth WAITING for. Conflating them sends a request the server drops in
+// silence and then waits out the full ack timeout for a reply that cannot
+// come.
+//
+// A server that declares no features at all has said nothing either way,
+// so the request goes out and the caller finds out from the answer — the
+// same rule the rest of the feature vocabulary follows.
+func (c *Conn) requireAction(feature string) error {
+	if !c.featuresDeclared || c.HasFeature(feature) {
+		return nil
+	}
+	return fmt.Errorf("this server does not support %s on this session (it declares no %q feature), so the request would be dropped without an answer", feature, feature)
+}
+
 func (c *Conn) React(externalID, reaction, action string) error {
+	if err := c.requireAction("reactions"); err != nil {
+		return err
+	}
 	r := wire.NewReactionRequest(externalID, reaction, action)
 	r.AckCursor = c.ackCursorForOutbound()
 	return c.ws.WriteJSON(r)
@@ -1252,6 +1357,9 @@ func (c *Conn) React(externalID, reaction, action string) error {
 // replaces the message's attachments (always the inline form — see
 // wire.Edit.Attachments); pass nil to leave existing attachments alone.
 func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) error {
+	if err := c.requireAction("edit"); err != nil {
+		return err
+	}
 	e := wire.NewEditRequest(externalID, text, attachments, format, replyTo, mentions)
 	e.AckCursor = c.ackCursorForOutbound()
 	return c.ws.WriteJSON(e)
@@ -1262,6 +1370,9 @@ func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachmen
 // Success/failure arrives asynchronously as a "deleteAck" (or an "error"
 // event on refusal), like React/EditMessage.
 func (c *Conn) DeleteMessage(externalID string) error {
+	if err := c.requireAction("delete"); err != nil {
+		return err
+	}
 	d := wire.NewDeleteRequest(externalID)
 	d.AckCursor = c.ackCursorForOutbound()
 	return c.ws.WriteJSON(d)
@@ -1270,31 +1381,31 @@ func (c *Conn) DeleteMessage(externalID string) error {
 // AckWaitTimeout is how long SendAwaitingAck/ReactAwaitingAck/
 // EditMessageAwaitingAck wait for their own ack (or a generic error)
 // before giving up — generous relative to how fast an ack has actually
-// been observed to arrive against a real bridge server (well under a
+// been observed to arrive against a real teams relay (well under a
 // second), while staying small enough that a caller mistakenly calling
-// one of these against a connection where IsBridge() is false wouldn't
-// be worth blocking on for long even without the IsBridge check these
-// methods already do first.
+// one of these against a server that declares no actionAcks wouldn't be
+// worth blocking on for long even without the WantsActionAcks check
+// these methods already do first.
 var AckWaitTimeout = 5 * time.Second
 
 // SendAwaitingAck sends text (broadcast, or to a single peer if to is
-// non-empty) and, only for a bridge connection (see IsBridge — a plain
-// mcp-hub-server connection never emits any ack at all, so waiting would
-// be a pure timeout tax for no benefit), waits up to AckWaitTimeout for
+// non-empty) and, only against a server declaring actionAcks (see
+// WantsActionAcks — a server that emits no ack at all would make waiting
+// a pure timeout tax for no benefit), waits up to AckWaitTimeout for
 // its own outcome via claimNextAck: a "sendAck" event on success, an
 // "error" event on refusal.
 //
 // Returns (event, true, nil) if an outcome arrived in time — format it
 // with FormatEvent to report it, whether success or failure, directly as
-// the caller's own answer. Returns (Event{}, false, nil) if this isn't a
-// bridge connection (nothing to wait for; report success the way this
+// the caller's own answer. Returns (Event{}, false, nil) if no ack is
+// declared for this server (nothing to wait for; report success the way this
 // always has, since the write itself is fire-and-forget either way) or
 // if the wait timed out with no outcome yet — the write may still
 // succeed or fail later, reported the normal way via wait/hub_receive/
 // hub_wait, exactly as before this existed. Returns (Event{}, false, err)
 // only if the write itself failed locally.
 func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) (Event, bool, error) {
-	if !c.isBridge {
+	if !c.WantsActionAcks() {
 		if to == "" {
 			return Event{}, false, c.Send(text, attachments, format, replyTo, mentions)
 		}
@@ -1319,11 +1430,11 @@ func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, f
 	}
 }
 
-// ReactAwaitingAck is React, but — only for a bridge connection — waits
+// ReactAwaitingAck is React, but — only when actionAcks is declared — waits
 // up to AckWaitTimeout for its own "reactionAck"/"error" outcome. See
 // SendAwaitingAck for the full contract; identical shape.
 func (c *Conn) ReactAwaitingAck(externalID, reaction, action string) (Event, bool, error) {
-	if !c.isBridge {
+	if !c.WantsActionAcks() {
 		return Event{}, false, c.React(externalID, reaction, action)
 	}
 	resultCh, cancel := c.claimNextAck("reactionAck")
@@ -1339,11 +1450,11 @@ func (c *Conn) ReactAwaitingAck(externalID, reaction, action string) (Event, boo
 	}
 }
 
-// EditMessageAwaitingAck is EditMessage, but — only for a bridge
+// EditMessageAwaitingAck is EditMessage, but — only when actionAcks is
 // connection — waits up to AckWaitTimeout for its own "editAck"/"error"
 // outcome. See SendAwaitingAck for the full contract; identical shape.
 func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) (Event, bool, error) {
-	if !c.isBridge {
+	if !c.WantsActionAcks() {
 		return Event{}, false, c.EditMessage(externalID, text, attachments, format, replyTo, mentions)
 	}
 	resultCh, cancel := c.claimNextAck("editAck")
@@ -1383,11 +1494,11 @@ func (c *Conn) RequestAttachment(token string) (Event, bool, error) {
 	}
 }
 
-// DeleteMessageAwaitingAck is DeleteMessage, but — only for a bridge
+// DeleteMessageAwaitingAck is DeleteMessage, but — only when actionAcks is
 // connection — waits up to AckWaitTimeout for its own "deleteAck"/"error"
 // outcome. See SendAwaitingAck for the full contract; identical shape.
 func (c *Conn) DeleteMessageAwaitingAck(externalID string) (Event, bool, error) {
-	if !c.isBridge {
+	if !c.WantsActionAcks() {
 		return Event{}, false, c.DeleteMessage(externalID)
 	}
 	resultCh, cancel := c.claimNextAck("deleteAck")
@@ -1413,7 +1524,7 @@ func (c *Conn) DeleteMessageAwaitingAck(externalID string) (Event, bool, error) 
 // server despite Close() otherwise behaving normally, traced (by
 // elimination — the connection was confirmed alive and the server's own
 // process confirmed not to have restarted) to this race, not to a missing
-// or bridge-specific code path. Var so tests can shorten it.
+// or teams-specific code path. Var so tests can shorten it.
 var closeFlushGrace = 200 * time.Millisecond
 
 // SetCloseFlushGraceForTesting overrides closeFlushGrace (see its own doc
@@ -1565,7 +1676,7 @@ func (c *Conn) DrainEvents() (events []Event, connected bool) {
 // and one-shot `wait` use to write events to the wait socket, neither of
 // which confirms a model ever read anything — only that this process
 // wrote bytes onward. Marking "consumed" at drain time meant a standalone
-// ack (and hence a bridge server's own delivery-tracking field, e.g.
+// ack (and hence a teams relay's own delivery-tracking field, e.g.
 // chat-relay's Behind) reported truthfully on "reached this process,"
 // not on "reached the model," while claiming the latter. Call this only
 // from a genuinely synchronous hand-over — an MCP tool result the model
@@ -1577,6 +1688,7 @@ func (c *Conn) MarkConsumed(events []Event) {
 	for _, e := range events {
 		if e.Cursor != "" {
 			c.lastConsumed = e.Cursor
+			c.liveUnconfirmed = false
 		}
 	}
 }

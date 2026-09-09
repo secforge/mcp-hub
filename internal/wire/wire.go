@@ -116,7 +116,7 @@ type Joined struct {
 	// empty if none was supplied.
 	AgePublicKey string `json:"agePublicKey,omitempty"`
 
-	// The fields below are for a bridge-style session (e.g. one reached via
+	// The fields below are for a teams session (e.g. one reached via
 	// teams_relay_connect) backed by a channel with real history and
 	// send-permission policy — mcp-hub-server never sets any of them, since
 	// none apply to an ordinary hub session.
@@ -189,7 +189,7 @@ type Joined struct {
 type AttachmentsFeature struct {
 	MaxRawBytes   int  `json:"maxRawBytes,omitempty"`
 	MaxFrameBytes int  `json:"maxFrameBytes,omitempty"`
-	// ImagesOnly is set by a bridge session whose platform only accepts
+	// ImagesOnly is set by a teams relay whose platform only accepts
 	// image attachments (see hub_send's imagePath/filePath split) —
 	// absent (false) for a server that accepts any content type.
 	ImagesOnly bool `json:"imagesOnly,omitempty"`
@@ -229,7 +229,7 @@ type Error struct {
 	Type    Type   `json:"type"`
 	Message string `json:"message"`
 	// Code, if present, is a stable machine-readable reason a client can
-	// branch on without parsing Message — e.g. a chat-relay-style bridge
+	// branch on without parsing Message — e.g. a chat-relay-style teams
 	// distinguishing "invalid_credential" (never retry) from "unavailable"
 	// (transient, retry is fine). Empty when a server doesn't set one;
 	// mcp-hub-server itself doesn't today. Additive: an older client that
@@ -282,10 +282,10 @@ type Msg struct {
 	// Historical marks a msg delivered in answer to a History request
 	// rather than live traffic — additive, so a client that doesn't know
 	// the field just renders it as an ordinary message. mcp-hub-server
-	// itself never sets this; it's for a bridge server (e.g. one backed by
+	// itself never sets this; it's for a teams relay (e.g. one backed by
 	// a channel with real message history) answering History.
 	Historical bool `json:"historical,omitempty"`
-	// ExternalID, for a bridge session, is the sending server's own id for
+	// ExternalID, for a teams session, is the sending server's own id for
 	// this message (the same value given in a SendAck for the send that
 	// produced it) — correlates a canonical msg with the sendAck that
 	// preceded it. Empty when not applicable.
@@ -340,14 +340,14 @@ type Msg struct {
 	// this frame is the reply to a specific pull, not unrelated traffic,
 	// even if a downstream layer merges the two.
 	Answers *Anchor `json:"answers,omitempty"`
-	// Own, for a bridge session, is true when this exact connection is
+	// Own, for a teams session, is true when this exact connection is
 	// the one that sent the message. Deliberately a decision for the
 	// receiving client to act on, not the server: whether to skip waking
 	// on your own echoed send is policy, and different consumers of the
 	// same stream (an agent, a UI, a hub client) may want different
 	// answers. mcp-hub-server never sets this.
 	Own bool `json:"own,omitempty"`
-	// Cursor, for a bridge session, is this message's own opaque
+	// Cursor, for a teams session, is this message's own opaque
 	// position — the value a client passes back as History.Before to
 	// page further back past it. mcp-hub-server never sets this, since it
 	// has no history concept at all.
@@ -669,9 +669,9 @@ func NewRosterComplete() RosterComplete {
 
 // History is a client request for messages relative to its own
 // connection — not part of a normal mcp-hub session (peers only ever see
-// events from when they joined forward), but meaningful for a bridge
+// events from when they joined forward), but meaningful for a teams
 // server backed by a channel with real retained history (e.g. a
-// Teams-relay bridge). Exactly one of Before/After should be set (Before
+// relay). Exactly one of Before/After should be set (Before
 // takes precedence if a server receives both, but a well-behaved client
 // never sends both at once); both are server-defined opaque cursors,
 // exclusive of the boundary message itself.
@@ -814,7 +814,7 @@ func NewAck(ackCursor string) Ack {
 
 // SendAck confirms a send reached its destination, sent immediately —
 // before the canonical message comes back through whatever async delivery
-// path a bridge server uses to fan a sent message back out to connections
+// path a teams relay uses to fan a sent message back out to connections
 // (which can be arbitrarily delayed, e.g. a slow polling/reconciliation
 // mode). Without this, a client has no way to distinguish "the send is
 // still in flight" from "it silently failed" during that gap. Deliberately
@@ -831,8 +831,8 @@ type SendAck struct {
 }
 
 // ReactionChanged reports a reaction added to or removed from an earlier
-// message — by anyone, on any bridge session; not something a receiving
-// client requested. mcp-hub-server never sends this; a bridge server does,
+// message — by anyone, on any teams session; not something a receiving
+// client requested. mcp-hub-server never sends this; a teams relay does,
 // as part of a real chat platform's normal activity. Reaction and Label
 // are both open strings, not a closed enum: Microsoft Teams' own reaction
 // set has changed over time (confirmed from live chat-relay data
@@ -904,7 +904,7 @@ type MessageEdited struct {
 // authority on whether a value is valid, not this package; an invalid
 // value comes back as an ordinary error event, not a client-side
 // rejection. Not meaningful for mcp-hub-server, which has nothing to
-// react to; for a bridge server with write access to the underlying
+// react to; for a teams relay with write access to the underlying
 // platform.
 type Reaction struct {
 	Type       Type   `json:"type"`
@@ -921,7 +921,7 @@ func NewReactionRequest(externalID, reaction, action string) Reaction {
 
 // Edit is a client request to change an earlier message's content,
 // identified by ExternalID. Not meaningful for mcp-hub-server; for a
-// bridge server with write access, and then only ever for a message that
+// teams relay with write access, and then only ever for a message that
 // server itself is able to edit (e.g. a platform's "you may only edit
 // your own messages" rule) — a server is the authority on whether an edit
 // is permitted, not this package.

@@ -10,12 +10,11 @@ import (
 	"time"
 )
 
-// TestConcurrentUpsertsUnderLockDoNotLoseUpdates proves the fix for the
-// documented race a bare load-then-save has: many goroutines (standing in
-// for many mcp-hub-client processes) each Upsert a distinct entry
-// concurrently, and every single one must survive — none silently
-// clobbered by another's stale in-memory snapshot winning the save race.
-// Without withLock's serialization, this reliably loses updates.
+// TestConcurrentUpsertsUnderLockDoNotLoseUpdates proves withLock closes the
+// race a bare load-then-save has: many goroutines (standing in for many
+// mcp-hub-client processes) each Upsert a distinct entry concurrently, and
+// every single one must survive — none silently clobbered by another's stale
+// in-memory snapshot winning the save race.
 func TestConcurrentUpsertsUnderLockDoNotLoseUpdates(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
@@ -25,7 +24,7 @@ func TestConcurrentUpsertsUnderLockDoNotLoseUpdates(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			target := Target{Host: "wss://mcp-hub.secforge.de", SessionID: fmt.Sprintf("550e8400-e29b-41d4-a716-4466554400%02d", i)}
+			target := Target{Link: fmt.Sprintf("wss://mcp-hub.secforge.de/hub/join-%02d", i)}
 			err := Upsert(target, Entry{PeerID: fmt.Sprintf("peer-%d", i)})
 			if err != nil {
 				t.Errorf("upsert %d: %v", i, err)
@@ -61,10 +60,10 @@ func TestCurrentProjectFallsBackToWorkingDirectory(t *testing.T) {
 	}
 }
 
-func TestDifferentProjectsWithSameHostAndSessionAreDistinctEntries(t *testing.T) {
+func TestDifferentProjectsWithTheSameLinkAreDistinctEntries(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://mcp-hub.secforge.de", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join"}
 	targetA := target
 	targetA.Project = "/projects/a"
 	targetB := target
@@ -91,15 +90,15 @@ func TestDifferentProjectsWithSameHostAndSessionAreDistinctEntries(t *testing.T)
 		t.Fatalf("list: %v", err)
 	}
 	if len(entries) != 2 {
-		t.Fatalf("expected 2 distinct entries for the same host+sessionId but different projects, got %d: %+v",
+		t.Fatalf("expected 2 distinct entries for the same link under different projects, got %d: %+v",
 			len(entries), entries)
 	}
 }
 
-func TestSameProjectHostAndSessionOverwritesNotDuplicates(t *testing.T) {
+func TestSameProjectAndLinkOverwritesNotDuplicates(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://mcp-hub.secforge.de", SessionID: "550e8400-e29b-41d4-a716-446655440000", Project: "/projects/a"}
+	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join", Project: "/projects/a"}
 	if err := Upsert(target, Entry{PeerID: "peer-1"}); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
@@ -123,7 +122,7 @@ func TestSameProjectHostAndSessionOverwritesNotDuplicates(t *testing.T) {
 func TestUpsertThenGetRoundTrips(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://mcp-hub.secforge.de", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join"}
 	entry := Entry{
 		PeerID: "peer-1", Name: "Alice", ReconnectSecret: "s3cr3t",
 		LastConnectedAt: time.Now().UTC().Truncate(time.Second), Connected: true,
@@ -141,15 +140,14 @@ func TestUpsertThenGetRoundTrips(t *testing.T) {
 	}
 }
 
-// TestUpsertPreservesExistingCatchUpState is the regression test for the
-// hazard the 2026-09-08 rewrite's Upsert doc comment calls out: folding
-// CatchUp into Entry means a naive full-replace Upsert (as a reconnect's
-// identity-only Entry would trigger) would silently wipe the persisted
-// read position on every reconnect. Upsert must preserve it instead.
+// TestUpsertPreservesExistingCatchUpState guards the hazard Upsert's own doc
+// comment names: CatchUp lives inside Entry, so a naive full-replace Upsert —
+// which is exactly what a reconnect's identity-only Entry looks like — would
+// silently wipe the persisted read position on every reconnect.
 func TestUpsertPreservesExistingCatchUpState(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://mcp-hub.secforge.de", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join"}
 	if err := Upsert(target, Entry{PeerID: "peer-1"}); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
@@ -175,7 +173,7 @@ func TestUpsertPreservesExistingCatchUpState(t *testing.T) {
 func TestGetReturnsFalseWhenNothingStored(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	_, ok := Get(Target{Host: "wss://never-seen", SessionID: "550e8400-e29b-41d4-a716-446655440000"})
+	_, ok := Get(Target{Link: "wss://never-seen/hub/join"})
 	if ok {
 		t.Fatal("expected no entry to be found")
 	}
@@ -184,7 +182,7 @@ func TestGetReturnsFalseWhenNothingStored(t *testing.T) {
 func TestUpsertOverwritesExistingEntryForSameTarget(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://mcp-hub.secforge.de", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join"}
 	if err := Upsert(target, Entry{PeerID: "peer-1"}); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
@@ -201,7 +199,7 @@ func TestUpsertOverwritesExistingEntryForSameTarget(t *testing.T) {
 func TestMarkDisconnectedClearsConnectedFlag(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://mcp-hub.secforge.de", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join"}
 	if err := Upsert(target, Entry{PeerID: "peer-1", Connected: true}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -222,7 +220,7 @@ func TestMarkDisconnectedClearsConnectedFlag(t *testing.T) {
 func TestMarkDisconnectedOnUnknownTargetIsANoop(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	if err := MarkDisconnected(Target{Host: "wss://never-seen", SessionID: "550e8400-e29b-41d4-a716-446655440000"}); err != nil {
+	if err := MarkDisconnected(Target{Link: "wss://never-seen/hub/join"}); err != nil {
 		t.Fatalf("expected no error for an unknown target, got %v", err)
 	}
 }
@@ -230,10 +228,10 @@ func TestMarkDisconnectedOnUnknownTargetIsANoop(t *testing.T) {
 func TestListReturnsAllEntries(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	if err := Upsert(Target{Host: "wss://a", SessionID: "550e8400-e29b-41d4-a716-446655440000"}, Entry{PeerID: "peer-a"}); err != nil {
+	if err := Upsert(Target{Link: "wss://a/hub/join"}, Entry{PeerID: "peer-a"}); err != nil {
 		t.Fatalf("upsert a: %v", err)
 	}
-	if err := Upsert(Target{Host: "wss://b", SessionID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}, Entry{PeerID: "peer-b"}); err != nil {
+	if err := Upsert(Target{Link: "wss://b/teams/join"}, Entry{PeerID: "peer-b"}); err != nil {
 		t.Fatalf("upsert b: %v", err)
 	}
 
@@ -266,7 +264,7 @@ func TestGetReturnsFalseWhenStoreFileIsMissing(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "state.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected no file to exist yet, stat err: %v", err)
 	}
-	if _, ok := Get(Target{Host: "wss://x", SessionID: "550e8400-e29b-41d4-a716-446655440000"}); ok {
+	if _, ok := Get(Target{Link: "wss://x/hub/join"}); ok {
 		t.Fatal("expected no entry when the store file doesn't exist")
 	}
 }
@@ -275,7 +273,7 @@ func TestUpsertWritesAtomicallyViaTempFileAndRename(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", dir)
 
-	if err := Upsert(Target{Host: "wss://a", SessionID: "550e8400-e29b-41d4-a716-446655440000"}, Entry{PeerID: "peer-a"}); err != nil {
+	if err := Upsert(Target{Link: "wss://a/hub/join"}, Entry{PeerID: "peer-a"}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -293,24 +291,21 @@ func TestUpsertWritesAtomicallyViaTempFileAndRename(t *testing.T) {
 	}
 }
 
-// TestProjectIsTheOutermostKeyOnDisk proves the 2026-09-08 restructuring
-// the user asked for directly: "shouldn't the main key be the project,
-// because every project has its own connections?" — every entry for one
-// project must be reachable as one contiguous block, not scattered
-// across every host/sessionId/link a machine has ever seen. Also proves
-// the follow-up merge ("merge hub and teams lists"): both connection
-// kinds live in the SAME per-project map, distinguished only by their
-// "hub "/"teams " key prefix — not two separate top-level sections.
+// TestProjectIsTheOutermostKeyOnDisk proves the on-disk shape: every entry
+// for one project is reachable as one contiguous block rather than scattered
+// across every link a machine has ever seen, and each connection is keyed by
+// its own link directly inside that block — one flat map per project, with no
+// further nesting and no per-kind section.
 func TestProjectIsTheOutermostKeyOnDisk(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://a", SessionID: "550e8400-e29b-41d4-a716-446655440000", Project: "/proj/x"}
-	if err := Upsert(target, Entry{PeerID: "peer-1"}); err != nil {
+	hubTarget := Target{Link: "wss://a/hub/join", Project: "/proj/x"}
+	if err := Upsert(hubTarget, Entry{PeerID: "peer-1"}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	teamsID := TeamsID{LinkTarget: "wss://b", Project: "/proj/x"}
-	if err := SetTeamsCatchUp(teamsID, CatchUpState{Cursor: "teams-cursor"}); err != nil {
-		t.Fatalf("SetTeamsCatchUp: %v", err)
+	teamsTarget := Target{Link: "wss://b/teams/join", Project: "/proj/x"}
+	if err := SetCatchUp(teamsTarget, CatchUpState{Cursor: "teams-cursor"}); err != nil {
+		t.Fatalf("SetCatchUp: %v", err)
 	}
 
 	data, err := os.ReadFile(path())
@@ -321,35 +316,27 @@ func TestProjectIsTheOutermostKeyOnDisk(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("unmarshal raw: %v", err)
 	}
-	byKey, ok := raw["/proj/x"]
+	byLink, ok := raw["/proj/x"]
 	if !ok {
 		t.Fatalf("expected the project keyed at the top level, got: %s", data)
 	}
 
-	// Host+SessionID combine into one space-joined key line prefixed
-	// "hub ", and the teams entry lives right alongside it in the SAME
-	// map, prefixed "teams " — not a further nesting level, not a
-	// separate top-level section.
-	wantHubKey := "hub wss://a 550e8400-e29b-41d4-a716-446655440000"
-	if _, ok := byKey[wantHubKey]; !ok {
-		t.Fatalf("expected the combined key %q, got: %s", wantHubKey, data)
+	// Both connections live side by side in the SAME per-project map, each
+	// under its own link verbatim.
+	if _, ok := byLink[hubTarget.Link]; !ok {
+		t.Fatalf("expected the link %q as a key, got: %s", hubTarget.Link, data)
 	}
-	wantTeamsKey := "teams wss://b"
-	if _, ok := byKey[wantTeamsKey]; !ok {
-		t.Fatalf("expected the combined key %q, got: %s", wantTeamsKey, data)
+	if _, ok := byLink[teamsTarget.Link]; !ok {
+		t.Fatalf("expected the link %q as a key, got: %s", teamsTarget.Link, data)
 	}
 }
 
-// TestHubEntryTopicRoundTripsAndSurvivesReconnect proves the
-// conversation's own display name (distinct from the peer's own Name)
-// persists via Upsert and, like CatchUp, survives a later Upsert that
-// doesn't carry a Topic of its own — built 2026-09-08 at the project
-// owner's own request ("if the name of the conversation is known to the
-// mcp, it should write that too").
-func TestHubEntryTopicRoundTripsAndSurvivesReconnect(t *testing.T) {
+// TestEntryTopicRoundTrips proves the conversation's own display name
+// (distinct from the peer's own Name) persists via Upsert.
+func TestEntryTopicRoundTrips(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://a", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	target := Target{Link: "wss://a/hub/join"}
 	if err := Upsert(target, Entry{PeerID: "peer-1", Topic: "Q3 Planning"}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -359,28 +346,27 @@ func TestHubEntryTopicRoundTripsAndSurvivesReconnect(t *testing.T) {
 	}
 }
 
-// TestSetTeamsTopicPreservesCatchUpAndViceVersa proves the two setters
-// on a teams entry (SetTeamsTopic, SetTeamsCatchUp) merge rather than
-// clobber each other — the same hazard Upsert's own doc comment covers
-// on the hub side.
-func TestSetTeamsTopicPreservesCatchUpAndViceVersa(t *testing.T) {
+// TestSetTopicPreservesCatchUpAndViceVersa proves the two single-field
+// setters merge rather than clobber each other — the same hazard Upsert's own
+// doc comment covers.
+func TestSetTopicPreservesCatchUpAndViceVersa(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	teamsID := TeamsID{LinkTarget: "wss://relay.example/join?c=abc", Project: "/proj"}
-	if err := SetTeamsCatchUp(teamsID, CatchUpState{Cursor: "cursor-1"}); err != nil {
-		t.Fatalf("SetTeamsCatchUp: %v", err)
+	target := Target{Link: "wss://relay.example/teams/join", Project: "/proj"}
+	if err := SetCatchUp(target, CatchUpState{Cursor: "cursor-1"}); err != nil {
+		t.Fatalf("SetCatchUp: %v", err)
 	}
-	if err := SetTeamsTopic(teamsID, "Design Review"); err != nil {
-		t.Fatalf("SetTeamsTopic: %v", err)
+	if err := SetTopic(target, "Design Review"); err != nil {
+		t.Fatalf("SetTopic: %v", err)
 	}
 
-	cs, ok := GetTeamsCatchUp(teamsID)
+	cs, ok := GetCatchUp(target)
 	if !ok || cs.Cursor != "cursor-1" {
-		t.Fatalf("expected the catch-up cursor to survive SetTeamsTopic, got %+v (ok=%v)", cs, ok)
+		t.Fatalf("expected the catch-up cursor to survive SetTopic, got %+v (ok=%v)", cs, ok)
 	}
 
 	s := load()
-	e := s[teamsID.Project][teamsKey(teamsID.LinkTarget)]
+	e := s[target.Project][target.Link]
 	if e.Topic != "Design Review" {
 		t.Fatalf("expected the topic to survive too, got %+v", e)
 	}
@@ -389,7 +375,7 @@ func TestSetTeamsTopicPreservesCatchUpAndViceVersa(t *testing.T) {
 func TestSetCatchUpGapAndAheadRoundTrip(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	target := Target{Host: "wss://mcp-hub.secforge.de", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
+	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join"}
 	cs := CatchUpState{
 		Cursor: "cursor-1",
 		Gap:    &GapState{From: "2026-09-01T00:00:00Z", To: "2026-09-01T01:00:00Z"},
@@ -408,58 +394,22 @@ func TestSetCatchUpGapAndAheadRoundTrip(t *testing.T) {
 	}
 }
 
-// TestTeamsCatchUpIsIndependentOfHubCatchUp proves a bridge session's
-// catch-up state lives under its own identity (TeamsID), never colliding
-// with a hub_connect Target that happens to share the same-looking
-// strings.
-func TestTeamsCatchUpIsIndependentOfHubCatchUp(t *testing.T) {
+// TestCatchUpForDifferentLinksIsIndependent proves one connection's read
+// position never leaks into another's.
+func TestCatchUpForDifferentLinksIsIndependent(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	teamsID := TeamsID{LinkTarget: "wss://chat-relay.example/relay/join?c=abc", Project: "/proj"}
-	if err := SetTeamsCatchUp(teamsID, CatchUpState{Cursor: "teams-cursor"}); err != nil {
-		t.Fatalf("SetTeamsCatchUp: %v", err)
+	one := Target{Link: "wss://chat-relay.example/teams/join", Project: "/proj"}
+	two := Target{Link: "wss://chat-relay.example/hub/join", Project: "/proj"}
+	if err := SetCatchUp(one, CatchUpState{Cursor: "cursor-one"}); err != nil {
+		t.Fatalf("SetCatchUp one: %v", err)
 	}
 
-	hubTarget := Target{Host: "wss://chat-relay.example/relay/join?c=abc", SessionID: "", Project: "/proj"}
-	if _, ok := GetCatchUp(hubTarget); ok {
-		t.Fatal("expected no hub catch-up entry to exist just because a teams one shares similar strings")
+	if _, ok := GetCatchUp(two); ok {
+		t.Fatal("expected no catch-up state for a link nothing was stored under")
 	}
-	cs, ok := GetTeamsCatchUp(teamsID)
-	if !ok || cs.Cursor != "teams-cursor" {
+	cs, ok := GetCatchUp(one)
+	if !ok || cs.Cursor != "cursor-one" {
 		t.Fatalf("got %+v (ok=%v)", cs, ok)
-	}
-}
-
-// TestCatchUpIDDispatchesToTheRightBackingStore proves the CatchUpID
-// union type mcptools.Hub keeps a single field of correctly dispatches
-// Get/Set to the hub or teams backing store depending on which is set.
-func TestCatchUpIDDispatchesToTheRightBackingStore(t *testing.T) {
-	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
-
-	hubID := HubCatchUpID(Target{Host: "wss://a", SessionID: "550e8400-e29b-41d4-a716-446655440000"})
-	if err := hubID.Set(CatchUpState{Cursor: "hub-cursor"}); err != nil {
-		t.Fatalf("hubID.Set: %v", err)
-	}
-	teamsID := TeamsCatchUpID(TeamsID{LinkTarget: "wss://b"})
-	if err := teamsID.Set(CatchUpState{Cursor: "teams-cursor"}); err != nil {
-		t.Fatalf("teamsID.Set: %v", err)
-	}
-
-	if cs, ok := hubID.Get(); !ok || cs.Cursor != "hub-cursor" {
-		t.Fatalf("got %+v (ok=%v)", cs, ok)
-	}
-	if cs, ok := teamsID.Get(); !ok || cs.Cursor != "teams-cursor" {
-		t.Fatalf("got %+v (ok=%v)", cs, ok)
-	}
-
-	var zero CatchUpID
-	if zero.Valid() {
-		t.Fatal("expected the zero CatchUpID to be invalid")
-	}
-	if _, ok := zero.Get(); ok {
-		t.Fatal("expected the zero CatchUpID's Get to report false")
-	}
-	if err := zero.Set(CatchUpState{Cursor: "x"}); err != nil {
-		t.Fatalf("expected the zero CatchUpID's Set to be a silent no-op, got err: %v", err)
 	}
 }

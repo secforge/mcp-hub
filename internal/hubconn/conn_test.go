@@ -2,11 +2,13 @@ package hubconn
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,27 @@ func startTestServer(t *testing.T) string {
 	srv := httptest.NewServer(wsserver.NewHandler())
 	t.Cleanup(srv.Close)
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
+}
+
+// testSecretSeq hands out a distinct secret per dialTest call.
+var testSecretSeq atomic.Int64
+
+// testLink builds the link Dial takes: an address, plus the fragment
+// carrying the credential. wsserver identifies a session by its path
+// segment and never receives the fragment, so both carry the same id.
+func testLink(base, sessionID string) string {
+	return base + "/" + sessionID + "#" + sessionID
+}
+
+// dialTest dials a session over a link, with a distinct secret unless the
+// caller pins one. Distinct matters: two connections presenting the same
+// secret are one identity being reclaimed, with the earlier connection
+// superseded, rather than two participants.
+func dialTest(base, sessionID string, opts DialOptions) (*Conn, error) {
+	if opts.ReconnectSecret == "" {
+		opts.ReconnectSecret = fmt.Sprintf("test-secret-%d", testSecretSeq.Add(1))
+	}
+	return Dial(testLink(base, sessionID), opts)
 }
 
 func waitForActivity(t *testing.T, ch <-chan struct{}) {
@@ -138,7 +161,7 @@ func TestDecodeEventStillRejectsInvalidNonEmptyPeerID(t *testing.T) {
 
 func TestDialJoinsAndAssignsPeerID(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -155,7 +178,7 @@ func TestDialReachesServerMountedUnderABasePath(t *testing.T) {
 	t.Cleanup(srv.Close)
 	host := "ws" + strings.TrimPrefix(srv.URL, "http") + "/hub"
 
-	c, err := Dial(host, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(host, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -180,7 +203,7 @@ func TestLastSeenCursorTracksMostRecentDeliveredMsg(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -223,7 +246,7 @@ func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -283,7 +306,7 @@ func TestAckCursorOmittedBeforeAnythingConsumed(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -309,7 +332,7 @@ func TestAckCursorOmittedBeforeAnythingConsumed(t *testing.T) {
 // to mark events consumed as a side effect, which meant waiter's
 // follow-mode delivery and one-shot `wait` — neither of which confirms a
 // model read anything, only that this process wrote bytes onward — could
-// trigger a standalone ack that a bridge server (e.g. chat-relay) then
+// trigger a standalone ack that a teams relay (e.g. chat-relay) then
 // stored as proof of delivery to the model. Draining alone must never
 // move LastConsumedCursor; only an explicit MarkConsumed call may.
 func TestDrainDoesNotMarkConsumed(t *testing.T) {
@@ -327,7 +350,7 @@ func TestDrainDoesNotMarkConsumed(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -369,7 +392,7 @@ func TestConfirmReminderFiresWhenSeenPastConsumed(t *testing.T) {
 	defer func() { confirmReminderInterval = origInterval }()
 
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -391,6 +414,7 @@ func TestConfirmReminderFiresWhenSeenPastConsumed(t *testing.T) {
 
 	c.mu.Lock()
 	c.lastSeenCursor = "cursor-live-1"
+	c.liveUnconfirmed = true
 	c.mu.Unlock()
 
 	var found *Event
@@ -430,7 +454,7 @@ func TestConfirmReminderDoesNotFireWhenNothingUnconfirmed(t *testing.T) {
 	defer func() { confirmReminderInterval = origInterval }()
 
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -438,6 +462,7 @@ func TestConfirmReminderDoesNotFireWhenNothingUnconfirmed(t *testing.T) {
 
 	c.mu.Lock()
 	c.lastSeenCursor = "cursor-live-1"
+	c.liveUnconfirmed = true
 	c.mu.Unlock()
 	c.MarkConsumed([]Event{{Cursor: "cursor-live-1"}})
 
@@ -447,6 +472,45 @@ func TestConfirmReminderDoesNotFireWhenNothingUnconfirmed(t *testing.T) {
 	for _, e := range events {
 		if e.Kind == "confirmReminder" {
 			t.Fatalf("expected no reminder once lastSeenCursor is fully confirmed, got: %+v", events)
+		}
+	}
+}
+
+// TestConfirmReminderStopsAfterConfirmingADifferentCursor reproduces the
+// defect chat-relay's author reported live on 2026-09-09: a live delivery
+// arrived cut, they recovered it via hub_catch_up and confirmed a cursor
+// the live read loop had never seen, and the reminder then fired on every
+// tick forever, still naming the older live cursor. The old condition
+// compared lastSeenCursor to lastConsumed by string equality, which two
+// legitimately divergent positions can never satisfy — cursors are opaque,
+// so there is no "at or beyond" test available.
+func TestConfirmReminderStopsAfterConfirmingADifferentCursor(t *testing.T) {
+	origInterval := confirmReminderInterval
+	confirmReminderInterval = 30 * time.Millisecond
+	defer func() { confirmReminderInterval = origInterval }()
+
+	url := startTestServer(t)
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	c.mu.Lock()
+	c.lastSeenCursor = "cursor-live-cut"
+	c.liveUnconfirmed = true
+	c.mu.Unlock()
+
+	// The hand-over that actually happened: a synchronous path delivered a
+	// LATER cursor than the live loop ever saw, so the two never match.
+	c.MarkConsumed([]Event{{Cursor: "cursor-recovered-via-catch-up"}})
+
+	time.Sleep(150 * time.Millisecond)
+
+	events, _ := c.DrainEvents()
+	for _, e := range events {
+		if e.Kind == "confirmReminder" {
+			t.Fatalf("expected no reminder after a genuine hand-over of a different cursor, got one naming %q", e.Text)
 		}
 	}
 }
@@ -482,7 +546,7 @@ func TestConfirmReceivedSendsImmediateAckAndMarksConsumed(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -507,7 +571,7 @@ func TestConfirmReceivedSendsImmediateAckAndMarksConsumed(t *testing.T) {
 
 // TestConfirmReceivedRatchetsToNoWaitAfterConsecutiveMisses is the
 // regression test for the per-server probe design (built 2026-09-08,
-// correcting an earlier isBridge-based gate chat-relay's author caught
+// correcting an earlier isTeams-based gate chat-relay's author caught
 // live, then refined again the same day per their own follow-up: a
 // single miss must not permanently conclude "this server never
 // answers" — see ackReplyMisses's doc comment). Against a server that
@@ -524,7 +588,7 @@ func TestConfirmReceivedRatchetsToNoWaitAfterConsecutiveMisses(t *testing.T) {
 	defer func() { ackReplyMissThreshold = origThreshold }()
 
 	url := startTestServer(t)
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -599,7 +663,7 @@ func TestConfirmReceivedDoesNotRatchetOnASingleTransientMiss(t *testing.T) {
 	defer func() { AckWaitTimeout = origTimeout }()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -629,9 +693,9 @@ func TestConfirmReceivedDoesNotRatchetOnASingleTransientMiss(t *testing.T) {
 
 // TestConfirmReceivedOnPlainConnReturnsBehindFromReply proves the actual
 // bug chat-relay caught: their server replies to a standalone ack on a
-// PLAIN hub_connect session (host+sessionId), same as on a bridge link —
+// PLAIN hub_connect session (host+sessionId), same as on a teams relay link —
 // this client's own coordination-hub session is exactly such a
-// connection, so gating the wait on isBridge silently dropped the count
+// connection, so gating the wait on isTeams silently dropped the count
 // precisely where it was needed.
 func TestConfirmReceivedOnPlainConnReturnsBehindFromReply(t *testing.T) {
 	upgrader := websocket.Upgrader{}
@@ -652,7 +716,7 @@ func TestConfirmReceivedOnPlainConnReturnsBehindFromReply(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -701,7 +765,7 @@ func TestConfirmReceivedSkipsWaitImmediatelyWhenFeatureDeclaredUnsupported(t *te
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -753,7 +817,7 @@ func TestConfirmReceivedWaitsWhenFeatureDeclaredSupported(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -778,7 +842,7 @@ func TestConfirmReceivedWaitsWhenFeatureDeclaredSupported(t *testing.T) {
 // falls back to the ackReplyMisses probe.
 func TestFeaturesDeclaredFalseWhenServerOmitsFeatures(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -792,12 +856,12 @@ func TestFeaturesDeclaredFalseWhenServerOmitsFeatures(t *testing.T) {
 	}
 }
 
-// TestConfirmReceivedOnBridgeReturnsBehindFromReply is the regression
+// TestConfirmReceivedOnTeamsSessionReturnsBehindFromReply is the regression
 // test for chat-relay's server-side extension (found live, 2026-09-08):
 // a standalone ack's reply can carry a Behind count measured from the
-// position just confirmed. On a bridge connection, ConfirmReceived must
+// position just confirmed. On a teams connection, ConfirmReceived must
 // wait for and surface it.
-func TestConfirmReceivedOnBridgeReturnsBehindFromReply(t *testing.T) {
+func TestConfirmReceivedReturnsBehindWhenAckRepliesDeclared(t *testing.T) {
 	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
 		var raw json.RawMessage
 		if err := conn.ReadJSON(&raw); err != nil {
@@ -807,9 +871,9 @@ func TestConfirmReceivedOnBridgeReturnsBehindFromReply(t *testing.T) {
 		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: true, Behind: &behind})
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -822,12 +886,12 @@ func TestConfirmReceivedOnBridgeReturnsBehindFromReply(t *testing.T) {
 	}
 }
 
-// TestConfirmReceivedOnBridgeReturnsNilWhenServerDoesNotReply proves the
-// graceful-fallback half: a bridge server that never answers a
+// TestConfirmReceivedOnTeamsSessionReturnsNilWhenServerDoesNotReply proves the
+// graceful-fallback half: a teams relay that never answers a
 // standalone ack at all (predating chat-relay's extension, or simply not
 // implementing it) still resolves ConfirmReceived — after AckWaitTimeout
 // — with behind=nil, not an error or a hang.
-func TestConfirmReceivedOnBridgeReturnsNilWhenServerDoesNotReply(t *testing.T) {
+func TestConfirmReceivedOnTeamsSessionReturnsNilWhenServerDoesNotReply(t *testing.T) {
 	orig := AckWaitTimeout
 	AckWaitTimeout = 100 * time.Millisecond
 	defer func() { AckWaitTimeout = orig }()
@@ -835,9 +899,9 @@ func TestConfirmReceivedOnBridgeReturnsNilWhenServerDoesNotReply(t *testing.T) {
 	link, _ := startRelayTestServer(t, func(conn *websocket.Conn) {
 		time.Sleep(2 * time.Second)
 	})
-	c, err := DialRelay(link+"#secret", RelayDialOptions{ReconnectSecret: "resume-me"})
+	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
 	if err != nil {
-		t.Fatalf("DialRelay: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
@@ -883,7 +947,7 @@ func TestAckLoopSendsStandaloneAckWhenIdleAndConsumedMoved(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -933,7 +997,7 @@ func TestAckReplyRejectionAdoptsServerReportedCursor(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -983,7 +1047,7 @@ func TestBadAckCursorErrorDisablesFurtherAcks(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1023,7 +1087,7 @@ func TestBadAckCursorErrorDisablesFurtherAcks(t *testing.T) {
 
 // TestUnrelatedBadCursorErrorDoesNotDisableAcks proves the fix for a real
 // bug: bad_cursor/bad_request are emitted by many unrelated request kinds
-// on a bridge server (e.g. a malformed reaction, a history request naming
+// on a teams relay (e.g. a malformed reaction, a history request naming
 // both before and after) — only bad_ack/bad_ack_cursor are specific to the
 // ack subsystem. Reacting to the generic codes would have let one
 // malformed reaction silently and permanently kill read receipts for the
@@ -1047,7 +1111,7 @@ func TestUnrelatedBadCursorErrorDoesNotDisableAcks(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1100,7 +1164,7 @@ func TestCloseSendsNormalClosureCloseFrame(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1142,7 +1206,7 @@ func TestCloseWaitsForFlushGraceAfterSuccessfulWrite(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1174,7 +1238,7 @@ func TestCloseReturnsWriteControlErrorWhenFrameCannotBeSent(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1194,7 +1258,7 @@ func TestDialSendsCreateTokenHeaderWhenGiven(t *testing.T) {
 	var gotHeader string
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeader = r.Header.Get("X-Hub-Create-Token")
+		gotHeader = r.Header.Get("Hub-Create-Token")
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -1205,14 +1269,14 @@ func TestDialSendsCreateTokenHeaderWhenGiven(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{CreateToken: "abc123.secretvalue"})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{CreateToken: "abc123.secretvalue"})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
 	if gotHeader != "abc123.secretvalue" {
-		t.Fatalf("expected X-Hub-Create-Token header %q, got %q", "abc123.secretvalue", gotHeader)
+		t.Fatalf("expected Hub-Create-Token header %q, got %q", "abc123.secretvalue", gotHeader)
 	}
 }
 
@@ -1220,7 +1284,7 @@ func TestDialOmitsCreateTokenHeaderWhenNotGiven(t *testing.T) {
 	var sawHeader bool
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawHeader = r.Header.Get("X-Hub-Create-Token") != ""
+		sawHeader = r.Header.Get("Hub-Create-Token") != ""
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -1231,29 +1295,36 @@ func TestDialOmitsCreateTokenHeaderWhenNotGiven(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
 	if sawHeader {
-		t.Fatal("expected no X-Hub-Create-Token header when none was given")
+		t.Fatal("expected no Hub-Create-Token header when none was given")
 	}
 }
 
-func TestDialRejectsInvalidSessionID(t *testing.T) {
+// A link a server will not accept fails with the status the server
+// actually sent, not an opaque "bad handshake": a refusal and an
+// unreachable host need different fixes.
+func TestDialSurfacesServerRefusalStatus(t *testing.T) {
 	url := startTestServer(t)
-	if _, err := Dial(url, "not-a-uuid", DialOptions{}); err == nil {
-		t.Fatal("expected an error for an invalid sessionId")
+	_, err := dialTest(url, "not-a-uuid", DialOptions{})
+	if err == nil {
+		t.Fatal("expected an error for a session the server refuses")
+	}
+	if !strings.Contains(err.Error(), "400") {
+		t.Fatalf("expected the server's status in the error, got: %v", err)
 	}
 }
 
-func TestDialSendsCurrentProtocolVersionAsQueryParam(t *testing.T) {
-	var gotQuery string
+func TestDialSendsProtocolVersionHeader(t *testing.T) {
+	var gotVersion string
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.RawQuery
+		gotVersion = r.Header.Get("Hub-Protocol-Version")
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -1264,21 +1335,20 @@ func TestDialSendsCurrentProtocolVersionAsQueryParam(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
-	want := "v=" + strconv.Itoa(wire.ProtocolVersion)
-	if gotQuery != want {
-		t.Fatalf("got query %q, want %q", gotQuery, want)
+	if want := strconv.Itoa(wire.ProtocolVersion); gotVersion != want {
+		t.Fatalf("got Hub-Protocol-Version %q, want %q", gotVersion, want)
 	}
 }
 
 func TestDialCapturesServerVersion(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1315,7 +1385,7 @@ func TestMsgFromSystemConstantsIsMarkedOperator(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1348,7 +1418,7 @@ func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID, DialOptions{})
+	a, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -1357,7 +1427,7 @@ func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
 		t.Fatalf("a: expected 0, got %d", a.ExpectedPeerCount())
 	}
 
-	b, err := Dial(url, sessionID, DialOptions{})
+	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -1369,7 +1439,7 @@ func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
 
 func TestRosterCompleteImmediatelyWhenNoExistingPeers(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1395,13 +1465,13 @@ func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID, DialOptions{})
+	a, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
 	defer a.Close()
 
-	b, err := Dial(url, sessionID, DialOptions{})
+	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -1428,18 +1498,11 @@ func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
 	}
 }
 
-func TestDialRejectsHostWithPath(t *testing.T) {
-	url := startTestServer(t)
-	if _, err := Dial(url+"/extra-path", "550e8400-e29b-41d4-a716-446655440000", DialOptions{}); err == nil {
-		t.Fatal("expected Dial to reject a host containing a path")
-	}
-}
-
 func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID, DialOptions{})
+	a, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -1449,7 +1512,7 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 	a.OnActivity(func() { activity <- struct{}{} })
 	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
 
-	b, err := Dial(url, sessionID, DialOptions{})
+	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -1475,7 +1538,7 @@ func TestSendWithAttachmentsDeliversThem(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID, DialOptions{})
+	a, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -1485,7 +1548,7 @@ func TestSendWithAttachmentsDeliversThem(t *testing.T) {
 	a.OnActivity(func() { activity <- struct{}{} })
 	waitForActivity(t, activity) // a's own rosterComplete
 
-	b, err := Dial(url, sessionID, DialOptions{})
+	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -1522,7 +1585,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID, DialOptions{})
+	a, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -1531,7 +1594,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	a.OnActivity(func() { activityA <- struct{}{} })
 	waitForActivity(t, activityA) // a's own rosterComplete (no peers yet)
 
-	b, err := Dial(url, sessionID, DialOptions{})
+	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -1560,7 +1623,7 @@ func TestSendToUnknownPeerSurfacesAsErrorEvent(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID, DialOptions{})
+	a, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1587,7 +1650,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID, DialOptions{})
+	a, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
@@ -1600,7 +1663,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 		t.Fatalf("expected no peers before anyone else joins, got %v", peers)
 	}
 
-	b, err := Dial(url, sessionID, DialOptions{})
+	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -1611,7 +1674,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 		t.Fatalf("expected [%s], got %v", b.PeerID(), peers)
 	}
 
-	c, err := Dial(url, sessionID, DialOptions{})
+	c, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial c: %v", err)
 	}
@@ -1636,12 +1699,12 @@ func TestPeekAndDrainReflectDisconnect(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 
-	a, err := Dial(url, sessionID, DialOptions{})
+	a, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 
-	b, err := Dial(url, sessionID, DialOptions{})
+	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
@@ -1694,7 +1757,7 @@ func TestSilentDropIsDetectedViaReadDeadline(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1723,25 +1786,45 @@ const testAgePublicKey = "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2g
 
 func TestDialRejectsMalformedAgePublicKey(t *testing.T) {
 	url := startTestServer(t)
-	_, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{AgePublicKey: "not-a-key"})
+	_, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{AgePublicKey: "not-a-key"})
 	if err == nil {
 		t.Fatal("expected an error for a malformed agePublicKey")
 	}
 }
 
-func TestDialEchoesBackSanitizedNameAndAgePublicKey(t *testing.T) {
-	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000",
-		DialOptions{Name: "Alice\n\x1b[31m", AgePublicKey: testAgePublicKey})
+// Name and agePublicKey travel as headers, and a server echoes back what
+// it made of them (see Conn.Name/Conn.AgePublicKey) — this pins the
+// sending half, which is all the client controls.
+func TestDialSendsIdentityHeaders(t *testing.T) {
+	var gotName, gotKey string
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotName, gotKey = r.Header.Get("Agent-Name"), r.Header.Get("Agent-Age-Public-Key")
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "Alice", testAgePublicKey))
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		DialOptions{Name: "Alice", AgePublicKey: testAgePublicKey})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
-	if c.Name() != "Alice[31m" {
-		t.Fatalf("expected control chars/newlines stripped from name, got %q", c.Name())
+
+	if gotName != "Alice" {
+		t.Fatalf("got Agent-Name %q, want %q", gotName, "Alice")
 	}
-	if c.AgePublicKey() != testAgePublicKey {
-		t.Fatalf("got AgePublicKey %q, want %q", c.AgePublicKey(), testAgePublicKey)
+	if gotKey != testAgePublicKey {
+		t.Fatalf("got Agent-Age-Public-Key %q, want %q", gotKey, testAgePublicKey)
+	}
+	if c.Name() != "Alice" || c.AgePublicKey() != testAgePublicKey {
+		t.Fatalf("expected the server's echo surfaced, got name=%q key=%q", c.Name(), c.AgePublicKey())
 	}
 }
 
@@ -1858,7 +1941,7 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1915,7 +1998,6 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 	}
 }
 
-
 func TestReactSendsReactionMessage(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	gotReaction := make(chan wire.Reaction, 1)
@@ -1935,7 +2017,7 @@ func TestReactSendsReactionMessage(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1974,7 +2056,7 @@ func TestEditMessageSendsEditMessage(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2013,7 +2095,7 @@ func TestEditMessageSendsAttachments(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2053,7 +2135,7 @@ func TestSendWithReplyToSetsField(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2092,7 +2174,7 @@ func TestEditMessageSendsReplyTo(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2137,7 +2219,7 @@ func TestRequestAttachmentReturnsFetchedBytes(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2177,7 +2259,7 @@ func TestRequestAttachmentSurfacesServerError(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2195,7 +2277,7 @@ func TestRequestAttachmentSurfacesServerError(t *testing.T) {
 	}
 }
 
-func TestBridgeFieldsOnJoinedFlowThroughToAccessors(t *testing.T) {
+func TestTeamsFieldsOnJoinedFlowThroughToAccessors(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -2214,7 +2296,7 @@ func TestBridgeFieldsOnJoinedFlowThroughToAccessors(t *testing.T) {
 	defer srv.Close()
 
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := Dial(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2231,42 +2313,16 @@ func TestBridgeFieldsOnJoinedFlowThroughToAccessors(t *testing.T) {
 	}
 }
 
-func TestBridgeFieldsAreZeroForAnOrdinaryConnect(t *testing.T) {
+func TestTeamsFieldsAreZeroForAnOrdinaryConnect(t *testing.T) {
 	url := startTestServer(t)
-	c, err := Dial(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
 
 	if c.CanSend() || c.ConversationKind() != "" || c.Topic() != nil {
-		t.Fatalf("expected all bridge fields zero, got CanSend=%v "+
+		t.Fatalf("expected all teams fields zero, got CanSend=%v "+
 			"ConversationKind=%q Topic=%v", c.CanSend(), c.ConversationKind(), c.Topic())
-	}
-}
-
-func TestPeersReportsNameAndAgePublicKeyOfOthers(t *testing.T) {
-	url := startTestServer(t)
-	sessionID := "550e8400-e29b-41d4-a716-446655440000"
-
-	a, err := Dial(url, sessionID, DialOptions{})
-	if err != nil {
-		t.Fatalf("dial a: %v", err)
-	}
-	defer a.Close()
-	activity := make(chan struct{}, 8)
-	a.OnActivity(func() { activity <- struct{}{} })
-	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
-
-	b, err := Dial(url, sessionID, DialOptions{Name: "Alice", AgePublicKey: testAgePublicKey})
-	if err != nil {
-		t.Fatalf("dial b: %v", err)
-	}
-	defer b.Close()
-	waitForActivity(t, activity) // a sees b's peerJoined
-
-	peers := a.Peers()
-	if len(peers) != 1 || peers[0].Name != "Alice" || peers[0].AgePublicKey != testAgePublicKey {
-		t.Fatalf("expected b's name/agePublicKey to be reported, got %+v", peers)
 	}
 }

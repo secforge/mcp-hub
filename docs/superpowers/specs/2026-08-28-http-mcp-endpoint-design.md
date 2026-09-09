@@ -24,8 +24,8 @@ mechanism are all unmodified.
 
 The built-in MCP tool set covers only what `hubsession`/`wsserver` already
 understand server-side: connect, send, receive, wait, peers. Reactions,
-edits, deletes, and history are chat-relay/Teams-bridge-specific concepts
-that only exist between `mcp-hub-client` and a bridge server's own
+edits, deletes, and history are chat-relay/teams-specific concepts
+that only exist between `mcp-hub-client` and a teams relay's own
 implementation (e.g. chat-relay) — `mcp-hub-server`'s relay has no
 server-side concept of any of them today, and adding one is out of scope
 here.

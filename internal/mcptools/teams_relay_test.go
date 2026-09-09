@@ -13,14 +13,27 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
-// startRelayTestServer starts a bare websocket server (not wsserver.NewHandler
-// — teams_relay_connect deliberately doesn't dial that) that captures the
-// handshake headers it received and sends a "joined" message, for exercising
-// handleTeamsRelayConnect without a real chat-relay-style server.
+// startRelayTestServer starts a bare websocket server (not
+// wsserver.NewHandler) that captures the handshake headers it received and
+// sends a "joined" message, for exercising handleConnect against a
+// teams-relay-shaped server without a real one.
+// teamsTestFeatures is what a teams server declares so a client
+// waits for its per-action acks (sendAck/reactionAck/editAck/deleteAck).
+// Every fake server in this file speaks that shape, so they all declare it.
+func teamsTestFeatures() map[string]json.RawMessage {
+	return map[string]json.RawMessage{
+		"actionAcks": json.RawMessage("{}"),
+		"reactions":  json.RawMessage("{}"),
+		"edit":       json.RawMessage("{}"),
+		"delete":     json.RawMessage("{}"),
+	}
+}
+
 func startRelayTestServer(t *testing.T) (link string, gotHeaders func() http.Header) {
 	t.Helper()
 	upgrader := websocket.Upgrader{}
@@ -33,6 +46,8 @@ func startRelayTestServer(t *testing.T) (link string, gotHeaders func() http.Hea
 		}
 		defer conn.Close()
 		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined.Features = teamsTestFeatures()
+		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		for {
@@ -47,7 +62,7 @@ func startRelayTestServer(t *testing.T) (link string, gotHeaders func() http.Hea
 }
 
 // startRelayTestServerWithJoined is startRelayTestServer but sending a
-// caller-supplied "joined" message, for exercising the bridge-only fields
+// caller-supplied "joined" message, for exercising the teams-only fields
 // (latestCursor, historyLimitMax, canSend, conversationKind, topic).
 func startRelayTestServerWithJoined(t *testing.T, joined wire.Joined) (link string) {
 	t.Helper()
@@ -76,18 +91,20 @@ func TestTeamsRelayConnectSendsHeadersAndReturnsGuidance(t *testing.T) {
 
 	hub := NewHub()
 	req := mcp.CallToolRequest{}
-	req.Params.Arguments = map[string]any{"link": link, "name": "tester", "reconnectSecret": "resume-me"}
-	res, err := hub.handleTeamsRelayConnect(ctx, req)
+	req.Params.Arguments = map[string]any{"link": link, "name": "tester"}
+	res, err := hub.handleConnect(ctx, req)
 	if err != nil || res.IsError {
-		t.Fatalf("teams_relay_connect failed: err=%v result=%+v", err, res)
+		t.Fatalf("hub_connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
 
 	if got := headers().Get("Authorization"); got != "Bearer the-link-secret" {
 		t.Fatalf("expected Authorization header, got %q", got)
 	}
-	if got := headers().Get("Reconnect-Secret"); got != "resume-me" {
-		t.Fatalf("expected Reconnect-Secret header, got %q", got)
+	// The secret is the client's own, so the header must be present and
+	// non-empty — its value is never something a caller chose.
+	if got := headers().Get("Agent-Secret"); got == "" {
+		t.Fatal("expected an Agent-Secret header to be sent")
 	}
 	if got := headers().Get("Agent-Name"); got != "tester" {
 		t.Fatalf("expected Agent-Name header, got %q", got)
@@ -97,8 +114,8 @@ func TestTeamsRelayConnectSendsHeadersAndReturnsGuidance(t *testing.T) {
 	if !strings.Contains(text, "Connected as peer") {
 		t.Fatalf("expected a connected confirmation, got: %s", text)
 	}
-	if !strings.Contains(text, "chat-relay bridge session") {
-		t.Fatalf("expected bridge-specific guidance, got: %s", text)
+	if !strings.Contains(text, "mirrors a real chat conversation") {
+		t.Fatalf("expected mirrored-conversation guidance, got: %s", text)
 	}
 	if !strings.Contains(text, "hub_catch_up()") {
 		t.Fatalf("expected a mention of hub_catch_up, got: %s", text)
@@ -118,6 +135,8 @@ func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T)
 		}
 		defer conn.Close()
 		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined.Features = teamsTestFeatures()
+		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 
@@ -143,8 +162,8 @@ func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T)
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -187,6 +206,8 @@ func startRelayTestServerCapturingClientMessages(t *testing.T) (link string, got
 		}
 		defer conn.Close()
 		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined.Features = teamsTestFeatures()
+		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		for {
@@ -217,6 +238,8 @@ func startRelayTestServerEchoingAcks(t *testing.T) (link string) {
 		}
 		defer conn.Close()
 		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined.Features = teamsTestFeatures()
+		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		for {
@@ -259,8 +282,8 @@ func TestHubReactSendsReactionRequest(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -301,8 +324,8 @@ func TestHubReactRejectsInvalidAction(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -335,8 +358,8 @@ func TestHubEditSendsEditRequest(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -375,8 +398,8 @@ func TestHubSendWithMentionsSendsMentionsOnTheWire(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -417,8 +440,8 @@ func TestHubSendRejectsMentionWithoutExactlyOneIdentifier(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -445,8 +468,8 @@ func TestHubEditWithMentionsSendsMentionsOnTheWire(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -486,8 +509,8 @@ func TestHubConfirmSendsAckAndPersistsCursor(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -522,7 +545,7 @@ func TestHubConfirmSendsAckAndPersistsCursor(t *testing.T) {
 	if got != "cursor-confirmed" {
 		t.Fatalf("expected lastHandedOverCursor cursor-confirmed, got %q", got)
 	}
-	if cs, ok := id.Get(); !ok || cs.Cursor != "cursor-confirmed" {
+	if cs, ok := connstore.GetCatchUp(id); !ok || cs.Cursor != "cursor-confirmed" {
 		t.Fatalf("expected persisted catch-up cursor cursor-confirmed, got (%+v, %v)", cs, ok)
 	}
 }
@@ -541,8 +564,8 @@ func TestHubConfirmPrunesHandedOverAhead(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -601,8 +624,8 @@ func TestHubConfirmSurfacesBehindFromServerReply(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -637,8 +660,8 @@ func TestHubConfirmRequiresCursor(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -670,8 +693,8 @@ func TestHubSendWithConfirmCursorConfirmsBeforeSending(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -723,8 +746,8 @@ func TestHubEditWithConfirmCursorConfirmsBeforeEditing(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -755,8 +778,8 @@ func TestHubSendWithoutConfirmCursorDoesNotConfirm(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -787,8 +810,8 @@ func TestHubReactReportsAckDirectly(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -814,8 +837,8 @@ func TestHubEditReportsAckDirectly(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -841,8 +864,8 @@ func TestHubDeleteReportsAckDirectly(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -868,8 +891,8 @@ func TestHubDeleteSendsDeleteRequestAndFallsBackOnTimeout(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -913,37 +936,37 @@ func TestHubDeleteErrorsWhenNotConnected(t *testing.T) {
 	}
 }
 
-func TestHubSendReportsAckDirectlyOnBridgeSession(t *testing.T) {
+func TestHubSendReportsAckDirectlyOnTeamsSession(t *testing.T) {
 	link := startRelayTestServerEchoingAcks(t)
 	ctx := context.Background()
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
 
 	sendReq := mcp.CallToolRequest{}
-	sendReq.Params.Arguments = map[string]any{"text": "hello bridge"}
+	sendReq.Params.Arguments = map[string]any{"text": "hello teams"}
 	res, err := hub.handleSend(ctx, sendReq)
 	if err != nil || res.IsError {
 		t.Fatalf("hub_send failed: err=%v result=%+v", err, res)
 	}
 	text := textOf(res)
 	if !strings.Contains(text, "acknowledged") {
-		t.Fatalf("expected the sendAck reported directly on a bridge session, got: %s", text)
+		t.Fatalf("expected the sendAck reported directly on a teams session, got: %s", text)
 	}
 	if text == "sent" {
 		t.Fatal("expected the real ack, not the bare plain-session confirmation")
 	}
 }
 
-// TestHubSendDoesNotWaitOnAPlainHubConnectSession proves the IsBridge gate:
-// a normal hub_connect session must return its bare "sent" confirmation
-// immediately, with no ack-wait latency, since mcp-hub-server never emits
-// a sendAck at all.
+// TestHubSendDoesNotWaitOnAPlainHubConnectSession proves the actionAcks
+// gate: a server declaring no per-action acks must return the bare "sent"
+// confirmation immediately, with no ack-wait latency, since mcp-hub-server
+// never emits a sendAck at all.
 func TestHubSendDoesNotWaitOnAPlainHubConnectSession(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -951,7 +974,7 @@ func TestHubSendDoesNotWaitOnAPlainHubConnectSession(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	connReq.Params.Arguments = map[string]any{"link": hubLink(url, sessionID)}
 	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
@@ -984,7 +1007,7 @@ func TestHubEditErrorsWhenNotConnected(t *testing.T) {
 	}
 }
 
-func TestTeamsRelayConnectSurfacesBridgeFields(t *testing.T) {
+func TestTeamsRelayConnectSurfacesTeamsFields(t *testing.T) {
 	topic := "Support chat"
 	joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
 	joined.CanSend = true
@@ -995,10 +1018,10 @@ func TestTeamsRelayConnectSurfacesBridgeFields(t *testing.T) {
 
 	hub := NewHub()
 	req := mcp.CallToolRequest{}
-	req.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	res, err := hub.handleTeamsRelayConnect(ctx, req)
+	req.Params.Arguments = map[string]any{"link": link}
+	res, err := hub.handleConnect(ctx, req)
 	if err != nil || res.IsError {
-		t.Fatalf("teams_relay_connect failed: err=%v result=%+v", err, res)
+		t.Fatalf("hub_connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
 
@@ -1016,15 +1039,16 @@ func TestTeamsRelayConnectSurfacesBridgeFields(t *testing.T) {
 func TestTeamsRelayConnectNotesSendRefused(t *testing.T) {
 	joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
 	joined.CanSend = false
+	joined.ConversationKind = "group"
 	link := startRelayTestServerWithJoined(t, joined)
 	ctx := context.Background()
 
 	hub := NewHub()
 	req := mcp.CallToolRequest{}
-	req.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	res, err := hub.handleTeamsRelayConnect(ctx, req)
+	req.Params.Arguments = map[string]any{"link": link}
+	res, err := hub.handleConnect(ctx, req)
 	if err != nil || res.IsError {
-		t.Fatalf("teams_relay_connect failed: err=%v result=%+v", err, res)
+		t.Fatalf("hub_connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
 
@@ -1034,19 +1058,40 @@ func TestTeamsRelayConnectNotesSendRefused(t *testing.T) {
 	}
 }
 
-func TestTeamsRelayConnectRequiresReconnectSecret(t *testing.T) {
-	link, _ := startRelayTestServer(t)
+// The secret is mandatory on the wire but managed here, so a caller that
+// supplies none still connects — and the minted one is stored, so the next
+// connect presents the same one and the identity stays resumable.
+func TestTeamsRelayConnectMintsAndStoresASecretWhenCallerGivesNone(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, headers := startRelayTestServer(t)
 	ctx := context.Background()
 
 	hub := NewHub()
 	req := mcp.CallToolRequest{}
 	req.Params.Arguments = map[string]any{"link": link}
-	res, err := hub.handleTeamsRelayConnect(ctx, req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	res, err := hub.handleConnect(ctx, req)
+	if err != nil || res.IsError {
+		t.Fatalf("expected the connect to succeed without a caller-supplied secret, got err=%v result=%+v", err, res)
 	}
-	if !res.IsError || !strings.Contains(textOf(res), "reconnectSecret") {
-		t.Fatalf("expected a clear error about the missing reconnectSecret, got: %+v", res)
+	sent := headers().Get("Agent-Secret")
+	if sent == "" {
+		t.Fatal("expected an Agent-Secret header to be sent even though the caller supplied none")
+	}
+	hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	target := connstore.Target{Link: link, Project: connstore.CurrentProject()}
+	stored, ok := connstore.Get(target)
+	if !ok || stored.ReconnectSecret != sent {
+		t.Fatalf("expected the minted secret %q to be stored, got %+v (ok=%v)", sent, stored, ok)
+	}
+
+	hub2 := NewHub()
+	if res, err := hub2.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("second connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub2.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if got := headers().Get("Agent-Secret"); got != sent {
+		t.Fatalf("expected the stored secret %q reused on a later connect, got %q", sent, got)
 	}
 }
 
@@ -1055,9 +1100,9 @@ func TestTeamsRelayConnectRejectsLinkWithoutFragment(t *testing.T) {
 	hub := NewHub()
 	req := mcp.CallToolRequest{}
 	req.Params.Arguments = map[string]any{
-		"link": "wss://example.com/relay/join?c=abc", "reconnectSecret": "x",
+		"link": "wss://example.com/relay/join?c=abc",
 	}
-	res, err := hub.handleTeamsRelayConnect(ctx, req)
+	res, err := hub.handleConnect(ctx, req)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1078,8 +1123,8 @@ func TestCatchUpWithNoPriorPositionAndNoBehindReportsNothingToCatchUp(t *testing
 	ctx := context.Background()
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1107,7 +1152,7 @@ func TestCatchUpWithPriorPositionSendsMessageAfterWithCursor(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion}
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		var m wire.MessageAfter
@@ -1132,8 +1177,8 @@ func TestCatchUpWithPriorPositionSendsMessageAfterWithCursor(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1182,7 +1227,7 @@ func TestCatchUpReportsCaughtUpOnNoMoreMessages(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion}
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		var m wire.MessageAfter
@@ -1202,8 +1247,8 @@ func TestCatchUpReportsCaughtUpOnNoMoreMessages(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1265,8 +1310,8 @@ func TestCatchUpSeeksWhenNoPriorCursorButBehindReported(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1301,8 +1346,8 @@ func TestTeamsRelayConnectSurfacesBehindWhenServerReportsIt(t *testing.T) {
 	ctx := context.Background()
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	res, err := hub.handleTeamsRelayConnect(ctx, connReq)
+	connReq.Params.Arguments = map[string]any{"link": link}
+	res, err := hub.handleConnect(ctx, connReq)
 	if err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
@@ -1323,8 +1368,8 @@ func TestTeamsRelayConnectOmitsBehindWhenServerDoesNotReportIt(t *testing.T) {
 	ctx := context.Background()
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	res, err := hub.handleTeamsRelayConnect(ctx, connReq)
+	connReq.Params.Arguments = map[string]any{"link": link}
+	res, err := hub.handleConnect(ctx, connReq)
 	if err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
@@ -1350,7 +1395,7 @@ func TestCatchUpPersistsCursorAcrossHubInstances(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion}
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		var m wire.MessageAfter
@@ -1375,8 +1420,8 @@ func TestCatchUpPersistsCursorAcrossHubInstances(t *testing.T) {
 
 	first := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := first.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := first.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	first.mu.Lock()
@@ -1398,7 +1443,7 @@ func TestCatchUpPersistsCursorAcrossHubInstances(t *testing.T) {
 	// connecting to the same link+project should recover cursor-persisted
 	// without any live traffic telling it — pure persistence.
 	second := NewHub()
-	id := catchUpIDForRelay(ctx, link)
+	id := targetForLink(ctx, link)
 	second.setCatchUpKey(id)
 
 	second.mu.Lock()
@@ -1424,7 +1469,7 @@ func TestCatchUpSkipsMessageAlreadyHandedOverViaHubReceive(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion}
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 
@@ -1470,8 +1515,8 @@ func TestCatchUpSkipsMessageAlreadyHandedOverViaHubReceive(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1537,7 +1582,7 @@ func TestHandedOverAheadPersistsAcrossHubInstances(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion}
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 
@@ -1572,8 +1617,8 @@ func TestHandedOverAheadPersistsAcrossHubInstances(t *testing.T) {
 
 	first := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := first.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := first.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
@@ -1594,13 +1639,13 @@ func TestHandedOverAheadPersistsAcrossHubInstances(t *testing.T) {
 	// A second, independent *Hub connecting to the same key catches up
 	// from before the already-seen cursor — it must skip it silently
 	// (proving handedOverAhead survived) rather than re-present it.
-	// handleTeamsRelayConnect calls setCatchUpKey internally, which loads
+	// handleConnect calls setCatchUpKey internally, which loads
 	// whatever's persisted for this key (including handedOverAhead); the
 	// manual lastHandedOverCursor override below simulates "this process
 	// had already walked to cursor-0," the same trick
 	// TestCatchUpPersistsCursorAcrossHubInstances uses.
 	second := NewHub()
-	if res, err := second.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	if res, err := second.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("second connect failed: err=%v result=%+v", err, res)
 	}
 	defer second.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1655,8 +1700,8 @@ func TestCatchUpSeekRecordsGapAndSurfacesItOnLaterCalls(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1706,6 +1751,8 @@ func TestBehindNoteSurfacesRecordedGapAtConnect(t *testing.T) {
 		}
 		defer conn.Close()
 		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined.Features = teamsTestFeatures()
+		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		for {
@@ -1718,13 +1765,13 @@ func TestBehindNoteSurfacesRecordedGapAtConnect(t *testing.T) {
 	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#secret-1"
 	ctx := context.Background()
 
-	id := catchUpIDForRelay(ctx, link)
+	id := targetForLink(ctx, link)
 	setCatchUpGap(id, "2026-09-01T09:12:00Z", "2026-09-04T15:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	res, err := hub.handleTeamsRelayConnect(ctx, connReq)
+	connReq.Params.Arguments = map[string]any{"link": link}
+	res, err := hub.handleConnect(ctx, connReq)
 	if err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
@@ -1750,8 +1797,8 @@ func TestCatchUpGapReportsNoneWhenNoGapRecorded(t *testing.T) {
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1786,7 +1833,7 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion}
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		for {
@@ -1823,13 +1870,13 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
 	ctx := context.Background()
 
-	id := catchUpIDForRelay(ctx, link)
+	id := targetForLink(ctx, link)
 	setCatchUpGap(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1904,7 +1951,7 @@ func TestCatchUpGapRetrievesPeerlessSystemMsg(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion}
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		for {
@@ -1927,13 +1974,13 @@ func TestCatchUpGapRetrievesPeerlessSystemMsg(t *testing.T) {
 	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
 	ctx := context.Background()
 
-	id := catchUpIDForRelay(ctx, link)
+	id := targetForLink(ctx, link)
 	setCatchUpGap(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -1973,7 +2020,7 @@ func TestCatchUpGapDedupBranchPrunesHandedOverAhead(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion}
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
 		for {
@@ -1997,13 +2044,13 @@ func TestCatchUpGapDedupBranchPrunesHandedOverAhead(t *testing.T) {
 	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
 	ctx := context.Background()
 
-	id := catchUpIDForRelay(ctx, link)
+	id := targetForLink(ctx, link)
 	setCatchUpGap(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
-	connReq.Params.Arguments = map[string]any{"link": link, "reconnectSecret": "resume-me"}
-	if res, err := hub.handleTeamsRelayConnect(ctx, connReq); err != nil || res.IsError {
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
@@ -2029,5 +2076,258 @@ func TestCatchUpGapDedupBranchPrunesHandedOverAhead(t *testing.T) {
 	}
 	if persisted := loadHandedOverAhead(id); persisted["cursor-dup-1"] {
 		t.Fatal("expected cursor-dup-1 to be pruned from the persisted handedOverAhead too")
+	}
+}
+
+// A large backlog is seeked past even when a position IS known — walking
+// it one message at a time is the round-trip cost the threshold exists to
+// avoid. The skip must be recorded, so it stays both announced and
+// retrievable, and it must happen only once: Behind is a connect-time
+// snapshot that never moves, so a second seek would overwrite the gap
+// record and lose whatever of it had been retrieved.
+func TestCatchUpSeeksPastALargeBacklogEvenWithAKnownCursorAndOnlyOnce(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	var mu sync.Mutex
+	var anchors []wire.Anchor
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+			Behind: 3000, BehindSince: "2026-09-01T09:12:00Z",
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			mu.Lock()
+			anchors = append(anchors, wire.Anchor{At: m.At, Cursor: m.Cursor})
+			mu.Unlock()
+			conn.WriteJSON(wire.Msg{
+				Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440099",
+				Text: "after the seek", Cursor: "cursor-live-1", Historical: true,
+				Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor},
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	// A known position, exactly the case that used to walk regardless.
+	hub.mu.Lock()
+	hub.lastHandedOverCursor = "cursor-known"
+	hub.mu.Unlock()
+
+	first, err := hub.handleCatchUp(ctx, mcp.CallToolRequest{})
+	if err != nil || first.IsError {
+		t.Fatalf("first catch-up failed: err=%v result=%+v", err, first)
+	}
+	if !strings.Contains(textOf(first), "seeking to recent context") {
+		t.Fatalf("expected a seek past the 3000-message backlog, got: %s", textOf(first))
+	}
+	if !strings.Contains(textOf(first), "hub_catch_up(gap: true)") {
+		t.Fatalf("expected the skipped range to be announced as retrievable, got: %s", textOf(first))
+	}
+
+	mu.Lock()
+	firstAnchor := anchors[0]
+	mu.Unlock()
+	if firstAnchor.At == "" || firstAnchor.Cursor != "" {
+		t.Fatalf("expected the first request to seek by timestamp, not walk by cursor, got %+v", firstAnchor)
+	}
+
+	hub.mu.Lock()
+	id := hub.catchUpID
+	hub.mu.Unlock()
+	from, to, ok := getCatchUpGap(id)
+	if !ok || from != "2026-09-01T09:12:00Z" || to == "" {
+		t.Fatalf("expected the skipped range recorded from the server's last-acked position, got from=%q to=%q ok=%v", from, to, ok)
+	}
+
+	// Behind is still 3000. A second call must walk from where the seek
+	// landed rather than seek again and overwrite the gap.
+	second, err := hub.handleCatchUp(ctx, mcp.CallToolRequest{})
+	if err != nil || second.IsError {
+		t.Fatalf("second catch-up failed: err=%v result=%+v", err, second)
+	}
+	if strings.Contains(textOf(second), "seeking to recent context") {
+		t.Fatalf("expected no second seek, got: %s", textOf(second))
+	}
+	if from2, to2, ok2 := getCatchUpGap(id); !ok2 || from2 != from || to2 != to {
+		t.Fatalf("expected the gap record untouched by the second call, got from=%q to=%q ok=%v", from2, to2, ok2)
+	}
+}
+
+// With no BehindSince to anchor a gap record, a seek could not be
+// announced or retrieved — so a large backlog walks instead. A silent
+// skip is the one outcome that is never acceptable here.
+func TestCatchUpWalksALargeBacklogWhenTheSkipCouldNotBeRecorded(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	var mu sync.Mutex
+	var anchors []wire.Anchor
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Behind without BehindSince: the spec requires them together, so
+		// this is a server that got it wrong — and being wrong must not
+		// cost the model messages it is never told about.
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+			Behind: 3000,
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			mu.Lock()
+			anchors = append(anchors, wire.Anchor{At: m.At, Cursor: m.Cursor})
+			mu.Unlock()
+			conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hub.mu.Lock()
+	hub.lastHandedOverCursor = "cursor-known"
+	hub.mu.Unlock()
+
+	res, err := hub.handleCatchUp(ctx, mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("catch-up failed: err=%v result=%+v", err, res)
+	}
+	if strings.Contains(textOf(res), "seeking to recent context") {
+		t.Fatalf("expected a walk when the skip could not be recorded, got: %s", textOf(res))
+	}
+	mu.Lock()
+	first := anchors[0]
+	mu.Unlock()
+	if first.Cursor != "cursor-known" {
+		t.Fatalf("expected a walk from the known cursor, got %+v", first)
+	}
+	hub.mu.Lock()
+	id := hub.catchUpID
+	hub.mu.Unlock()
+	if _, _, ok := getCatchUpGap(id); ok {
+		t.Fatal("expected no gap recorded when nothing was skipped")
+	}
+}
+
+// Discarding a gap must leave a record, not a hole: "nobody read this
+// range, deliberately" has to stay distinguishable from "there was never
+// a gap", or the discard reintroduces exactly the silence the gap
+// mechanism exists to prevent.
+func TestDiscardGapWritesItOffAndRecordsTheDecision(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := startRelayTestServer(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hub.mu.Lock()
+	id := hub.catchUpID
+	hub.mu.Unlock()
+	setCatchUpGap(id, "2026-09-01T09:00:00Z", "2026-09-08T09:00:00Z")
+
+	discardReq := mcp.CallToolRequest{}
+	discardReq.Params.Arguments = map[string]any{"discardGap": true}
+	res, err := hub.handleCatchUp(ctx, discardReq)
+	if err != nil || res.IsError {
+		t.Fatalf("discard failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "UNREAD") || !strings.Contains(text, "2026-09-01T09:00:00Z") {
+		t.Fatalf("expected the result to state plainly what was written off, got: %s", text)
+	}
+
+	if _, _, ok := getCatchUpGap(id); ok {
+		t.Fatal("expected the open gap to be gone after a discard")
+	}
+	cs, _ := connstore.GetCatchUp(id)
+	if len(cs.Discarded) != 1 {
+		t.Fatalf("expected the decision recorded, got %+v", cs.Discarded)
+	}
+	if cs.Discarded[0].From != "2026-09-01T09:00:00Z" || cs.Discarded[0].To != "2026-09-08T09:00:00Z" {
+		t.Fatalf("expected the discarded range recorded verbatim, got %+v", cs.Discarded[0])
+	}
+	if cs.Discarded[0].At.IsZero() {
+		t.Fatal("expected the discard to be timestamped")
+	}
+
+	// And it must stop nagging: a later catch-up no longer mentions it.
+	if again, err := hub.handleCatchUp(ctx, mcp.CallToolRequest{}); err == nil && !again.IsError {
+		if strings.Contains(textOf(again), "not yet walked") {
+			t.Fatalf("expected no further gap nagging after a discard, got: %s", textOf(again))
+		}
+	}
+}
+
+func TestDiscardGapWithNoGapChangesNothing(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := startRelayTestServer(t)
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	discardReq := mcp.CallToolRequest{}
+	discardReq.Params.Arguments = map[string]any{"discardGap": true}
+	res, err := hub.handleCatchUp(ctx, discardReq)
+	if err != nil || res.IsError {
+		t.Fatalf("discard failed: err=%v result=%+v", err, res)
+	}
+	if !strings.Contains(textOf(res), "nothing to discard") {
+		t.Fatalf("expected a plain no-op answer, got: %s", textOf(res))
+	}
+	hub.mu.Lock()
+	id := hub.catchUpID
+	hub.mu.Unlock()
+	if cs, _ := connstore.GetCatchUp(id); len(cs.Discarded) != 0 {
+		t.Fatalf("expected nothing recorded when there was nothing to discard, got %+v", cs.Discarded)
 	}
 }

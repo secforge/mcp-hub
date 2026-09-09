@@ -561,7 +561,7 @@ func TestDisconnectedSourceReportedImmediately(t *testing.T) {
 }
 
 // fakeSourceWithNote is a fakeSource that also implements disconnectNoter,
-// simulating a bridge-style Source (e.g. *hubconn.Conn after a relay
+// simulating a teams Source (e.g. *hubconn.Conn after a relay
 // server's close code) that can explain why it died beyond an ordinary
 // drop.
 type fakeSourceWithNote struct {

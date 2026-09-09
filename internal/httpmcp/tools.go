@@ -120,7 +120,7 @@ func (s *Server) Register(mcpServer *server.MCPServer) {
 					"Required if imageData is set")),
 			mcp.WithString("fileData", mcp.Description(
 				"Optional base64-encoded file to attach — any content type, not just images (use "+
-					"imageData for images against a server, like a Teams bridge, that only accepts "+
+					"imageData for images against a server, like a teams relay, that only accepts "+
 					"those). Raw (pre-encoding) size must not exceed 32MB. Mutually exclusive with "+
 					"imageData")),
 			mcp.WithString("fileContentType", mcp.Description(
@@ -296,7 +296,7 @@ func (s *Server) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 // client depending on how strictly it validates — never something this
 // should risk. httpmcp never sees the reference form of an attachment
 // (Token set, ContentBytes empty — see wire.Attachment.IsReference): that
-// only comes from a chat-relay-style bridge server, and httpmcp only ever
+// only comes from a chat-relay-style teams relay, and httpmcp only ever
 // talks to hubsession in-process, which never produces one.
 func resultWithAttachments(formatted string, events []hubconn.Event) *mcp.CallToolResult {
 	content := []mcp.Content{mcp.TextContent{Type: mcp.ContentTypeText, Text: formatted}}
