@@ -1491,6 +1491,55 @@ func TestHandleListConnectionsShowsEntriesWithoutLeakingSecret(t *testing.T) {
 	}
 }
 
+func TestHandleListConnectionsIncludesBridgeSessionsAndTopics(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440001"
+	ctx := context.Background()
+	project := connstore.CurrentProject()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"host": url, "sessionId": sessionID}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	target := connstore.Target{Host: url, SessionID: sessionID, Project: project}
+	entry, ok := connstore.Get(target)
+	if !ok {
+		t.Fatal("expected an entry to be stored")
+	}
+	entry.Topic = "Hub Session Topic"
+	if err := connstore.Upsert(target, entry); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	linkTarget := "wss://bridge.example/relay/join?c=list-connections-test"
+	teamsID := connstore.TeamsID{LinkTarget: linkTarget, Project: project}
+	if err := connstore.SetTeamsTopic(teamsID, "Bridge Conversation Topic"); err != nil {
+		t.Fatalf("SetTeamsTopic: %v", err)
+	}
+
+	res, err := hub.handleListConnections(ctx, mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("handleListConnections failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, url) || !strings.Contains(text, sessionID) {
+		t.Fatalf("expected the hub entry listed, got: %s", text)
+	}
+	if !strings.Contains(text, `topic="Hub Session Topic"`) {
+		t.Fatalf("expected the hub entry's topic shown, got: %s", text)
+	}
+	if !strings.Contains(text, linkTarget) {
+		t.Fatalf("expected the bridge/teams entry listed, got: %s", text)
+	}
+	if !strings.Contains(text, `topic="Bridge Conversation Topic"`) {
+		t.Fatalf("expected the bridge entry's topic shown, got: %s", text)
+	}
+}
+
 func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 

@@ -1683,6 +1683,14 @@ func TestCatchUpSeekRecordsGapAndSurfacesItOnLaterCalls(t *testing.T) {
 	if !strings.Contains(text, "2026-09-01T09:12:00Z") {
 		t.Fatalf("expected the persisted gap to still be mentioned, got: %s", text)
 	}
+	// Regression for the stale-wording bug found live, 2026-09-08: the
+	// note used to say "not walked by this tool" without ever mentioning
+	// hub_catch_up(gap: true) actually existed — left over from before
+	// that feature shipped, so a caller reading only this note had no
+	// way to learn how to retrieve the gap.
+	if !strings.Contains(text, "hub_catch_up(gap: true)") {
+		t.Fatalf("expected the note to name hub_catch_up(gap: true), got: %s", text)
+	}
 }
 
 // TestBehindNoteSurfacesRecordedGapAtConnect proves the gap is also
@@ -1725,6 +1733,11 @@ func TestBehindNoteSurfacesRecordedGapAtConnect(t *testing.T) {
 	text := textOf(res)
 	if !strings.Contains(text, "still on record") || !strings.Contains(text, "2026-09-01T09:12:00Z") {
 		t.Fatalf("expected the connect result to mention the recorded gap, got: %s", text)
+	}
+	// Regression for the stale-wording bug found live, 2026-09-08 — see
+	// the matching assertion in TestCatchUpSeekRecordsGapAndSurfacesItOnLaterCalls.
+	if !strings.Contains(text, "hub_catch_up(gap: true)") {
+		t.Fatalf("expected the note to name hub_catch_up(gap: true), got: %s", text)
 	}
 }
 

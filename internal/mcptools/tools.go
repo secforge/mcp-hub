@@ -1227,8 +1227,8 @@ func (h *Hub) behindNote(conn *hubconn.Conn) string {
 	h.mu.Unlock()
 	if from, to, ok := getCatchUpGap(id); ok {
 		note += fmt.Sprintf("\nAlso still on record: an earlier catch-up seek skipped the range %s "+
-			"to %s rather than walk it. Not lost — still on the server — but this tool has no way "+
-			"to manually target that range; mention it if it matters for the current task.", from, to)
+			"to %s rather than walk it. Not lost — still on the server — call "+
+			"hub_catch_up(gap: true) to retrieve it.", from, to)
 	}
 	return note
 }
@@ -1545,16 +1545,20 @@ func (h *Hub) Shutdown() {
 }
 
 func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	entries, err := connstore.List()
+	currentProject := projectForConnect(ctx)
+	hubEntries, err := connstore.ListForProject(currentProject)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not list stored connections: %v", err)), nil
 	}
-	if len(entries) == 0 {
-		return mcp.NewToolResultText("no stored connections"), nil
+	teamsEntries, err := connstore.ListTeamsForProject(currentProject)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("could not list stored connections: %v", err)), nil
 	}
-	currentProject := projectForConnect(ctx)
-	lines := make([]string, 0, len(entries))
-	for _, le := range entries {
+	if len(hubEntries) == 0 && len(teamsEntries) == 0 {
+		return mcp.NewToolResultText("no stored connections for this project"), nil
+	}
+	lines := make([]string, 0, len(hubEntries)+len(teamsEntries))
+	for _, le := range hubEntries {
 		line := fmt.Sprintf("host=%s sessionId=%s peerId=%s", le.Target.Host, le.Target.SessionID, le.Entry.PeerID)
 		if le.Entry.Name != "" {
 			line += fmt.Sprintf(" name=%q", le.Entry.Name)
@@ -1566,10 +1570,16 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		if le.Entry.Connected {
 			line += " (still marked open)"
 		}
-		if le.Target.Project == currentProject {
-			line += " [this project]"
-		} else if le.Target.Project != "" {
-			line += fmt.Sprintf(" [other project: %s]", le.Target.Project)
+		lines = append(lines, line)
+	}
+	for _, le := range teamsEntries {
+		line := fmt.Sprintf("link=%s", le.TeamsID.LinkTarget)
+		if le.Entry.Topic != "" {
+			line += fmt.Sprintf(" topic=%q", le.Entry.Topic)
+		}
+		line += fmt.Sprintf(" lastConnectedAt=%s", le.Entry.LastConnectedAt.Format(time.RFC3339))
+		if le.Entry.Connected {
+			line += " (still marked open)"
 		}
 		lines = append(lines, line)
 	}
@@ -1809,7 +1819,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	gapNote := ""
 	if from, to, ok := getCatchUpGap(catchUpIDNow); ok {
 		gapNote = fmt.Sprintf("\n[hub: note — an earlier catch-up seek also skipped %s to %s, "+
-			"still on the server but not walked by this tool]", from, to)
+			"still on the server but not yet walked — call hub_catch_up(gap: true) to retrieve it]", from, to)
 	}
 
 	var anchor wire.Anchor

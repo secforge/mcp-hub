@@ -167,6 +167,13 @@ type ListedEntry struct {
 	Entry  Entry
 }
 
+// ListedTeamsEntry is ListedEntry's counterpart for a teams_relay_connect
+// (bridge) session — see TeamsID.
+type ListedTeamsEntry struct {
+	TeamsID TeamsID
+	Entry   Entry
+}
+
 // state is the file's whole on-disk shape: ONE map, nested by identity
 // field rather than a concatenated string key — see the package doc
 // comment for why. Project is the OUTERMOST key, at the project owner's
@@ -416,6 +423,48 @@ func List() ([]ListedEntry, error) {
 					Entry:  e,
 				})
 			}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// ListForProject is List scoped to one project — a direct single-key
+// lookup rather than a full-file scan, since project is now the
+// outermost key on disk (see the package doc comment).
+func ListForProject(project string) ([]ListedEntry, error) {
+	var out []ListedEntry
+	err := withLock(false, func() error {
+		s := load()
+		for key, e := range s[project] {
+			if !strings.HasPrefix(key, "hub ") {
+				continue
+			}
+			host, sessionID := splitHubKey(key)
+			out = append(out, ListedEntry{
+				Target: Target{Host: host, SessionID: sessionID, Project: project},
+				Entry:  e,
+			})
+		}
+		return nil
+	})
+	return out, err
+}
+
+// ListTeamsForProject is ListForProject's counterpart for
+// teams_relay_connect (bridge) sessions.
+func ListTeamsForProject(project string) ([]ListedTeamsEntry, error) {
+	var out []ListedTeamsEntry
+	err := withLock(false, func() error {
+		s := load()
+		for key, e := range s[project] {
+			if !strings.HasPrefix(key, "teams ") {
+				continue
+			}
+			out = append(out, ListedTeamsEntry{
+				TeamsID: TeamsID{LinkTarget: strings.TrimPrefix(key, "teams "), Project: project},
+				Entry:   e,
+			})
 		}
 		return nil
 	})
