@@ -2,14 +2,23 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/secforge/mcp-hub/internal/mcptools"
+	"github.com/secforge/mcp-hub/internal/version"
 )
 
 func main() {
+	// Answered before anything else starts, and printed to stdout, because
+	// this is what a running MCP server is asked to compare itself against
+	// when a connect fails and the binary on disk may have moved on.
+	if len(os.Args) >= 2 && (os.Args[1] == "--version" || os.Args[1] == "version" || os.Args[1] == "-version") {
+		fmt.Println(version.String())
+		return
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "wait" {
 		fs := flag.NewFlagSet("wait", flag.ExitOnError)
 		socket := fs.String("socket", "", "path to the wait unix socket")
@@ -19,7 +28,7 @@ func main() {
 		os.Exit(runWait(*socket, *follow, os.Stdout, os.Stderr))
 	}
 
-	s := server.NewMCPServer("mcp-hub-client", "0.1.0", server.WithToolCapabilities(false), server.WithRoots())
+	s := server.NewMCPServer("mcp-hub-client", version.Short(), server.WithToolCapabilities(false), server.WithRoots())
 	hub := mcptools.NewHub()
 	hub.Register(s)
 	// ServeStdio returns on SIGTERM/SIGINT (it already installs a handler

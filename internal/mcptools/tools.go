@@ -18,6 +18,8 @@ import (
 	"github.com/secforge/mcp-hub/internal/agekey"
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/hubconn"
+	"github.com/secforge/mcp-hub/internal/selfupdate"
+	"github.com/secforge/mcp-hub/internal/version"
 	"github.com/secforge/mcp-hub/internal/waiter"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
@@ -681,6 +683,26 @@ func (h *Hub) Register(s *server.MCPServer) {
 		h.handleListConnections,
 	)
 	s.AddTool(
+		mcp.NewTool("hub_self_update",
+			mcp.WithDescription("Check GitHub for a newer mcp-hub-client release and, if there is "+
+				"one, install it over this client's own binary. Offered when a connect fails in a "+
+				"way that looks like the server having moved on — a handshake or protocol change "+
+				"this build predates.\n"+
+				"Checks in this order, and stops at the first that says no: whether the binary on "+
+				"disk already differs from this running process (then the update is installed "+
+				"already and the answer is a restart, not a download); whether the newest release "+
+				"is actually newer than this build; and whether the downloaded binary's detached "+
+				"signature verifies against this project's release key. A binary that fails "+
+				"verification is never written anywhere it could be run from.\n"+
+				"Nothing about the RUNNING process changes: replacing the file on disk leaves this "+
+				"process as it was, so the user has to restart the MCP server for it to take "+
+				"effect. Say so explicitly when reporting the result — an installed-but-unloaded "+
+				"update is exactly the confusing state this tool exists to resolve. Read-only "+
+				"until it finds a verified newer release; safe to call to find out where you "+
+				"stand")),
+		h.handleSelfUpdate,
+	)
+	s.AddTool(
 		mcp.NewTool("hub_receive",
 			mcp.WithDescription("Drain and return currently buffered hub events without blocking. "+
 				"An image attached to a received message is saved to a local temp file, not "+
@@ -995,7 +1017,12 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		Topic:           req.GetString("topic", ""),
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %v", err)), nil
+		// A failed connect is where "is this process even running the
+		// installed code?" stops being trivia. An MCP server outlives the
+		// binary it was launched from, so a handshake that a rebuilt client
+		// would have completed can keep failing here indefinitely, and the
+		// fix differs entirely depending on which case it is.
+		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %v%s", err, selfupdate.Check().Note())), nil
 	}
 	w, err := waiter.Listen(conn)
 	if err != nil {
@@ -1485,6 +1512,50 @@ func (h *Hub) Shutdown() {
 	if target != (connstore.Target{}) {
 		_ = connstore.MarkDisconnected(target)
 	}
+}
+
+// handleSelfUpdate is deliberately blunt about the one thing that trips
+// people up here: replacing the binary does nothing to this process. Every
+// success path says so, because an update that is installed but unloaded
+// looks exactly like an update that did not happen.
+func (h *Hub) handleSelfUpdate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Asked before going anywhere near the network: if the file on disk has
+	// already moved on, the newest release is not the question. Downloading
+	// it would "succeed" while changing nothing about why the connect
+	// failed, and would bury the actual answer.
+	if st := selfupdate.Check(); st.Stale {
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"No update needed — one is already installed and waiting. This process is running %s "+
+				"while the binary on disk is %s, so it was replaced after this MCP server started. "+
+				"Nothing was downloaded. Ask the user to restart the MCP server; that alone loads "+
+				"the newer client.", st.Running, st.OnDisk)), nil
+	}
+
+	running := version.Short()
+	res, err := selfupdate.Apply(ctx, running)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"self-update did not proceed: %v\n\nThis client is still %s and its binary is "+
+				"untouched.", err, running)), nil
+	}
+	if !res.Replaced {
+		latest := res.Latest
+		if latest == "" {
+			latest = "unknown"
+		}
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Already current: this client is %s and the newest published release is %s, so nothing "+
+				"was downloaded. If a connect is still failing, the cause is not an out-of-date "+
+				"client — say so rather than retrying the update.", running, latest)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"Installed %s over %s at %s, signature verified against this project's release key.\n\n"+
+			"TELL THE USER TO RESTART THE MCP SERVER. This process is still running the old %s — "+
+			"replacing the file on disk does not change a process already running from it, so "+
+			"nothing about the failure that prompted this is fixed until the restart happens. Do "+
+			"not retry the connect first and do not call this tool again; it will now report that "+
+			"an update is already installed and waiting.",
+		res.Latest, running, res.Path, running)), nil
 }
 
 func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

@@ -324,15 +324,26 @@ reads state already being kept.
 |`hub_disconnect()`
 |Leave the session and tear down the connection.
 
+|`hub_self_update()`
+|Check GitHub for a newer `mcp-hub-client` release and install it over
+this client's own binary. Offered by a failed `hub_connect` when the
+failure looks like the server having moved on. Checks in order, stopping
+at the first no: whether the binary *on disk* already differs from this
+running process (then the update is installed and the answer is a
+restart, not a download); whether the newest release is actually newer;
+and whether the downloaded binary's detached Ed25519 signature verifies
+against the release key compiled into this client. A binary that fails
+verification is never written anywhere it could be run from. Replacing
+the file does not change the running process, so a restart is always
+required afterwards — every result says so.
+
 |`hub_list_connections()`
-|List every `host`+`sessionId` this client has connected to before via
-`hub_connect`'s host path (not its link path, which manages identity
-differently) — the `peerId`/display name last used, when, and whether it's
-still marked open from a connection that never got an explicit
-`hub_disconnect` (most commonly because the process/conversation simply
-ended, not necessarily a crash), each tagged `[this project]` or
-`[other project: ...]` (see `reconnectSecret` above) so it's clear which
-entries this exact `hub_connect` call would actually reuse. Read-only.
+|List the links this client has connected to before *from this project* —
+the `peerId`/display name each last used, the conversation's name where
+the server reported one, any unretrieved or deliberately written-off
+catch-up gap, and whether it's still marked open from a connection that
+never got an explicit `hub_disconnect` (most commonly because the
+process/conversation simply ended, not necessarily a crash). Read-only.
 Never includes the stored
 `reconnectSecret` itself — that's meant to stay out of Claude's context by
 design, and `hub_connect` already reuses it automatically without needing
@@ -576,6 +587,36 @@ All packages (`internal/wire`, `internal/hublog`, `internal/hubsession`,
 tests; none require a running server or network access — the websocket tests
 use `httptest.Server`, and the wait-socket tests use real (temp-directory)
 Unix sockets.
+
+== Releasing the client
+
+Cut a release with `scripts/release.sh vX.Y.Z`. It builds every supported
+platform, signs each asset, and publishes them — but most of what it does
+is refuse to publish something untrue about itself:
+
+* `git fetch --tags` first. Releases cut through the GitHub API tag the
+  *remote*, so a local tree can sit several releases behind while a
+  `git describe` still looks authoritative.
+* Refuses a dirty tree, because the binary would embed `vcs.modified` and
+  could not be reproduced from any commit.
+* Asks the freshly built native binary its own version and refuses if the
+  answer isn't the tag being published — a typo in the ldflags fails the
+  release instead of shipping.
+* Signs each asset and then *verifies* it against the same public key the
+  client has compiled in, so a key mismatch costs one failed script rather
+  than one failed update per machine.
+
+The signing key lives at `~/.config/mcp-hub/release-signing.key` (mode
+0600), or wherever `MCP_HUB_SIGNING_KEY` points. It is never in the
+repository. The matching public key is compiled into the client, which has
+one consequence worth planning for: *key rotation must ship before it is
+needed*, since a new key can only reach a client through a build signed by
+the old one.
+
+A binary knows what it is via `mcp-hub-client --version`. Only a release
+build carries a tag; anything else reports the commit it was built from
+and says plainly that it is not a release, rather than guessing a version
+it might not be.
 
 == Deployment
 

@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
+	"github.com/secforge/mcp-hub/internal/selfupdate"
+	"github.com/secforge/mcp-hub/internal/version"
 	"github.com/secforge/mcp-hub/internal/wire"
 	"github.com/secforge/mcp-hub/internal/wsserver"
 )
@@ -1908,4 +1911,110 @@ func TestConnectWithANameDoesNotNagAboutIt(t *testing.T) {
 	if strings.Contains(text, "can see your .") {
 		t.Fatalf("expected no half-formed identity sentence, got: %s", text)
 	}
+}
+
+// The staleness short-circuit is the point of the tool: when the binary on
+// disk has already moved on, the answer is a restart and NOTHING should be
+// downloaded. Getting this wrong means a "successful" update that changes
+// nothing about why the connect failed, burying the real answer.
+func TestSelfUpdateReportsAnAlreadyInstalledUpdateWithoutTouchingTheNetwork(t *testing.T) {
+	// A stand-in binary whose reported version differs from this process's.
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "mcp-hub-client")
+	script := "#!/bin/sh\necho 'mcp-hub-client v99.0.0'\n"
+	if err := os.WriteFile(exe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	restore := selfupdate.SetExecutablePathForTest(exe)
+	defer restore()
+
+	// Pointed at a server that fails the test if it is ever consulted.
+	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the network was consulted even though the on-disk binary had already moved on")
+	}))
+	defer unreachable.Close()
+	restoreAPI := selfupdate.SetReleasesAPIForTest(unreachable.URL)
+	defer restoreAPI()
+
+	res, err := NewHub().handleSelfUpdate(context.Background(), mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("hub_self_update failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "v99.0.0") || !strings.Contains(text, "restart") {
+		t.Fatalf("expected it to name the installed version and prescribe a restart, got: %s", text)
+	}
+	if !strings.Contains(text, "Nothing was downloaded") {
+		t.Fatalf("expected it to say nothing was downloaded, got: %s", text)
+	}
+}
+
+// A development build carries a revision, not a release version, so there
+// is nothing to compare a published tag against. It must refuse rather
+// than guess — guessing "older" would let a connect failure silently
+// replace someone's working-tree build with a release.
+func TestSelfUpdateRefusesToCompareADevelopmentBuild(t *testing.T) {
+	exe := selfUpdateStubBinary(t, version.Short())
+	restore := selfupdate.SetExecutablePathForTest(exe)
+	defer restore()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"tag_name":"v99.0.0","assets":[]}`)
+	}))
+	defer srv.Close()
+	restoreAPI := selfupdate.SetReleasesAPIForTest(srv.URL)
+	defer restoreAPI()
+
+	res, err := NewHub().handleSelfUpdate(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected a refusal rather than an update, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), "not a release version") {
+		t.Fatalf("expected the reason to be an uncomparable version, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), "binary is untouched") {
+		t.Fatalf("expected it to state the binary was untouched, got: %s", textOf(res))
+	}
+}
+
+// A refusal must come back as an error the model cannot mistake for
+// success, and must say the binary is untouched.
+func TestSelfUpdateSurfacesARefusalAsAnError(t *testing.T) {
+	exe := selfUpdateStubBinary(t, version.Short())
+	restore := selfupdate.SetExecutablePathForTest(exe)
+	defer restore()
+
+	// A newer release with an asset but no signature beside it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"tag_name":"v99.0.0","assets":[{"name":%q,"browser_download_url":"http://127.0.0.1:1/x"}]}`,
+			selfupdate.AssetName())
+	}))
+	defer srv.Close()
+	restoreAPI := selfupdate.SetReleasesAPIForTest(srv.URL)
+	defer restoreAPI()
+
+	res, err := NewHub().handleSelfUpdate(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected a refusal to be reported as an error, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), "binary is untouched") {
+		t.Fatalf("expected it to state the binary was untouched, got: %s", textOf(res))
+	}
+}
+
+// selfUpdateStubBinary writes an executable that reports the given version,
+// standing in for this process's own binary.
+func selfUpdateStubBinary(t *testing.T, reported string) string {
+	t.Helper()
+	exe := filepath.Join(t.TempDir(), "mcp-hub-client")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\necho 'mcp-hub-client "+reported+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return exe
 }
