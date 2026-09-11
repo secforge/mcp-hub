@@ -2069,3 +2069,34 @@ func TestConnectSaysNothingAboutVersionsWhenNothingIsStale(t *testing.T) {
 		t.Fatalf("expected no version commentary when nothing is stale, got: %s", textOf(res))
 	}
 }
+
+// The recovery for a cut-off message is stated at connect, because the
+// moment it matters is the moment one arrives looking wrong — not a moment
+// to go hunting for which call retrieves it. It must also be accurate
+// about the anchor: a cut message's own cursor cannot fetch it, since
+// `after` returns what FOLLOWS the cursor given.
+func TestConnectExplainsHowToRetrieveATruncatedMessage(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440003"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": hubLink(url, sessionID)}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	text := textOf(res)
+	for _, want := range []string{
+		"marker is missing",          // how to notice
+		"do NOT confirm it",          // what not to do
+		"hub_read(after:",            // how to recover
+		"OWN cursor cannot fetch it", // the trap in the anchor semantics
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected the connect result to state %q, got: %s", want, text)
+		}
+	}
+}

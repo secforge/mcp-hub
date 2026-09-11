@@ -2441,3 +2441,147 @@ func waitForBufferedEvent(t *testing.T, hub *Hub) {
 	}
 	t.Fatal("no event arrived")
 }
+
+// hub_read must not consume a backlog — the position and any recorded gap
+// stay put, so asking about the past cannot eat what is still unread. But
+// the delivery itself IS recorded: the message reached the model, and a
+// later catch-up should skip past it rather than show it twice.
+func TestReadRecordsTheDeliveryWithoutConsumingTheBacklog(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	var mu sync.Mutex
+	var anchors []wire.Anchor
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			mu.Lock()
+			anchors = append(anchors, wire.Anchor{At: m.At, Cursor: m.Cursor})
+			mu.Unlock()
+			conn.WriteJSON(wire.Msg{
+				Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440099",
+				Text: "something said earlier", Cursor: "cursor-old-1", Historical: true,
+				Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor},
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hub.mu.Lock()
+	id := hub.catchUpID
+	hub.lastHandedOverCursor = "cursor-position"
+	hub.knownContiguous = true
+	hub.mu.Unlock()
+	setCatchUpGap(id, "2026-09-10T18:00:00Z", "2026-09-10T20:00:00Z")
+	before, _ := connstore.GetCatchUp(id)
+
+	readReq := mcp.CallToolRequest{}
+	readReq.Params.Arguments = map[string]any{"at": "2026-09-10T18:30:00Z"}
+	res, err := hub.handleRead(ctx, readReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_read failed: err=%v result=%+v", err, res)
+	}
+	if !strings.Contains(textOf(res), "something said earlier") {
+		t.Fatalf("expected the message back, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), "unread position is unchanged") {
+		t.Fatalf("expected the result to say the position did not move, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), "recorded as delivered") {
+		t.Fatalf("expected the result to say the delivery was recorded, got: %s", textOf(res))
+	}
+
+	mu.Lock()
+	sent := anchors[len(anchors)-1]
+	mu.Unlock()
+	if sent.At != "2026-09-10T18:30:00Z" || sent.Cursor != "" {
+		t.Fatalf("expected the timestamp anchor passed through verbatim, got %+v", sent)
+	}
+
+	// Nothing may have moved: not the position, not the seen-ahead set,
+	// not the recorded gap.
+	after, _ := connstore.GetCatchUp(id)
+	if after.Cursor != before.Cursor {
+		t.Fatalf("expected the position untouched, %q -> %q", before.Cursor, after.Cursor)
+	}
+	// The one thing that MUST have changed: the delivery is on record, so
+	// a later catch-up skips it instead of re-showing it.
+	if len(after.Ahead) != len(before.Ahead)+1 {
+		t.Fatalf("expected the delivered cursor recorded, %v -> %v", before.Ahead, after.Ahead)
+	}
+	found := false
+	for _, c := range after.Ahead {
+		if c == "cursor-old-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the read message's own cursor recorded as delivered, got %v", after.Ahead)
+	}
+	// But the wire-level receipt must NOT point at an old message: that
+	// would tell the server this peer is further behind than it is.
+	conn, _ := hub.activeConn()
+	if lc := conn.LastConsumedCursor(); lc == "cursor-old-1" {
+		t.Fatal("expected the read NOT to move the server-side read receipt backwards")
+	}
+	if from, to, ok := getCatchUpGap(id); !ok || from != "2026-09-10T18:00:00Z" || to != "2026-09-10T20:00:00Z" {
+		t.Fatalf("expected the gap record untouched, got from=%q to=%q ok=%v", from, to, ok)
+	}
+	hub.mu.Lock()
+	pos, contiguous := hub.lastHandedOverCursor, hub.knownContiguous
+	hub.mu.Unlock()
+	if pos != "cursor-position" || !contiguous {
+		t.Fatalf("expected in-memory position and contiguity untouched, got %q / %v", pos, contiguous)
+	}
+}
+
+func TestReadRequiresExactlyOneAnchor(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := startRelayTestServer(t)
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	for _, args := range []map[string]any{
+		{},
+		{"at": "2026-09-10T18:30:00Z", "after": "cursor-x"},
+	} {
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = args
+		res, err := hub.handleRead(ctx, req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !res.IsError || !strings.Contains(textOf(res), "exactly one") {
+			t.Fatalf("expected a refusal for args %v, got: %s", args, textOf(res))
+		}
+	}
+}

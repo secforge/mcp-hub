@@ -723,6 +723,32 @@ func (h *Hub) Register(s *server.MCPServer) {
 		h.handleSelfUpdate,
 	)
 	s.AddTool(
+		mcp.NewTool("hub_read",
+			mcp.WithDescription("Read one message from this conversation's history, by where it "+
+				"sits rather than by what you have already seen. A QUERY, not a hand-over: it "+
+				"advances no position, marks nothing as read, and clears no recorded gap, so "+
+				"calling it twice gives the same answer. What you read IS recorded as delivered "+
+				"to you, so a later hub_catch_up skips past it rather than showing it twice — but "+
+				"your unread position does not move, so nothing you still have to read is "+
+				"consumed by asking.\n"+
+				"Use this for a question about the past ('what was said around 18:00', 'what came "+
+				"after that message'). Use hub_catch_up to make progress through what you have "+
+				"not read. They are different jobs and the position only moves for the second.\n"+
+				"Returns ONE message, or states plainly that there is none after that point. To "+
+				"walk forward, pass the cursor of what came back as `after`. A server that does "+
+				"not implement messageAfter (including every mcp-hub-server) will not answer at "+
+				"all, which this reports rather than leaving you waiting"),
+			mcp.WithString("at", mcp.Description(
+				"Timestamp to read from, RFC 3339 (e.g. 2026-09-10T18:00:00Z). Returns the first "+
+					"message after that instant. Mutually exclusive with after")),
+			mcp.WithString("after", mcp.Description(
+				"A cursor copied verbatim from a message you were delivered — returns the message "+
+					"following it. Cursors are opaque: copy one, never construct or edit one. "+
+					"Mutually exclusive with at")),
+		),
+		h.handleRead,
+	)
+	s.AddTool(
 		mcp.NewTool("hub_receive",
 			mcp.WithDescription("Drain and return currently buffered hub events without blocking. "+
 				"An image attached to a received message is saved to a local temp file, not "+
@@ -1184,6 +1210,17 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		"unconditionally on every connect, whether this is a fresh session or a reconnect, " +
 		"don't wait until something looks missing. It resumes from wherever this identity last " +
 		"left off (persisted across restarts), or reports there's nothing to catch up on."
+	// Stated at connect because the moment it matters is the moment a
+	// message arrives looking wrong, and that is not a moment to go
+	// looking for which call recovers it.
+	notes += "\nEvery delivered message ends with a marker echoing the cursor its opening line " +
+		"named. If that marker is missing, the message was cut off in transit — do NOT confirm " +
+		"it and do not act on half a message. Retrieve it with hub_read(after: <the cursor of " +
+		"the message BEFORE it>), which returns the one following that cursor and changes " +
+		"nothing about your position. hub_read(at: <a timestamp just before it>) works too. " +
+		"Note a cut message's OWN cursor cannot fetch it — `after` means the message following " +
+		"the cursor you pass. hub_catch_up also re-delivers it, but only while your unread " +
+		"position still sits behind it."
 
 	// The same staleness check a failed connect runs, on every connect.
 	// A connection that works does not make an installed-but-unloaded
@@ -1594,6 +1631,67 @@ func (h *Hub) Shutdown() {
 // people up here: replacing the binary does nothing to this process. Every
 // success path says so, because an update that is installed but unloaded
 // looks exactly like an update that did not happen.
+// handleRead answers a question about history rather than making progress
+// through a backlog. It advances no position and clears no gap, so it
+// cannot consume what this session still has to read.
+//
+// What it DOES record is that the message reached the model, because it
+// did — delivery is delivery, whichever call performed it, and a record
+// that depended on which tool was used would be a record of the tool
+// rather than of the fact. That goes in the same handed-over set live
+// delivery uses (see recordHandedOver), which is exactly the place for
+// "delivered, but not necessarily the next thing unread": a later
+// hub_catch_up recognises it and skips it silently instead of showing it
+// twice, while the position itself stays where it was.
+//
+// Deliberately NOT MarkConsumed. That drives the read receipt sent to the
+// server, and pointing it at an old message would move this peer's
+// server-side position BACKWARDS — telling the server it is further behind
+// than it is, and distorting the backlog it reports on the next connect.
+// The local record of a delivery and the wire-level receipt are different
+// claims, and only the first one is true here.
+//
+// Idempotent in what it answers: the same arguments give the same message
+// back, and the only thing a second call changes is a set-membership that
+// was already true.
+func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	conn, _ := h.activeConn()
+	if conn == nil {
+		return mcp.NewToolResultError("not connected"), nil
+	}
+	at, after := req.GetString("at", ""), req.GetString("after", "")
+	switch {
+	case at == "" && after == "":
+		return mcp.NewToolResultError("pass exactly one of at (a timestamp) or after (a cursor " +
+			"copied from a message you were delivered)"), nil
+	case at != "" && after != "":
+		return mcp.NewToolResultError("pass exactly one of at or after, not both — they are two " +
+			"ways of naming the same starting point"), nil
+	}
+	anchor := wire.Anchor{At: at, Cursor: after}
+
+	ev, ok, err := conn.RequestMessageAfterAwaiting(anchor)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("read failed: %v", err)), nil
+	}
+	if !ok {
+		return mcp.NewToolResultText("the server did not answer in time — call hub_read again with " +
+			"the same arguments; nothing about this session's state changed"), nil
+	}
+	if ev.Kind == "noMoreMessages" {
+		return mcp.NewToolResultText("no message after that point"), nil
+	}
+	// The delivery is recorded, but this is not resultWithReceivedAttachments:
+	// that also marks the wire-level receipt, which must not point at an
+	// old message. See this function's doc comment.
+	h.recordHandedOver([]hubconn.Event{ev})
+	return mcp.NewToolResultText(hubconn.FormatEvent(ev) + "\n\n[hub: this was a read, not a " +
+		"catch-up — your unread position is unchanged, so nothing you still have to read was " +
+		"consumed. This message is recorded as delivered to you, so a later hub_catch_up will " +
+		"skip past it rather than show it again. To keep reading forward, pass this message's " +
+		"own cursor as after]"), nil
+}
+
 func (h *Hub) handleSelfUpdate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Asked before going anywhere near the network: if the file on disk has
 	// already moved on, the newest release is not the question. Downloading
