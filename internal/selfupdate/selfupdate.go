@@ -96,10 +96,22 @@ type Staleness struct {
 	// OnDisk is the version of the binary at this process's own path, or
 	// "" when it could not be determined (see Err).
 	OnDisk string
-	// Stale is true when the two differ: the installed binary has moved on
-	// and this process is still the old one. A restart is the fix, and
-	// checking for a newer release would answer the wrong question.
+	// Stale is true when the installed binary is not the one this process
+	// is running: a restart is the fix, and checking for a newer release
+	// would answer the wrong question.
 	Stale bool
+	// SameVersion is true when Stale was concluded from the FILE having
+	// been replaced rather than from the two versions differing — the
+	// case where both report the same string and are nonetheless
+	// different builds.
+	//
+	// Two development builds from one commit report identically, because
+	// a version can only name what the commit names and uncommitted work
+	// has no name. Comparing the reported versions alone therefore misses
+	// every replacement between two such builds, which is most of them
+	// while a change is being iterated on. The file's own timestamp
+	// answers a question the version string cannot.
+	SameVersion bool
 	// Err records why OnDisk is unknown. Not fatal — a connect failure
 	// still needs reporting, just without this half of the diagnosis.
 	Err error
@@ -115,7 +127,47 @@ func Check() Staleness {
 	}
 	s.OnDisk = onDisk
 	s.Stale = onDisk != s.Running
+	if !s.Stale && replacedSinceStart() {
+		s.Stale, s.SameVersion = true, true
+	}
 	return s
+}
+
+// processStart is when this process began, near enough: a file written
+// after it cannot be the file it was launched from. Recorded at init
+// rather than read from the OS so it works the same on every platform
+// this is built for.
+var processStart = time.Now()
+
+// SetProcessStartForTest moves the recorded start time and returns a
+// function restoring it. A test that writes a stand-in binary writes it
+// during the test, so it is always newer than the real start time and
+// would look replaced; a test about anything else needs to say it is not
+// exercising that.
+func SetProcessStartForTest(t time.Time) func() {
+	prev := processStart
+	processStart = t
+	return func() { processStart = prev }
+}
+
+// replacedSinceStart reports whether the binary at this process's own
+// path was written after this process started — the one signal that
+// still distinguishes two builds reporting the same version.
+//
+// A false answer is the safe direction: it says only "no evidence of
+// replacement", never "this is the same build". Anything unreadable
+// therefore reports false rather than raising an alarm that the caller
+// cannot check.
+func replacedSinceStart() bool {
+	exe, err := ExecutablePath()
+	if err != nil {
+		return false
+	}
+	fi, err := os.Stat(exe)
+	if err != nil {
+		return false
+	}
+	return fi.ModTime().After(processStart)
 }
 
 // RestartRecommendation is what to append to a connect that SUCCEEDED.
@@ -132,7 +184,14 @@ func (s Staleness) RestartRecommendation() string {
 	if !s.Stale {
 		return ""
 	}
-	return fmt.Sprintf("\nNOTE: a newer client is already installed — this process is running %s "+
+	if s.SameVersion {
+		return fmt.Sprintf("\nNOTE: the client binary has been replaced since this process "+
+			"started — both builds report %s, so the difference is not visible in the version, "+
+			"but the file is not the one running here. Nothing is wrong with this connection; "+
+			"mention to the user that restarting the MCP server would load what is installed.",
+			s.Running)
+	}
+	return fmt.Sprintf("\nNOTE: a different client is already installed — this process is running %s "+
 		"while the binary on disk is %s. Nothing is wrong with this connection, so there is no "+
 		"need to act now; mention to the user that restarting the MCP server would load it.",
 		s.Running, s.OnDisk)

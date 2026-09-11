@@ -734,7 +734,10 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"Use this for a question about the past ('what was said around 18:00', 'what came "+
 				"after that message'). Use hub_catch_up to make progress through what you have "+
 				"not read. They are different jobs and the position only moves for the second.\n"+
-				"Returns ONE message, or states plainly that there is none after that point. To "+
+				"Returns ONE message, or states plainly that there is none after that point. On a "+
+				"FILTERED read the end of the walk is a different statement — nothing further "+
+				"MATCHES, which does not mean there are no further messages — and the result "+
+				"says which of the two it is rather than leaving you to assume. To "+
 				"walk forward, pass the cursor of what came back as `after`. A server that does "+
 				"not implement messageAfter (including every mcp-hub-server) will not answer at "+
 				"all, which this reports rather than leaving you waiting"),
@@ -745,8 +748,53 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"A cursor copied verbatim from a message you were delivered — returns the message "+
 					"following it. Cursors are opaque: copy one, never construct or edit one. "+
 					"Mutually exclusive with at")),
+			mcp.WithString("sender", mcp.Description(
+				"Only consider messages from this one sender — the identity id that messages you "+
+					"were delivered already carry, copied from one of them. Not a display name, "+
+					"and nothing you need to look up separately. Combines with query (both must "+
+					"hold) and with at/after")),
+			mcp.WithString("query", mcp.Description(
+				"Only consider messages whose text contains this. Two characters minimum. This "+
+					"is a filtered READ, not a search: still one message at a time, still oldest "+
+					"first, no ranking and no best-match. If you want the best match rather than "+
+					"the next one, that is a different question and this is the wrong tool")),
 		),
 		h.handleRead,
+	)
+	s.AddTool(
+		mcp.NewTool("hub_pin",
+			mcp.WithDescription("Pin a message in this conversation — only where the server "+
+				"declares it can do this; against one that doesn't (every ordinary hub session, "+
+				"which has no conversation behind it to pin in), the call is refused here with "+
+				"that reason rather than sent into silence. Pinning is CONVERSATION state, not a "+
+				"property of the message, and it is visible to everyone in the conversation "+
+				"including the people on the other side of a mirrored one. Errors if not "+
+				"connected"),
+			mcp.WithString("externalId", mcp.Description(
+				"The target message's externalId, from an earlier msg or sendAck event")),
+		),
+		h.handlePin,
+	)
+	s.AddTool(
+		mcp.NewTool("hub_unpin",
+			mcp.WithDescription("Remove a message from this conversation's pinned set — same "+
+				"contract as hub_pin, including being refused where the server declares no "+
+				"pinning. Unpinning something a person pinned is visible to them, so it is worth "+
+				"being sure it is yours to undo"),
+			mcp.WithString("externalId", mcp.Description(
+				"The target message's externalId, from an earlier msg or sendAck event")),
+		),
+		h.handleUnpin,
+	)
+	s.AddTool(
+		mcp.NewTool("hub_pins",
+			mcp.WithDescription("List what is pinned in this conversation RIGHT NOW, asking the "+
+				"server rather than reporting what this client last heard. Read-only.\n"+
+				"Worth reaching for whenever it matters that the answer is current: the set "+
+				"arrives at connect and changes arrive as events, so a client that missed one — a "+
+				"drop, a truncated delivery — would otherwise hold a stale set with no way to "+
+				"notice. This is the repair path for exactly that")),
+		h.handlePins,
 	)
 	s.AddTool(
 		mcp.NewTool("hub_receive",
@@ -1210,6 +1258,23 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		"unconditionally on every connect, whether this is a fresh session or a reconnect, " +
 		"don't wait until something looks missing. It resumes from wherever this identity last " +
 		"left off (persisted across restarts), or reports there's nothing to catch up on."
+	// Stated at connect because that is when the set is known without
+	// asking, and a model that has to discover pinning exists will not
+	// think to look for it. Nil means the server declares no pinning at
+	// all, which is different from an empty set and says nothing worth
+	// saying.
+	if pinned := conn.PinnedAtConnect(); pinned != nil {
+		if len(pinned) == 0 {
+			notes += "\nNothing is pinned in this conversation. hub_pin/hub_unpin change that, " +
+				"and hub_pins() reports it as it stands — worth asking rather than assuming, since " +
+				"this line is only a snapshot from connect time."
+		} else {
+			notes += fmt.Sprintf("\nPinned in this conversation right now (%d): %s. That is a "+
+				"snapshot from connect time — people and other agents can pin and unpin while you "+
+				"are here, so call hub_pins() when it matters that the answer is current.",
+				len(pinned), strings.Join(pinned, ", "))
+		}
+	}
 	// Stated at connect because the moment it matters is the moment a
 	// message arrives looking wrong, and that is not a moment to go
 	// looking for which call recovers it.
@@ -1654,6 +1719,62 @@ func (h *Hub) Shutdown() {
 // Idempotent in what it answers: the same arguments give the same message
 // back, and the only thing a second call changes is a set-membership that
 // was already true.
+func (h *Hub) handlePin(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return h.pinAction(req, true)
+}
+
+func (h *Hub) handleUnpin(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return h.pinAction(req, false)
+}
+
+func (h *Hub) pinAction(req mcp.CallToolRequest, pin bool) (*mcp.CallToolResult, error) {
+	conn, _ := h.activeConn()
+	if conn == nil {
+		return mcp.NewToolResultError("not connected"), nil
+	}
+	externalID, err := req.RequireString("externalId")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	verb := "pin"
+	act := conn.PinAwaitingAck
+	if !pin {
+		verb, act = "unpin", conn.UnpinAwaitingAck
+	}
+	ev, ok, err := act(externalID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("%s request failed: %v", verb, err)), nil
+	}
+	if ok {
+		return mcp.NewToolResultText(hubconn.FormatEvent(ev)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"%s request sent — confirmation (or a refusal) will arrive via wait/hub_receive/hub_wait, "+
+			"not from this call", verb)), nil
+}
+
+// handlePins asks the server what is pinned NOW. The pinned set is
+// otherwise only pushed — at connect, then as changes — so a client that
+// missed one event holds a wrong set with no way to notice. This is the
+// repair path, and the reason it exists is that state which rots silently
+// needs a way to be asked about rather than a rule saying it should not
+// drift.
+func (h *Hub) handlePins(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	conn, _ := h.activeConn()
+	if conn == nil {
+		return mcp.NewToolResultError("not connected"), nil
+	}
+	ev, ok, err := conn.Pins()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("pins request failed: %v", err)), nil
+	}
+	if !ok {
+		return mcp.NewToolResultText("the server did not answer in time — call hub_pins again; " +
+			"nothing about this session's state changed"), nil
+	}
+	return mcp.NewToolResultText(hubconn.FormatEvent(ev)), nil
+}
+
 func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
@@ -1670,7 +1791,15 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	}
 	anchor := wire.Anchor{At: at, Cursor: after}
 
-	ev, ok, err := conn.RequestMessageAfterAwaiting(anchor)
+	filter := wire.Filter{
+		Sender: req.GetString("sender", ""),
+		Query:  req.GetString("query", ""),
+	}
+	if msg := checkFilterSupport(conn, filter); msg != "" {
+		return mcp.NewToolResultError(msg), nil
+	}
+
+	ev, ok, err := conn.RequestMessageAfterFiltered(anchor, filter)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("read failed: %v", err)), nil
 	}
@@ -1678,7 +1807,34 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		return mcp.NewToolResultText("the server did not answer in time — call hub_read again with " +
 			"the same arguments; nothing about this session's state changed"), nil
 	}
+	if ev.Kind == "error" {
+		// bad_filter and bad_anchor name different halves of the request,
+		// and saying which is what stops a retry fixing the part that was
+		// already right.
+		return mcp.NewToolResultError(fmt.Sprintf("the server refused this read: %s%s", ev.Text,
+			filterErrorHint(ev.Code))), nil
+	}
+	// What was asked for and what was applied are different facts, and only
+	// the server's own echo reports the second. Checked before the answer
+	// is described, because every sentence below depends on it.
+	unapplied := unappliedFilters(filter, ev.Matching)
+
 	if ev.Kind == "noMoreMessages" {
+		if ev.Matching == nil && filter.Set() {
+			return mcp.NewToolResultText("NOT A COMPLETE ANSWER: this server did not apply the " +
+				"filter — it sent back no record of having applied one — so \"no more messages\" " +
+				"here means the unfiltered walk reached the end, not that nothing further " +
+				"matched. Do not report this as \"nothing from that sender\" or \"no mention of " +
+				"that text\": that question was never asked. Read without a filter and check " +
+				"yourself, or say the server cannot answer it."), nil
+		}
+		if ev.Matching != nil {
+			return mcp.NewToolResultText("Nothing FURTHER MATCHES after that point" +
+				describeApplied(*ev.Matching) + ".\n\n[hub: this is not the same statement as " +
+				"\"no more messages\" — there may well be messages past that point, and this says " +
+				"only that none of them match. To find out whether there are any at all, read " +
+				"again from the same anchor without the filter]" + unappliedNote(unapplied)), nil
+		}
 		return mcp.NewToolResultText("no message after that point"), nil
 	}
 	// The delivery is recorded, but this is not resultWithReceivedAttachments:
@@ -1689,7 +1845,109 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		"catch-up — your unread position is unchanged, so nothing you still have to read was " +
 		"consumed. This message is recorded as delivered to you, so a later hub_catch_up will " +
 		"skip past it rather than show it again. To keep reading forward, pass this message's " +
-		"own cursor as after]"), nil
+		"own cursor as after" + matchedSuffix(ev.Matching) + "]" + unappliedNote(unapplied)), nil
+}
+
+// checkFilterSupport refuses, before anything is written to the socket, a
+// filter this server has said it cannot apply — and refuses a query too
+// short for the server's own minimum. Both save a round trip, but the
+// first matters for a different reason: an unsupported filter comes back
+// as an ordinary-looking answer with no `matching`, and a caller that did
+// not check would have to notice the absence to avoid over-reporting.
+//
+// A server that declares no features at all has said nothing either way,
+// so the request goes out and the answer's own `matching` settles it.
+func checkFilterSupport(conn *hubconn.Conn, filter wire.Filter) string {
+	if len(filter.Query) == 1 {
+		return "query needs at least two characters — a single character matches too much to be " +
+			"a filter, and this server refuses it outright"
+	}
+	if !conn.HasFeature("messageAfter") {
+		return ""
+	}
+	declared := conn.MessageAfterFilters()
+	if len(declared) == 0 {
+		if filter.Set() {
+			return "this server declares no filters on its read path, so sender/query would be " +
+				"ignored and you would get the next message regardless — which reads exactly " +
+				"like a filtered answer. Read without them and filter what comes back yourself"
+		}
+		return ""
+	}
+	for name, set := range map[string]bool{"sender": filter.Sender != "", "query": filter.Query != ""} {
+		if set && !conn.SupportsMessageAfterFilter(name) {
+			return fmt.Sprintf("this server declares it can filter by %s, but not by %q — sending "+
+				"it anyway would return an answer that looks filtered and is not",
+				strings.Join(declared, " and "), name)
+		}
+	}
+	return ""
+}
+
+// unappliedFilters names the constraints that were asked for and not
+// applied. The server echoes what it APPLIED rather than what it
+// received, so this comparison is meaningful per field: a filter the
+// server does not know comes back absent rather than silently counted as
+// honoured.
+func unappliedFilters(asked wire.Filter, applied *wire.Filter) []string {
+	var got wire.Filter
+	if applied != nil {
+		got = *applied
+	}
+	var missing []string
+	if asked.Sender != "" && got.Sender == "" {
+		missing = append(missing, "sender")
+	}
+	if asked.Query != "" && got.Query == "" {
+		missing = append(missing, "query")
+	}
+	return missing
+}
+
+func unappliedNote(missing []string) string {
+	if len(missing) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("\n\nWARNING: the server did not apply the %s filter you asked for — its "+
+		"answer says which constraints it actually used, and %s not among them. So this result is "+
+		"broader than what you asked for. Do not describe it as filtered by %s.",
+		strings.Join(missing, " and "), map[bool]string{true: "they are", false: "it is"}[len(missing) > 1],
+		strings.Join(missing, " and "))
+}
+
+func describeApplied(f wire.Filter) string {
+	var parts []string
+	if f.Sender != "" {
+		parts = append(parts, "sender "+f.Sender)
+	}
+	if f.Query != "" {
+		parts = append(parts, fmt.Sprintf("text containing %q", f.Query))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (matching " + strings.Join(parts, " and ") + ")"
+}
+
+func matchedSuffix(applied *wire.Filter) string {
+	if applied == nil {
+		return ""
+	}
+	return " — keeping the same filter, since the walk is filtered and its end means only that " +
+		"nothing further matches"
+}
+
+func filterErrorHint(code string) string {
+	switch code {
+	case "bad_filter":
+		return "\n\nThe ANCHOR was fine — it is the filter the server would not take, so retrying " +
+			"with a different at/after changes nothing. Fix sender or query instead."
+	case "bad_anchor":
+		return "\n\nThe FILTER was fine — it is the anchor the server could not resolve. Cursors " +
+			"are opaque: copy one verbatim from a message you were delivered rather than " +
+			"constructing or editing one, and pass a timestamp with an explicit offset."
+	}
+	return ""
 }
 
 func (h *Hub) handleSelfUpdate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1720,7 +1978,15 @@ func (h *Hub) handleSelfUpdate(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultText(fmt.Sprintf(
 			"Already current: this client is %s and the newest published release is %s, so nothing "+
 				"was downloaded. If a connect is still failing, the cause is not an out-of-date "+
-				"client — say so rather than retrying the update.", running, latest)), nil
+				"client — say so rather than retrying the update.\n"+
+				"If what you were looking for is a missing TOOL rather than a failing connect, note "+
+				"that this answer does not explain it. A capability can be absent for three "+
+				"reasons: this process is older than the installed binary (a restart fixes it, and "+
+				"this tool would have said so), the installed binary is older than the newest "+
+				"release (an update fixes it, and this tool would have done it), or it was never "+
+				"released at all — and only the first two are things an update can reach. Nothing "+
+				"here distinguishes the third from a capability that does not exist.",
+			running, latest)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf(
 		"Installed %s over %s at %s, signature verified against this project's release key.\n\n"+

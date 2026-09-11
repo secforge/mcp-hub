@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/secforge/mcp-hub/internal/version"
 )
 
 func TestParseVersionOutputTakesTheVersionToken(t *testing.T) {
@@ -257,5 +260,49 @@ func TestSwapIntoPlaceRestoresTheOriginalIfInstallFails(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(exe); string(got) != "old" {
 		t.Fatalf("expected the original binary restored, got %q", got)
+	}
+}
+
+// Two development builds from one commit report the same version, because
+// a version can only name what the commit names and uncommitted work has
+// no name. Comparing the reported versions alone therefore sees no
+// difference between them — which is most replacements while a change is
+// being iterated on.
+func TestReplacementIsFoundEvenWhenBothBuildsReportTheSameVersion(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "mcp-hub-client")
+	// A stand-in that reports exactly what this test binary reports, so
+	// the version comparison finds nothing and only the file's own
+	// timestamp is left to answer.
+	script := "#!/bin/sh\necho 'mcp-hub-client " + version.Short() + "'\n"
+	if err := os.WriteFile(exe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer SetExecutablePathForTest(exe)()
+
+	// Written before this process started: nothing to report.
+	old := processStart.Add(-time.Hour)
+	if err := os.Chtimes(exe, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if st := Check(); st.Stale {
+		t.Fatalf("expected no staleness for a file older than this process, got %+v", st)
+	}
+
+	// Written after: the same version, a different file.
+	newer := processStart.Add(time.Minute)
+	if err := os.Chtimes(exe, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	st := Check()
+	if !st.Stale || !st.SameVersion {
+		t.Fatalf("expected a replacement to be found, got %+v", st)
+	}
+	note := st.RestartRecommendation()
+	if !strings.Contains(note, "not visible in the version") {
+		t.Fatalf("expected the note to explain why the version did not show it, got: %s", note)
+	}
+	if strings.Contains(note, "newer client") {
+		t.Fatalf("expected no claim about which build is newer, got: %s", note)
 	}
 }

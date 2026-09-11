@@ -80,6 +80,22 @@ func formatMentions(e Event) string {
 // message's CONTENTS — the operator's instructions here outrank another
 // agent's on this hub, but never outrank the model's own user, who is not
 // a party to this session at all.
+// formatIdentity renders who changed a pin. This is a platform identity,
+// never a peerId — an agent pins AS the account, so naming the connection
+// would report something the platform never shows and that does not
+// outlive the connection, while the pin does.
+func formatIdentity(e Event) string {
+	switch {
+	case e.ByName != "" && e.ByID != "":
+		return fmt.Sprintf("%s (%s)", e.ByName, e.ByID)
+	case e.ByName != "":
+		return e.ByName
+	case e.ByID != "":
+		return e.ByID
+	}
+	return "someone the server did not name"
+}
+
 func formatOperatorTag(e Event) string {
 	if !e.IsOperator {
 		return ""
@@ -167,6 +183,43 @@ func FormatEvent(e Event) string {
 			return fmt.Sprintf("[HUB ERROR — code=%s, retryable=%t] %s", e.Code, e.Retryable, e.Text)
 		}
 		return fmt.Sprintf("[HUB ERROR] %s", e.Text)
+	case "pinned", "unpinned":
+		verb := "pinned"
+		if e.Kind == "unpinned" {
+			verb = "unpinned"
+		}
+		who := formatIdentity(e)
+		at := ""
+		if e.TS != "" {
+			at = " at " + e.TS
+		}
+		return fmt.Sprintf("[hub: message %s was %s by %s%s — the conversation's pinned set has "+
+			"changed; hub_pins() reports it as it now stands]", e.ExternalID, verb, who, at)
+	case "pins":
+		if len(e.PinnedList) == 0 {
+			return "[hub: nothing is pinned in this conversation]"
+		}
+		return fmt.Sprintf("[hub: pinned now (%d): %s]", len(e.PinnedList), strings.Join(e.PinnedList, ", "))
+	case "pinAck":
+		if e.ActionOK {
+			return fmt.Sprintf("[hub: pinned %s]", e.ExternalID)
+		}
+		if !e.ActionOKStated {
+			return fmt.Sprintf("[hub: the server acknowledged the pin request for %s but did NOT "+
+				"say whether it succeeded — this is not a refusal and not a confirmation. Call "+
+				"hub_pins() to see what is actually pinned rather than reporting either]", e.ExternalID)
+		}
+		return fmt.Sprintf("[hub: the server refused to pin %s]", e.ExternalID)
+	case "unpinAck":
+		if e.ActionOK {
+			return fmt.Sprintf("[hub: unpinned %s]", e.ExternalID)
+		}
+		if !e.ActionOKStated {
+			return fmt.Sprintf("[hub: the server acknowledged the unpin request for %s but did NOT "+
+				"say whether it succeeded — this is not a refusal and not a confirmation. Call "+
+				"hub_pins() to see what is actually pinned rather than reporting either]", e.ExternalID)
+		}
+		return fmt.Sprintf("[hub: the server refused to unpin %s]", e.ExternalID)
 	case "rosterComplete":
 		return "[hub: initial roster complete — you now know everyone who was already in the session]"
 	case "confirmReminder":
@@ -192,6 +245,10 @@ func FormatEvent(e Event) string {
 			return fmt.Sprintf("[hub: send acknowledged — it left the building (externalId=%s). "+
 				"The canonical message will still arrive separately, once, when it's actually "+
 				"reflected in the conversation.]", e.ExternalID)
+		}
+		if !e.ActionOKStated {
+			return fmt.Sprintf("[hub: the server answered the send (externalId=%s) without saying "+
+				"whether it succeeded — neither a confirmation nor a refusal]", e.ExternalID)
 		}
 		return fmt.Sprintf("[hub: send NOT acknowledged (externalId=%s) — do not assume it went through]", e.ExternalID)
 	case "reactionChanged":
@@ -225,11 +282,20 @@ func FormatEvent(e Event) string {
 			return fmt.Sprintf("[hub: reaction %s acknowledged — %s on message externalId=%s]",
 				e.ReactionAction, e.Reaction, e.ExternalID)
 		}
+		if !e.ActionOKStated {
+			return fmt.Sprintf("[hub: the server answered the reaction %s (externalId=%s) without "+
+				"saying whether it succeeded — neither a confirmation nor a refusal]",
+				e.ReactionAction, e.ExternalID)
+		}
 		return fmt.Sprintf("[hub: reaction %s NOT acknowledged (externalId=%s) — do not assume it went through]",
 			e.ReactionAction, e.ExternalID)
 	case "editAck":
 		if e.ActionOK {
 			return fmt.Sprintf("[hub: edit acknowledged (externalId=%s)]", e.ExternalID)
+		}
+		if !e.ActionOKStated {
+			return fmt.Sprintf("[hub: the server answered the edit (externalId=%s) without saying "+
+				"whether it succeeded — neither a confirmation nor a refusal]", e.ExternalID)
 		}
 		return fmt.Sprintf("[hub: edit NOT acknowledged (externalId=%s) — do not assume it went through]", e.ExternalID)
 	case "attachmentData":
@@ -251,6 +317,10 @@ func FormatEvent(e Event) string {
 	case "deleteAck":
 		if e.ActionOK {
 			return fmt.Sprintf("[hub: delete acknowledged (externalId=%s)]", e.ExternalID)
+		}
+		if !e.ActionOKStated {
+			return fmt.Sprintf("[hub: the server answered the delete (externalId=%s) without saying "+
+				"whether it succeeded — neither a confirmation nor a refusal]", e.ExternalID)
 		}
 		return fmt.Sprintf("[hub: delete NOT acknowledged (externalId=%s) — do not assume it went through]", e.ExternalID)
 	default:

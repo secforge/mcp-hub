@@ -112,11 +112,31 @@ type Event struct {
 	// ack kinds: "did the action this connection asked for succeed."
 	ExternalID string
 	ActionOK   bool
+	// ActionOKStated reports whether the server actually SAID whether the
+	// action succeeded, as opposed to sending an ack with no "ok" field
+	// at all. Go decodes an absent bool as false, so without this an
+	// omitted field is indistinguishable from an explicit refusal — and
+	// the client would report "the server refused" about a server that
+	// said nothing of the kind. Seen live: an ack family where one member
+	// was built unlike its siblings and omitted the field, turning every
+	// success into a reported refusal.
+	//
+	// So the three states stay apart: succeeded, refused, and didn't say.
+	// Only the first two are claims about the world.
+	ActionOKStated bool
 	// Behind carries a standalone ack's reply's own wire.Ack.Behind, if
 	// the server sent one — see that field's doc comment. Nil on every
 	// other event kind, and on an "ack" from a server that doesn't send
 	// it; never zero-as-absent, since a genuine "0 behind" is meaningful
 	// and must stay distinguishable from "not sent."
+	// ByName and ByID identify who made a pin change, on the platform
+	// behind a mirrored conversation — never a peerId. See wire.Identity.
+	ByName string
+	ByID   string
+	// PinnedList carries the answer to a pins request, and is nil rather
+	// than empty when this event is not one: an empty set of pins and "no
+	// answer here" are different things.
+	PinnedList []string
 	// UnconfirmedCount and UnconfirmedSince are set only on a
 	// "confirmReminder": how many cursor-bearing messages have been
 	// delivered live without a confirm, and when that run started. They
@@ -184,7 +204,16 @@ type Event struct {
 	// reached any other way (live traffic) — its presence is what
 	// identifies this event as the answer to a specific pull. See
 	// wire.MessageAfter's doc comment.
-	Answers *wire.Anchor
+	//
+	// Matching carries a "msg" or "noMoreMessages" event's
+	// wire.Msg.Matching/wire.NoMoreMessages.Matching — the filter the
+	// server actually APPLIED, which is not necessarily the one that was
+	// sent. Nil when the answer was unfiltered, which is what makes a
+	// filtered terminator ("nothing further matches") distinguishable
+	// from an unfiltered one ("no more messages") instead of two
+	// readings of the same frame.
+	Answers  *wire.Anchor
+	Matching *wire.Filter
 }
 
 // PeerInfo is what's known about one other peer in the session.
@@ -215,6 +244,11 @@ type Conn struct {
 	// unsupported) — both look identical as a missing map entry
 	// otherwise. Immutable after construction, same as the other Joined-
 	// derived fields above; not under mu.
+	// pinnedAtConnect is what joined.Pinned carried. A snapshot, not a
+	// live set: it is what was pinned when this connection opened, and
+	// pinned/unpinned events move it on from there. Kept so the connect
+	// result can state it without a round trip.
+	pinnedAtConnect  []string
 	features         map[string]json.RawMessage
 	featuresDeclared bool
 	// pongWait is snapshotted from the package-level var once, synchronously,
@@ -594,6 +628,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		topic:                   joined.Topic,
 		behind:                  joined.Behind,
 		behindSince:             joined.BehindSince,
+		pinnedAtConnect:         pinnedOrNil(joined.Pinned),
 		features:                joined.Features,
 		featuresDeclared:        joined.Features != nil,
 		lastFrameKind:           "joined",
@@ -1125,6 +1160,19 @@ func DecodeEvent(raw []byte) (Event, bool) {
 	return decodeEvent(raw)
 }
 
+// statesOK reports whether an ack frame carried an "ok" field at all.
+// Go cannot tell an absent bool from an explicit false, so this is read
+// from the raw frame rather than from the decoded struct — the only place
+// the difference still exists.
+func statesOK(raw []byte) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false
+	}
+	_, ok := fields["ok"]
+	return ok
+}
+
 func decodeEvent(raw []byte) (Event, bool) {
 	typ, err := wire.DecodeType(raw)
 	if err != nil {
@@ -1147,13 +1195,14 @@ func decodeEvent(raw []byte) (Event, bool) {
 		return Event{Kind: "msg", PeerID: m.PeerID, Text: m.Text, TS: m.TS, Private: m.Private,
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
-			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers}, true
+			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,
+			Matching: m.Matching}, true
 	case wire.TypeNoMoreMessages:
 		var n wire.NoMoreMessages
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "noMoreMessages", Answers: n.Answers}, true
+		return Event{Kind: "noMoreMessages", Answers: n.Answers, Matching: n.Matching}, true
 	case wire.TypeError:
 		var e wire.Error
 		if err := json.Unmarshal(raw, &e); err != nil {
@@ -1179,7 +1228,8 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "sendAck", ExternalID: a.ExternalID, ActionOK: a.OK}, true
+		return Event{Kind: "sendAck", ExternalID: a.ExternalID, ActionOK: a.OK,
+			ActionOKStated: statesOK(raw)}, true
 	case wire.TypeReactionChanged:
 		var r wire.ReactionChanged
 		if err := json.Unmarshal(raw, &r); err != nil {
@@ -1204,19 +1254,58 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "reactionAck", ExternalID: a.ExternalID, Reaction: a.Reaction,
-			ReactionAction: a.Action, ActionOK: a.OK}, true
+			ReactionAction: a.Action, ActionOK: a.OK, ActionOKStated: statesOK(raw)}, true
 	case wire.TypeEditAck:
 		var a wire.EditAck
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "editAck", ExternalID: a.ExternalID, ActionOK: a.OK}, true
+		return Event{Kind: "editAck", ExternalID: a.ExternalID, ActionOK: a.OK,
+			ActionOKStated: statesOK(raw)}, true
 	case wire.TypeDeleteAck:
 		var a wire.DeleteAck
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "deleteAck", ExternalID: a.ExternalID, ActionOK: a.OK}, true
+		return Event{Kind: "deleteAck", ExternalID: a.ExternalID, ActionOK: a.OK,
+			ActionOKStated: statesOK(raw)}, true
+	case wire.TypePinned:
+		var p wire.Pinned
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "pinned", ExternalID: p.ExternalID, ByName: p.By.Name, ByID: p.By.ID, TS: p.At}, true
+	case wire.TypeUnpinned:
+		var p wire.Unpinned
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "unpinned", ExternalID: p.ExternalID, ByName: p.By.Name, ByID: p.By.ID, TS: p.At}, true
+	case wire.TypePinAck:
+		var a wire.PinAck
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "pinAck", ExternalID: a.ExternalID, ActionOK: a.OK,
+			ActionOKStated: statesOK(raw)}, true
+	case wire.TypeUnpinAck:
+		var a wire.UnpinAck
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "unpinAck", ExternalID: a.ExternalID, ActionOK: a.OK,
+			ActionOKStated: statesOK(raw)}, true
+	case wire.TypePins:
+		var p wire.PinsResponse
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return Event{}, false
+		}
+		// Never nil: an answer naming no pins is an answer, and a caller
+		// must be able to tell it from having received nothing.
+		if p.List == nil {
+			p.List = []string{}
+		}
+		return Event{Kind: "pins", PinnedList: p.List, TS: p.At}, true
 	case wire.TypeMessageDeleted:
 		var d wire.MessageDeleted
 		if err := json.Unmarshal(raw, &d); err != nil {
@@ -1232,7 +1321,8 @@ func decodeEvent(raw []byte) (Event, bool) {
 		// doc comment: on OK false it's the position the server actually
 		// holds, to be adopted rather than treated as confirmation of what
 		// was sent.
-		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK, Behind: a.Behind}, true
+		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK, Behind: a.Behind,
+			ActionOKStated: statesOK(raw)}, true
 	case wire.TypeAttachmentData:
 		var a wire.AttachmentData
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -1306,6 +1396,51 @@ func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format
 // it's worth stating since the wire itself doesn't forbid concurrent
 // walks (see wire.MessageAfter's doc comment on the server side of that).
 func (c *Conn) RequestMessageAfterAwaiting(anchor wire.Anchor) (Event, bool, error) {
+	return c.RequestMessageAfterFiltered(anchor, wire.Filter{})
+}
+
+// MessageAfterFilters lists the filter names this server declares it can
+// apply, from features.messageAfter's own payload. Empty when the server
+// declares none, when it declares messageAfter as a bare marker rather
+// than an object, or when it declares no features at all — all of which
+// mean the same thing to a caller: do not promise a filter will hold.
+//
+// This exists so filter support is never inferred from a version number
+// or from messageAfter merely being present. The two questions differ:
+// messageAfter says the pull path exists, filters says which constraints
+// that path can honour.
+func (c *Conn) MessageAfterFilters() []string {
+	c.mu.Lock()
+	raw, ok := c.features["messageAfter"]
+	c.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	var payload struct {
+		Filters []string `json:"filters"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	return payload.Filters
+}
+
+// SupportsMessageAfterFilter reports whether the server declared it can
+// apply this named filter.
+func (c *Conn) SupportsMessageAfterFilter(name string) bool {
+	for _, f := range c.MessageAfterFilters() {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}
+
+// RequestMessageAfterFiltered is RequestMessageAfterAwaiting with a
+// filter — see wire.Filter. The answer's own Matching says what was
+// actually applied, and the caller must read that rather than assume the
+// filter it sent was honoured.
+func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filter) (Event, bool, error) {
 	ch := make(chan Event, 1)
 	c.mu.Lock()
 	claim := &ackClaim{result: ch}
@@ -1322,7 +1457,7 @@ func (c *Conn) RequestMessageAfterAwaiting(anchor wire.Anchor) (Event, bool, err
 	}
 	defer cancel()
 
-	m := wire.MessageAfter{Type: wire.TypeMessageAfter, Anchor: anchor}
+	m := wire.MessageAfter{Type: wire.TypeMessageAfter, Anchor: anchor, Filter: filter}
 	if err := c.ws.WriteJSON(m); err != nil {
 		debugf("RequestMessageAfterAwaiting: claim=%p write error: %v", claim, err)
 		return Event{}, false, err
@@ -1508,6 +1643,104 @@ func (c *Conn) RequestAttachment(token string) (Event, bool, error) {
 	resultCh, cancel := c.claimNextAck("attachmentData")
 	defer cancel()
 	if err := c.ws.WriteJSON(wire.NewAttachmentRequest(token)); err != nil {
+		return Event{}, false, err
+	}
+	select {
+	case ev := <-resultCh:
+		return ev, true, nil
+	case <-time.After(AckWaitTimeout):
+		return Event{}, false, nil
+	}
+}
+
+// pinnedOrNil flattens the wire's three-state pointer into the same three
+// states a caller can read: nil for "no pinning here", an empty slice for
+// "pinning exists and nothing is pinned".
+func pinnedOrNil(p *[]string) []string {
+	if p == nil {
+		return nil
+	}
+	if *p == nil {
+		return []string{}
+	}
+	return *p
+}
+
+// PinnedAtConnect is what the server said was pinned when this connection
+// opened, by externalId. Nil when the server does not declare "pins" —
+// distinct from an empty slice, which means the feature exists and nothing
+// is pinned.
+//
+// A snapshot, deliberately not maintained as a live set here: pinned and
+// unpinned events move it on, and Pins() re-reads it authoritatively. A
+// client that tracked it internally would hold a set that silently drifts
+// the moment one event is missed, which is the failure the pull path
+// exists to make repairable.
+func (c *Conn) PinnedAtConnect() []string { return c.pinnedAtConnect }
+
+// Pin and Unpin ask the server to change the pinned set. Refused locally
+// where the server declares no "pins" feature, rather than sent into
+// silence.
+func (c *Conn) Pin(externalID string) error {
+	if err := c.requireAction("pins"); err != nil {
+		return err
+	}
+	r := wire.NewPinRequest(externalID)
+	r.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(r)
+}
+
+func (c *Conn) Unpin(externalID string) error {
+	if err := c.requireAction("pins"); err != nil {
+		return err
+	}
+	r := wire.NewUnpinRequest(externalID)
+	r.AckCursor = c.ackCursorForOutbound()
+	return c.ws.WriteJSON(r)
+}
+
+// PinAwaitingAck and UnpinAwaitingAck are Pin/Unpin, but wait for the
+// server's own answer where it declares actionAcks — the same division as
+// every other write action: "pins" decides whether to send, "actionAcks"
+// decides whether an answer is worth waiting for.
+func (c *Conn) PinAwaitingAck(externalID string) (Event, bool, error) {
+	return c.pinAwaiting(externalID, c.Pin, "pinAck")
+}
+
+func (c *Conn) UnpinAwaitingAck(externalID string) (Event, bool, error) {
+	return c.pinAwaiting(externalID, c.Unpin, "unpinAck")
+}
+
+func (c *Conn) pinAwaiting(externalID string, send func(string) error, ackKind string) (Event, bool, error) {
+	if !c.WantsActionAcks() {
+		return Event{}, false, send(externalID)
+	}
+	resultCh, cancel := c.claimNextAck(ackKind)
+	defer cancel()
+	if err := send(externalID); err != nil {
+		return Event{}, false, err
+	}
+	select {
+	case ev := <-resultCh:
+		return ev, true, nil
+	case <-time.After(AckWaitTimeout):
+		return Event{}, false, nil
+	}
+}
+
+// Pins asks the server for the pinned set as it currently stands. This is
+// the repair path for state that is otherwise only pushed: a client that
+// missed a pinned or unpinned event has no way to notice, so it needs a
+// way to ask rather than a rule saying the set should not drift.
+func (c *Conn) Pins() (Event, bool, error) {
+	if err := c.requireAction("pins"); err != nil {
+		return Event{}, false, err
+	}
+	resultCh, cancel := c.claimNextAck("pins")
+	defer cancel()
+	r := wire.NewPinsRequest()
+	r.AckCursor = c.ackCursorForOutbound()
+	if err := c.ws.WriteJSON(r); err != nil {
 		return Event{}, false, err
 	}
 	select {

@@ -275,7 +275,7 @@ func TestFormatEventDeleteAckOK(t *testing.T) {
 }
 
 func TestFormatEventDeleteAckNotOK(t *testing.T) {
-	got := FormatEvent(Event{Kind: "deleteAck", ExternalID: "ext-1", ActionOK: false})
+	got := FormatEvent(Event{Kind: "deleteAck", ExternalID: "ext-1", ActionOK: false, ActionOKStated: true})
 	if !strings.Contains(got, "NOT acknowledged") {
 		t.Fatalf("got %q", got)
 	}
@@ -289,7 +289,7 @@ func TestFormatEventReactionAckOK(t *testing.T) {
 }
 
 func TestFormatEventReactionAckNotOK(t *testing.T) {
-	got := FormatEvent(Event{Kind: "reactionAck", ExternalID: "ext-1", ReactionAction: "remove", ActionOK: false})
+	got := FormatEvent(Event{Kind: "reactionAck", ExternalID: "ext-1", ReactionAction: "remove", ActionOK: false, ActionOKStated: true})
 	if !strings.Contains(got, "NOT acknowledged") {
 		t.Fatalf("got %q", got)
 	}
@@ -303,7 +303,7 @@ func TestFormatEventEditAckOK(t *testing.T) {
 }
 
 func TestFormatEventEditAckNotOK(t *testing.T) {
-	got := FormatEvent(Event{Kind: "editAck", ExternalID: "ext-1", ActionOK: false})
+	got := FormatEvent(Event{Kind: "editAck", ExternalID: "ext-1", ActionOK: false, ActionOKStated: true})
 	if !strings.Contains(got, "NOT acknowledged") {
 		t.Fatalf("got %q", got)
 	}
@@ -317,7 +317,7 @@ func TestFormatEventSendAckOK(t *testing.T) {
 }
 
 func TestFormatEventSendAckNotOK(t *testing.T) {
-	got := FormatEvent(Event{Kind: "sendAck", ExternalID: "abc123", ActionOK: false})
+	got := FormatEvent(Event{Kind: "sendAck", ExternalID: "abc123", ActionOK: false, ActionOKStated: true})
 	if !strings.Contains(got, "NOT acknowledged") || !strings.Contains(got, "abc123") {
 		t.Fatalf("got %q", got)
 	}
@@ -417,5 +417,100 @@ func TestFormatEventsBatchReturnsSingleChunkUnmarkedForOneEvent(t *testing.T) {
 func TestFormatEventsBatchEmptyForNoEvents(t *testing.T) {
 	if chunks := FormatEventsBatch(nil); len(chunks) != 0 {
 		t.Fatalf("got %v", chunks)
+	}
+}
+
+// A pin change names a platform identity, never a peerId, and says the set
+// has moved so a reader knows its own copy is now stale.
+func TestFormatPinnedNamesWhoAndPointsAtThePullPath(t *testing.T) {
+	got := FormatEvent(Event{
+		Kind: "pinned", ExternalID: "ext-1",
+		ByName: "Steffen Heil", ByID: "aad-123", TS: "2026-09-11T13:00:00Z",
+	})
+	for _, want := range []string{"ext-1", "was pinned", "Steffen Heil", "aad-123", "hub_pins()"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in %q", want, got)
+		}
+	}
+	if un := FormatEvent(Event{Kind: "unpinned", ExternalID: "ext-1", ByName: "Someone"}); !strings.Contains(un, "was unpinned") {
+		t.Fatalf("expected an unpin to read as one, got %q", un)
+	}
+}
+
+// A server that names nobody must not render as if it had.
+func TestFormatPinnedWithoutAnIdentitySaysSo(t *testing.T) {
+	got := FormatEvent(Event{Kind: "pinned", ExternalID: "ext-1"})
+	if !strings.Contains(got, "did not name") {
+		t.Fatalf("expected it to admit the server named nobody, got %q", got)
+	}
+}
+
+// An answer of "nothing is pinned" is an answer, and must not render as
+// though no answer came back.
+func TestFormatPinsDistinguishesEmptyFromAbsent(t *testing.T) {
+	if got := FormatEvent(Event{Kind: "pins", PinnedList: []string{}}); !strings.Contains(got, "nothing is pinned") {
+		t.Fatalf("expected an empty set stated plainly, got %q", got)
+	}
+	got := FormatEvent(Event{Kind: "pins", PinnedList: []string{"a", "b"}})
+	if !strings.Contains(got, "(2)") || !strings.Contains(got, "a, b") {
+		t.Fatalf("expected the set listed, got %q", got)
+	}
+}
+
+// An ack with no "ok" field is not a refusal. Go decodes an absent bool
+// as false, so without the distinction the client reports "the server
+// refused" about a server that said nothing — which happened live, on a
+// pinAck family member built unlike its siblings.
+func TestAckWithoutAnOKFieldIsNotReportedAsRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"pinAck", `{"type":"pinAck","externalId":"ext-1"}`},
+		{"unpinAck", `{"type":"unpinAck","externalId":"ext-1"}`},
+		{"sendAck", `{"type":"sendAck","externalId":"ext-1"}`},
+		{"editAck", `{"type":"editAck","externalId":"ext-1"}`},
+		{"deleteAck", `{"type":"deleteAck","externalId":"ext-1"}`},
+		{"reactionAck", `{"type":"reactionAck","externalId":"ext-1","action":"add"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, ok := DecodeEvent([]byte(tc.raw))
+			if !ok {
+				t.Fatalf("decode failed for %s", tc.raw)
+			}
+			if ev.ActionOKStated {
+				t.Fatal("expected an absent ok to be recorded as unstated")
+			}
+			got := FormatEvent(ev)
+			if strings.Contains(got, "refused") || strings.Contains(got, "NOT acknowledged") {
+				t.Fatalf("expected no claim of refusal for an unstated outcome, got: %s", got)
+			}
+			if !strings.Contains(got, "did NOT say") && !strings.Contains(got, "without saying") {
+				t.Fatalf("expected the result to say the server was silent on the outcome, got: %s", got)
+			}
+		})
+	}
+}
+
+// And an explicit ok:false must still read as a refusal — otherwise the
+// test above passes by making every failure unreportable.
+func TestExplicitFalseStillReadsAsRefusal(t *testing.T) {
+	ev, ok := DecodeEvent([]byte(`{"type":"pinAck","externalId":"ext-1","ok":false}`))
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	if !ev.ActionOKStated {
+		t.Fatal("expected an explicit ok to be recorded as stated")
+	}
+	if got := FormatEvent(ev); !strings.Contains(got, "refused") {
+		t.Fatalf("expected a refusal, got: %s", got)
+	}
+}
+
+// An explicit ok:true is unchanged.
+func TestExplicitTrueStillReadsAsSuccess(t *testing.T) {
+	ev, _ := DecodeEvent([]byte(`{"type":"pinAck","externalId":"ext-1","ok":true}`))
+	if got := FormatEvent(ev); !strings.Contains(got, "pinned ext-1") {
+		t.Fatalf("expected success, got: %s", got)
 	}
 }

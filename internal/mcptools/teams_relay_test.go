@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -2583,5 +2584,449 @@ func TestReadRequiresExactlyOneAnchor(t *testing.T) {
 		if !res.IsError || !strings.Contains(textOf(res), "exactly one") {
 			t.Fatalf("expected a refusal for args %v, got: %s", args, textOf(res))
 		}
+	}
+}
+
+// pinsTestFeatures is teamsTestFeatures plus pinning, for a server that
+// declares it.
+func pinsTestFeatures() map[string]json.RawMessage {
+	f := teamsTestFeatures()
+	f["pins"] = json.RawMessage("{}")
+	return f
+}
+
+// startPinServer is a fake that answers the pin request/ack pairs and the
+// pull, so the client half can be exercised before the real server is up.
+// pinnedAtConnect is a pointer so a test can express all three states the
+// wire distinguishes: nil for a server with no pinning, a pointer to an
+// empty slice for pinning with nothing pinned.
+func startPinServer(t *testing.T, features map[string]json.RawMessage, pinnedAtConnect *[]string, pullAnswer []string) string {
+	t.Helper()
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: features, Pinned: pinnedAtConnect,
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m map[string]any
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			switch m["type"] {
+			case "pin":
+				conn.WriteJSON(wire.PinAck{Type: wire.TypePinAck, ExternalID: fmt.Sprint(m["externalId"]), OK: true})
+			case "unpin":
+				conn.WriteJSON(wire.UnpinAck{Type: wire.TypeUnpinAck, ExternalID: fmt.Sprint(m["externalId"]), OK: true})
+			case "pins":
+				conn.WriteJSON(wire.PinsResponse{Type: wire.TypePins, List: pullAnswer, At: "2026-09-11T13:00:00Z"})
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+}
+
+func connectForPins(t *testing.T, link string) (*Hub, context.Context, *mcp.CallToolResult) {
+	t.Helper()
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link}
+	res, err := hub.handleConnect(ctx, req)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	t.Cleanup(func() { hub.handleDisconnect(ctx, mcp.CallToolRequest{}) })
+	return hub, ctx, res
+}
+
+func TestPinAndUnpinReportTheServersOwnAnswer(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub, ctx, _ := connectForPins(t, startPinServer(t, pinsTestFeatures(), &[]string{}, nil))
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"externalId": "ext-1"}
+	res, err := hub.handlePin(ctx, req)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_pin failed: err=%v result=%+v", err, res)
+	}
+	if !strings.Contains(textOf(res), "pinned ext-1") {
+		t.Fatalf("expected the server's own ack reported, got: %s", textOf(res))
+	}
+	res, err = hub.handleUnpin(ctx, req)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_unpin failed: err=%v result=%+v", err, res)
+	}
+	if !strings.Contains(textOf(res), "unpinned ext-1") {
+		t.Fatalf("expected the server's own ack reported, got: %s", textOf(res))
+	}
+}
+
+// A server that declares no pinning gets the request refused locally
+// rather than sent into silence — the same division as every other write
+// action: the feature decides whether to send, actionAcks decides whether
+// to wait.
+func TestPinIsRefusedWhereTheServerDeclaresNoPinning(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub, ctx, _ := connectForPins(t, startPinServer(t, teamsTestFeatures(), nil, nil))
+
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"externalId": "ext-1"}
+	for name, call := range map[string]func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error){
+		"hub_pin": hub.handlePin, "hub_unpin": hub.handleUnpin, "hub_pins": hub.handlePins,
+	} {
+		start := time.Now()
+		res, err := call(ctx, req)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", name, err)
+		}
+		if !res.IsError || !strings.Contains(textOf(res), "pins") {
+			t.Fatalf("%s: expected a local refusal naming the missing feature, got: %s", name, textOf(res))
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("%s: expected an immediate refusal, took %v", name, elapsed)
+		}
+	}
+}
+
+// The pull is the repair path: it reports what the server says now, not
+// what this client last heard.
+func TestPinsReportsTheServersCurrentSetNotTheConnectSnapshot(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub, ctx, connectRes := connectForPins(t,
+		startPinServer(t, pinsTestFeatures(), &[]string{"ext-old"}, []string{"ext-new-1", "ext-new-2"}))
+
+	if !strings.Contains(textOf(connectRes), "ext-old") {
+		t.Fatalf("expected the connect-time set stated, got: %s", textOf(connectRes))
+	}
+	if !strings.Contains(textOf(connectRes), "snapshot from connect time") {
+		t.Fatalf("expected the connect line to say it is only a snapshot, got: %s", textOf(connectRes))
+	}
+
+	res, err := hub.handlePins(ctx, mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("hub_pins failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "ext-new-1") || !strings.Contains(text, "ext-new-2") {
+		t.Fatalf("expected the server's current set, got: %s", text)
+	}
+	if strings.Contains(text, "ext-old") {
+		t.Fatalf("expected the stale connect-time entry NOT to be reported, got: %s", text)
+	}
+}
+
+// An empty pinned set and no pinning at all are different facts, and the
+// connect result must not conflate them.
+func TestConnectDistinguishesNothingPinnedFromNoPinningAtAll(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	_, _, empty := connectForPins(t, startPinServer(t, pinsTestFeatures(), &[]string{}, nil))
+	if !strings.Contains(textOf(empty), "Nothing is pinned") {
+		t.Fatalf("expected an empty set to be stated, got: %s", textOf(empty))
+	}
+
+	_, _, unsupported := connectForPins(t, startPinServer(t, teamsTestFeatures(), nil, nil))
+	if strings.Contains(textOf(unsupported), "pinned") {
+		t.Fatalf("expected no pinning commentary where the server declares none, got: %s", textOf(unsupported))
+	}
+}
+
+// filterTestFeatures declares the read path and which filters it can
+// apply. Passing nil filters declares messageAfter as a bare marker —
+// the pull path exists, no filter does — which is a different statement
+// from declaring no messageAfter at all.
+func filterTestFeatures(filters []string) map[string]json.RawMessage {
+	f := teamsTestFeatures()
+	if filters == nil {
+		f["messageAfter"] = json.RawMessage("{}")
+		return f
+	}
+	payload, _ := json.Marshal(map[string][]string{"filters": filters})
+	f["messageAfter"] = payload
+	return f
+}
+
+// filterServerReply is what a fake server should answer one request with.
+// Deliberately expressed as "what to send back" rather than "does it
+// match": these tests are about how the client reads an answer, so the
+// answers have to be constructible independently of any matching logic —
+// including the dishonest ones a real server would never send.
+type filterServerReply struct {
+	// msg, when non-empty, is returned as the message text.
+	msg string
+	// applied is echoed as `matching`; nil sends no matching at all,
+	// which is how a server that ignored the filter answers.
+	applied *wire.Filter
+	// errCode, when set, answers with an error instead.
+	errCode string
+}
+
+func startFilterServer(t *testing.T, features map[string]json.RawMessage,
+	reply func(wire.MessageAfter) filterServerReply) (link string, sent func() []wire.MessageAfter) {
+	t.Helper()
+	upgrader := websocket.Upgrader{}
+	var mu sync.Mutex
+	var requests []wire.MessageAfter
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: features,
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			mu.Lock()
+			requests = append(requests, m)
+			mu.Unlock()
+			anchor := wire.Anchor{At: m.At, Cursor: m.Cursor}
+			rep := reply(m)
+			switch {
+			case rep.errCode != "":
+				conn.WriteJSON(wire.Error{
+					Type: wire.TypeError, Code: rep.errCode,
+					Message: "refused by the test server", Retryable: false,
+				})
+			case rep.msg != "":
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440099",
+					Text: rep.msg, Cursor: "cursor-filtered-1", Historical: true,
+					Answers: &anchor, Matching: rep.applied,
+				})
+			default:
+				conn.WriteJSON(wire.NoMoreMessages{
+					Type: wire.TypeNoMoreMessages, Answers: &anchor, Matching: rep.applied,
+				})
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	return link, func() []wire.MessageAfter {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]wire.MessageAfter(nil), requests...)
+	}
+}
+
+func connectForFilters(t *testing.T, link string) *Hub {
+	t.Helper()
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	t.Cleanup(func() { hub.handleDisconnect(ctx, mcp.CallToolRequest{}) })
+	return hub
+}
+
+func readWith(t *testing.T, hub *Hub, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = args
+	res, err := hub.handleRead(context.Background(), req)
+	if err != nil {
+		t.Fatalf("hub_read errored: %v", err)
+	}
+	return res
+}
+
+// The filter has to reach the wire as a filter, not be applied locally to
+// a full walk — which would fetch everything and discard most of it, the
+// exact cost the filter exists to avoid.
+func TestReadSendsTheFilterToTheServer(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	applied := wire.Filter{Sender: "peer-42", Query: "release"}
+	link, sent := startFilterServer(t, filterTestFeatures([]string{"sender", "query"}),
+		func(wire.MessageAfter) filterServerReply {
+			return filterServerReply{msg: "the one that matched", applied: &applied}
+		})
+	hub := connectForFilters(t, link)
+
+	res := readWith(t, hub, map[string]any{
+		"at": "2026-09-10T18:30:00Z", "sender": "peer-42", "query": "release"})
+	if res.IsError {
+		t.Fatalf("unexpected refusal: %s", textOf(res))
+	}
+	reqs := sent()
+	if len(reqs) != 1 {
+		t.Fatalf("expected exactly one request, got %d", len(reqs))
+	}
+	if reqs[0].Sender != "peer-42" || reqs[0].Query != "release" {
+		t.Fatalf("expected the filter on the wire, got %+v", reqs[0].Filter)
+	}
+	if reqs[0].At != "2026-09-10T18:30:00Z" {
+		t.Fatalf("expected the anchor alongside the filter, got %+v", reqs[0].Anchor)
+	}
+	if !strings.Contains(textOf(res), "the one that matched") {
+		t.Fatalf("expected the message back, got: %s", textOf(res))
+	}
+}
+
+// The whole point of `matching`: a filtered terminator says nothing
+// further MATCHES, which is not the same claim as no more messages.
+// Reading the second as the first ends a walk with unread messages past
+// the anchor, silently, looking exactly like success.
+func TestFilteredTerminatorIsNotTheUnfilteredOne(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	applied := wire.Filter{Sender: "peer-42"}
+	link, _ := startFilterServer(t, filterTestFeatures([]string{"sender", "query"}),
+		func(wire.MessageAfter) filterServerReply {
+			return filterServerReply{applied: &applied}
+		})
+	hub := connectForFilters(t, link)
+
+	res := readWith(t, hub, map[string]any{"at": "2026-09-10T18:30:00Z", "sender": "peer-42"})
+	got := textOf(res)
+	if !strings.Contains(got, "Nothing FURTHER MATCHES") {
+		t.Fatalf("expected the filtered terminator, got: %s", got)
+	}
+	if !strings.Contains(got, "not the same statement") {
+		t.Fatalf("expected the distinction spelled out, got: %s", got)
+	}
+	if strings.Contains(got, "no message after that point") {
+		t.Fatalf("expected NOT the unfiltered wording, got: %s", got)
+	}
+}
+
+// And the same server, asked without a filter, must give the plain
+// answer — otherwise the test above passes on wording that is always
+// present and proves nothing.
+func TestUnfilteredTerminatorStaysPlain(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := startFilterServer(t, filterTestFeatures([]string{"sender", "query"}),
+		func(wire.MessageAfter) filterServerReply { return filterServerReply{} })
+	hub := connectForFilters(t, link)
+
+	res := readWith(t, hub, map[string]any{"at": "2026-09-10T18:30:00Z"})
+	got := textOf(res)
+	if !strings.Contains(got, "no message after that point") {
+		t.Fatalf("expected the plain terminator, got: %s", got)
+	}
+	if strings.Contains(got, "MATCHES") {
+		t.Fatalf("expected no filter commentary on an unfiltered read, got: %s", got)
+	}
+}
+
+// A server that ignored the filter sends no `matching`. Its terminator
+// then answers a question that was never asked, and must not be reported
+// as "nothing from that sender".
+func TestUnappliedFilterTerminatorIsNotReportedAsAnAnswer(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := startFilterServer(t, filterTestFeatures(nil),
+		func(wire.MessageAfter) filterServerReply { return filterServerReply{} })
+	hub := connectForFilters(t, link)
+
+	// The gate is off for this call, so the answer's own absence of
+	// `matching` is the only thing that can catch it.
+	res := readWith(t, hub, map[string]any{"at": "2026-09-10T18:30:00Z", "sender": "peer-42"})
+	if res.IsError {
+		// A bare messageAfter marker declares no filters, so the gate
+		// refuses ahead of the wire — that is the better outcome, and
+		// the refusal must say why rather than just fail.
+		if !strings.Contains(textOf(res), "declares no filters") {
+			t.Fatalf("expected the refusal to explain itself, got: %s", textOf(res))
+		}
+		return
+	}
+	got := textOf(res)
+	if !strings.Contains(got, "NOT A COMPLETE ANSWER") {
+		t.Fatalf("expected the result to refuse to read as an answer, got: %s", got)
+	}
+}
+
+// Per-field, because `matching` echoes what was APPLIED: a server that
+// honours sender and ignores query must not read as having honoured both.
+func TestPartiallyAppliedFilterNamesWhatWasNotApplied(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	applied := wire.Filter{Sender: "peer-42"}
+	link, _ := startFilterServer(t, filterTestFeatures([]string{"sender", "query"}),
+		func(wire.MessageAfter) filterServerReply {
+			return filterServerReply{msg: "from the right sender, text unchecked", applied: &applied}
+		})
+	hub := connectForFilters(t, link)
+
+	res := readWith(t, hub, map[string]any{
+		"at": "2026-09-10T18:30:00Z", "sender": "peer-42", "query": "release"})
+	got := textOf(res)
+	if !strings.Contains(got, "did not apply the query filter") {
+		t.Fatalf("expected the unapplied filter named, got: %s", got)
+	}
+	if strings.Contains(got, "sender and query") {
+		t.Fatalf("expected sender NOT to be reported as unapplied, got: %s", got)
+	}
+}
+
+// bad_filter and bad_anchor name different halves of the request, and
+// retrying the wrong half fixes nothing.
+func TestBadFilterSaysTheAnchorWasFine(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := startFilterServer(t, filterTestFeatures([]string{"sender", "query"}),
+		func(wire.MessageAfter) filterServerReply {
+			return filterServerReply{errCode: "bad_filter"}
+		})
+	hub := connectForFilters(t, link)
+
+	res := readWith(t, hub, map[string]any{"at": "2026-09-10T18:30:00Z", "query": "ab"})
+	got := textOf(res)
+	if !res.IsError {
+		t.Fatalf("expected a refusal, got: %s", got)
+	}
+	if !strings.Contains(got, "ANCHOR was fine") {
+		t.Fatalf("expected the error to name which half was wrong, got: %s", got)
+	}
+}
+
+// A filter the server declares it cannot apply is refused before it
+// reaches the wire: the answer would look filtered and would not be.
+func TestUndeclaredFilterIsRefusedBeforeSending(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, sent := startFilterServer(t, filterTestFeatures([]string{"sender"}),
+		func(wire.MessageAfter) filterServerReply { return filterServerReply{} })
+	hub := connectForFilters(t, link)
+
+	res := readWith(t, hub, map[string]any{"at": "2026-09-10T18:30:00Z", "query": "release"})
+	if !res.IsError || !strings.Contains(textOf(res), "not by \"query\"") {
+		t.Fatalf("expected a local refusal naming the filter, got: %s", textOf(res))
+	}
+	if len(sent()) != 0 {
+		t.Fatalf("expected nothing sent to the server, got %d requests", len(sent()))
+	}
+	// The declared one still works — the gate must narrow, not block.
+	if res := readWith(t, hub, map[string]any{"at": "2026-09-10T18:30:00Z", "sender": "peer-42"}); res.IsError {
+		t.Fatalf("expected the declared filter to be allowed, got: %s", textOf(res))
+	}
+}
+
+func TestSingleCharacterQueryIsRefusedLocally(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, sent := startFilterServer(t, filterTestFeatures([]string{"sender", "query"}),
+		func(wire.MessageAfter) filterServerReply { return filterServerReply{} })
+	hub := connectForFilters(t, link)
+
+	res := readWith(t, hub, map[string]any{"at": "2026-09-10T18:30:00Z", "query": "a"})
+	if !res.IsError || !strings.Contains(textOf(res), "at least two characters") {
+		t.Fatalf("expected a local refusal, got: %s", textOf(res))
+	}
+	if len(sent()) != 0 {
+		t.Fatalf("expected nothing sent to the server, got %d requests", len(sent()))
 	}
 }

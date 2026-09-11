@@ -60,6 +60,17 @@ func init() {
 	}
 }
 
+// SetReleaseForTest makes this build report a release version and returns
+// a function restoring what it reported before. Needed because a test
+// binary carries no VCS stamp and no injected tag, so it reports "unknown"
+// — which is correct, and makes every code path that only runs for a
+// real release untestable without a seam.
+func SetReleaseForTest(release string) func() {
+	prevRelease, prevModified := Release, modified
+	Release, modified = release, false
+	return func() { Release, modified = prevRelease, prevModified }
+}
+
 // Revision is the commit this binary was built from, or "" when it was
 // built outside a repository (e.g. from a module cache).
 func Revision() string { return revision }

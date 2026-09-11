@@ -48,6 +48,13 @@ const (
 	TypeAttachment      Type = "attachment"
 	TypeAttachmentData  Type = "attachmentData"
 	TypeMessageAfter    Type = "messageAfter"
+	TypePinned          Type = "pinned"
+	TypeUnpinned        Type = "unpinned"
+	TypePin             Type = "pin"
+	TypeUnpin           Type = "unpin"
+	TypePinAck          Type = "pinAck"
+	TypeUnpinAck        Type = "unpinAck"
+	TypePins            Type = "pins"
 	TypeNoMoreMessages  Type = "noMoreMessages"
 )
 
@@ -182,6 +189,20 @@ type Joined struct {
 	// Removed in the same change that removes the feature it names —
 	// never left describing a capability that no longer exists.
 	Features map[string]json.RawMessage `json:"features,omitempty"`
+	// Pinned is the conversation's currently pinned messages, by
+	// externalId. Present whenever the "pins" feature is declared and
+	// ALWAYS present then — an EMPTY ARRAY when nothing is pinned, never
+	// omitted. That is what makes absence mean exactly one thing
+	// (unsupported) rather than being ambiguous between "none pinned" and
+	// "this server has no such concept"; reading presence as capability is
+	// how conversationKind was misread.
+	//
+	// A pointer because that is the only way Go's encoder distinguishes
+	// the three states this field needs: nil omits the field, a pointer to
+	// an empty slice emits [], and omitempty on a plain slice would
+	// collapse "nothing pinned" into "no pinning" — the exact conflation
+	// the contract exists to prevent.
+	Pinned *[]string `json:"pinned,omitempty"`
 }
 
 // AttachmentsFeature is Features["attachments"]'s own parameter shape —
@@ -340,6 +361,15 @@ type Msg struct {
 	// this frame is the reply to a specific pull, not unrelated traffic,
 	// even if a downstream layer merges the two.
 	Answers *Anchor `json:"answers,omitempty"`
+	// Matching echoes the Filter that was APPLIED in producing this
+	// answer — not the one that was received. The distinction is the
+	// useful part: a server that ignored the filter sends no Matching at
+	// all, and a server that honoured some of what was sent echoes
+	// exactly the honoured ones. So a client can tell WHICH constraints
+	// held rather than only whether any did, and an unknown filter it
+	// sent comes back absent instead of silently reading as applied.
+	// Nil on any Msg that did not answer a filtered request.
+	Matching *Filter `json:"matching,omitempty"`
 	// Own, for a teams session, is true when this exact connection is
 	// the one that sent the message. Deliberately a decision for the
 	// receiving client to act on, not the server: whether to skip waking
@@ -754,7 +784,38 @@ type Anchor struct {
 type MessageAfter struct {
 	Type Type `json:"type"`
 	Anchor
+	Filter
 }
+
+// Filter narrows which messages a MessageAfter request will consider. It
+// does not change the shape of the answer: still exactly one message,
+// oldest first, no ranking and no page. The one rule gains three words —
+// the first message strictly after the anchor THAT MATCHES.
+//
+// A read is not a search. A server may well have a search endpoint with
+// ranking and paging of its own, answering "what is the best match"; this
+// answers "what is the next one", and the two are different questions
+// that happen to share a vocabulary.
+//
+// Fields AND with each other, and an empty field is not a constraint.
+// Both are optional and a request with neither is an ordinary unfiltered
+// walk.
+type Filter struct {
+	// Sender matches a single sender by the identity id that this
+	// session's own msg frames already carry — the directory object id
+	// on a teams session, the peerId on a hub one. So a caller filters
+	// with a value it was given rather than one it has to construct, and
+	// the identity space is the server's own rather than a second one
+	// invented for filtering.
+	Sender string `json:"sender,omitempty"`
+	// Query matches message text. Two characters minimum; a shorter one
+	// is refused as Error{Code: "bad_filter"} rather than bad_anchor,
+	// since the anchor was fine and retrying that half fixes nothing.
+	Query string `json:"query,omitempty"`
+}
+
+// Set reports whether this filter constrains anything at all.
+func (f Filter) Set() bool { return f.Sender != "" || f.Query != "" }
 
 func NewMessageAfterCursor(cursor string) MessageAfter {
 	return MessageAfter{Type: TypeMessageAfter, Anchor: Anchor{Cursor: cursor}}
@@ -766,13 +827,29 @@ func NewMessageAfterAt(at string) MessageAfter {
 
 // NoMoreMessages answers a MessageAfter whose anchor has no successor —
 // see MessageAfter's doc comment. Answers echoes the anchor as sent.
+//
+// Matching echoes the filter that was applied, and is absent on an
+// unfiltered walk. That distinction is the whole point of the field: a
+// filtered NoMoreMessages means NOTHING FURTHER MATCHES, not "no more
+// messages", and the two are the same frame with opposite consequences.
+// Reading the second as the first stops a walk with unread messages still
+// past the anchor, silently and looking exactly like success. Its
+// PRESENCE is the answer to "was this filtered", so a server that ignored
+// the filter cannot be mistaken for one that honoured it.
 type NoMoreMessages struct {
-	Type    Type    `json:"type"`
-	Answers *Anchor `json:"answers,omitempty"`
+	Type     Type    `json:"type"`
+	Answers  *Anchor `json:"answers,omitempty"`
+	Matching *Filter `json:"matching,omitempty"`
 }
 
 func NewNoMoreMessages(answers Anchor) NoMoreMessages {
 	return NoMoreMessages{Type: TypeNoMoreMessages, Answers: &answers}
+}
+
+// NewNoMoreMessagesMatching is the filtered terminator — see
+// NoMoreMessages.Matching for why it is a different statement.
+func NewNoMoreMessagesMatching(answers Anchor, matching Filter) NoMoreMessages {
+	return NoMoreMessages{Type: TypeNoMoreMessages, Answers: &answers, Matching: &matching}
 }
 
 // Ack is a standalone read receipt — the same information Msg/Reaction/
@@ -1025,3 +1102,91 @@ type MessageDeleted struct {
 	TS         string `json:"ts,omitempty"`
 	Own        bool   `json:"own,omitempty"`
 }
+
+// Identity names a person or account on the platform behind a mirrored
+// conversation — the same shape a Mention uses. Never a peerId: a peerId
+// says which CONNECTION did something, which is neither what the platform
+// displays nor durable, and pins outlive connections.
+type Identity struct {
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+}
+
+// Pinned and Unpinned report a change to the pinned set, from anyone —
+// a person acting in the platform's own UI, or an agent. There is
+// deliberately no "own" flag: an agent pins AS the account, so the
+// platform shows the account as the pinner and a connection-level answer
+// would name something the platform never displays. An agent recognises
+// its own pin by the externalId it asked for, and by the ack answering
+// that request directly.
+type Pinned struct {
+	Type       Type     `json:"type"`
+	ExternalID string   `json:"externalId"`
+	By         Identity `json:"by"`
+	At         string   `json:"at,omitempty"`
+}
+
+type Unpinned struct {
+	Type       Type     `json:"type"`
+	ExternalID string   `json:"externalId"`
+	By         Identity `json:"by"`
+	At         string   `json:"at,omitempty"`
+}
+
+// Pin and Unpin request a change. Answered by PinAck/UnpinAck where the
+// server declares "actionAcks" — "pins" says the action exists, actionAcks
+// says an answer is worth waiting for.
+type Pin struct {
+	Type       Type   `json:"type"`
+	ExternalID string `json:"externalId"`
+	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
+	AckCursor string `json:"ackCursor,omitempty"`
+}
+
+type Unpin struct {
+	Type       Type   `json:"type"`
+	ExternalID string `json:"externalId"`
+	AckCursor  string `json:"ackCursor,omitempty"`
+}
+
+type PinAck struct {
+	Type       Type   `json:"type"`
+	ExternalID string `json:"externalId,omitempty"`
+	OK         bool   `json:"ok"`
+}
+
+type UnpinAck struct {
+	Type       Type   `json:"type"`
+	ExternalID string `json:"externalId,omitempty"`
+	OK         bool   `json:"ok"`
+}
+
+// PinsRequest asks for the current pinned set, and PinsResponse answers
+// it. The pull path exists because the set is otherwise only pushed: a
+// client that misses one pinned/unpinned event would hold a wrong set with
+// no way to discover that and no way to repair it. Pushed state that can
+// drift needs a way to ask.
+//
+// A server must answer from the same stored set Joined.Pinned carries,
+// not from a fresh upstream read — otherwise the two disagree under
+// exactly the conditions the pull exists to resolve.
+type PinsRequest struct {
+	Type      Type   `json:"type"`
+	AckCursor string `json:"ackCursor,omitempty"`
+}
+
+type PinsResponse struct {
+	Type Type     `json:"type"`
+	List []string `json:"list"`
+	At   string   `json:"at,omitempty"`
+}
+
+func NewPinRequest(externalID string) Pin {
+	return Pin{Type: TypePin, ExternalID: externalID}
+}
+
+func NewUnpinRequest(externalID string) Unpin {
+	return Unpin{Type: TypeUnpin, ExternalID: externalID}
+}
+
+func NewPinsRequest() PinsRequest { return PinsRequest{Type: TypePins} }

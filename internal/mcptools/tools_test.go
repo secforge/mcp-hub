@@ -1926,6 +1926,10 @@ func TestSelfUpdateReportsAnAlreadyInstalledUpdateWithoutTouchingTheNetwork(t *t
 		t.Fatal(err)
 	}
 	restore := selfupdate.SetExecutablePathForTest(exe)
+	// The stand-in is written during this test, so it is newer than this
+	// process — which is the replacement signal, and not what this test is
+	// about. Say so rather than letting it fire.
+	defer selfupdate.SetProcessStartForTest(time.Now().Add(time.Hour))()
 	defer restore()
 
 	// Pointed at a server that fails the test if it is ever consulted.
@@ -1956,6 +1960,10 @@ func TestSelfUpdateReportsAnAlreadyInstalledUpdateWithoutTouchingTheNetwork(t *t
 func TestSelfUpdateRefusesToCompareADevelopmentBuild(t *testing.T) {
 	exe := selfUpdateStubBinary(t, version.Short())
 	restore := selfupdate.SetExecutablePathForTest(exe)
+	// The stand-in is written during this test, so it is newer than this
+	// process — which is the replacement signal, and not what this test is
+	// about. Say so rather than letting it fire.
+	defer selfupdate.SetProcessStartForTest(time.Now().Add(time.Hour))()
 	defer restore()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1985,6 +1993,10 @@ func TestSelfUpdateRefusesToCompareADevelopmentBuild(t *testing.T) {
 func TestSelfUpdateSurfacesARefusalAsAnError(t *testing.T) {
 	exe := selfUpdateStubBinary(t, version.Short())
 	restore := selfupdate.SetExecutablePathForTest(exe)
+	// The stand-in is written during this test, so it is newer than this
+	// process — which is the replacement signal, and not what this test is
+	// about. Say so rather than letting it fire.
+	defer selfupdate.SetProcessStartForTest(time.Now().Add(time.Hour))()
 	defer restore()
 
 	// A newer release with an asset but no signature beside it.
@@ -2029,6 +2041,10 @@ func TestConnectRecommendsARestartWhenANewerBinaryIsInstalled(t *testing.T) {
 
 	exe := selfUpdateStubBinary(t, "v99.0.0")
 	restore := selfupdate.SetExecutablePathForTest(exe)
+	// The stand-in is written during this test, so it is newer than this
+	// process — which is the replacement signal, and not what this test is
+	// about. Say so rather than letting it fire.
+	defer selfupdate.SetProcessStartForTest(time.Now().Add(time.Hour))()
 	defer restore()
 
 	hub := NewHub()
@@ -2040,7 +2056,10 @@ func TestConnectRecommendsARestartWhenANewerBinaryIsInstalled(t *testing.T) {
 	}
 	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
 	text := textOf(res)
-	if !strings.Contains(text, "a newer client is already installed") {
+	// "different", not "newer": the check compares the two versions for
+	// inequality and has no way to order them, so claiming the installed
+	// one is newer would state more than was checked.
+	if !strings.Contains(text, "a different client is already installed") {
 		t.Fatalf("expected a restart recommendation on a successful connect, got: %s", text)
 	}
 	if !strings.Contains(text, "no need to act now") {
@@ -2055,6 +2074,10 @@ func TestConnectSaysNothingAboutVersionsWhenNothingIsStale(t *testing.T) {
 
 	exe := selfUpdateStubBinary(t, version.Short())
 	restore := selfupdate.SetExecutablePathForTest(exe)
+	// The stand-in is written during this test, so it is newer than this
+	// process — which is the replacement signal, and not what this test is
+	// about. Say so rather than letting it fire.
+	defer selfupdate.SetProcessStartForTest(time.Now().Add(time.Hour))()
 	defer restore()
 
 	hub := NewHub()
@@ -2098,5 +2121,40 @@ func TestConnectExplainsHowToRetrieveATruncatedMessage(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected the connect result to state %q, got: %s", want, text)
 		}
+	}
+}
+
+// "Already current" answers a question about connecting, and is routinely
+// reached by someone chasing a MISSING TOOL instead. Three things can hide
+// a capability — a stale process, a stale binary, or a release that never
+// shipped it — and an update reaches only the first two. Saying so is the
+// difference between a useful answer and one that sends someone restarting
+// for something that does not exist yet.
+func TestSelfUpdateAlreadyCurrentNamesWhatAnUpdateCannotFix(t *testing.T) {
+	restoreVersion := version.SetReleaseForTest("v9.9.9")
+	defer restoreVersion()
+
+	exe := selfUpdateStubBinary(t, version.Short())
+	restoreExe := selfupdate.SetExecutablePathForTest(exe)
+	defer selfupdate.SetProcessStartForTest(time.Now().Add(time.Hour))()
+	defer restoreExe()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"tag_name":"v9.9.9","assets":[]}`)
+	}))
+	defer srv.Close()
+	restoreAPI := selfupdate.SetReleasesAPIForTest(srv.URL)
+	defer restoreAPI()
+
+	res, err := NewHub().handleSelfUpdate(context.Background(), mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("hub_self_update failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "Already current") {
+		t.Fatalf("expected an already-current answer, got: %s", text)
+	}
+	if !strings.Contains(text, "never released at all") {
+		t.Fatalf("expected it to name the cause an update cannot reach, got: %s", text)
 	}
 }
