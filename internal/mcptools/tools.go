@@ -55,6 +55,22 @@ type Hub struct {
 	// both derive a stable identity from; see setCatchUpKey and
 	// catchUpKeyForRelay.
 	lastHandedOverCursor string
+	// knownContiguous records that this session has been told, by the
+	// server, that nothing precedes live traffic: a catch-up walk that
+	// answered "caught up", or a connect reporting nothing behind and no
+	// recorded gap.
+	//
+	// It is what makes auto-confirming a live message safe. A returning
+	// tool call IS delivery to the model — unlike wait --follow, which
+	// writes to a socket nobody may read — so a synchronous hand-over is
+	// exactly the confirmation hub_confirm would give. What it cannot do
+	// on its own is prove the message FOLLOWS the last confirmed one:
+	// cursors are opaque, so a client holding two of them cannot tell
+	// whether anything sits between. Advancing anyway would silently skip
+	// that middle, which is the one failure this whole mechanism exists to
+	// prevent. Knowing the gap is empty is the missing premise, and only
+	// the server can supply it.
+	knownContiguous bool
 	// seekedSinceConnect records that this connection has already seeked
 	// past a large backlog, so it does so at most once. Conn.Behind() is a
 	// connect-time snapshot that never moves, so without this every
@@ -469,6 +485,10 @@ func (h *Hub) setCatchUpKey(id connstore.Target) {
 	h.catchUpID = id
 	h.lastHandedOverCursor = ""
 	h.seekedSinceConnect = false
+	// Nothing is known about what precedes live traffic until a server
+	// says so. Assuming otherwise on a fresh connection is how a backlog
+	// gets skipped.
+	h.knownContiguous = false
 	// handedOverAhead's entries are cursors witnessed live for THIS
 	// connection's message stream — carrying them into a DIFFERENT
 	// identity (a different conversation entirely) would be the same
@@ -1165,9 +1185,14 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		"don't wait until something looks missing. It resumes from wherever this identity last " +
 		"left off (persisted across restarts), or reports there's nothing to catch up on."
 
+	// The same staleness check a failed connect runs, on every connect.
+	// A connection that works does not make an installed-but-unloaded
+	// update irrelevant — it just makes it a recommendation rather than a
+	// diagnosis, and this is the only moment anyone is looking.
 	return mcp.NewToolResultText(fmt.Sprintf(
-		"Connected as peer %s.\n%s\n%s%s%s%s%s",
+		"Connected as peer %s.\n%s\n%s%s%s%s%s%s",
 		conn.PeerID(), rosterNote, waitBlock, versionNote, identityNote, notes, h.behindNote(conn),
+		selfupdate.Check().RestartRecommendation(),
 	)), nil
 }
 
@@ -1364,9 +1389,60 @@ func (h *Hub) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.Event
 // comment for why the wire-level read-receipt boundary needs the same
 // synchronous-hand-over guarantee recordHandedOver already relies on.
 func (h *Hub) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string, events []hubconn.Event) *mcp.CallToolResult {
+	// Order matters: recordHandedOver stacks every cursor in the ahead
+	// set, and confirmLiveDelivery is what then takes back out the ones it
+	// could confirm outright. Running it first would just have them added
+	// straight back.
 	h.recordHandedOver(events)
+	h.confirmLiveDelivery(events)
 	conn.MarkConsumed(events)
 	return mcp.NewToolResultText(formatted + h.saveReceivedAttachments(conn, events))
+}
+
+// confirmLiveDelivery advances the persisted catch-up position for LIVE
+// messages handed to the model synchronously, while this session knows
+// nothing precedes them (see Hub.knownContiguous).
+//
+// Without this, a client reading only through blocking calls never
+// advanced its position at all: every delivery recorded the cursor as
+// merely "seen ahead" and simultaneously satisfied the confirm reminder's
+// condition, so the reminder never fired either. The position stayed
+// frozen wherever the last walk left it while hundreds of cursors stacked
+// up ahead of it, and the next reconnect re-walked the lot. Asking the
+// model to call hub_confirm for these is asking twice for the same fact —
+// the tool result IS the hand-over.
+//
+// Historical messages are excluded: hub_catch_up's own walk advances the
+// position itself, one message at a time, and a gap retrieval delivers
+// messages from BEFORE the current position, which must never move it.
+func (h *Hub) confirmLiveDelivery(events []hubconn.Event) {
+	h.mu.Lock()
+	if !h.knownContiguous {
+		h.mu.Unlock()
+		return
+	}
+	advanced := ""
+	for _, e := range events {
+		if e.Cursor == "" || e.Historical {
+			continue
+		}
+		advanced = e.Cursor
+		delete(h.handedOverAhead, e.Cursor)
+	}
+	if advanced == "" {
+		h.mu.Unlock()
+		return
+	}
+	h.lastHandedOverCursor = advanced
+	id := h.catchUpID
+	snapshot := make(map[string]bool, len(h.handedOverAhead))
+	for c := range h.handedOverAhead {
+		snapshot[c] = true
+	}
+	h.mu.Unlock()
+
+	setCatchUpCursor(id, advanced)
+	saveHandedOverAhead(id, snapshot)
 }
 
 // recordHandedOver marks each event's own Cursor as confirmed delivered
@@ -1869,6 +1945,11 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		id := h.catchUpID
 		h.seekedSinceConnect = true
 		h.mu.Unlock()
+		// A seek leaves a range nobody has walked, so live traffic is no
+		// longer known to follow the confirmed position.
+		h.mu.Lock()
+		h.knownContiguous = false
+		h.mu.Unlock()
 		setCatchUpGap(id, conn.BehindSince(), seekAt)
 		seekNote = fmt.Sprintf(
 			"You were %d messages behind — seeking to recent context (%s) instead of walking the "+
@@ -1885,6 +1966,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		seekNote = "No prior position recorded for this session — seeking to recent context " +
 			"instead of walking from the start.\n\n"
 	default:
+		h.mu.Lock()
+		h.knownContiguous = true
+		h.mu.Unlock()
 		return mcp.NewToolResultText(
 			"nothing to catch up — no prior position recorded and the server reports nothing behind; "+
 				"live traffic will arrive normally"+gapNote,
@@ -1902,6 +1986,15 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		}
 		switch ev.Kind {
 		case "noMoreMessages":
+			// The server has just said nothing sits after the confirmed
+			// position, so anything arriving live from here IS the next
+			// message and a synchronous delivery of it can advance the
+			// position by itself. A recorded gap does not change that:
+			// the gap is a separate, explicitly-tracked range, not an
+			// unknown one.
+			h.mu.Lock()
+			h.knownContiguous = true
+			h.mu.Unlock()
 			return mcp.NewToolResultText(seekNote +
 				"[hub: caught up — no more messages after your last known position]" + gapNote), nil
 		case "error":

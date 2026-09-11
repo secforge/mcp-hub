@@ -2331,3 +2331,113 @@ func TestDiscardGapWithNoGapChangesNothing(t *testing.T) {
 		t.Fatalf("expected nothing recorded when there was nothing to discard, got %+v", cs.Discarded)
 	}
 }
+
+// A returning tool call IS delivery to the model, so it should confirm
+// itself rather than asking the model to repeat the fact via hub_confirm.
+// Without this, a client reading only through blocking calls never
+// advanced its position at all: each delivery recorded the cursor as
+// merely "seen ahead" while simultaneously satisfying the confirm
+// reminder's condition, so the reminder never fired either — the position
+// stayed frozen and the ahead set grew without bound.
+func TestLiveDeliveryConfirmsItselfOnceKnownCaughtUp(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	live := make(chan string)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		go func() {
+			for {
+				var m wire.MessageAfter
+				if err := conn.ReadJSON(&m); err != nil {
+					return
+				}
+				conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+			}
+		}()
+		for cursor := range live {
+			conn.WriteJSON(wire.Msg{
+				Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440099",
+				Text: "live " + cursor, Cursor: cursor,
+			})
+		}
+		<-make(chan struct{})
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	hub.mu.Lock()
+	id := hub.catchUpID
+	hub.mu.Unlock()
+
+	// Before anything establishes that nothing precedes live traffic, a
+	// delivered live cursor must NOT move the position: the client cannot
+	// tell whether something sits between, and guessing would skip it.
+	live <- "cursor-before-catchup"
+	waitForBufferedEvent(t, hub)
+	if _, err := hub.handleReceive(ctx, mcp.CallToolRequest{}); err != nil {
+		t.Fatalf("hub_receive: %v", err)
+	}
+	if cs, _ := connstore.GetCatchUp(id); cs.Cursor != "" {
+		t.Fatalf("expected no position advance before being told it is contiguous, got %q", cs.Cursor)
+	}
+
+	// A catch-up answering "caught up" is the server saying exactly that.
+	res, err := hub.handleCatchUp(ctx, mcp.CallToolRequest{})
+	if err != nil || res.IsError {
+		t.Fatalf("catch-up failed: err=%v result=%+v", err, res)
+	}
+	// Either phrasing is the server saying nothing precedes live traffic:
+	// a walk that reached the end, or no backlog to walk in the first
+	// place.
+	if !strings.Contains(textOf(res), "caught up") && !strings.Contains(textOf(res), "nothing to catch up") {
+		t.Fatalf("expected an answer establishing contiguity, got: %s", textOf(res))
+	}
+
+	live <- "cursor-after-catchup"
+	waitForBufferedEvent(t, hub)
+	if _, err := hub.handleReceive(ctx, mcp.CallToolRequest{}); err != nil {
+		t.Fatalf("hub_receive: %v", err)
+	}
+	cs, _ := connstore.GetCatchUp(id)
+	if cs.Cursor != "cursor-after-catchup" {
+		t.Fatalf("expected the live delivery to confirm itself, got cursor %q", cs.Cursor)
+	}
+	// And it must not also be left stacked in the ahead set, which is what
+	// a reconnect would otherwise have to re-walk.
+	for _, c := range cs.Ahead {
+		if c == "cursor-after-catchup" {
+			t.Fatalf("expected the confirmed cursor removed from ahead, got %v", cs.Ahead)
+		}
+	}
+	close(live)
+}
+
+func waitForBufferedEvent(t *testing.T, hub *Hub) {
+	t.Helper()
+	conn, _ := hub.activeConn()
+	for i := 0; i < 200; i++ {
+		if has, _ := conn.Peek(); has {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("no event arrived")
+}

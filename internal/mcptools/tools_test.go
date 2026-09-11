@@ -2018,3 +2018,54 @@ func selfUpdateStubBinary(t *testing.T, reported string) string {
 	}
 	return exe
 }
+
+// The staleness check runs on every connect, not only failed ones — but a
+// working connection gets a recommendation, not an alarm, and silence when
+// there is nothing to recommend.
+func TestConnectRecommendsARestartWhenANewerBinaryIsInstalled(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := context.Background()
+
+	exe := selfUpdateStubBinary(t, "v99.0.0")
+	restore := selfupdate.SetExecutablePathForTest(exe)
+	defer restore()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": hubLink(url, sessionID)}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	text := textOf(res)
+	if !strings.Contains(text, "a newer client is already installed") {
+		t.Fatalf("expected a restart recommendation on a successful connect, got: %s", text)
+	}
+	if !strings.Contains(text, "no need to act now") {
+		t.Fatalf("expected it framed as a recommendation rather than a failure, got: %s", text)
+	}
+}
+
+func TestConnectSaysNothingAboutVersionsWhenNothingIsStale(t *testing.T) {
+	url := startTestServer(t)
+	sessionID := "550e8400-e29b-41d4-a716-446655440002"
+	ctx := context.Background()
+
+	exe := selfUpdateStubBinary(t, version.Short())
+	restore := selfupdate.SetExecutablePathForTest(exe)
+	defer restore()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": hubLink(url, sessionID)}
+	res, err := hub.handleConnect(ctx, connReq)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if strings.Contains(textOf(res), "already installed") {
+		t.Fatalf("expected no version commentary when nothing is stale, got: %s", textOf(res))
+	}
+}

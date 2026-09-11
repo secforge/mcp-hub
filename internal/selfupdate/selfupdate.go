@@ -118,6 +118,26 @@ func Check() Staleness {
 	return s
 }
 
+// RestartRecommendation is what to append to a connect that SUCCEEDED.
+// Empty unless there is something to act on: a working connection needs no
+// running commentary about being up to date, and a probe that could not
+// read the binary on disk is not worth mentioning when nothing is wrong.
+//
+// The same check runs on success and on failure because the answer matters
+// in both cases — it is only the weight that differs. On a failure it is
+// the first thing to try; here it is a recommendation, since whatever the
+// installed binary would have done differently, this connection worked
+// without it.
+func (s Staleness) RestartRecommendation() string {
+	if !s.Stale {
+		return ""
+	}
+	return fmt.Sprintf("\nNOTE: a newer client is already installed — this process is running %s "+
+		"while the binary on disk is %s. Nothing is wrong with this connection, so there is no "+
+		"need to act now; mention to the user that restarting the MCP server would load it.",
+		s.Running, s.OnDisk)
+}
+
 // Note is what to append to a failed connect, and it says which of the two
 // situations this is rather than listing possibilities. Empty when there is
 // nothing useful to add, so a caller can concatenate it unconditionally.

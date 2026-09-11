@@ -117,6 +117,13 @@ type Event struct {
 	// other event kind, and on an "ack" from a server that doesn't send
 	// it; never zero-as-absent, since a genuine "0 behind" is meaningful
 	// and must stay distinguishable from "not sent."
+	// UnconfirmedCount and UnconfirmedSince are set only on a
+	// "confirmReminder": how many cursor-bearing messages have been
+	// delivered live without a confirm, and when that run started. They
+	// are what makes the reminder state a growing cost rather than repeat
+	// an instruction.
+	UnconfirmedCount int
+	UnconfirmedSince time.Time
 	Behind *int
 	// ReplyTo/ReplyPreview carry a "msg"/"messageEdited"'s reply
 	// reference, if any — see wire.Msg.ReplyTo/ReplyPreview. Empty (not a
@@ -282,6 +289,14 @@ type Conn struct {
 	// never saw — which would leave them unequal forever and the reminder
 	// firing on every tick.
 	liveUnconfirmed bool
+	// unconfirmedCount and unconfirmedSince describe HOW MUCH has been
+	// read live without being confirmed. The reminder needs them because
+	// the cost of ignoring it is not constant: every unconfirmed message
+	// is one a reconnect has to re-walk to rediscover, and a reminder that
+	// reads identically at one message and at four hundred is one a reader
+	// stops looking at.
+	unconfirmedCount int
+	unconfirmedSince time.Time
 	// lastConsumed/lastAckSent/ackDisabled implement the read-receipt
 	// contract — see LastConsumedCursor, Drain, and ackLoop.
 	//   - lastConsumed: cursor of the most recent event actually returned
@@ -1022,7 +1037,12 @@ func (c *Conn) confirmReminderLoop() {
 			c.mu.Unlock()
 			continue
 		}
-		c.buffer = append(c.buffer, Event{Kind: "confirmReminder", Text: seen})
+		c.buffer = append(c.buffer, Event{
+			Kind:             "confirmReminder",
+			Text:             seen,
+			UnconfirmedCount: c.unconfirmedCount,
+			UnconfirmedSince: c.unconfirmedSince,
+		})
 		f := c.onActivity
 		c.mu.Unlock()
 		if f != nil {
@@ -1074,7 +1094,11 @@ func (c *Conn) readLoop() {
 		c.buffer = append(c.buffer, ev)
 		if ev.Cursor != "" {
 			c.lastSeenCursor = ev.Cursor
+			if !c.liveUnconfirmed {
+				c.unconfirmedSince = time.Now()
+			}
 			c.liveUnconfirmed = true
+			c.unconfirmedCount++
 		}
 		switch ev.Kind {
 		case "peerJoined":
@@ -1689,6 +1713,8 @@ func (c *Conn) MarkConsumed(events []Event) {
 		if e.Cursor != "" {
 			c.lastConsumed = e.Cursor
 			c.liveUnconfirmed = false
+			c.unconfirmedCount = 0
+			c.unconfirmedSince = time.Time{}
 		}
 	}
 }
