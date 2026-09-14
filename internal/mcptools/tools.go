@@ -293,9 +293,8 @@ func targetForLink(ctx context.Context, link string) connstore.Target {
 }
 
 // setCatchUpGap persists {from, to} as id's current abandoned range,
-// overwriting whatever was recorded before (including any retrieval
-// progress a previous gap had — a fresh seek means a fresh, unretrieved
-// range). Recorded as ongoing STATE, not a one-time notice: a seek's
+// WIDENING rather than replacing any range already recorded. Recorded as
+// ongoing STATE, not a one-time notice: a seek's
 // skipped range doesn't stop existing once the call that performed it
 // returns, so any later "am I caught up" check (a fresh hub_catch_up
 // call, a fresh hub_connect) should keep saying so until something
@@ -305,8 +304,33 @@ func targetForLink(ctx context.Context, link string) connstore.Target {
 // range starts (Conn.BehindSince() at the time of the seek), To is where
 // it ends (the seek's own landing point, so everything from there
 // onward is already covered by ordinary hub_catch_up).
+//
+// Widening, not replacing, because a seek can happen while an earlier
+// range is still unwalked — a reconnect while behind does exactly that,
+// and it is the ordinary case rather than an exotic one. Replacing threw
+// the earlier range away: the client had correctly identified it,
+// correctly told the model about it, and then discarded it with nothing
+// recording that it ever existed. Nobody would know to go looking, which
+// is the whole failure this record exists to prevent, reintroduced by
+// the thing meant to prevent it.
+//
+// The old From and AnchorCursor are what carry forward, and the
+// AnchorCursor half is the part worth being careful about: a range can
+// be PARTLY walked, and its progress lives there. Keeping it means
+// retrieval resumes where it stopped instead of restarting, so widening
+// costs nothing already read. Only To moves.
+//
+// The merged range does cover ground the ordinary walk may have covered
+// between the two seeks, so retrieving it can re-deliver a few messages
+// already seen. That is the safe direction and the same trade gap
+// retrieval already makes.
 func setCatchUpGap(id connstore.Target, from, to string) {
-	saveCatchUpGap(id, connstore.GapState{From: from, To: to})
+	g := connstore.GapState{From: from, To: to}
+	if prev, ok := loadCatchUpGap(id); ok {
+		g.From = prev.From
+		g.AnchorCursor = prev.AnchorCursor
+	}
+	saveCatchUpGap(id, g)
 }
 
 // saveCatchUpGap persists g as id's current gap record — an empty g (the
@@ -752,7 +776,14 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"Only consider messages from this one sender — the identity id that messages you "+
 					"were delivered already carry, copied from one of them. Not a display name, "+
 					"and nothing you need to look up separately. Combines with query (both must "+
-					"hold) and with at/after")),
+					"hold) and with at/after.\n"+
+					"KNOWN LIMITATION on a session mirroring a real chat platform: the sender id "+
+					"you are shown there is derived per-link and is NOT the id the server filters "+
+					"on, so this matches nothing and returns an empty result that looks exactly "+
+					"like 'that sender said nothing in this range'. The filter is reported as "+
+					"applied, because it was — it simply cannot match. Nothing on this side can "+
+					"detect that, so on such a session do not read an empty answer as evidence; "+
+					"read without sender and filter what comes back yourself")),
 			mcp.WithString("query", mcp.Description(
 				"Only consider messages whose text contains this. Two characters minimum. This "+
 					"is a filtered READ, not a search: still one message at a time, still oldest "+
@@ -2017,7 +2048,16 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		}
 		line += fmt.Sprintf(" lastConnectedAt=%s", le.Entry.LastConnectedAt.Format(time.RFC3339))
 		if le.Entry.Connected {
-			line += " (still marked open)"
+			// "marked", and deliberately not "connected": the mark is
+			// cleared by a clean disconnect, by the read loop noticing a
+			// drop, and by the next connect finding it stale — but a
+			// process that is killed runs none of those, and an MCP server
+			// being restarted is the ordinary way this ends. So a set mark
+			// means "nothing ever recorded the end", which includes both a
+			// live connection and a client that died mid-session. Nothing
+			// stored here can tell those apart; only asking the server can.
+			line += " (still marked open — meaning nothing recorded it closing," +
+				" which a killed process never does; not proof it is live)"
 		}
 		if gap := le.Entry.CatchUp.Gap; gap != nil && gap.From != "" {
 			line += fmt.Sprintf("\n    unretrieved gap: %s to %s — hub_catch_up(gap: true) once connected", gap.From, gap.To)

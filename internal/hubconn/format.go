@@ -113,14 +113,16 @@ func confirmReminderCost(e Event) string {
 	if e.UnconfirmedCount <= 0 {
 		return " This repeats periodically until you confirm"
 	}
-	cost := fmt.Sprintf(" %d message(s) have been delivered to you live without a confirm",
-		e.UnconfirmedCount)
+	cost := fmt.Sprintf(" %d delivered live without a confirm", e.UnconfirmedCount)
 	if !e.UnconfirmedSince.IsZero() {
-		cost += fmt.Sprintf(", the oldest %s ago", time.Since(e.UnconfirmedSince).Round(time.Minute))
+		cost += fmt.Sprintf(", oldest %s ago", time.Since(e.UnconfirmedSince).Round(time.Minute))
 	}
-	cost += ". Nothing is lost by leaving them, but this session's catch-up position stays where " +
-		"it was, so a reconnect re-walks all of them to rediscover what you already read — twenty " +
-		"per call. Confirming is what stops that growing"
+	// Kept short on purpose: this trails the two questions, and the line
+	// is delivered through a path that cuts at a fixed length. The cost
+	// is the reason to act, not the action, so it is what should be lost
+	// first if anything is — but losing it every time would waste the
+	// only thing that makes the reminder escalate rather than repeat.
+	cost += ". None lost, but an unconfirmed position makes a reconnect re-walk them"
 	return cost
 }
 
@@ -233,13 +235,19 @@ func FormatEvent(e Event) string {
 		// cut or missing) forces an actual look — two values that must be
 		// consistent aren't producible without checking, where one alone
 		// is.
-		return fmt.Sprintf("[hub: the last thing delivered to you on this connection was cursor=%q — "+
-			"before calling hub_confirm, look back and answer both: (1) what is the last message YOU "+
-			"actually have complete and contiguous (this may be earlier than %q, if anything since "+
-			"then arrived cut off or you never saw it at all) — confirm THAT cursor, not necessarily "+
-			"this one; (2) was anything cut off or missing between your answer and %q? If so, don't "+
-			"advance past it — a hub_catch_up call will recover it later.%s]",
-			e.Text, e.Text, e.Text, confirmReminderCost(e))
+		// Ordered so truncation costs the least. This line is delivered
+		// through a notification path that cuts at a fixed length, and it
+		// used to be long enough to lose its own tail — which held the
+		// recovery instruction, so the reminder about truncated messages
+		// was itself truncated out of the part that said what to do. Both
+		// actions now come before any explanation, and the whole thing is
+		// short enough to arrive intact.
+		return fmt.Sprintf("[hub: confirm the last message you have COMPLETE — possibly earlier "+
+			"than %q, the last delivered here. If anything since was cut off or never arrived, do "+
+			"NOT confirm past it; hub_catch_up recovers it. Answer both first: (1) your last "+
+			"complete, contiguous cursor? (2) anything cut or missing between it and the one "+
+			"above?%s]",
+			e.Text, confirmReminderCost(e))
 	case "sendAck":
 		if e.ActionOK {
 			return fmt.Sprintf("[hub: send acknowledged — it left the building (externalId=%s). "+

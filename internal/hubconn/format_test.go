@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/secforge/mcp-hub/internal/wire"
 )
@@ -512,5 +513,54 @@ func TestExplicitTrueStillReadsAsSuccess(t *testing.T) {
 	ev, _ := DecodeEvent([]byte(`{"type":"pinAck","externalId":"ext-1","ok":true}`))
 	if got := FormatEvent(ev); !strings.Contains(got, "pinned ext-1") {
 		t.Fatalf("expected success, got: %s", got)
+	}
+}
+
+// notificationRuneBudget is where the delivery path this reminder travels
+// through cuts a line. Measured, not guessed: the same cut point was
+// observed on 2026-09-07 and 2026-09-14, at the identical character, by
+// two different readers.
+const notificationRuneBudget = 500
+
+// The reminder teaches what to do when a message arrives truncated. It
+// used to be 599 runes, so it was itself truncated — and the part lost
+// was the recovery instruction, the one thing a reader who did not
+// already know the rule needed. A reminder about truncation that cannot
+// survive truncation teaches nothing.
+func TestConfirmReminderFitsTheNotificationBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ev   Event
+	}{
+		{"no count", Event{Kind: "confirmReminder", Text: "639249652996240000.44396"}},
+		{"typical", Event{Kind: "confirmReminder", Text: "639249652996240000.44396",
+			UnconfirmedCount: 37, UnconfirmedSince: time.Now().Add(-3 * time.Hour)}},
+		{"worst seen live", Event{Kind: "confirmReminder", Text: "639249652996240000.44396",
+			UnconfirmedCount: 435, UnconfirmedSince: time.Now().Add(-50 * time.Hour)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FormatEvent(tc.ev)
+			if n := len([]rune(got)); n > notificationRuneBudget {
+				t.Fatalf("reminder is %d runes, over the %d budget — the tail will be cut, and the "+
+					"tail is where the instruction lives:\n%s", n, notificationRuneBudget, got)
+			}
+		})
+	}
+}
+
+// Ordering, not just length: if it ever does get cut, what survives must
+// be the action rather than the reasoning. Both instructions therefore
+// have to appear before the cost explanation.
+func TestConfirmReminderPutsTheActionBeforeTheRationale(t *testing.T) {
+	got := FormatEvent(Event{Kind: "confirmReminder", Text: "639249652996240000.44396",
+		UnconfirmedCount: 37, UnconfirmedSince: time.Now().Add(-3 * time.Hour)})
+	doNot := strings.Index(got, "do NOT confirm past it")
+	recover := strings.Index(got, "hub_catch_up")
+	cost := strings.Index(got, "delivered live without a confirm")
+	if doNot < 0 || recover < 0 || cost < 0 {
+		t.Fatalf("expected all three parts present, got: %s", got)
+	}
+	if doNot > cost || recover > cost {
+		t.Fatalf("expected both instructions before the cost rationale, got: %s", got)
 	}
 }

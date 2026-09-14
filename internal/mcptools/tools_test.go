@@ -1371,7 +1371,7 @@ func TestHandleListConnectionsShowsEntriesWithoutLeakingSecret(t *testing.T) {
 		t.Fatalf("handleListConnections failed: err=%v result=%+v", err, res)
 	}
 	text := textOf(res)
-	if !strings.Contains(text, url) || !strings.Contains(text, sessionID) || !strings.Contains(text, "(still marked open)") {
+	if !strings.Contains(text, url) || !strings.Contains(text, sessionID) || !strings.Contains(text, "still marked open") {
 		t.Fatalf("expected the still-open entry listed, got: %s", text)
 	}
 	if strings.Contains(text, stored.ReconnectSecret) {

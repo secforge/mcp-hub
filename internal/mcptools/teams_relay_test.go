@@ -3030,3 +3030,76 @@ func TestSingleCharacterQueryIsRefusedLocally(t *testing.T) {
 		t.Fatalf("expected nothing sent to the server, got %d requests", len(sent()))
 	}
 }
+
+// A seek can happen while an earlier range is still unwalked — a
+// reconnect while behind does exactly that. Replacing the record threw
+// that range away: correctly identified, correctly announced, then
+// discarded with nothing recording it ever existed. Observed live on
+// 2026-09-13, where it cost seven messages that were sitting on the
+// server the whole time.
+func TestSecondSeekWidensTheGapInsteadOfReplacingIt(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
+
+	setCatchUpGap(id, "2026-09-13T14:40:17Z", "2026-09-13T15:51:22Z")
+	from, to, ok := getCatchUpGap(id)
+	if !ok || from != "2026-09-13T14:40:17Z" || to != "2026-09-13T15:51:22Z" {
+		t.Fatalf("expected the first gap recorded, got from=%q to=%q ok=%v", from, to, ok)
+	}
+
+	// A second seek, before anything walked the first range.
+	setCatchUpGap(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
+	from, to, ok = getCatchUpGap(id)
+	if !ok {
+		t.Fatal("expected a gap to still be recorded after a second seek")
+	}
+	if from != "2026-09-13T14:40:17Z" {
+		t.Fatalf("expected the earlier start carried forward (the unwalked range), got from=%q", from)
+	}
+	if to != "2026-09-14T07:17:34Z" {
+		t.Fatalf("expected the later end, got to=%q", to)
+	}
+}
+
+// And a partly-walked range keeps its progress: widening must not cost
+// what has already been retrieved, or a reconnect mid-walk restarts it
+// one message per call.
+func TestWideningKeepsRetrievalProgress(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
+
+	setCatchUpGap(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
+	// Retrieval gets a third of the way in.
+	g, _ := loadCatchUpGap(id)
+	g.AnchorCursor = "639249632127954000.44361"
+	saveCatchUpGap(id, g)
+
+	setCatchUpGap(id, "2026-09-14T08:00:00Z", "2026-09-14T09:30:00Z")
+
+	got, ok := loadCatchUpGap(id)
+	if !ok {
+		t.Fatal("expected a gap after widening")
+	}
+	if got.AnchorCursor != "639249632127954000.44361" {
+		t.Fatalf("expected retrieval progress preserved, got anchorCursor=%q", got.AnchorCursor)
+	}
+	if got.From != "2026-09-14T05:35:55Z" || got.To != "2026-09-14T09:30:00Z" {
+		t.Fatalf("expected the union of both ranges, got from=%q to=%q", got.From, got.To)
+	}
+}
+
+// A gap fully retrieved is cleared, so the next seek starts clean rather
+// than resurrecting a range somebody already walked.
+func TestSeekAfterAFullyRetrievedGapStartsClean(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
+
+	setCatchUpGap(id, "2026-09-13T14:40:17Z", "2026-09-13T15:51:22Z")
+	clearCatchUpGap(id)
+	setCatchUpGap(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
+
+	from, to, ok := getCatchUpGap(id)
+	if !ok || from != "2026-09-14T05:35:55Z" || to != "2026-09-14T07:17:34Z" {
+		t.Fatalf("expected only the new range, got from=%q to=%q ok=%v", from, to, ok)
+	}
+}

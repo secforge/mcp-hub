@@ -912,11 +912,11 @@ and customer-portal:
   send one, not zero). Unlike `Joined.Behind` (measured from whatever the
   server's own ack cursor happened to be at connect time), this is
   measured from a position the model itself chose. `Conn.ConfirmReceived`
-  now waits for and returns it. First gated on `isBridge` (only wait on a
-  bridge/link connection) — wrong, caught live by chat-relay's author:
+  now waits for and returns it. First gated on the connection's own form
+  (only wait on a teams link) — wrong, caught live by chat-relay's author:
   whether a server answers is a per-SERVER capability, not a
   per-connection-form one, and their own server answers on a plain
-  `hub_connect` session exactly the same as on a bridge link (this
+  `hub_connect` session exactly the same as on a teams link (this
   client's own coordination-hub session is exactly such a connection, so
   the wrong gate silently dropped the count precisely where it was
   needed). Fixed to a per-connection probe instead
@@ -996,7 +996,7 @@ and customer-portal:
   and deleted; every `mcp-hub-client` process on the machine was killed
   so none could keep writing the old files, per the project owner's own
   instruction.
-- **`Entry.Topic`/`TeamsEntry.Topic`**: when the server sets
+- **`Entry.Topic`**: when the server sets
   `wire.Joined.Topic` (the conversation's own display name — a teams-
   session-only field, e.g. a Teams chat's title), it's now written to
   connstore too, at the project owner's own request ("if the name of the
@@ -1040,12 +1040,14 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   teams relay's own bot identity in Teams, so `name` never appears in the
   conversation itself).
 
-  Implemented as `hubconn.DialRelay` (`internal/hubconn/relay.go`),
-  distinct from `Dial` only in how it reaches an open `*websocket.Conn` —
-  both funnel into a shared `finishHandshake` that reads the initial
-  `joined` message, validates it, and starts the same background read
-  loop, buffering, keepalive, and disconnect detection either path uses.
-  A relay connection is an ordinary `Conn` after that point, including
+  Implemented as a single `hubconn.Dial(link, DialOptions)`. The link is
+  split at its first `#`: the left side is dialled verbatim and the
+  fragment travels as an `Authorization: Bearer` header, so one opaque
+  string carries both where to connect and what authorizes it. There is
+  one dial path and one handshake — the initial `joined` message is read
+  and validated, then the same background read loop, buffering, keepalive
+  and disconnect detection run for every connection.
+  A teams connection is an ordinary `Conn` after that point, including
   reusing `hub_send`/`hub_receive`/`hub_wait`/`hub_peers` unmodified — this
   is why the teams relay's peer ids must stay UUID-shaped (it derives
   synthetic per-link HMAC-derived UUIDs for real participant identities,
@@ -1485,14 +1487,14 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
     distinguish them either.
   - `Conn.SendAwaitingAck(text, to)` / `Conn.ReactAwaitingAck(externalID,
     reaction, action)` / `Conn.EditMessageAwaitingAck(externalID, text)`
-    wrap claim-then-write-then-wait, but only *do* the wait for a bridge
-    connection (`Conn.IsBridge()`, true only when constructed via
-    `DialRelay`) — a plain `mcp-hub-server` connection never emits any
-    ack at all, so waiting on one would just be a fixed latency tax on
-    every single send for zero benefit. `IsBridge` is set once during
-    `finishHandshake` (a new parameter, `false` from `Dial`, `true` from
-    `DialRelay`) and read only after construction, so — like
-    `peerID`/`name`/etc. — it needs no locking of its own. Each method
+    wrap claim-then-write-then-wait, but only *do* the wait when the
+    server declares it answers: `Conn.WantsActionAcks()`, i.e. the
+    `actionAcks` feature on `joined`. A server that never emits an ack
+    would otherwise charge every send a fixed latency tax for nothing.
+    Keyed on what the server SAYS it does rather than on how this client
+    reached it: the connection's form is merely correlated with the
+    capability, and inferring one from the other is the recurring mistake
+    this design keeps having to unlearn. Each method
     returns `(Event{}, false, nil)` on a plain connection (report success
     exactly as always) or on a real timeout (`AckWaitTimeout`, a
     package var default 5s — generous relative to how fast an ack has
@@ -1513,8 +1515,9 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
     `TestHubReactReportsAckDirectly`, `TestHubEditReportsAckDirectly`,
     `TestHubSendReportsAckDirectlyOnBridgeSession`,
     `TestHubSendDoesNotWaitOnAPlainHubConnectSession` (`internal/mcptools`,
-    the last one specifically proving the `IsBridge` gate keeps a normal
-    session's `hub_send` exactly as fast as it always was).
+    the last one specifically proving the ack-wait gate keeps a session
+    whose server declares no `actionAcks` exactly as fast as an
+    unguarded send).
 
 - **A real bug caught while adding `hub_delete`, on this client's side:
   `wire.Msg` never actually had a `Cursor` field.** chat-relay had been
@@ -1547,7 +1550,7 @@ separate tool rather than a relaxation of `hub_connect`'s rules.
   `SendAwaitingAck`/`ReactAwaitingAck`/`EditMessageAwaitingAck` do, and
   `handleDelete` reports it directly, falling back to an async
   confirmation on timeout — no new plumbing needed, the claim mechanism
-  and the `IsBridge` gate were already general. Deliberately a distinct
+  and the ack-wait gate were already general. Deliberately a distinct
   request from `Edit` with empty text, not a special case of it: the
   underlying platform payload for a deletion and an edit-to-nothing look
   identical, but a client that conflated them would render an empty
