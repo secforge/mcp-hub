@@ -222,6 +222,14 @@ func FormatEvent(e Event) string {
 				"hub_pins() to see what is actually pinned rather than reporting either]", e.ExternalID)
 		}
 		return fmt.Sprintf("[hub: the server refused to unpin %s]", e.ExternalID)
+	case "serverStopping":
+		if e.ReconnectAfter > 0 {
+			return fmt.Sprintf("[hub: the server is shutting down on purpose and estimates about "+
+				"%ds to restart. The disconnect that follows is expected; the disconnect message "+
+				"says how long to wait before reconnecting]", e.ReconnectAfter)
+		}
+		return "[hub: the server is shutting down on purpose, with no estimate of when it will be " +
+			"back. The disconnect that follows is expected]"
 	case "rosterComplete":
 		return "[hub: initial roster complete — you now know everyone who was already in the session]"
 	case "confirmReminder":

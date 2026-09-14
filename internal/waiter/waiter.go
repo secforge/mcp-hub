@@ -55,6 +55,94 @@ type Waiter struct {
 
 	mu      sync.Mutex
 	current *registeredWaiter
+	// expecting is set while a planned reconnect is in flight. It changes
+	// what a dead source MEANS to this waiter: normally the connection
+	// ending is the end of the story and a follower is told so and
+	// released, but during an announced restart the connection is coming
+	// back and the follower should still be here when it does.
+	//
+	// Without this a planned restart silently costs the session its live
+	// channel: the client reconnects, and the only process that would
+	// have reported anything died with the old connection. The session
+	// ends up connected and blind, which is worse than staying down —
+	// nothing arrives to prompt anyone to look.
+	expecting bool
+	// held records that the waiting side has already been told we are
+	// holding, so a burst of pokes during the outage does not repeat it.
+	held bool
+}
+
+// ExpectReconnect tells this waiter that the source is about to die on
+// purpose and will be replaced. Followers are kept open across the gap
+// rather than released.
+func (w *Waiter) ExpectReconnect() {
+	w.mu.Lock()
+	w.expecting, w.held = true, false
+	w.mu.Unlock()
+}
+
+// SetSource swaps in the connection that replaced the one this waiter was
+// built on, ending the hold. The socket path never changes, so a follower
+// that survived the gap keeps receiving without knowing anything happened.
+func (w *Waiter) SetSource(s Source) {
+	w.mu.Lock()
+	w.source = s
+	w.expecting, w.held = false, false
+	w.mu.Unlock()
+	w.Poke()
+}
+
+// Following reports whether a follow-mode reader is registered right
+// now. Used to decide whether a caller can be told to WAIT for a
+// notification or has to be told to check back itself — telling someone
+// to wait for a message that nothing will send is worse than telling
+// them to poll.
+func (w *Waiter) Following() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.current != nil && w.current.follow
+}
+
+// Announce pushes one line to whoever is currently following, outside
+// the ordinary event flow. Used to say something about the CHANNEL
+// rather than about the conversation — the one case being a reconnect,
+// after which this channel looks exactly as it did before while the
+// session may have missed everything that arrived in the gap.
+//
+// A no-op when nobody is following: this is a courtesy to a live reader,
+// not a record, and anything that must not be lost belongs in the
+// catch-up position instead.
+func (w *Waiter) Announce(msg string) {
+	w.mu.Lock()
+	rw := w.current
+	w.mu.Unlock()
+	if rw == nil || !rw.follow {
+		return
+	}
+	if _, err := rw.conn.Write([]byte(msg + "\n\n")); err != nil {
+		rw.conn.Close()
+		w.mu.Lock()
+		if w.current == rw {
+			w.current = nil
+		}
+		w.mu.Unlock()
+	}
+}
+
+// holdingFor reports whether a dead source should be waited out rather
+// than reported as the end, and whether the waiting side still needs to
+// be told that is what is happening.
+func (w *Waiter) holdingFor() (holding, announce bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.expecting {
+		return false, false
+	}
+	if w.held {
+		return true, false
+	}
+	w.held = true
+	return true, true
 }
 
 // socketDir is where wait sockets live — a package var (not a plain
@@ -293,6 +381,32 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 	// self-identifying (FormatEventsBatch's "i/N" marker).
 	chunks, connected := w.source.DrainBatch()
 	if !connected {
+		if holding, announce := w.holdingFor(); holding {
+			// Deliver whatever the old connection had buffered before it
+			// went, then stay. Closing here would take the live channel
+			// down with a connection that is coming back.
+			for _, c := range chunks {
+				if _, err := rw.conn.Write([]byte(c + "\n\n")); err != nil {
+					rw.conn.Close()
+					return
+				}
+			}
+			if announce {
+				if _, err := rw.conn.Write([]byte(w.holdingMessage() + "\n\n")); err != nil {
+					rw.conn.Close()
+					return
+				}
+			}
+			w.mu.Lock()
+			if w.current == nil {
+				w.current = rw
+				w.mu.Unlock()
+				return
+			}
+			w.mu.Unlock()
+			writeAndClose(rw.conn, w.supersededMessage())
+			return
+		}
 		writeAndClose(rw.conn, w.disconnectedMessage())
 		return
 	}
@@ -373,6 +487,17 @@ func (w *Waiter) disconnectedMessage() string {
 		note = n.DisconnectNote()
 	}
 	return "hub disconnected" + note + "\n"
+}
+
+// holdingMessage tells the waiting side that the connection ended on
+// purpose and this channel is staying open across it. Said once per
+// outage, and deliberately says nothing needs doing: a follower that
+// treats this as a disconnect and exits recreates the exact problem the
+// hold exists to prevent.
+func (w *Waiter) holdingMessage() string {
+	return "[hub: the server is restarting on purpose — this follower is being held open " +
+		"across it and will keep delivering once the client reconnects. Nothing to do, and do " +
+		"NOT restart this process: doing so would replace a follower that is already waiting]"
 }
 
 // supersededMessage tells the losing wait's process not to restart itself —

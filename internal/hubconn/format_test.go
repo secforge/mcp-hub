@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -562,5 +564,77 @@ func TestConfirmReminderPutsTheActionBeforeTheRationale(t *testing.T) {
 	}
 	if doNot > cost || recover > cost {
 		t.Fatalf("expected both instructions before the cost rationale, got: %s", got)
+	}
+}
+
+// The close code says whether a shutdown was deliberate; the frame only
+// carries the estimate. A client that required the frame would report a
+// clean restart as a crash exactly when its reader was busy — the frame
+// is an ordinary message and can be missed or truncated, the close code
+// cannot be half-received.
+func TestGracefulShutdownIsDecidedByTheCloseCodeNotTheFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		closeCode int
+		sawFrame  bool
+		want      bool
+	}{
+		{"1001 with frame", websocket.CloseGoingAway, true, true},
+		{"1001 without frame", websocket.CloseGoingAway, false, true},
+		{"abnormal with frame", websocket.CloseAbnormalClosure, true, false},
+		{"abnormal without frame", websocket.CloseAbnormalClosure, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Conn{closeCode: tc.closeCode}
+			if tc.sawFrame {
+				c.reconnectAfter = 60
+			}
+			if got := c.GracefulShutdown(); got != tc.want {
+				t.Fatalf("GracefulShutdown() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The estimate is a floor to spread retries around, not an appointment.
+// Every peer told the same number and obeying it exactly returns in one
+// burst, against a server that has only just come up.
+func TestSuggestedReconnectDelayExceedsTheEstimateAndVaries(t *testing.T) {
+	c := &Conn{reconnectAfter: 60}
+	base := 60 * time.Second
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 50; i++ {
+		d := c.SuggestedReconnectDelay()
+		if d < base {
+			t.Fatalf("delay %s is below the server's estimate %s — the estimate is a floor", d, base)
+		}
+		if d > base+time.Duration(reconnectJitter*float64(base)) {
+			t.Fatalf("delay %s exceeds the jitter window", d)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 10 {
+		t.Fatalf("expected spread across retries, got %d distinct values in 50 draws", len(seen))
+	}
+}
+
+// No estimate means no advice, not "reconnect immediately".
+func TestNoEstimateYieldsNoDelayAdvice(t *testing.T) {
+	c := &Conn{closeCode: websocket.CloseGoingAway}
+	if d := c.SuggestedReconnectDelay(); d != 0 {
+		t.Fatalf("expected no advice without an estimate, got %s", d)
+	}
+	if !c.GracefulShutdown() {
+		t.Fatal("expected the close code alone to still say this was graceful")
+	}
+}
+
+func TestServerStoppingDecodesTheEstimate(t *testing.T) {
+	ev, ok := DecodeEvent([]byte(`{"type":"serverStopping","reconnectAfter":45}`))
+	if !ok || ev.Kind != "serverStopping" || ev.ReconnectAfter != 45 {
+		t.Fatalf("unexpected decode: %+v ok=%v", ev, ok)
+	}
+	if got := FormatEvent(ev); !strings.Contains(got, "on purpose") || !strings.Contains(got, "45") {
+		t.Fatalf("expected the intent and the estimate rendered, got: %s", got)
 	}
 }

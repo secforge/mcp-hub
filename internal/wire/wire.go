@@ -56,6 +56,7 @@ const (
 	TypeUnpinAck        Type = "unpinAck"
 	TypePins            Type = "pins"
 	TypeNoMoreMessages  Type = "noMoreMessages"
+	TypeServerStopping  Type = "serverStopping"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -208,8 +209,8 @@ type Joined struct {
 // AttachmentsFeature is Features["attachments"]'s own parameter shape —
 // see Joined.Features.
 type AttachmentsFeature struct {
-	MaxRawBytes   int  `json:"maxRawBytes,omitempty"`
-	MaxFrameBytes int  `json:"maxFrameBytes,omitempty"`
+	MaxRawBytes   int `json:"maxRawBytes,omitempty"`
+	MaxFrameBytes int `json:"maxFrameBytes,omitempty"`
 	// ImagesOnly is set by a teams relay whose platform only accepts
 	// image attachments (see hub_send's imagePath/filePath split) —
 	// absent (false) for a server that accepts any content type.
@@ -850,6 +851,35 @@ func NewNoMoreMessages(answers Anchor) NoMoreMessages {
 // NoMoreMessages.Matching for why it is a different statement.
 func NewNoMoreMessagesMatching(answers Anchor, matching Filter) NoMoreMessages {
 	return NoMoreMessages{Type: TypeNoMoreMessages, Answers: &answers, Matching: &matching}
+}
+
+// ServerStopping is the server saying it is shutting down on purpose,
+// sent immediately before it closes with 1001 (Going Away). Declared as
+// the "serverStopping" feature, so a client knows to expect it rather
+// than discovering it by meeting a frame it has never seen.
+//
+// The frame and the close code are two signals and they fail
+// differently: the close code comes from the websocket layer and cannot
+// be half-received, while this is an ordinary message and can be
+// truncated or missed by a reader that is busy. So 1001 is what says
+// "this was graceful"; this frame only adds the estimate. A client must
+// never require this frame to have arrived in order to treat a close as
+// deliberate.
+//
+// It narrows ONE case and does not turn absence into a signal. A kill
+// -9, an OOM, or a dead host sends nothing at all, so a bare 1006 stays
+// exactly as ambiguous as it always was — it does not become evidence
+// that the server did not restart. "The server always warns us" is the
+// rule this must never be allowed to encourage.
+type ServerStopping struct {
+	Type Type `json:"type"`
+	// ReconnectAfter is the server's own estimate, in seconds, of how
+	// long its restart will take. Advisory, and a FLOOR rather than an
+	// instruction: a client that reconnects at exactly this value, along
+	// with every other peer told the same number, arrives in one burst
+	// against a server that has only just come up. Spread actual retries
+	// across it. Zero when the server offered no estimate.
+	ReconnectAfter int `json:"reconnectAfter,omitempty"`
 }
 
 // Ack is a standalone read receipt — the same information Msg/Reaction/

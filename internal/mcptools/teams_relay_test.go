@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -3101,5 +3102,775 @@ func TestSeekAfterAFullyRetrievedGapStartsClean(t *testing.T) {
 	from, to, ok := getCatchUpGap(id)
 	if !ok || from != "2026-09-14T05:35:55Z" || to != "2026-09-14T07:17:34Z" {
 		t.Fatalf("expected only the new range, got from=%q to=%q ok=%v", from, to, ok)
+	}
+}
+
+// End to end: a server that announces its shutdown and closes with 1001
+// must read as deliberate, with wait advice — where before this was a
+// bare drop indistinguishable from a dead laptop.
+func TestGracefulServerRestartReadsAsDeliberateWithWaitAdvice(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	announce := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		<-announce
+		conn.WriteJSON(wire.ServerStopping{Type: wire.TypeServerStopping, ReconnectAfter: 60})
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "restarting"))
+		time.Sleep(50 * time.Millisecond)
+	}))
+	t.Cleanup(srv.Close)
+
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	conn, _ := hub.activeConn()
+	close(announce)
+	deadline := time.Now().Add(3 * time.Second)
+	for conn.Connected() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if conn.Connected() {
+		t.Fatal("expected the connection to close")
+	}
+	if !conn.GracefulShutdown() {
+		t.Fatal("expected a 1001 close to read as deliberate")
+	}
+	text := disconnectedText(conn)
+	if !strings.Contains(text, "ON PURPOSE") {
+		t.Fatalf("expected the disconnect to say it was deliberate, got: %s", text)
+	}
+	if !strings.Contains(text, "wait roughly") {
+		t.Fatalf("expected wait advice, got: %s", text)
+	}
+	if d := conn.SuggestedReconnectDelay(); d < 60*time.Second {
+		t.Fatalf("expected the advice to respect the server's floor, got %s", d)
+	}
+}
+
+// And an ordinary drop must stay exactly as ambiguous as it was: silence
+// about deliberateness, not a claim that nothing happened.
+func TestUnannouncedDropSaysNothingAboutIntent(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	drop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		<-drop
+		conn.NetConn().Close() // no close frame at all, as a killed process leaves
+	}))
+	t.Cleanup(srv.Close)
+
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	conn, _ := hub.activeConn()
+	close(drop)
+	deadline := time.Now().Add(3 * time.Second)
+	for conn.Connected() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if conn.GracefulShutdown() {
+		t.Fatal("expected an unannounced drop NOT to read as deliberate")
+	}
+	if text := disconnectedText(conn); strings.Contains(text, "ON PURPOSE") {
+		t.Fatalf("expected no claim about intent for a bare drop, got: %s", text)
+	}
+}
+
+// The case the two-signal design exists for: a graceful close whose
+// announcement never arrived. This is what a busy or truncated reader
+// sees, and it must still read as deliberate — just without an estimate.
+func TestGracefulCloseWithoutAnAnnouncementStillReadsAsDeliberate(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	stop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		<-stop
+		// 1001, no serverStopping frame — the announcement was lost.
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "restarting"))
+		time.Sleep(50 * time.Millisecond)
+	}))
+	t.Cleanup(srv.Close)
+
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	conn, _ := hub.activeConn()
+	close(stop)
+	deadline := time.Now().Add(3 * time.Second)
+	for conn.Connected() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !conn.GracefulShutdown() {
+		t.Fatal("expected 1001 alone to read as deliberate, with no frame received")
+	}
+	text := disconnectedText(conn)
+	if !strings.Contains(text, "ON PURPOSE") {
+		t.Fatalf("expected the disconnect to say it was deliberate, got: %s", text)
+	}
+	if !strings.Contains(text, "no estimate") {
+		t.Fatalf("expected it to say no estimate was given, got: %s", text)
+	}
+}
+
+// restartOnceServer accepts a connection, closes the first one the way
+// the caller asked, and serves the second normally — a server restart,
+// as a client experiences it.
+func restartOnceServer(t *testing.T, graceful bool, announce int) (link string, joins func() int) {
+	t.Helper()
+	upgrader := websocket.Upgrader{}
+	var mu sync.Mutex
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		mu.Lock()
+		n++
+		first := n == 1
+		mu.Unlock()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		if !first {
+			// Stay up so the reconnect has something to hold.
+			time.Sleep(2 * time.Second)
+			conn.Close()
+			return
+		}
+		if graceful {
+			// Give the client time to finish connect and register its
+			// activity callback, so the restart goes through the ORDINARY
+			// disconnect path rather than the rare die-during-setup one.
+			// Without this the teardown never runs at all and a test
+			// asserting the waiter survived would pass for the wrong
+			// reason.
+			time.Sleep(300 * time.Millisecond)
+			if announce > 0 {
+				conn.WriteJSON(wire.ServerStopping{Type: wire.TypeServerStopping, ReconnectAfter: announce})
+			}
+			conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseGoingAway, "restarting"))
+			time.Sleep(30 * time.Millisecond)
+			conn.Close()
+			return
+		}
+		conn.NetConn().Close()
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret",
+		func() int { mu.Lock(); defer mu.Unlock(); return n }
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+// An announced restart is the one case where coming back needs no
+// decision: the server said it meant to go and said roughly when it
+// would return.
+func TestAnnouncedRestartReconnectsAutomaticallyAndSaysSo(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, joins := restartOnceServer(t, true, 1)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	if !waitFor(t, "reconnect", func() bool { return joins() >= 2 }) {
+		t.Fatal("expected the client to reconnect on its own after an announced restart")
+	}
+	if !waitFor(t, "note", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return hub.autoReconnect != ""
+	}) {
+		t.Fatal("expected a pending report about the automatic reconnect")
+	}
+	note := hub.takeAutoReconnectNote()
+	if !strings.Contains(note, "RECONNECTED AUTOMATICALLY") {
+		t.Fatalf("expected the report to say what happened, got: %s", note)
+	}
+	if !strings.Contains(note, "hub_catch_up") {
+		t.Fatalf("expected the report to say to catch up, got: %s", note)
+	}
+	if note2 := hub.takeAutoReconnectNote(); note2 != "" {
+		t.Fatalf("expected the report to be delivered exactly once, got it twice: %s", note2)
+	}
+}
+
+// A bare drop says nothing about intent, so it must not be retried
+// automatically — that stays the model's judgement, as it always was.
+func TestUnannouncedDropDoesNotReconnectAutomatically(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, joins := restartOnceServer(t, false, 0)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	time.Sleep(1500 * time.Millisecond)
+	if joins() != 1 {
+		t.Fatalf("expected no automatic reconnect after an ambiguous drop, got %d joins", joins())
+	}
+	hub.mu.Lock()
+	note := hub.autoReconnect
+	hub.mu.Unlock()
+	if note != "" {
+		t.Fatalf("expected no reconnect report for a bare drop, got: %s", note)
+	}
+}
+
+// Leaving on purpose ends the permission to come back — a restart
+// arriving moments later must not drag the caller back in.
+func TestExplicitDisconnectStopsAutomaticReconnect(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := restartOnceServer(t, true, 1)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hub.mu.Lock()
+	l, n := hub.redialLink, hub.redialName
+	hub.mu.Unlock()
+	if l != "" || n != "" {
+		t.Fatalf("expected disconnect to clear the redial permission, got link=%q name=%q", l, n)
+	}
+}
+
+// The point of holding the wait socket: a planned restart used to restore
+// the connection and destroy the only channel that would have reported
+// anything. The session came back connected and blind, with nothing
+// arriving to prompt anyone to look.
+func TestAnnouncedRestartKeepsTheFollowerAlive(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, joins := restartOnceServer(t, true, 1)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hub.mu.Lock()
+	before := hub.waiter
+	hub.mu.Unlock()
+	if before == nil {
+		t.Fatal("expected a waiter after connect")
+	}
+	beforePath := before.WaitFollowCommand()
+
+	if !waitFor(t, "reconnect", func() bool { return joins() >= 2 }) {
+		t.Fatal("expected an automatic reconnect")
+	}
+	if !waitFor(t, "note", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return hub.autoReconnect != ""
+	}) {
+		t.Fatal("expected a reconnect report")
+	}
+
+	hub.mu.Lock()
+	after := hub.waiter
+	hub.mu.Unlock()
+	if after != before {
+		t.Fatal("expected the SAME waiter to survive the restart, not a replacement")
+	}
+	if after.WaitFollowCommand() != beforePath {
+		t.Fatalf("expected the socket path to be unchanged so a live follower keeps working:\n%s\n%s",
+			beforePath, after.WaitFollowCommand())
+	}
+	note := hub.takeAutoReconnectNote()
+	if !strings.Contains(note, "held open across the restart") {
+		t.Fatalf("expected the report to say the follower survived, got: %s", note)
+	}
+	if strings.Contains(note, "start one with") {
+		t.Fatalf("expected NOT to be told to start a follower that is already running, got: %s", note)
+	}
+}
+
+// An ambiguous drop is not a planned restart: the socket closes as it
+// always did, because nothing says the connection is coming back.
+func TestUnannouncedDropStillClosesTheWaitSocket(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := restartOnceServer(t, false, 0)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	// A connection that dies during connect's own setup is torn down at
+	// the next tool call rather than instantly — so ask, the way a caller
+	// would, instead of asserting a promptness the code does not make.
+	if !waitFor(t, "teardown", func() bool {
+		hub.handleReceive(ctx, mcp.CallToolRequest{})
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return hub.conn == nil
+	}) {
+		t.Fatal("expected the dead connection to be torn down")
+	}
+	hub.mu.Lock()
+	w := hub.waiter
+	hub.mu.Unlock()
+	if w != nil {
+		t.Fatal("expected the wait socket to be released on an ambiguous drop")
+	}
+}
+
+// "not connected" is the same sentence for a hub coming back in forty
+// seconds and one that is never coming back, and those call for opposite
+// decisions. During a planned reconnect it must say which.
+func TestNotConnectedNamesAPendingReconnect(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub := NewHub()
+
+	// Nothing pending: the plain answer, unchanged.
+	if got := textOf(hub.notConnected()); got != "not connected" {
+		t.Fatalf("expected the plain answer with nothing pending, got: %s", got)
+	}
+
+	hub.mu.Lock()
+	hub.reconnecting = true
+	hub.reconnectAt = time.Now().Add(40 * time.Second)
+	hub.mu.Unlock()
+
+	got := textOf(hub.notConnected())
+	if !strings.HasPrefix(got, "WAIT: RECONNECTING") {
+		t.Fatalf("expected the instruction to lead, got: %s", got)
+	}
+	if !strings.Contains(got, "reconnect by itself") {
+		t.Fatalf("expected it to say a reconnect is coming, got: %s", got)
+	}
+	if !strings.Contains(got, "NOT happened") {
+		t.Fatalf("expected it to say nothing was queued, got: %s", got)
+	}
+	if !strings.Contains(got, "races the automatic one") {
+		t.Fatalf("expected it to warn against reconnecting by hand, got: %s", got)
+	}
+	// With nothing following, waiting for a notification would be waiting
+	// for something nobody will send.
+	if !strings.Contains(got, "will NOT be told") {
+		t.Fatalf("expected it to say no notification is coming, got: %s", got)
+	}
+}
+
+// With a follower held across the outage, the reconnect announces itself
+// — so the caller should be told to wait for that rather than to poll.
+func TestNotConnectedSaysANotificationIsComingWhenSomethingIsFollowing(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := restartOnceServer(t, true, 1)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hub.mu.Lock()
+	w := hub.waiter
+	hub.mu.Unlock()
+	c, err := net.Dial("unix", strings.Fields(w.WaitFollowCommand())[3])
+	if err != nil {
+		t.Skipf("could not dial the wait socket: %v", err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte{0x01}); err != nil {
+		t.Fatalf("write mode: %v", err)
+	}
+	if !waitFor(t, "following", func() bool { return w.Following() }) {
+		t.Fatal("expected the follower to register")
+	}
+	if !waitFor(t, "pending", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return hub.reconnecting
+	}) {
+		t.Fatal("expected a reconnect to be pending")
+	}
+
+	got := textOf(hub.notConnected())
+	if !strings.Contains(got, "you will be notified") {
+		t.Fatalf("expected it to say a notification is coming, got: %s", got)
+	}
+	if strings.Contains(got, "will NOT be told") {
+		t.Fatalf("expected it NOT to say the opposite, got: %s", got)
+	}
+}
+
+// The held follower is the reason this matters: it survives, so the
+// channel looks unchanged, and a quiet channel then means either nothing
+// happened or everything that happened is unretrieved. The follower
+// cannot tell those apart and will never deliver the second.
+func TestReconnectTellsTheSurvivingFollowerToCatchUp(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, joins := restartOnceServer(t, true, 1)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	hub.mu.Lock()
+	w := hub.waiter
+	hub.mu.Unlock()
+
+	// Follow the socket the way the CLI does.
+	c, err := net.Dial("unix", strings.TrimSuffix(strings.Fields(w.WaitFollowCommand())[3], ""))
+	if err != nil {
+		t.Skipf("could not dial the wait socket directly: %v", err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte{0x01}); err != nil {
+		t.Fatalf("write mode: %v", err)
+	}
+
+	if !waitFor(t, "reconnect", func() bool { return joins() >= 2 }) {
+		t.Fatal("expected an automatic reconnect")
+	}
+
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 4096)
+	var seen string
+	for {
+		n, err := c.Read(buf)
+		if n > 0 {
+			seen += string(buf[:n])
+		}
+		if err != nil || strings.Contains(seen, "hub_catch_up") {
+			break
+		}
+	}
+	if !strings.Contains(seen, "restarting on purpose") {
+		t.Fatalf("expected the follower to be told it was being held, got: %q", seen)
+	}
+	if !strings.Contains(seen, "hub_catch_up") {
+		t.Fatalf("expected the follower to be told to catch up after the reconnect, got: %q", seen)
+	}
+	if !strings.Contains(seen, "does not mean nothing was missed") {
+		t.Fatalf("expected silence to be disambiguated explicitly, got: %q", seen)
+	}
+}
+
+// Three states, three answers. Connecting while a reconnect is in flight
+// is refused rather than raced: the automatic attempt already holds this
+// session's identity and a follower kept open across the gap, and a
+// second dial would either lose that race or win it and strand what the
+// first was holding.
+func TestConnectDuringAReconnectIsRefused(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := restartOnceServer(t, true, 30) // long estimate: still pending when we ask
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	if !waitFor(t, "pending", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return hub.conn == nil && hub.reconnecting
+	}) {
+		t.Fatal("expected a pending reconnect with no connection")
+	}
+
+	res, err := hub.handleConnect(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected the second connect to be refused, got: %s", textOf(res))
+	}
+	got := textOf(res)
+	if !strings.Contains(got, "reconnection in progress") {
+		t.Fatalf("expected the refusal to name the reason, got: %s", got)
+	}
+	if !strings.Contains(got, "hub_disconnect") {
+		t.Fatalf("expected it to say how to stop waiting, got: %s", got)
+	}
+	// The held waiter must still be held — refusing must not disturb it.
+	hub.mu.Lock()
+	w := hub.waiter
+	hub.mu.Unlock()
+	if w == nil {
+		t.Fatal("expected the refusal to leave the held follower alone")
+	}
+}
+
+// Asking to disconnect while a reconnect is pending must release the
+// follower held for it — nothing else ever will.
+func TestDisconnectDuringAHeldReconnectReleasesTheFollower(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := restartOnceServer(t, true, 30)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	if !waitFor(t, "hold", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return hub.conn == nil && hub.waiter != nil
+	}) {
+		t.Fatal("expected a held waiter with no connection")
+	}
+
+	res, err := hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("disconnect errored: %v", err)
+	}
+	if !strings.Contains(textOf(res), "released") {
+		t.Fatalf("expected it to say the held follower was released, got: %s", textOf(res))
+	}
+	hub.mu.Lock()
+	w := hub.waiter
+	hub.mu.Unlock()
+	if w != nil {
+		t.Fatal("expected no waiter left after disconnecting")
+	}
+}
+
+// A server slower to return than it predicted is ordinary, not
+// exceptional. One failed attempt must not leave the session down
+// indefinitely with a follower held open for a reconnect nobody is still
+// attempting — so it retries, and says so every time.
+func TestFailedReconnectRetriesAndSaysHowToStop(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	var mu sync.Mutex
+	joins := 0
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		joins++
+		first := joins == 1
+		mu.Unlock()
+		if !first {
+			// Refuse every reconnect, so the loop has to keep trying.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		raw, _ := json.Marshal(wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+		})
+		conn.WriteMessage(websocket.TextMessage, raw)
+		time.Sleep(300 * time.Millisecond)
+		conn.WriteJSON(wire.ServerStopping{Type: wire.TypeServerStopping, ReconnectAfter: 1})
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "restarting"))
+		time.Sleep(30 * time.Millisecond)
+	}))
+	t.Cleanup(srv.Close)
+
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	// At least two attempts means it did not stop at the first failure.
+	if !waitFor(t, "retries", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return joins >= 3
+	}) {
+		mu.Lock()
+		n := joins
+		mu.Unlock()
+		t.Fatalf("expected repeated attempts, saw %d connections", n)
+	}
+
+	note := hub.takeAutoReconnectNote()
+	if !strings.Contains(note, "FAILED") {
+		t.Fatalf("expected a failure report, got: %s", note)
+	}
+	if !strings.Contains(note, "Another attempt follows") {
+		t.Fatalf("expected it to say another attempt is coming, got: %s", note)
+	}
+	if !strings.Contains(note, "hub_disconnect") {
+		t.Fatalf("expected it to name the way out, got: %s", note)
+	}
+
+	// And the follower is still held, since it is still coming back.
+	hub.mu.Lock()
+	w, pending := hub.waiter, hub.reconnecting
+	hub.mu.Unlock()
+	if w == nil || !pending {
+		t.Fatalf("expected the hold and the pending flag to persist across failures (waiter=%v pending=%v)", w != nil, pending)
+	}
+}
+
+// Disconnecting during the retry loop stops it — the loop must not
+// outlive a caller's decision to leave.
+func TestDisconnectStopsTheRetryLoop(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	var mu sync.Mutex
+	joins := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		joins++
+		first := joins == 1
+		mu.Unlock()
+		if !first {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		raw, _ := json.Marshal(wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+		})
+		conn.WriteMessage(websocket.TextMessage, raw)
+		time.Sleep(300 * time.Millisecond)
+		conn.WriteJSON(wire.ServerStopping{Type: wire.TypeServerStopping, ReconnectAfter: 1})
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "restarting"))
+		time.Sleep(30 * time.Millisecond)
+	}))
+	t.Cleanup(srv.Close)
+
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	if !waitFor(t, "retrying", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return joins >= 2
+	}) {
+		t.Fatal("expected the retry loop to start")
+	}
+
+	hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+	mu.Lock()
+	at := joins
+	mu.Unlock()
+	time.Sleep(2500 * time.Millisecond)
+	mu.Lock()
+	after := joins
+	mu.Unlock()
+	if after > at+1 {
+		t.Fatalf("expected the loop to stop after disconnect, attempts went %d -> %d", at, after)
+	}
+	hub.mu.Lock()
+	pending := hub.reconnecting
+	hub.mu.Unlock()
+	if pending {
+		t.Fatal("expected the pending flag cleared after disconnect")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -144,7 +145,7 @@ type Event struct {
 	// an instruction.
 	UnconfirmedCount int
 	UnconfirmedSince time.Time
-	Behind *int
+	Behind           *int
 	// ReplyTo/ReplyPreview carry a "msg"/"messageEdited"'s reply
 	// reference, if any — see wire.Msg.ReplyTo/ReplyPreview. Empty (not a
 	// distinguishable "absent" vs. "empty string") when this message
@@ -214,6 +215,9 @@ type Event struct {
 	// readings of the same frame.
 	Answers  *wire.Anchor
 	Matching *wire.Filter
+	// ReconnectAfter carries a "serverStopping" frame's own estimate, in
+	// seconds — see wire.ServerStopping.
+	ReconnectAfter int
 }
 
 // PeerInfo is what's known about one other peer in the session.
@@ -278,8 +282,8 @@ type Conn struct {
 	// Everything behavioural comes from the server's own declaration —
 	// see features/HasFeature.
 
-	mu         sync.Mutex
-	buffer     []Event
+	mu     sync.Mutex
+	buffer []Event
 	// ackReplyMisses counts CONSECUTIVE ConfirmReceived calls that waited
 	// for a standalone ack's reply and got nothing back within
 	// AckWaitTimeout. Whether a server answers a standalone ack with a
@@ -294,10 +298,15 @@ type Conn struct {
 	// genuine ack reply resets it — reconnect gets a fresh Conn and
 	// starts at 0 again either way.
 	ackReplyMisses int
-	closed     bool
-	closeCode  int       // set from the WebSocket close frame's code, if any — see DisconnectNote
-	timedOut   bool      // set when the connection was dropped by our own pongWait deadline, not a close frame — see DisconnectNote
-	timedOutAt time.Time // when timedOut was set — see DisconnectNote's use of it against lastFrameAt
+	closed         bool
+	closeCode      int // set from the WebSocket close frame's code, if any — see DisconnectNote
+	// reconnectAfter is the server's own restart estimate in seconds,
+	// from a "serverStopping" frame. Zero when none arrived — which
+	// includes a graceful stop whose frame was missed, so it is never
+	// read as "this was not graceful": the close code answers that.
+	reconnectAfter int
+	timedOut       bool      // set when the connection was dropped by our own pongWait deadline, not a close frame — see DisconnectNote
+	timedOutAt     time.Time // when timedOut was set — see DisconnectNote's use of it against lastFrameAt
 	// lastFrameKind/lastFrameAt record the most recent frame observed —
 	// "joined" (construction), "ping" (a control frame, from
 	// SetPingHandler — gorilla handles these internally and they never
@@ -425,6 +434,57 @@ func (c *Conn) DisconnectNote() string {
 		return fmt.Sprintf(" (connection closed, code %d)", c.closeCode)
 	}
 	return ""
+}
+
+// GracefulShutdown reports whether the server closed this connection on
+// purpose, from the close code alone.
+//
+// Deliberately NOT keyed on having received a "serverStopping" frame. The
+// close code comes from the websocket layer and cannot be half-received;
+// the frame is an ordinary message that a busy reader can miss or receive
+// truncated. Requiring the frame would report a clean shutdown as a crash
+// exactly when this client was busiest, which is the failure mode the
+// two-signal design exists to avoid.
+//
+// False for an ordinary drop, and that stays as ambiguous as it has
+// always been: a killed process, an OOM, or a dead host sends no close
+// frame at all, so false means "nothing said this was deliberate" — never
+// "the server did not restart".
+func (c *Conn) GracefulShutdown() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeCode == websocket.CloseGoingAway
+}
+
+// reconnectJitter is how much of the server's estimate to spread retries
+// across. The estimate is a floor, not an appointment: every peer told
+// the same number and obeying it exactly arrives in one burst against a
+// server that has only just finished starting.
+const reconnectJitter = 0.4
+
+// SuggestedReconnectDelay is how long to wait before reconnecting after a
+// graceful shutdown — the server's own estimate plus a random share of
+// it, drawn per call so two peers given the same number do not return
+// together. Zero when the server offered no estimate, which means "no
+// advice", not "reconnect immediately".
+func (c *Conn) SuggestedReconnectDelay() time.Duration {
+	c.mu.Lock()
+	secs := c.reconnectAfter
+	c.mu.Unlock()
+	if secs <= 0 {
+		return 0
+	}
+	base := time.Duration(secs) * time.Second
+	return base + time.Duration(rand.Float64()*reconnectJitter*float64(base))
+}
+
+// ServerReconnectEstimate is what the server actually said, unjittered —
+// for reporting what was claimed as distinct from what this client
+// decided to do about it. Zero when no estimate arrived.
+func (c *Conn) ServerReconnectEstimate() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Duration(c.reconnectAfter) * time.Second
 }
 
 // maxNameRunes and maxTopicRunes bound the free-text header values this
@@ -1136,6 +1196,11 @@ func (c *Conn) readLoop() {
 			c.unconfirmedCount++
 		}
 		switch ev.Kind {
+		case "serverStopping":
+			// Kept so the disconnect that follows can report an estimate.
+			// Not what decides "was this graceful" — the close code is,
+			// and it arrives whether or not this frame did.
+			c.reconnectAfter = ev.ReconnectAfter
 		case "peerJoined":
 			c.peers[ev.PeerID] = PeerInfo{ID: ev.PeerID, Name: ev.Name, AgePublicKey: ev.AgePublicKey}
 		case "peerLeft":
@@ -1197,6 +1262,12 @@ func decodeEvent(raw []byte) (Event, bool) {
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,
 			Matching: m.Matching}, true
+	case wire.TypeServerStopping:
+		var st wire.ServerStopping
+		if err := json.Unmarshal(raw, &st); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "serverStopping", ReconnectAfter: st.ReconnectAfter}, true
 	case wire.TypeNoMoreMessages:
 		var n wire.NoMoreMessages
 		if err := json.Unmarshal(raw, &n); err != nil {

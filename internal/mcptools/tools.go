@@ -103,6 +103,29 @@ type Hub struct {
 	// the whole conversation's history.
 	handedOverAhead map[string]bool
 
+	// redial is what a graceful restart needs in order to come back
+	// without the model having to act: the link and name this session last
+	// connected with. Held only after a successful connect, and cleared by
+	// an explicit hub_disconnect — a caller that chose to leave must not
+	// be dragged back in.
+	redialLink string
+	redialName string
+	// autoReconnect holds the outcome of a reconnect this client performed
+	// on its own, waiting to be told to the model. A reconnection the
+	// model never hears about is exactly the delivery-vs-comprehension gap
+	// this codebase keeps closing elsewhere: the socket would be healthy
+	// and the model would still believe it was offline.
+	autoReconnect string
+	// reconnecting guards against two automatic attempts overlapping, and
+	// against one racing a hub_connect the model issued itself.
+	reconnecting bool
+	// reconnectAt is when the pending automatic attempt is due. Without
+	// it every tool answers a planned outage with a bare "not connected",
+	// which is true and useless: it reads identically to a hub that is
+	// simply gone, so a caller cannot tell whether waiting is worthwhile
+	// or whether it should give up and do something else.
+	reconnectAt time.Time
+
 	// waitMu, waitCancel, and waitGen let a new handleWait call supersede
 	// one already in flight, mirroring waiter.Waiter's single-registered-
 	// waiter design for the CLI wait socket — see handleWait.
@@ -555,6 +578,15 @@ func (h *Hub) clearActiveConn() (*hubconn.Conn, *waiter.Waiter, connstore.Target
 // not just explicit hub_disconnect, so a session that ends this way isn't
 // wrongly reported as "still open" by a later process's startup note.
 func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
+	h.teardown(conn, false)
+}
+
+// teardown ends the active connection. keepWaiter holds the wait socket
+// open instead of closing it, for the one case where the connection is
+// coming back on its own: closing it would kill the follower process,
+// and the reconnect would then restore the connection while leaving the
+// session with no live channel and nothing to tell it so.
+func (h *Hub) teardown(conn *hubconn.Conn, keepWaiter bool) {
 	h.mu.Lock()
 	if h.conn != conn {
 		h.mu.Unlock()
@@ -562,11 +594,18 @@ func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
 	}
 	w := h.waiter
 	target := h.connTarget
-	h.conn, h.waiter, h.connTarget = nil, nil, connstore.Target{}
+	h.conn, h.connTarget = nil, connstore.Target{}
+	if !keepWaiter {
+		h.waiter = nil
+	}
 	h.mu.Unlock()
 	h.clearAttachDir()
 	if w != nil {
-		w.Close()
+		if keepWaiter {
+			w.ExpectReconnect()
+		} else {
+			w.Close()
+		}
 	}
 	if target != (connstore.Target{}) {
 		_ = connstore.MarkDisconnected(target)
@@ -584,7 +623,7 @@ func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
 // next hub_connect, but naming it explicitly here means a client checking
 // this text mid-session doesn't need to trust that silently.
 func disconnectedText(conn *hubconn.Conn) string {
-	text := "hub disconnected" + conn.DisconnectNote()
+	text := "hub disconnected" + conn.DisconnectNote() + gracefulRestartNote(conn)
 	if cursor := conn.LastSeenCursor(); cursor != "" {
 		text += fmt.Sprintf("\nLast message cursor you saw on this connection: %q. On your "+
 			"next hub_connect, call hub_catch_up() to pick up anything that arrived while "+
@@ -593,8 +632,388 @@ func disconnectedText(conn *hubconn.Conn) string {
 	return text
 }
 
+// gracefulRestartNote distinguishes a server that said goodbye from a
+// connection that simply stopped — a distinction that did not exist
+// before, since both arrived as a bare drop and a deploy was
+// indistinguishable from a dead laptop.
+//
+// Keyed on the close code alone. A "serverStopping" frame, when one
+// arrived, supplies the estimate and nothing else: it is an ordinary
+// message and can be missed or truncated, so requiring it would report a
+// clean restart as a crash exactly when this client was busy reading.
+//
+// Silent for an ordinary drop, deliberately. Nothing said that one was
+// deliberate, and nothing says it was not — an unannounced close stays
+// exactly as ambiguous as it has always been rather than becoming
+// evidence that no restart happened.
+func gracefulRestartNote(conn *hubconn.Conn) string {
+	if !conn.GracefulShutdown() {
+		return ""
+	}
+	note := "\nThe server closed this connection ON PURPOSE (a restart or shutdown), rather than " +
+		"it dropping — so this is expected, not a fault to investigate."
+	delay := conn.SuggestedReconnectDelay()
+	if delay == 0 {
+		return note + " It gave no estimate of when it will be back, so retry hub_connect and " +
+			"expect it to fail until it is."
+	}
+	return note + fmt.Sprintf(" It estimated about %s to restart; wait roughly %s before calling "+
+		"hub_connect. That is deliberately longer than the estimate and randomised, so peers do "+
+		"not all return in the same instant against a server that has only just come up.",
+		conn.ServerReconnectEstimate().Round(time.Second), delay.Round(time.Second))
+}
+
+// scheduleReconnectIfGraceful reconnects by itself, but ONLY after a
+// close the server declared deliberate (1001). That restriction is the
+// whole design:
+//
+//   - A 1001 says the server meant to go, so coming back is what the
+//     caller would have wanted and there is nothing to decide.
+//   - A bare drop says nothing about intent. It could be a dead laptop,
+//     a revoked credential, or a network partition, and retrying on that
+//     ambiguity is how a client ends up hammering a server that will
+//     never answer. Those stay the model's call, exactly as before.
+//
+// Credential refusals (4001/4002/4003) are not 1001 and so never reach
+// here — the server means "do not come back", and honouring that matters
+// more than availability.
+//
+// The result is REPORTED rather than silent. A connection restored
+// without the model hearing about it is the same failure this codebase
+// keeps closing elsewhere: the socket would be healthy and the model
+// would still believe it was offline, which is worse than staying down,
+// because nothing would prompt it to check.
+// willAutoReconnect answers, before anything is torn down, whether this
+// client intends to come back on its own — which is what decides whether
+// the wait socket is kept alive across the gap. Deliberately the same
+// conditions scheduleReconnectIfGraceful applies, asked separately
+// because the decision has to be made BEFORE the teardown that would
+// otherwise close the socket, and a socket closed on a wrong guess
+// cannot be un-closed.
+func (h *Hub) willAutoReconnect(conn *hubconn.Conn) bool {
+	if !conn.GracefulShutdown() || conn.SuggestedReconnectDelay() == 0 {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.redialLink != "" && !h.reconnecting
+}
+
+func (h *Hub) scheduleReconnectIfGraceful(conn *hubconn.Conn) {
+	if !conn.GracefulShutdown() {
+		return
+	}
+	delay := conn.SuggestedReconnectDelay()
+	if delay == 0 {
+		// The server said it was going but gave no estimate. Guessing one
+		// risks returning before it is up and burning the attempt; the
+		// model is told it was deliberate and can reconnect when it likes.
+		return
+	}
+	h.mu.Lock()
+	link, name := h.redialLink, h.redialName
+	if link == "" || h.reconnecting {
+		h.mu.Unlock()
+		return
+	}
+	h.reconnecting = true
+	h.reconnectAt = time.Now().Add(delay)
+	h.mu.Unlock()
+
+	go h.reconnectLoop(link, name, delay)
+}
+
+// reconnectLoop keeps trying at the interval the server itself named,
+// until it succeeds or someone calls hub_disconnect.
+//
+// It retries rather than reporting one failure and stopping, because a
+// server that is slower to come back than it predicted is the ordinary
+// case, not an exceptional one — and a single missed attempt would leave
+// the session down indefinitely while a follower sits held open waiting
+// for a reconnect nobody is still attempting. What makes an unbounded
+// loop acceptable here is that it is bounded by something real: it only
+// ever runs after a server ANNOUNCED it was coming back, and any caller
+// can end it with hub_disconnect, which is said in every failure report.
+//
+// Each failure is reported rather than swallowed, so waiting is a choice
+// the caller keeps making with current information instead of one it made
+// once and forgot.
+func (h *Hub) reconnectLoop(link, name string, interval time.Duration) {
+	defer func() {
+		h.mu.Lock()
+		h.reconnecting, h.reconnectAt = false, time.Time{}
+		h.mu.Unlock()
+	}()
+	for attempt := 1; ; attempt++ {
+		time.Sleep(interval)
+		// hub_disconnect clears the link, and that is the cancel signal:
+		// a caller that chose to leave must not be dragged back in by an
+		// attempt scheduled before it decided.
+		h.mu.Lock()
+		cancelled := h.redialLink == ""
+		h.mu.Unlock()
+		if cancelled {
+			return
+		}
+		outcome := h.reconnectOnce(link, name, interval, attempt)
+		if outcome != reconnectRetry {
+			return
+		}
+		h.mu.Lock()
+		h.reconnectAt = time.Now().Add(interval)
+		h.mu.Unlock()
+	}
+}
+
+type reconnectOutcome int
+
+const (
+	reconnectDone  reconnectOutcome = iota // connected, or someone else did
+	reconnectRetry                         // failed in a way another attempt could fix
+	reconnectFatal                         // failed in a way it cannot
+)
+
+// reconnectOnce performs a single redial and says whether trying again
+// could help.
+func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int) reconnectOutcome {
+	// The model may have reconnected itself while this was waiting.
+	if prev, _ := h.activeConn(); prev != nil && prev.Connected() {
+		return reconnectDone
+	}
+
+	target := targetForLink(context.Background(), link)
+	stored, _ := connstore.Get(target)
+	secret := stored.ReconnectSecret
+	if secret == "" {
+		h.abandonReconnect("Automatic reconnect was not attempted after the server's restart: " +
+			"this session's stored identity for that link is gone, so reconnecting would take a " +
+			"new one. Retrying cannot fix that. Call hub_connect yourself when ready.")
+		return reconnectFatal
+	}
+	conn, err := hubconn.Dial(link, hubconn.DialOptions{
+		ReconnectSecret: secret,
+		AgentID:         stored.PeerID,
+		Name:            name,
+	})
+	if err != nil {
+		h.reportFailedAttempt(attempt, waited, err)
+		return reconnectRetry
+	}
+	// Reuse the wait socket that was deliberately kept open across the
+	// restart, so the follower that survived the gap simply resumes. Only
+	// fall back to a new one if there was nothing to keep.
+	h.mu.Lock()
+	w := h.waiter
+	h.mu.Unlock()
+	keptFollower := w != nil
+	if keptFollower {
+		w.SetSource(conn)
+	} else {
+		var err error
+		w, err = waiter.Listen(conn)
+		if err != nil {
+			conn.Close()
+			h.noteAutoReconnect(fmt.Sprintf("Automatic reconnect dialled successfully but could "+
+				"not start its wait socket (%v), so it was abandoned and you are still "+
+				"disconnected — call hub_connect to retry.", err))
+			return reconnectFatal
+		}
+	}
+	conn.OnActivity(func() {
+		// The hold is armed BEFORE Poke, not after. Poke is what delivers
+		// the disconnect to a follower and releases it, so arming
+		// afterwards arms nothing: the follower is already gone by the
+		// time the teardown runs.
+		if !conn.Connected() && h.willAutoReconnect(conn) {
+			w.ExpectReconnect()
+		}
+		w.Poke()
+		if !conn.Connected() {
+			h.teardown(conn, h.willAutoReconnect(conn))
+			h.scheduleReconnectIfGraceful(conn)
+		}
+	})
+	h.setActiveConn(conn, w, target)
+	h.setCatchUpKey(target)
+	topic := ""
+	if t := conn.Topic(); t != nil {
+		topic = *t
+	}
+	_ = connstore.Upsert(target, connstore.Entry{
+		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic,
+		ReconnectSecret: secret, LastConnectedAt: time.Now().UTC(), Connected: true,
+	})
+	followerNote := "Your follower was held open across the restart and is already delivering " +
+		"again — do NOT start another, it would supersede the one that is working."
+	if keptFollower {
+		// The held follower is why this needs saying twice. It survived,
+		// so the channel looks exactly as it did before — and a quiet
+		// channel now means either that nothing happened or that
+		// everything which happened during the outage is sitting
+		// unretrieved on the server. The follower cannot tell those
+		// apart, and will never deliver the second: what arrived while
+		// this client was away was never written to this connection.
+		w.Announce("[hub: reconnected after the server's restart — this follower is live again. " +
+			"Anything sent DURING the outage was not delivered here and will not appear on this " +
+			"channel: call hub_catch_up() to retrieve it. Silence here from now on means nothing " +
+			"new, but it does not mean nothing was missed.]")
+	}
+	if !keptFollower {
+		followerNote = "There was no follower to keep, so nothing is delivering live events — " +
+			"start one with:\n    " + w.WaitFollowCommand()
+	}
+	h.noteAutoReconnect(fmt.Sprintf("RECONNECTED AUTOMATICALLY after the server's announced "+
+		"restart, having waited %s. You are connected again as peer %s. Messages may have arrived "+
+		"while you were away and while this client was waiting — call hub_catch_up() now, the same "+
+		"as after any reconnect. %s",
+		waited.Round(time.Second), conn.PeerID(), followerNote))
+	return reconnectDone
+}
+
+// reportFailedAttempt says an attempt failed and that another is coming,
+// to the model and to anyone following. Said EVERY time rather than once:
+// the caller is choosing to keep waiting, and a choice made on stale
+// information is not really being made. It always names the way out,
+// because an automatic retry with no visible exit is indistinguishable
+// from being stuck.
+func (h *Hub) reportFailedAttempt(attempt int, interval time.Duration, err error) {
+	msg := fmt.Sprintf("Automatic reconnect attempt %d FAILED: %v. You are still disconnected. "+
+		"Another attempt follows in about %s, and it will keep retrying at that interval. Either "+
+		"WAIT — you will be told when it succeeds — or call hub_disconnect to stop trying, which "+
+		"also releases the follower being held open for it.",
+		attempt, err, interval.Round(time.Second))
+	h.noteAutoReconnect(msg)
+	h.mu.Lock()
+	w := h.waiter
+	h.mu.Unlock()
+	if w != nil {
+		w.Announce("[hub: " + msg + "]")
+	}
+}
+
+// withReconnectNote prepends a pending automatic-reconnect report to
+// whatever the tool was going to say. Prepended, not appended, because it
+// changes what the rest of the result MEANS: a "not connected" that is
+// actually "reconnected while you were away" must not be read top-down as
+// a failure. Delivered exactly once, on the next call of any tool.
+func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		res, err := handler(ctx, req)
+		note := h.takeAutoReconnectNote()
+		if note == "" || res == nil {
+			return res, err
+		}
+		return prependText(res, "[hub: "+note+"]\n\n"), err
+	}
+}
+
+// prependText puts text in front of a result's first text content,
+// leaving everything else (images, further blocks, the error flag) as it
+// was.
+func prependText(res *mcp.CallToolResult, text string) *mcp.CallToolResult {
+	for i, c := range res.Content {
+		if tc, ok := c.(mcp.TextContent); ok {
+			tc.Text = text + tc.Text
+			res.Content[i] = tc
+			return res
+		}
+	}
+	res.Content = append([]mcp.Content{mcp.NewTextContent(text)}, res.Content...)
+	return res
+}
+
+// notConnected is every tool's answer when there is no live connection.
+// It names a pending automatic reconnect when there is one, because "not
+// connected" alone is the same sentence for a hub that is coming back in
+// forty seconds and one that is never coming back — and those call for
+// opposite decisions. Nothing is queued either way: a send during the gap
+// fails, and it should, since holding a message to deliver later means
+// sending it into a conversation that has moved on.
+func (h *Hub) notConnected() *mcp.CallToolResult {
+	h.mu.Lock()
+	pending, at := h.reconnecting, h.reconnectAt
+	h.mu.Unlock()
+	if !pending {
+		return mcp.NewToolResultError("not connected")
+	}
+	// Whether anything is still following decides what "wait" even means
+	// here: with a follower held open across the outage, the reconnect
+	// announces itself on that channel and there is nothing to poll for.
+	// Without one, nobody will say anything and checking back is the only
+	// option. Telling someone to wait for a notification that nothing
+	// will send is worse than telling them to poll.
+	h.mu.Lock()
+	w := h.waiter
+	h.mu.Unlock()
+	whatHappensNext := "Nothing is following, so you will NOT be told when it returns — try again " +
+		"after that, then call hub_catch_up()."
+	if w != nil && w.Following() {
+		whatHappensNext = "You are following, so you will be notified on this channel when it " +
+			"reconnects; that notice tells you to call hub_catch_up(). Just wait for it."
+	}
+	in := time.Until(at).Round(time.Second)
+	if in < 0 {
+		return mcp.NewToolResultError("WAIT: RECONNECTING — an automatic reconnect after the " +
+			"server's announced restart is in progress right now. Nothing was queued, so whatever " +
+			"you were doing has NOT happened and must be done again. " + whatHappensNext)
+	}
+	return mcp.NewToolResultError(fmt.Sprintf("WAIT: RECONNECTING — the server announced a restart "+
+		"and this client will reconnect by itself in about %s. Nothing is queued, so whatever you "+
+		"were doing has NOT happened and must be done again afterwards. Do not reconnect by hand; "+
+		"a manual hub_connect now races the automatic one. %s", in, whatHappensNext))
+}
+
+// abandonReconnect gives up on coming back by itself, and releases the
+// follower that was being held for a reconnect that is not going to
+// happen. Without this, a failed attempt leaves a live follower attached
+// to nothing: no connection, no pending reconnect, and no event will ever
+// reach it again — silent in a way indistinguishable from a quiet
+// conversation. Giving up has to be as visible as succeeding.
+func (h *Hub) abandonReconnect(note string) {
+	h.mu.Lock()
+	w := h.waiter
+	h.waiter = nil
+	h.reconnectAt = time.Time{}
+	h.mu.Unlock()
+	if w != nil {
+		w.Announce("[hub: the automatic reconnect did not succeed, so this follower is being " +
+			"closed. Nothing further will arrive on it. Reconnect with hub_connect when ready]")
+		w.Close()
+	}
+	h.noteAutoReconnect(note)
+}
+
+// noteAutoReconnect stores something the model has not been told yet. It
+// is delivered on the next tool result rather than pushed, because there
+// is no channel to push down — which is precisely why it must be stored
+// instead of logged and forgotten.
+func (h *Hub) noteAutoReconnect(note string) {
+	h.mu.Lock()
+	h.autoReconnect = note
+	h.mu.Unlock()
+}
+
+// takeAutoReconnectNote returns and clears the pending note, so it is
+// reported exactly once.
+func (h *Hub) takeAutoReconnectNote() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	note := h.autoReconnect
+	h.autoReconnect = ""
+	return note
+}
+
 func (h *Hub) Register(s *server.MCPServer) {
-	s.AddTool(
+	// Every tool goes through withReconnectNote so that a reconnection
+	// this client performed on its own is reported on the very next call,
+	// whichever call that happens to be. Wrapping here rather than in
+	// each handler is deliberate: a note delivered by only some tools
+	// would be delivered reliably by none, since which tool a caller
+	// reaches for next is not something this code gets to choose.
+	addTool := func(tool mcp.Tool, handler server.ToolHandlerFunc) {
+		s.AddTool(tool, h.withReconnectNote(handler))
+	}
+	addTool(
 		mcp.NewTool("hub_connect",
 			mcp.WithDescription("Connect to a hub session via a link the user was given — one "+
 				"opaque string that identifies both where to connect and what authorizes it. "+
@@ -647,7 +1066,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handleConnect,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_send",
 			mcp.WithDescription("Send a text message to the current hub session. On a teams "+
 				"session (e.g. via hub_connect's link form), this call itself waits briefly for the "+
@@ -710,12 +1129,12 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handleSend,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_disconnect",
 			mcp.WithDescription("Disconnect from the current hub session")),
 		h.handleDisconnect,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_list_connections",
 			mcp.WithDescription("List the links this client has connected to before FROM THIS "+
 				"PROJECT, with the peerId and display name each one last used, the "+
@@ -726,7 +1145,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"presents it for you")),
 		h.handleListConnections,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_self_update",
 			mcp.WithDescription("Check GitHub for a newer mcp-hub-client release and, if there is "+
 				"one, install it over this client's own binary. Offered when a connect fails in a "+
@@ -746,7 +1165,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"stand")),
 		h.handleSelfUpdate,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_read",
 			mcp.WithDescription("Read one message from this conversation's history, by where it "+
 				"sits rather than by what you have already seen. A QUERY, not a hand-over: it "+
@@ -792,7 +1211,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handleRead,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_pin",
 			mcp.WithDescription("Pin a message in this conversation — only where the server "+
 				"declares it can do this; against one that doesn't (every ordinary hub session, "+
@@ -806,7 +1225,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handlePin,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_unpin",
 			mcp.WithDescription("Remove a message from this conversation's pinned set — same "+
 				"contract as hub_pin, including being refused where the server declares no "+
@@ -817,7 +1236,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handleUnpin,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_pins",
 			mcp.WithDescription("List what is pinned in this conversation RIGHT NOW, asking the "+
 				"server rather than reporting what this client last heard. Read-only.\n"+
@@ -827,7 +1246,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"notice. This is the repair path for exactly that")),
 		h.handlePins,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_receive",
 			mcp.WithDescription("Drain and return currently buffered hub events without blocking. "+
 				"An image attached to a received message is saved to a local temp file, not "+
@@ -835,7 +1254,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"with a Read tool) to view it. The file is removed automatically on disconnect")),
 		h.handleReceive,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_wait",
 			mcp.WithDescription("Block until the next hub event arrives (or the hub disconnects), "+
 				"then return it — the direct MCP-tool alternative to running the wait CLI binary "+
@@ -848,14 +1267,14 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"old call returns right away); only ever have one in flight at a time")),
 		h.handleWait,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_peers",
 			mcp.WithDescription("List everyone else currently in the hub session, including each "+
 				"peer's peerId and — if they supplied one on connect — their display name and age "+
 				"public key (e.g. for encrypting a message to them before sending)")),
 		h.handlePeers,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_catch_up",
 			mcp.WithDescription("Read the single next message you missed. A server that doesn't "+
 				"implement messageAfter (including every mcp-hub-server, and any teams relay "+
@@ -896,7 +1315,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handleCatchUp,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_confirm",
 			mcp.WithDescription("Explicitly confirm you received a message INTACT, by its cursor — "+
 				"for when you've been reading mostly via wait --follow (or the wait CLI's one-shot "+
@@ -923,7 +1342,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handleConfirmReceived,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_react",
 			mcp.WithDescription("Add or remove a reaction on an earlier message — only where the "+
 				"server declares it can do this; against one that doesn't, the call is refused "+
@@ -943,7 +1362,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handleReact,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_edit",
 			mcp.WithDescription("Change an earlier message's content — only where the server declares "+
 				"it can do this; against one that doesn't, the call is refused here with that "+
@@ -997,7 +1416,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 		),
 		h.handleEdit,
 	)
-	s.AddTool(
+	addTool(
 		mcp.NewTool("hub_delete",
 			mcp.WithDescription("Remove an earlier message — only where the server declares it can do "+
 				"this; against one that doesn't, the call is refused here with that reason rather "+
@@ -1096,6 +1515,26 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 }
 
 func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Three states, three answers. Connecting while a reconnect is in
+	// flight is refused rather than raced: the automatic attempt already
+	// holds this session's identity, its stored secret and a follower
+	// kept open across the gap, and a second dial would either lose that
+	// race or win it and strand what the first one was holding.
+	h.mu.Lock()
+	pendingReconnect, pendingAt := h.reconnecting, h.reconnectAt
+	h.mu.Unlock()
+	if pendingReconnect {
+		in := time.Until(pendingAt).Round(time.Second)
+		when := "right now"
+		if in > 0 {
+			when = fmt.Sprintf("in about %s", in)
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("reconnection in progress — this client is "+
+			"already coming back on its own after the server announced a restart, %s. Do not dial "+
+			"a second time; wait for it. If you want to stop waiting instead, call hub_disconnect, "+
+			"which gives up and releases the follower being held for it.", when)), nil
+	}
+
 	if prev, _ := h.activeConn(); prev != nil {
 		if !prev.Connected() {
 			// The previous connection died on its own (server restart,
@@ -1155,6 +1594,13 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError(fmt.Sprintf("could not start wait socket: %v", err)), nil
 	}
 	conn.OnActivity(func() {
+		// The hold is armed BEFORE Poke, not after. Poke is what delivers
+		// the disconnect to a follower and releases it, so arming
+		// afterwards arms nothing: the follower is already gone by the
+		// time the teardown runs.
+		if !conn.Connected() && h.willAutoReconnect(conn) {
+			w.ExpectReconnect()
+		}
 		w.Poke()
 		if !conn.Connected() {
 			// The read loop that just invoked us is the one that detected
@@ -1162,11 +1608,36 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			// our own hub_disconnect(). Tear down proactively rather than
 			// leaving a dead-but-unnoticed connection (and its wait socket
 			// still listening) around until the next tool call.
-			h.teardownIfCurrent(conn)
+			// A restart the server announced is coming back, so the
+			// follower is kept rather than killed — see teardown.
+			h.teardown(conn, h.willAutoReconnect(conn))
+			h.scheduleReconnectIfGraceful(conn)
 		}
 	})
 	h.setActiveConn(conn, w, target)
 	h.setCatchUpKey(target)
+	h.mu.Lock()
+	h.redialLink, h.redialName = link, name
+	h.mu.Unlock()
+	// A server can close between Dial returning and the callback above
+	// being registered — a restart announced moments after a join does
+	// exactly that, and the read loop has then already exited without
+	// firing anything. Schedule the reconnect here instead.
+	//
+	// Deliberately WITHOUT tearing the connection down: whatever the
+	// server sent before closing is still in this connection's buffer and
+	// still the caller's to read, and the disconnect notice that follows
+	// it is how a caller learns the connection ended. Tearing down here
+	// would make both unreachable, replacing a readable ending with
+	// silence.
+	if !conn.Connected() {
+		// Tell the waiter to hold BEFORE scheduling, since scheduling
+		// sets the in-flight flag that willAutoReconnect reads.
+		if h.willAutoReconnect(conn) {
+			w.ExpectReconnect()
+		}
+		h.scheduleReconnectIfGraceful(conn)
+	}
 
 	topic := ""
 	if t := conn.Topic(); t != nil {
@@ -1635,7 +2106,7 @@ func readAttachmentParam(req mcp.CallToolRequest) ([]wire.Attachment, error) {
 func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	if !conn.Connected() {
 		h.teardownIfCurrent(conn)
@@ -1689,9 +2160,27 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Leaving on purpose ends the standing permission to come back. A
+	// server restart arriving moments later must not drag a caller into a
+	// session it chose to leave, and "I disconnected but it reconnected"
+	// is the kind of surprise that makes an automatic mechanism
+	// untrustworthy in general, not just here.
+	h.mu.Lock()
+	h.redialLink, h.redialName, h.autoReconnect = "", "", ""
+	h.reconnecting, h.reconnectAt = false, time.Time{}
+	h.mu.Unlock()
+
 	conn, w, target := h.clearActiveConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		// There may still be a waiter held open for a reconnect that is
+		// no longer wanted. Releasing it is the whole point of asking to
+		// disconnect, and nothing else will ever close it.
+		if w != nil {
+			w.Close()
+			return mcp.NewToolResultText("not connected — a reconnect was pending and has been " +
+				"cancelled, and the follower held open for it has been released"), nil
+		}
+		return h.notConnected(), nil
 	}
 	if w != nil {
 		w.Close()
@@ -1761,7 +2250,7 @@ func (h *Hub) handleUnpin(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 func (h *Hub) pinAction(req mcp.CallToolRequest, pin bool) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	externalID, err := req.RequireString("externalId")
 	if err != nil {
@@ -1793,7 +2282,7 @@ func (h *Hub) pinAction(req mcp.CallToolRequest, pin bool) (*mcp.CallToolResult,
 func (h *Hub) handlePins(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	ev, ok, err := conn.Pins()
 	if err != nil {
@@ -1809,7 +2298,7 @@ func (h *Hub) handlePins(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	at, after := req.GetString("at", ""), req.GetString("after", "")
 	switch {
@@ -2074,7 +2563,7 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	events, connected := conn.DrainEvents()
 	formatted := hubconn.FormatEvents(events)
@@ -2142,7 +2631,7 @@ const waitAgainReminder = "REMINDER: after processing the message(s) below, call
 func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 
 	innerCtx, cancel := context.WithCancel(ctx)
@@ -2194,7 +2683,7 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 func (h *Hub) handlePeers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	if !conn.Connected() {
 		h.teardownIfCurrent(conn)
@@ -2276,7 +2765,7 @@ const catchUpDedupSkipLimit = 20
 func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	if !conn.Connected() {
 		h.teardownIfCurrent(conn)
@@ -2374,8 +2863,8 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		h.knownContiguous = true
 		h.mu.Unlock()
 		return mcp.NewToolResultText(
-			"nothing to catch up — no prior position recorded and the server reports nothing behind; "+
-				"live traffic will arrive normally"+gapNote,
+			"nothing to catch up — no prior position recorded and the server reports nothing behind; " +
+				"live traffic will arrive normally" + gapNote,
 		), nil
 	}
 
@@ -2596,7 +3085,7 @@ func (h *Hub) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mcp.Ca
 func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	if !conn.Connected() {
 		h.teardownIfCurrent(conn)
@@ -2675,7 +3164,7 @@ func (h *Hub) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
 func (h *Hub) handleReact(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	if !conn.Connected() {
 		h.teardownIfCurrent(conn)
@@ -2718,7 +3207,7 @@ func (h *Hub) handleReact(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	if !conn.Connected() {
 		h.teardownIfCurrent(conn)
@@ -2770,7 +3259,7 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 func (h *Hub) handleDelete(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	conn, _ := h.activeConn()
 	if conn == nil {
-		return mcp.NewToolResultError("not connected"), nil
+		return h.notConnected(), nil
 	}
 	if !conn.Connected() {
 		h.teardownIfCurrent(conn)
