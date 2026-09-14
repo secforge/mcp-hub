@@ -777,13 +777,13 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"were delivered already carry, copied from one of them. Not a display name, "+
 					"and nothing you need to look up separately. Combines with query (both must "+
 					"hold) and with at/after.\n"+
-					"KNOWN LIMITATION on a session mirroring a real chat platform: the sender id "+
-					"you are shown there is derived per-link and is NOT the id the server filters "+
-					"on, so this matches nothing and returns an empty result that looks exactly "+
-					"like 'that sender said nothing in this range'. The filter is reported as "+
-					"applied, because it was — it simply cannot match. Nothing on this side can "+
-					"detect that, so on such a session do not read an empty answer as evidence; "+
-					"read without sender and filter what comes back yourself")),
+					"An empty filtered result is weaker evidence than it looks. It says nothing "+
+					"matched the value you SENT, which is only the same as 'that sender said "+
+					"nothing here' if the server resolves sender ids the way you assumed — and a "+
+					"filter reported as applied still tells you nothing about that, since a filter "+
+					"that cannot match is applied exactly like one that matches nothing. Nothing "+
+					"on this side distinguishes them. So if an empty answer would change what you "+
+					"do, read the range again without sender and check for yourself")),
 			mcp.WithString("query", mcp.Description(
 				"Only consider messages whose text contains this. Two characters minimum. This "+
 					"is a filtered READ, not a search: still one message at a time, still oldest "+
