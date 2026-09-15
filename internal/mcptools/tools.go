@@ -363,6 +363,30 @@ func setCatchUpGap(id connstore.Target, from, to string) {
 	saveCatchUpGap(id, g)
 }
 
+// noteCatchUpWriteFailure surfaces a failed write of the persisted
+// catch-up state on the next tool call.
+//
+// It used to be discarded, while hub_confirm's own result said
+// "persisted; a future hub_catch_up or reconnect resumes from here". A
+// silent failure is bad; a silent failure underneath a success message is
+// worse, because the reader then has a positive reason not to check. What
+// is actually lost differs: a cursor that did not persist costs a re-walk,
+// a gap that did not persist costs the messages it was recording.
+func noteCatchUpWriteFailure(err error) {
+	if activeHub != nil {
+		activeHub.noteAutoReconnect(fmt.Sprintf("this session's catch-up position could NOT be "+
+			"saved (%v), so a reconnect will resume from wherever it last succeeded and may "+
+			"re-deliver, or fail to re-deliver, messages around that point. Nothing is lost on "+
+			"the server.", err))
+	}
+}
+
+// activeHub is the Hub whose notes a package-level write failure should
+// reach. Set at Register: there is one Hub per process, and the
+// alternative — threading a receiver through every persistence helper —
+// would put the reporting further from the failure rather than closer.
+var activeHub *Hub
+
 // saveCatchUpGap persists g as id's current gap record — an empty g (the
 // zero value) clears it, since loadCatchUpGap already treats a blank
 // From as "no gap recorded."
@@ -370,13 +394,20 @@ func saveCatchUpGap(id connstore.Target, g connstore.GapState) {
 	if id.Link == "" {
 		return
 	}
-	cs, _ := connstore.GetCatchUp(id)
-	if g.From == "" {
-		cs.Gap = nil
-	} else {
-		cs.Gap = &g
+	// One exclusive lock across read and write. Done by hand this used to
+	// straddle two lock acquisitions, and what another process recorded in
+	// between was erased by a snapshot taken before it — with the gap
+	// record, which says messages exist that nothing will walk to, as the
+	// thing most worth losing.
+	if err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
+		if g.From == "" {
+			cs.Gap = nil
+		} else {
+			cs.Gap = &g
+		}
+	}); err != nil {
+		noteCatchUpWriteFailure(err)
 	}
-	_ = connstore.SetCatchUp(id, cs)
 }
 
 // clearCatchUpGap removes id's gap record — called once
@@ -452,9 +483,11 @@ func setCatchUpCursor(id connstore.Target, cursor string) {
 	if id.Link == "" {
 		return
 	}
-	cs, _ := connstore.GetCatchUp(id)
-	cs.Cursor = cursor
-	_ = connstore.SetCatchUp(id, cs)
+	if err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
+		cs.Cursor = cursor
+	}); err != nil {
+		noteCatchUpWriteFailure(err)
+	}
 }
 
 // saveHandedOverAhead persists ahead (a snapshot, not a delta) under id,
@@ -1087,6 +1120,7 @@ func receiveTools() string {
 }
 
 func (h *Hub) Register(s *server.MCPServer) {
+	activeHub = h
 	sweepStaleAttachmentDirs()
 	// Every tool goes through withReconnectNote so that a reconnection
 	// this client performed on its own is reported on the very next call,

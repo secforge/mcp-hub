@@ -42,6 +42,9 @@ package connstore
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -187,7 +190,13 @@ func dir() string {
 	if d, err := os.UserConfigDir(); err == nil {
 		return filepath.Join(d, "mcp-hub")
 	}
-	return "."
+	// NOT the working directory. This file's map KEYS are whole links,
+	// fragment included, so the reconnect credentials are not merely
+	// inside it — they are the key names, visible in any diff. Writing it
+	// wherever the process happens to be standing puts them in a repo the
+	// moment this runs somewhere without HOME: a container, a systemd
+	// unit, some CI. 0600 is no defence against a commit.
+	return filepath.Join(os.TempDir(), "mcp-hub")
 }
 
 func path() string {
@@ -232,16 +241,45 @@ func withLock(exclusive bool, fn func() error) error {
 // load reads the persisted store. A missing or unreadable file is not an
 // error — either just means nothing has been persisted yet — so load
 // always returns a usable, non-nil state.
-func load() state {
+// load reads the store, distinguishing "nothing has been persisted yet"
+// from "the persisted state could not be read".
+//
+// Those were the same answer once — both returned an empty state — and
+// the consequence is the worst failure this package can have. Every
+// writer takes what load returns, sets its one entry, and saves over the
+// top, so a single unreadable read (an EMFILE, a permission blip, a
+// truncated write from a full disk, a hand-edit, a future type change
+// that makes the map fail to unmarshal) silently replaced every project's
+// reconnect secret, peerId and catch-up position with nothing. The
+// symptom is the one all of this exists to prevent: every session comes
+// back as a stranger with no position, and nothing anywhere reports why.
+//
+// A missing file is still not an error — that genuinely means nothing has
+// been persisted. Anything else stops the write.
+func load() (state, error) {
 	data, err := os.ReadFile(path())
+	if errors.Is(err, fs.ErrNotExist) {
+		return state{}, nil
+	}
 	if err != nil {
-		return state{}
+		return state{}, fmt.Errorf("reading %s: %w", path(), err)
 	}
 	var s state
 	if err := json.Unmarshal(data, &s); err != nil {
-		return state{}
+		// Renamed aside rather than overwritten: whatever is in there is
+		// the only copy of credentials that cannot be regenerated, and a
+		// parse failure is exactly when a human needs to see the bytes.
+		aside := path() + ".corrupt"
+		renameErr := os.Rename(path(), aside)
+		if renameErr != nil {
+			return state{}, fmt.Errorf("parsing %s: %w (and it could not be moved aside: %v)",
+				path(), err, renameErr)
+		}
+		return state{}, fmt.Errorf("parsing %s: %w — moved aside to %s so it is not overwritten; "+
+			"stored identities and positions are unavailable until it is restored or removed",
+			path(), err, aside)
 	}
-	return s
+	return s, nil
 }
 
 // save durably persists s, overwriting whatever was stored before, via a
@@ -302,7 +340,11 @@ func Get(target Target) (Entry, bool) {
 	var e Entry
 	var ok bool
 	_ = withLock(false, func() error {
-		e, ok = getEntry(load(), target.Project, target.Link)
+		st, err := load()
+		if err != nil {
+			return err
+		}
+		e, ok = getEntry(st, target.Project, target.Link)
 		return nil
 	})
 	return e, ok
@@ -313,7 +355,10 @@ func Get(target Target) (Entry, bool) {
 // different callers at different times, so neither may clobber the other.
 func Upsert(target Target, identity Entry) error {
 	return withLock(true, func() error {
-		s := load()
+		s, err := load()
+		if err != nil {
+			return err
+		}
 		existing, _ := getEntry(s, target.Project, target.Link)
 		identity.CatchUp = existing.CatchUp
 		setEntry(&s, target.Project, target.Link, identity)
@@ -325,7 +370,10 @@ func Upsert(target Target, identity Entry) error {
 // else — including the identity needed to reconnect — in place.
 func MarkDisconnected(target Target) error {
 	return withLock(true, func() error {
-		s := load()
+		s, err := load()
+		if err != nil {
+			return err
+		}
 		e, ok := getEntry(s, target.Project, target.Link)
 		if !ok {
 			return nil
@@ -340,7 +388,10 @@ func MarkDisconnected(target Target) error {
 // ask for it back (see hubconn.DialOptions.AgentID).
 func SetPeerID(target Target, peerID string) error {
 	return withLock(true, func() error {
-		s := load()
+		s, err := load()
+		if err != nil {
+			return err
+		}
 		e, _ := getEntry(s, target.Project, target.Link)
 		e.PeerID = peerID
 		e.LastConnectedAt = time.Now().UTC()
@@ -354,7 +405,10 @@ func SetPeerID(target Target, peerID string) error {
 // resuming without a caller ever holding it.
 func SetReconnectSecret(target Target, secret string) error {
 	return withLock(true, func() error {
-		s := load()
+		s, err := load()
+		if err != nil {
+			return err
+		}
 		e, _ := getEntry(s, target.Project, target.Link)
 		e.ReconnectSecret = secret
 		setEntry(&s, target.Project, target.Link, e)
@@ -366,7 +420,10 @@ func SetReconnectSecret(target Target, secret string) error {
 // Entry.Topic).
 func SetTopic(target Target, topic string) error {
 	return withLock(true, func() error {
-		s := load()
+		s, err := load()
+		if err != nil {
+			return err
+		}
 		e, _ := getEntry(s, target.Project, target.Link)
 		e.Topic = topic
 		setEntry(&s, target.Project, target.Link, e)
@@ -378,7 +435,11 @@ func SetTopic(target Target, topic string) error {
 func List() ([]ListedEntry, error) {
 	var out []ListedEntry
 	err := withLock(false, func() error {
-		for project, byLink := range load() {
+		st, err := load()
+		if err != nil {
+			return err
+		}
+		for project, byLink := range st {
 			for link, e := range byLink {
 				out = append(out, ListedEntry{
 					Target: Target{Link: link, Project: project},
@@ -396,7 +457,11 @@ func List() ([]ListedEntry, error) {
 func ListForProject(project string) ([]ListedEntry, error) {
 	var out []ListedEntry
 	err := withLock(false, func() error {
-		for link, e := range load()[project] {
+		st, err := load()
+		if err != nil {
+			return err
+		}
+		for link, e := range st[project] {
 			out = append(out, ListedEntry{
 				Target: Target{Link: link, Project: project},
 				Entry:  e,
@@ -413,18 +478,58 @@ func GetCatchUp(target Target) (CatchUpState, bool) {
 	var ok bool
 	_ = withLock(false, func() error {
 		var e Entry
-		e, ok = getEntry(load(), target.Project, target.Link)
+		st, err := load()
+		if err != nil {
+			return err
+		}
+		e, ok = getEntry(st, target.Project, target.Link)
 		cs = e.CatchUp
 		return nil
 	})
 	return cs, ok
 }
 
+// UpdateCatchUp mutates target's catch-up state inside ONE exclusive lock,
+// so a caller never holds a snapshot across the read and the write.
+//
+// This is the shape every other mutator in this file already has:
+// SetPeerID takes a peerID, SetTopic a topic, MarkDisconnected takes
+// nothing. SetCatchUp was the only one taking a composite value, which
+// forced its callers to GetCatchUp, mutate, and SetCatchUp back — three
+// operations with the lock released between the first and the third.
+//
+// The window is not a narrow one. GetCatchUp takes a SHARED lock, which
+// by design lets any number of readers in at once, so two processes
+// reading the same state simultaneously is the documented behaviour
+// rather than an unlucky interleaving: under real concurrency the lost
+// update is the expected outcome. On this machine that is two MCP servers
+// registered against the same store, and what gets lost is the gap record
+// — the one thing that says messages exist which nothing will walk to.
+//
+// Upsert already defended against exactly this by preserving CatchUp
+// across an identity write. The hazard was seen once, fixed where it was
+// seen, and left in the contract of the API whose whole job is that state.
+func UpdateCatchUp(target Target, mutate func(*CatchUpState)) error {
+	return withLock(true, func() error {
+		s, err := load()
+		if err != nil {
+			return err
+		}
+		e, _ := getEntry(s, target.Project, target.Link)
+		mutate(&e.CatchUp)
+		setEntry(&s, target.Project, target.Link, e)
+		return save(s)
+	})
+}
+
 // SetCatchUp records target's hub_catch_up state, preserving the identity
 // fields stored alongside it.
 func SetCatchUp(target Target, cs CatchUpState) error {
 	return withLock(true, func() error {
-		s := load()
+		s, err := load()
+		if err != nil {
+			return err
+		}
 		e, _ := getEntry(s, target.Project, target.Link)
 		e.CatchUp = cs
 		setEntry(&s, target.Project, target.Link, e)

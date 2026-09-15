@@ -365,7 +365,10 @@ func TestSetTopicPreservesCatchUpAndViceVersa(t *testing.T) {
 		t.Fatalf("expected the catch-up cursor to survive SetTopic, got %+v (ok=%v)", cs, ok)
 	}
 
-	s := load()
+	s, err := load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
 	e := s[target.Project][target.Link]
 	if e.Topic != "Design Review" {
 		t.Fatalf("expected the topic to survive too, got %+v", e)

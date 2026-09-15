@@ -3,11 +3,14 @@ package waiter
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -55,6 +58,11 @@ type Waiter struct {
 
 	mu      sync.Mutex
 	current *registeredWaiter
+	// closed is set by Close under w.mu. A delivery in flight has
+	// unregistered its reader, so Close cannot see it to say goodbye —
+	// this is what lets the delivery discover, when it comes back to
+	// re-register, that there is no longer a Waiter to register with.
+	closed bool
 	// expecting is set while a planned reconnect is in flight. It changes
 	// what a dead source MEANS to this waiter: normally the connection
 	// ending is the end of the story and a follower is told so and
@@ -240,11 +248,28 @@ func sweepStaleSockets(excludePath string) {
 // sweepStaleSockets for why this is safe against a live listener.
 func isStaleSocket(path string) bool {
 	conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
-	if err != nil {
-		return true
+	if err == nil {
+		conn.Close()
+		return false
 	}
-	conn.Close()
-	return false
+	// Only a refusal proves absence. Any other failure — a timeout above
+	// all — says this dial did not complete, which is not the same fact
+	// and on a loaded machine is routinely produced by a listener that is
+	// perfectly alive and merely slow to accept.
+	//
+	// The difference is not academic: deleting the socket does not stop
+	// the process behind it, it makes that process unreachable forever
+	// while its follower still believes it is connected. This directory is
+	// shared by every session on the machine, and every Listen sweeps it,
+	// so treating "no answer within 200ms" as "dead" lets any session
+	// silence any other. Absence of a reply is not evidence of absence.
+	var se syscall.Errno
+	if errors.As(err, &se) {
+		// ECONNREFUSED: the path exists and nothing is listening.
+		// ENOENT: there is no such socket at all. Both are absence.
+		return se == syscall.ECONNREFUSED || se == syscall.ENOENT
+	}
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // socketPath generates a short, random wait-socket filename — deliberately
@@ -442,6 +467,15 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 	// closes the gap: whichever of the two acquires w.mu first, the other
 	// is guaranteed to observe accurate state once it's their turn.
 	w.mu.Lock()
+	if w.closed {
+		// The Waiter was closed while this delivery was writing. Tell the
+		// reader rather than re-registering it on something that will
+		// never poke it again: its socket file is already gone, so silence
+		// here is permanent and looks exactly like an idle connection.
+		w.mu.Unlock()
+		writeAndClose(rw.conn, w.disconnectedMessage())
+		return
+	}
 	if w.current != nil {
 		// A genuinely new connection claimed the slot while we were
 		// writing; it rightfully wins (see handleAccept) — we lose ours.
@@ -460,6 +494,15 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 
 func (w *Waiter) Close() error {
 	w.mu.Lock()
+	// Set before releasing the lock, and checked by deliver before it
+	// re-registers. A delivery in flight has UNREGISTERED its reader —
+	// Poke clears w.current before writing — so a Close landing in that
+	// window sees nobody to say goodbye to, tears the listener down, and
+	// then deliver re-registers that reader on a dead Waiter. It is never
+	// delivered to, never told the hub disconnected, and its socket path
+	// is already gone: a follower that waits forever looking alive, which
+	// is the exact state the hold mechanism exists to prevent.
+	w.closed = true
 	if w.current != nil {
 		writeAndClose(w.current.conn, w.disconnectedMessage())
 		w.current = nil
