@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -132,5 +133,31 @@ func TestConnectGuidanceInPushModeSaysNothingToStart(t *testing.T) {
 	}
 	if !strings.Contains(got, "hub_catch_up") {
 		t.Errorf("push-mode guidance never names the one gap live delivery cannot cover:\n%s", got)
+	}
+}
+
+// Every tool that hands a cursor to the model must give it a position in
+// the delivery ledger, or confirming what it returned releases nothing
+// and a closed delivery window never reopens. hub_read is the case that
+// was missed, and it is the tool the skipped-hold notice recommends for
+// recovering a held range — so the hole sat in the recovery path itself.
+//
+// Asserted against the SOURCE rather than by driving a server, because
+// what matters is that no delivery site is left out: a behavioural test
+// passes for the sites that exist and says nothing about the next one.
+func TestEveryToolThatHandsOverACursorRecordsALedgerPosition(t *testing.T) {
+	src, err := os.ReadFile("tools.go")
+	if err != nil {
+		t.Fatalf("reading tools.go: %v", err)
+	}
+	text := string(src)
+	recorded := strings.Count(text, "h.recordHandedOver(")
+	noted := strings.Count(text, "NoteHandedOver(")
+	// recordHandedOver marks a cursor as delivered; NoteHandedOver gives
+	// it a ledger position. Every site doing the first must do the second,
+	// minus recordHandedOver's own definition.
+	if noted < recorded-1 {
+		t.Fatalf("%d hand-over sites but only %d ledger positions — a tool hands the model a "+
+			"cursor that a later confirm cannot locate", recorded-1, noted)
 	}
 }

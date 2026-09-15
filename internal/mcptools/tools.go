@@ -2604,6 +2604,14 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// that also marks the wire-level receipt, which must not point at an
 	// old message. See this function's doc comment.
 	h.recordHandedOver([]hubconn.Event{ev})
+	// NoteHandedOver is a LOCAL position in the delivery ledger — no
+	// cursor on the wire, no acknowledgement — so it does not weaken the
+	// split above, and leaving it out reopened the defect it exists to
+	// prevent through the one tool the skipped-hold notice recommends: a
+	// reader recovering a held range does it with hub_read, confirms what
+	// it recovered, and without a position that confirm released nothing
+	// and the window stayed shut.
+	conn.NoteHandedOver([]hubconn.Event{ev})
 	return mcp.NewToolResultText(hubconn.FormatEvent(ev) + "\n\n[hub: this was a read, not a " +
 		"catch-up — your unread position is unchanged, so nothing you still have to read was " +
 		"consumed. This message is recorded as delivered to you, so a later hub_catch_up will " +
