@@ -162,7 +162,13 @@ type Joined struct {
 	// later from an empty MessageAfter answer. Omitted (not zero) when
 	// a server has no such concept — mcp-hub-server and a fresh
 	// connection with no prior position never set it.
-	Behind int `json:"behind,omitempty"`
+	// A POINTER because the doc above states two things Go cannot both
+	// encode in an int with omitempty: that 0 asserts "caught up" as a
+	// fact, and that the field is omitted rather than zero when a server
+	// has no such concept. Absent and 0 decode identically otherwise, so
+	// the two states merge — Ack.Behind is already a pointer for exactly
+	// this reason, one field over.
+	Behind *int `json:"behind,omitempty"`
 	// BehindSince is the timestamp of this peer's last-acked position,
 	// pairing with Behind: Behind says whether to walk (small) or seek
 	// (large) MessageAfter{at:...} from recent context instead;
@@ -379,9 +385,9 @@ type Msg struct {
 	// answers. mcp-hub-server never sets this.
 	Own bool `json:"own,omitempty"`
 	// Cursor, for a teams session, is this message's own opaque
-	// position — the value a client passes back as History.Before to
-	// page further back past it. mcp-hub-server never sets this, since it
-	// has no history concept at all.
+	// position — the anchor a client passes back to MessageAfter to read
+	// on from here. mcp-hub-server never sets this, since it has no
+	// history concept at all.
 	Cursor string `json:"cursor,omitempty"`
 	// AckCursor, set by the client, piggybacks a read receipt on this
 	// message: "this is the cursor of the last event I've actually
@@ -501,10 +507,19 @@ type AttachmentData struct {
 // across servers, not just within one.
 const MaxAttachmentRawBytes = 32 * 1024 * 1024
 
-// AllowedAttachmentContentTypes are the only content types the attachment
-// extension accepts — images only, matching what chat-relay refuses
-// server-side with error/unsupported_media. Checking client-side too gives
-// a faster, clearer error than a round trip just to be told no.
+// AllowedAttachmentContentTypes are the content types a server that
+// declares attachments.imagesOnly accepts (see AttachmentsFeature.
+// ImagesOnly) — the TEAMS path, whose platform is what restricts them.
+//
+// It is not a global rule and stopped being one on 2026-09-03. A hub
+// session accepts any content type: a non-image is stored as a file and
+// served only as application/octet-stream with nosniff, which is what
+// makes accepting unvouched bytes safe, so the control moved from a list
+// to a serving rule. Applying the list everywhere refused a PDF that both
+// servers would have taken.
+//
+// The policy has a declared source of truth per server, so this is the
+// copy and the declaration wins wherever one is available.
 var AllowedAttachmentContentTypes = map[string]bool{
 	"image/png":  true,
 	"image/jpeg": true,
@@ -563,11 +578,11 @@ func ReadAttachmentFile(path string) ([]Attachment, error) {
 // bytes directly — the shape a remote sender (no local filesystem to read
 // a path from, unlike ReadAttachmentFile) must use instead. Returns a
 // nil slice, nil error if data is empty (no attachment requested).
-func NewAttachmentFromData(data, contentType string) ([]Attachment, error) {
+func NewAttachmentFromData(data, contentType string, imagesOnly bool) ([]Attachment, error) {
 	if data == "" {
 		return nil, nil
 	}
-	if !AllowedAttachmentContentTypes[contentType] {
+	if imagesOnly && !AllowedAttachmentContentTypes[contentType] {
 		return nil, fmt.Errorf(
 			"unsupported image type — only image/png, image/jpeg, image/gif, image/webp are accepted")
 	}
@@ -883,7 +898,7 @@ type ServerStopping struct {
 }
 
 // Ack is a standalone read receipt — the same information Msg/Reaction/
-// Edit/Delete/History.AckCursor piggyback, sent on its own when nothing
+// Edit/Delete piggyback via their own AckCursor, sent on its own when nothing
 // else is about to go out anyway (see hubconn's idle-ack timer). Also
 // doubles as the server's reply shape to either form: OK true confirms the
 // cursor was accepted; OK false means it was behind what the server
@@ -898,7 +913,14 @@ type ServerStopping struct {
 type Ack struct {
 	Type      Type   `json:"type"`
 	AckCursor string `json:"ackCursor,omitempty"`
-	OK        bool   `json:"ok,omitempty"`
+	// OK is a POINTER for the same reason every other ack in this family
+	// states the field: absent and false encode identically in Go, so
+	// omitempty throws away the sender's ability to say "refused"
+	// distinguishably from "did not say". That distinction is what the
+	// pinAck rendering turned into three states rather than two, one
+	// struct over — and this was the only member of the family built
+	// unlike the rest, which is how such a defect arrives.
+	OK *bool `json:"ok,omitempty"`
 	// Behind, on a server's REPLY to a standalone ack (never meaningful
 	// on the outbound request), is how many messages remain after the
 	// position just acknowledged — added 2026-09-08, chat-relay's own
@@ -1207,7 +1229,10 @@ type PinsRequest struct {
 
 type PinsResponse struct {
 	Type Type     `json:"type"`
-	List []string `json:"list"`
+	// A pointer-to-slice so an empty list encodes as [] rather than null,
+	// matching Joined.Pinned. The two answers to "what is pinned" should
+	// not have different empty shapes.
+	List *[]string `json:"list"`
 	At   string   `json:"at,omitempty"`
 }
 
@@ -1220,3 +1245,14 @@ func NewUnpinRequest(externalID string) Unpin {
 }
 
 func NewPinsRequest() PinsRequest { return PinsRequest{Type: TypePins} }
+
+
+// OK returns a pointer to v, for building an ack that STATES its outcome.
+// A nil OK means the sender said nothing, which is a third answer and the
+// reason the field is a pointer at all.
+func OK(v bool) *bool { return &v }
+
+// BehindCount returns a pointer to n, for a server stating how far a peer
+// trails. Nil means the server has no such concept; a stated 0 asserts
+// "caught up" as a fact.
+func BehindCount(n int) *int { return &n }

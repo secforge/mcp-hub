@@ -247,8 +247,11 @@ type Conn struct {
 	canSend          bool
 	conversationKind string
 	topic            *string
-	behind           int
-	behindSince      string
+	// behind is nil when the server did not state it — a server with no
+	// such concept, or a connection with no prior position. Distinct from
+	// a stated 0, which asserts "you are caught up" as a fact.
+	behind      *int
+	behindSince string
 	// features/featuresDeclared hold wire.Joined.Features, if the server
 	// sent one at all — see that field's doc comment. featuresDeclared
 	// distinguishes "no Features field sent" (pre-v3, nothing known)
@@ -791,7 +794,19 @@ func (c *Conn) ConversationKind() string { return c.conversationKind }
 // message, as of connect — see wire.Joined.Behind/BehindSince. Zero/empty
 // when a server doesn't set this concept (including every
 // mcp-hub-server, and a fresh position with no prior cursor to compare).
-func (c *Conn) Behind() int         { return c.behind }
+// Behind reports how far this peer trails, and whether the server said so
+// at all. Callers branch on >0, for which an unstated value and a stated
+// zero mean the same thing — but they are different facts, and the one
+// that says "caught up, as of connect" is worth not throwing away.
+func (c *Conn) Behind() int {
+	if c.behind == nil {
+		return 0
+	}
+	return *c.behind
+}
+
+// BehindStated reports whether the server answered the question at all.
+func (c *Conn) BehindStated() bool  { return c.behind != nil }
 func (c *Conn) BehindSince() string { return c.behindSince }
 func (c *Conn) Topic() *string      { return c.topic }
 
@@ -1403,10 +1418,11 @@ func decodeEvent(raw []byte) (Event, bool) {
 		}
 		// Never nil: an answer naming no pins is an answer, and a caller
 		// must be able to tell it from having received nothing.
-		if p.List == nil {
-			p.List = []string{}
+		list := []string{}
+		if p.List != nil {
+			list = *p.List
 		}
-		return Event{Kind: "pins", PinnedList: p.List, TS: p.At}, true
+		return Event{Kind: "pins", PinnedList: list, TS: p.At}, true
 	case wire.TypeMessageDeleted:
 		var d wire.MessageDeleted
 		if err := json.Unmarshal(raw, &d); err != nil {
@@ -1422,8 +1438,12 @@ func decodeEvent(raw []byte) (Event, bool) {
 		// doc comment: on OK false it's the position the server actually
 		// holds, to be adopted rather than treated as confirmation of what
 		// was sent.
-		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK, Behind: a.Behind,
-			ActionOKStated: statesOK(raw)}, true
+		// The pointer now carries what statesOK(raw) had to re-derive from
+		// the raw JSON: present means the sender stated an outcome,
+		// absent means it said nothing, and false is a refusal rather
+		// than a default.
+		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK != nil && *a.OK,
+			Behind: a.Behind, ActionOKStated: a.OK != nil}, true
 	case wire.TypeAttachmentData:
 		var a wire.AttachmentData
 		if err := json.Unmarshal(raw, &a); err != nil {

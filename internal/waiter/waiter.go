@@ -432,6 +432,19 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 			writeAndClose(rw.conn, w.supersededMessage())
 			return
 		}
+		// Deliver what was drained BEFORE announcing the end, exactly as
+		// the holding branch above does. DrainBatch already emptied the
+		// buffer, so dropping these loses the live delivery of events that
+		// had arrived — not the events themselves, since DrainEvents does
+		// not MarkConsumed and the confirmed position therefore never
+		// moved, but the reader is told the channel ended and told nothing
+		// about content that had already left the buffer.
+		for _, c := range chunks {
+			if _, err := rw.conn.Write([]byte(c + "\n\n")); err != nil {
+				rw.conn.Close()
+				return
+			}
+		}
 		writeAndClose(rw.conn, w.disconnectedMessage())
 		return
 	}

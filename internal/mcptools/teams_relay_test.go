@@ -617,7 +617,7 @@ func TestHubConfirmSurfacesBehindFromServerReply(t *testing.T) {
 			return
 		}
 		behind := 5
-		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-confirmed", OK: true, Behind: &behind})
+		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-confirmed", OK: wire.OK(true), Behind: &behind})
 		time.Sleep(2 * time.Second)
 	}))
 	t.Cleanup(srv.Close)
@@ -1290,7 +1290,7 @@ func TestCatchUpSeeksWhenNoPriorCursorButBehindReported(t *testing.T) {
 		defer conn.Close()
 		joined := wire.Joined{
 			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion,
-			Behind: 3000, BehindSince: "2026-09-01T09:12:00Z",
+			Behind: wire.BehindCount(3000), BehindSince: "2026-09-01T09:12:00Z",
 		}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
@@ -1343,7 +1343,7 @@ func TestCatchUpSeeksWhenNoPriorCursorButBehindReported(t *testing.T) {
 func TestTeamsRelayConnectSurfacesBehindWhenServerReportsIt(t *testing.T) {
 	link := startRelayTestServerWithJoined(t, wire.Joined{
 		Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion,
-		Behind: 3, BehindSince: "2026-09-01T09:12:00Z",
+		Behind: wire.BehindCount(3), BehindSince: "2026-09-01T09:12:00Z",
 	})
 	ctx := context.Background()
 	hub := NewHub()
@@ -1683,7 +1683,7 @@ func TestCatchUpSeekRecordsGapAndSurfacesItOnLaterCalls(t *testing.T) {
 		defer conn.Close()
 		joined := wire.Joined{
 			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion,
-			Behind: 3000, BehindSince: "2026-09-01T09:12:00Z",
+			Behind: wire.BehindCount(3000), BehindSince: "2026-09-01T09:12:00Z",
 		}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
@@ -2101,7 +2101,7 @@ func TestCatchUpSeeksPastALargeBacklogEvenWithAKnownCursorAndOnlyOnce(t *testing
 		joined := wire.Joined{
 			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
 			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
-			Behind: 3000, BehindSince: "2026-09-01T09:12:00Z",
+			Behind: wire.BehindCount(3000), BehindSince: "2026-09-01T09:12:00Z",
 		}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
@@ -2197,7 +2197,7 @@ func TestCatchUpWalksALargeBacklogWhenTheSkipCouldNotBeRecorded(t *testing.T) {
 		joined := wire.Joined{
 			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
 			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
-			Behind: 3000,
+			Behind: wire.BehindCount(3000),
 		}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
@@ -2627,7 +2627,7 @@ func startPinServer(t *testing.T, features map[string]json.RawMessage, pinnedAtC
 			case "unpin":
 				conn.WriteJSON(wire.UnpinAck{Type: wire.TypeUnpinAck, ExternalID: fmt.Sprint(m["externalId"]), OK: true})
 			case "pins":
-				conn.WriteJSON(wire.PinsResponse{Type: wire.TypePins, List: pullAnswer, At: "2026-09-11T13:00:00Z"})
+				conn.WriteJSON(wire.PinsResponse{Type: wire.TypePins, List: &pullAnswer, At: "2026-09-11T13:00:00Z"})
 			}
 		}
 	}))

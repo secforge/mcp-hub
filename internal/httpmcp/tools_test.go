@@ -226,21 +226,28 @@ func TestSendRejectsImageDataOverSizeLimit(t *testing.T) {
 	}
 }
 
-func TestSendRejectsUnsupportedImageContentType(t *testing.T) {
+// This relay accepts any content type — a non-image is stored as a file
+// and served as application/octet-stream with nosniff, which is what makes
+// accepting unvouched bytes safe. The images-only list belongs to a teams
+// platform that declares it, and applying it here refused attachments both
+// servers would have taken. The test asserted the refusal, which is how the
+// stale policy survived its own premise expiring.
+func TestSendAcceptsANonImageAttachmentOnAHubSession(t *testing.T) {
 	s, mcpServer := newTestServer(t)
 	ctx := ctxFor(mcpServer, "mcp-a")
 	callTool(t, ctx, s, s.handleConnect, map[string]any{"name": "Alice"})
 
 	req := mcp.CallToolRequest{}
 	req.Params.Arguments = map[string]any{
-		"text": "nope", "imageData": base64.StdEncoding.EncodeToString([]byte("x")), "imageContentType": "application/pdf",
+		"text": "here is a pdf", "imageData": base64.StdEncoding.EncodeToString([]byte("x")),
+		"imageContentType": "application/pdf",
 	}
 	res, err := s.handleSend(ctx, req)
 	if err != nil {
 		t.Fatalf("handleSend returned unexpected error: %v", err)
 	}
-	if !res.IsError {
-		t.Fatal("expected an error result for an unsupported content type")
+	if res.IsError {
+		t.Fatalf("a non-image was refused on a hub session: %+v", res)
 	}
 }
 

@@ -229,7 +229,13 @@ func (s *Server) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		attachments, err = wire.NewFileAttachmentFromData(
 			fileData, req.GetString("fileContentType", ""), req.GetString("fileName", ""))
 	} else {
-		attachments, err = wire.NewAttachmentFromData(imageData, req.GetString("imageContentType", ""))
+		// Not images-only: this is mcp-hub-server's own relay, which never
+		// validates attachment content types — a non-image is stored as a
+		// file and served as application/octet-stream with nosniff. The
+		// images-only list belongs to a teams platform that says so, and
+		// applying it here refused attachments both servers accept.
+		attachments, err = wire.NewAttachmentFromData(
+			imageData, req.GetString("imageContentType", ""), false)
 	}
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil

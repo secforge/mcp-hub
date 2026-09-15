@@ -167,7 +167,7 @@ func TestAckRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if decoded.AckCursor != "cursor-123" || decoded.OK {
+	if decoded.AckCursor != "cursor-123" || (decoded.OK != nil && *decoded.OK) {
 		t.Fatalf("unexpected round trip: %+v", decoded)
 	}
 }
@@ -178,7 +178,7 @@ func TestAckDecodesServerReplyWithOK(t *testing.T) {
 	if err := json.Unmarshal(raw, &a); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if a.AckCursor != "cursor-9" || !a.OK {
+	if a.AckCursor != "cursor-9" || a.OK == nil || !*a.OK {
 		t.Fatalf("unexpected decode: %+v", a)
 	}
 }
@@ -570,7 +570,7 @@ func TestMsgOmitsAnswersWhenUnset(t *testing.T) {
 
 func TestJoinedBehindRoundTrip(t *testing.T) {
 	j := NewJoined("peer-1", 0, "", "")
-	j.Behind = 3
+	j.Behind = BehindCount(3)
 	j.BehindSince = "2026-09-01T09:12:00Z"
 	raw, err := json.Marshal(j)
 	if err != nil {
@@ -580,7 +580,7 @@ func TestJoinedBehindRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if decoded.Behind != 3 || decoded.BehindSince != "2026-09-01T09:12:00Z" {
+	if decoded.Behind == nil || *decoded.Behind != 3 || decoded.BehindSince != "2026-09-01T09:12:00Z" {
 		t.Fatalf("unexpected round trip: %+v", decoded)
 	}
 }

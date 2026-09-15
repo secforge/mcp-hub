@@ -652,7 +652,7 @@ func TestConfirmReceivedDoesNotRatchetOnASingleTransientMiss(t *testing.T) {
 				var a wire.Ack
 				json.Unmarshal(raw, &a)
 				behind := 1
-				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: a.AckCursor, OK: true, Behind: &behind})
+				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: a.AckCursor, OK: wire.OK(true), Behind: &behind})
 			}
 		}
 	}))
@@ -711,7 +711,7 @@ func TestConfirmReceivedOnPlainConnReturnsBehindFromReply(t *testing.T) {
 			return
 		}
 		behind := 2
-		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: true, Behind: &behind})
+		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: wire.OK(true), Behind: &behind})
 	}))
 	defer srv.Close()
 
@@ -812,7 +812,7 @@ func TestConfirmReceivedWaitsWhenFeatureDeclaredSupported(t *testing.T) {
 			return
 		}
 		behind := 4
-		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: true, Behind: &behind})
+		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: wire.OK(true), Behind: &behind})
 	}))
 	defer srv.Close()
 
@@ -868,7 +868,7 @@ func TestConfirmReceivedReturnsBehindWhenAckRepliesDeclared(t *testing.T) {
 			return
 		}
 		behind := 3
-		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: true, Behind: &behind})
+		conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-1", OK: wire.OK(true), Behind: &behind})
 		time.Sleep(2 * time.Second)
 	})
 	c, err := Dial(link+"#secret", DialOptions{ReconnectSecret: "resume-me"})
@@ -989,7 +989,7 @@ func TestAckReplyRejectionAdoptsServerReportedCursor(t *testing.T) {
 				return
 			}
 			if m.Type == wire.TypeMsg {
-				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-server-actual", OK: false})
+				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-server-actual", OK: wire.OK(false)})
 				return
 			}
 		}
