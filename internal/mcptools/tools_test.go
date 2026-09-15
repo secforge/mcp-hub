@@ -168,7 +168,6 @@ func TestConnectResultTellsCodexToUseHubWait(t *testing.T) {
 	}
 }
 
-
 func TestConnectResultDoesNotWarnNonCodexClients(t *testing.T) {
 	url := startTestServer(t)
 	ctx := ctxWithClientName("claude-code")
@@ -957,10 +956,10 @@ func TestPeersToolReturnsRoster(t *testing.T) {
 }
 
 func TestConnectWithNameAndAgePublicKeyDistributedViaPeers(t *testing.T) {
-	t.Skip("blocked on mcp-hub-server: hub_connect sends identity as Agent-Secret/"+
-		"Agent-Name/Agent-Age-Public-Key headers, and wsserver still reads name/"+
-		"agePublicKey/reconnectSecret as query parameters only, so nothing it echoes "+
-		"back or resumes identity from ever arrives. Unskip when wsserver reads the "+
+	t.Skip("blocked on mcp-hub-server: hub_connect sends identity as Agent-Secret/" +
+		"Agent-Name/Agent-Age-Public-Key headers, and wsserver still reads name/" +
+		"agePublicKey/reconnectSecret as query parameters only, so nothing it echoes " +
+		"back or resumes identity from ever arrives. Unskip when wsserver reads the " +
 		"headers.")
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -1036,10 +1035,10 @@ func TestConnectRejectsMalformedAgePublicKey(t *testing.T) {
 }
 
 func TestConnectWithReconnectSecretReusesPeerIDNotAgePublicKey(t *testing.T) {
-	t.Skip("blocked on mcp-hub-server: hub_connect sends identity as Agent-Secret/"+
-		"Agent-Name/Agent-Age-Public-Key headers, and wsserver still reads name/"+
-		"agePublicKey/reconnectSecret as query parameters only, so nothing it echoes "+
-		"back or resumes identity from ever arrives. Unskip when wsserver reads the "+
+	t.Skip("blocked on mcp-hub-server: hub_connect sends identity as Agent-Secret/" +
+		"Agent-Name/Agent-Age-Public-Key headers, and wsserver still reads name/" +
+		"agePublicKey/reconnectSecret as query parameters only, so nothing it echoes " +
+		"back or resumes identity from ever arrives. Unskip when wsserver reads the " +
 		"headers.")
 	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir()) // isolate persisted secretToPeerID from other tests
 	url := startTestServer(t)
@@ -1309,13 +1308,11 @@ func TestPrivateSendToUnknownPeerReturnsErrorEvent(t *testing.T) {
 	_ = got
 }
 
-
-
 func TestReconnectAfterDisconnectReusesStoredSecretAndPeerID(t *testing.T) {
-	t.Skip("blocked on mcp-hub-server: hub_connect sends identity as Agent-Secret/"+
-		"Agent-Name/Agent-Age-Public-Key headers, and wsserver still reads name/"+
-		"agePublicKey/reconnectSecret as query parameters only, so nothing it echoes "+
-		"back or resumes identity from ever arrives. Unskip when wsserver reads the "+
+	t.Skip("blocked on mcp-hub-server: hub_connect sends identity as Agent-Secret/" +
+		"Agent-Name/Agent-Age-Public-Key headers, and wsserver still reads name/" +
+		"agePublicKey/reconnectSecret as query parameters only, so nothing it echoes " +
+		"back or resumes identity from ever arrives. Unskip when wsserver reads the " +
 		"headers.")
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -1471,7 +1468,6 @@ func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 	}
 }
 
-
 func TestShutdownClosesActiveConnectionAndMarksStoreDisconnected(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
@@ -1523,7 +1519,7 @@ func TestConnectPassesCreateTokenAsHeader(t *testing.T) {
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
 	connReq.Params.Arguments = map[string]any{
-		"link": hubLink(url, "550e8400-e29b-41d4-a716-446655440000"),
+		"link":        hubLink(url, "550e8400-e29b-41d4-a716-446655440000"),
 		"createToken": "prefix.secretvalue",
 	}
 	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
@@ -1861,10 +1857,6 @@ func TestParseMentionsRejectsNonObjectEntry(t *testing.T) {
 		t.Fatal("expected an error for a non-object mentions entry")
 	}
 }
-
-
-
-
 
 // Connecting with no display name leaves every other peer looking at a
 // UUID, so the result says so rather than letting it pass unremarked.

@@ -20,10 +20,12 @@ type fakeSession struct {
 	id string
 }
 
-func (f *fakeSession) SessionID() string                                  { return f.id }
-func (f *fakeSession) NotificationChannel() chan<- mcp.JSONRPCNotification { return make(chan mcp.JSONRPCNotification, 1) }
-func (f *fakeSession) Initialize()                                        {}
-func (f *fakeSession) Initialized() bool                                  { return true }
+func (f *fakeSession) SessionID() string { return f.id }
+func (f *fakeSession) NotificationChannel() chan<- mcp.JSONRPCNotification {
+	return make(chan mcp.JSONRPCNotification, 1)
+}
+func (f *fakeSession) Initialize()       {}
+func (f *fakeSession) Initialized() bool { return true }
 
 func newTestServer(t *testing.T) (*Server, *server.MCPServer) {
 	t.Helper()
