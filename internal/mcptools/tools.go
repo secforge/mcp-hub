@@ -1914,8 +1914,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		sentinel = "Every delivered message ends with a bracketed trailer on its own line — " +
 			"[cursor: …] naming where it can be re-fetched from, or [no cursor: …] where there is " +
 			"nothing to re-fetch, which is what this client's own notices carry. Either form is " +
-			"complete; what matters is that a trailer is there. If none is, the message was cut " +
-			"off in transit."
+			"complete; what matters is that a trailer is there."
 	}
 	notes += "\n" + sentinel +
 		" If that marker is missing, the message was cut off in transit — do NOT confirm " +

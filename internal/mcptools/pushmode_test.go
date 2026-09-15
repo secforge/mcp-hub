@@ -161,3 +161,14 @@ func TestEveryToolThatHandsOverACursorRecordsALedgerPosition(t *testing.T) {
 			"cursor that a later confirm cannot locate", recorded-1, noted)
 	}
 }
+
+// The connect note is assembled from a mode-dependent opening plus shared
+// recovery guidance, which is exactly the shape that produces a sentence
+// stated twice — as it did, live, the first time the new wording shipped.
+func TestTheConnectNoteDoesNotSayTheSameThingTwice(t *testing.T) {
+	inPushMode(t)
+	got := buildWaitBlock(context.Background(), nil, "reconnect somehow")
+	if strings.Count(got, "cut off in transit") > 1 {
+		t.Errorf("the truncation rule is stated more than once:\n%s", got)
+	}
+}
