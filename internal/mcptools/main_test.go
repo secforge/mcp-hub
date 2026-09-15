@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/secforge/mcp-hub/internal/harness"
 	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/waiter"
 )
@@ -19,7 +20,18 @@ import (
 // comment — since this package's tests call handleDisconnect (and so
 // Close) heavily over loopback, where the real network flush race that
 // delay exists for doesn't occur.
+// It also unsets the harness messaging environment, which is the one
+// isolation failure that reaches outside this machine's temp directory
+// and into a human's conversation. A test binary is a child of whatever
+// launched `go test` — routinely the developer's own editor session — so
+// it inherits that session's messaging socket and child token and is, by
+// every check the protocol can make, a legitimate process pushing to its
+// own parent. Observed on first wiring: an entire suite run's worth of
+// fake hub events was delivered into the live session watching the tests.
+// The credential cannot distinguish us; only we can.
 func TestMain(m *testing.M) {
+	restoreHarness := harness.ClearEnvForTesting()
+	defer restoreHarness()
 	dir, err := os.MkdirTemp("", "mcp-hub-mcptools-logs")
 	if err != nil {
 		panic(err)
