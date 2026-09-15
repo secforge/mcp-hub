@@ -218,6 +218,14 @@ type Event struct {
 	// ReconnectAfter carries a "serverStopping" frame's own estimate, in
 	// seconds — see wire.ServerStopping.
 	ReconnectAfter int
+	// HeldCount, on a "deliveryHeld" event, is how many live messages the
+	// push window has withheld. SpillPath and SpillBytes, on a message
+	// whose body was too large to deliver inline, name the file it was
+	// written to and its size. All three exist so a shaped delivery states
+	// what was done to it rather than quietly arriving smaller.
+	HeldCount  int
+	SpillPath  string
+	SpillBytes int
 }
 
 // PeerInfo is what's known about one other peer in the session.
@@ -353,10 +361,14 @@ type Conn struct {
 	//     use) — per the server side's own guidance, that's a client-side
 	//     bug, not transient, so retrying (with any cursor) would fail
 	//     identically; stop trying rather than loop.
-	lastConsumed    string
-	lastAckSent     string
-	ackDisabled     bool
-	onActivity      func()
+	lastConsumed string
+	lastAckSent  string
+	ackDisabled  bool
+	onActivity   func()
+	// budget governs what may be PUSHED to a reader unbidden — see
+	// budget's own doc comment for why the receiver's context, rather than
+	// the transport, is the scarce resource here.
+	budget          *budget
 	peers           map[string]PeerInfo
 	rosterAnnounced bool
 	// pendingAcks holds at most one outstanding claim per expected ack
@@ -695,6 +707,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		lastFrameAt:             time.Now(),
 		ackIdleInterval:         snapAckIdleInterval,
 		confirmReminderInterval: snapConfirmReminderInterval,
+		budget:                  newBudget(),
 	}
 	ws.SetPingHandler(func(appData string) error {
 		ws.SetReadDeadline(time.Now().Add(snapPongWait))
@@ -1018,6 +1031,12 @@ var ackReplyMissThreshold = 2
 // an error.
 func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	c.MarkConsumed([]Event{{Cursor: cursor}})
+	// A confirm names a POSITION, so it releases a prefix of the ledger
+	// rather than clearing it: bytes delivered after this cursor are still
+	// occupying the reader's context, unread rather than freed.
+	if c.budget != nil {
+		c.budget.release(cursor)
+	}
 	// The server's own declaration (wire.Joined.Features) settles this
 	// whenever it's available: never infer a capability from silence at
 	// runtime. A declared "no" is certain for this connection's life, so
@@ -1976,7 +1995,77 @@ func (c *Conn) Drain() (formatted string, connected bool) {
 // should be called on a given batch.
 func (c *Conn) DrainBatch() (chunks []string, connected bool) {
 	events, connected := c.DrainEvents()
-	return FormatEventsBatch(events), connected
+	return FormatEventsBatch(c.applyBudget(events, deliveredCost)), connected
+}
+
+// PushItem is one event ready to be pushed into a model harness: the
+// formatted text, and the cursor that text can be re-fetched from.
+//
+// Both fields matter and they are not redundant. The cursor is the
+// contract — everything in Text is expected to be recoverable from it, so
+// a push that silently fails costs nothing that a catch-up cannot recover.
+// Text is the optimization: it saves the reader a round trip it would
+// otherwise have to make.
+type PushItem struct {
+	Cursor string
+	Text   string
+	// Event is the shaped event this was rendered from, so a caller can do
+	// the work that only it can do — resolving and saving attachments,
+	// which needs the connection and the local filesystem, neither of
+	// which belongs in a formatter.
+	Event Event
+}
+
+// DrainForPush is DrainBatch for a caller that delivers each event as its
+// own message rather than writing them down one stream — it pairs every
+// formatted chunk with its cursor instead of discarding it.
+//
+// The pairing is built here rather than by zipping two lists, because
+// FormatEvent renders some events as the empty string and those are
+// dropped; indexing a separate cursor list against the surviving chunks
+// would silently misalign every cursor after the first such event, which
+// is the kind of off-by-one that reports the wrong message as delivered.
+func (c *Conn) DrainForPush() (items []PushItem, connected bool) {
+	events, connected := c.DrainEvents()
+	for _, e := range c.applyBudget(events, pushDeliveredCost) {
+		text := FormatEventForPush(e)
+		if text == "" {
+			continue
+		}
+		items = append(items, PushItem{Cursor: e.Cursor, Text: text, Event: e})
+	}
+	return items, connected
+}
+
+// applyBudget is the only place a delivery is SHAPED rather than merely
+// formatted, and it runs on the live push path alone. A reader that asked
+// for events — hub_receive, hub_catch_up, hub_read — gets them whole,
+// because it chose to spend its own context; charging it would make
+// reading expensive, which is the opposite of the intent.
+//
+// Urgency crosses a closed window. An operator message or a direct mention
+// is exactly what must not be held behind a mechanism meant to protect
+// attention, or the guard against volume becomes the reason the one
+// message that mattered never arrived.
+func (c *Conn) applyBudget(events []Event, cost func(Event) int) []Event {
+	if c.budget == nil {
+		return events
+	}
+	out := make([]Event, 0, len(events))
+	for _, e := range events {
+		if !(e.IsOperator || e.MentionedMe) && c.budget.closed() {
+			if announce, held := c.budget.hold(); announce {
+				out = append(out, Event{Kind: "deliveryHeld", HeldCount: held})
+			}
+			continue
+		}
+		shaped := c.budget.shape(e)
+		out = append(out, shaped)
+		if shaped.Cursor != "" {
+			c.budget.charge(shaped.Cursor, cost(shaped))
+		}
+	}
+	return out
 }
 
 // DrainEvents is Drain without the text formatting — for a caller (like

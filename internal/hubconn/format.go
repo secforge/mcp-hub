@@ -230,6 +230,16 @@ func FormatEvent(e Event) string {
 		}
 		return "[hub: the server is shutting down on purpose, with no estimate of when it will be " +
 			"back. The disconnect that follows is expected]"
+	case "deliveryHeld":
+		// Deliberately short: this is the message that says delivery has
+		// stopped, so it is the one that must survive the notification
+		// path's own 500-rune cut. Said once per closure, not per event —
+		// repeating it would spend the attention the gate exists to save.
+		return fmt.Sprintf("[hub: LIVE DELIVERY PAUSED after %d message(s) — this client has "+
+			"pushed as much as it will without a confirm, so new messages are no longer being "+
+			"delivered here. Nothing is lost: they are on the server. Call hub_confirm with the "+
+			"last cursor you have COMPLETE to resume, or hub_catch_up to read on regardless. "+
+			"Mentions and operator messages still come through]", e.HeldCount)
 	case "rosterComplete":
 		return "[hub: initial roster complete — you now know everyone who was already in the session]"
 	case "confirmReminder":
@@ -376,6 +386,124 @@ func FormatEvent(e Event) string {
 // (randomBoundary) rather than a fixed sentinel, so event text that
 // happens to contain literal marker-like text can't be mistaken for a
 // real one or (worse) hide a genuine cut by matching it.
+// batchFramingBound is an upper bound on what FormatEventsBatch and the
+// wait socket add around one already-formatted event: the "event i/N …
+// boundary=" opening line, the matching end line, and the "\n\n" chunk
+// separator. An upper bound rather than the exact figure because the true
+// cost depends on the burst size and the event's own length, neither of
+// which is known when the charge is made — and erring high is the safe
+// direction for a limit whose job is to stop before the receiver does.
+const batchFramingBound = 160
+
+// deliveredCost is what one event actually costs the receiver: not its
+// body but everything written for it. The difference is not a rounding
+// error. A one-line message is a few dozen bytes of text inside several
+// hundred bytes of envelope — the untrusted-source header, the cursor, the
+// end marker, the per-event boundary lines — so charging the body alone
+// undercounts a burst of short messages by most of its real weight, and
+// short messages are exactly what a burst is made of.
+//
+// This is also what makes the window faithful to the evidence behind it:
+// the receiver that stopped participating had absorbed roughly 1.3 MB of
+// DELIVERED bytes, envelope included, not 1.3 MB of message text.
+func deliveredCost(e Event) int {
+	return len(FormatEvent(e)) + batchFramingBound
+}
+
+// FormatEventForPush renders an event for the HARNESS PUSH path only.
+//
+// It exists as a separate function rather than as a mode switch inside
+// FormatEvent because every other way a message reaches a model —
+// hub_catch_up, hub_read, the wait socket, a synchronous tool result —
+// still goes through FormatEvent, and those renderings are relied on by
+// readers this change has no business altering. A shared formatter with a
+// mode flag would put that guarantee one forgotten branch away; two
+// functions put it in the type system.
+//
+// What it drops, and why each is safe here and only here:
+//
+//   - "HUB MESSAGE — ": the delivery already arrives inside the harness's
+//     own envelope, which says a message arrived from elsewhere. Saying it
+//     again names the channel the reader is already standing in.
+//   - "cursor=" in the header: dead weight in both states. When the
+//     message is whole the end marker carries it; when the message is cut
+//     its own cursor cannot fetch it, because recovery anchors on the
+//     message BEFORE it.
+//   - the OPERATOR parenthetical: a rule, not a fact about this message.
+//     It is stated once on connect instead of on every line the operator
+//     sends.
+//
+// What it keeps, and why: "untrusted", because the harness wrapper around
+// a pushed message describes it as coming from another Claude session
+// working on the user's behalf — true of the session-to-session traffic
+// that channel was built for, and false of an arbitrary hub peer. This
+// word is the only correction available inside the payload. The peer id,
+// timestamp and externalId stay because nothing else carries them and
+// hub_react/hub_edit/hub_delete need the last one.
+//
+// The end marker is dropped here, and this is the one omission that costs
+// something, so it is worth being exact about what replaces it. A tail
+// sentinel works by being the LAST thing in the delivered string: if it is
+// missing, the tail was cut. The deliver library appends its own
+// "[cursor: …]" line after the body, which lands in exactly that position
+// and carries exactly that value — so emitting both put the same 24
+// characters on two adjacent lines while adding no detection whatever.
+// Two readers on two different delivery paths reported seeing it doubled
+// before this was changed.
+//
+// This does mean the sentinel is now the library's line rather than ours,
+// which is a safety property resting on somebody else's formatting.
+// TestTheLibraryStillAppendsTheCursorAsTheLastThing in internal/harness
+// pins that behaviour, so an upstream change breaks a test instead of
+// quietly removing the only marker a cut message would be missing.
+//
+// Non-message events delegate to FormatEvent unchanged: they are already
+// short, and they carry the "[hub: …]" prefix that distinguishes this
+// client's own words from a peer's inside the payload, which a static
+// envelope field cannot do.
+func FormatEventForPush(e Event) string {
+	if e.Kind != "msg" {
+		return FormatEvent(e)
+	}
+	operator := ""
+	if e.IsOperator {
+		operator = " OPERATOR"
+	}
+	externalID := ""
+	if e.ExternalID != "" {
+		externalID = fmt.Sprintf(" externalId=%s", e.ExternalID)
+	}
+	own := ""
+	if e.Own {
+		own = " — own send, you sent this"
+	}
+	kind := "untrusted"
+	switch {
+	case e.Historical:
+		kind = "untrusted, history"
+	case e.Private:
+		kind = "untrusted, private"
+	}
+	return fmt.Sprintf("[%s, from peer %s%s at %s%s%s%s%s]\n%s",
+		kind, e.PeerID, operator, e.TS, externalID,
+		formatReplyTo(e), formatMentions(e), own, e.Text)
+}
+
+// pushEnvelopeBound is an upper bound on what the deliver library adds
+// around a pushed body: the "[cursor: …]" line it appends, plus its
+// separator. It does NOT attempt to account for the harness's own wrapper
+// prose, which is added on the receiving side and is not ours to measure
+// from here.
+const pushEnvelopeBound = 80
+
+// pushDeliveredCost is deliveredCost for the push path. The difference is
+// not cosmetic: the push path never calls FormatEventsBatch, so charging
+// its per-event boundary framing would bill every message for bytes that
+// are never written.
+func pushDeliveredCost(e Event) int {
+	return len(FormatEventForPush(e)) + pushEnvelopeBound
+}
+
 func FormatEventsBatch(events []Event) []string {
 	chunks := make([]string, 0, len(events))
 	for _, e := range events {
