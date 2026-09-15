@@ -42,7 +42,14 @@ const deliverTimeout = 30 * time.Second
 // safe to call when there is no harness at all.
 type Pusher struct {
 	mu sync.Mutex
-	d  deliver.Deliverer
+	// d is opened on first use, not at construction, because the name it
+	// is opened with is part of what the model sees and may only be
+	// learnable from an inbound request. Opening eagerly would fix the
+	// attribution before the one source that could improve it has spoken.
+	d deliver.Deliverer
+	// learned is a server name taken from request metadata, if the harness
+	// supplies one. Empty when it does not.
+	learned string
 	// adopted records that a thread id has been latched from an MCP
 	// request, so the Codex path is not asked to re-latch on every call.
 	adopted bool
@@ -66,12 +73,46 @@ func Open() *Pusher {
 	// relayed message carries "untrusted" as the first word of its own
 	// header, in the payload, where truncation cannot reach.
 	//
-	// It has to be configured because it cannot be derived: the harness
-	// tells an MCP server nothing about the alias it was registered under
-	// (verified against a live process environment — only the socket,
-	// token, session id and project dir are passed), and two entries can
-	// run the same binary with identical arguments.
-	return &Pusher{d: deliver.Open(deliver.WithSenderName(senderName()))}
+	// The name is taken from the harness when it offers one (see
+	// learnServerName) and configured only when it does not. The
+	// environment carries no alias — verified against a live process, it
+	// passes the messaging socket, token, session id and project dir and
+	// nothing else — and two entries can run the same binary with
+	// identical arguments, so without either source they are
+	// indistinguishable.
+	return &Pusher{}
+}
+
+// deliverer returns the underlying Deliverer, opening it on first use with
+// the best name known by then. Caller must hold p.mu.
+func (p *Pusher) deliverer() deliver.Deliverer {
+	if p.d == nil {
+		p.d = deliver.Open(deliver.WithSenderName(senderName(p.learned)))
+	}
+	return p.d
+}
+
+// learnServerName looks for a server name the harness may have stamped
+// into an inbound request's metadata, so the attribution names the right
+// entry without anyone having to configure it.
+//
+// Speculative by necessity and safe by construction: if the name is
+// available at all, request metadata is where it would be, so matching is
+// by shape rather than by a key known to exist, and anything unrecognised
+// leaves the name alone. The value is a display string, never an identity
+// or an authorization, so a wrong guess mislabels a line and nothing more.
+func learnServerName(meta map[string]any) string {
+	for k, v := range meta {
+		s, ok := v.(string)
+		if !ok || s == "" || len(s) > 64 {
+			continue
+		}
+		key := strings.ToLower(k)
+		if strings.Contains(key, "server") && strings.Contains(key, "name") {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 // EnvServerName names this MCP server as the model's own config registered
@@ -80,9 +121,16 @@ func Open() *Pusher {
 // in the attribution line.
 const EnvServerName = "MCP_HUB_SERVER_NAME"
 
-// senderName builds the attribution shown to the model.
-func senderName() string {
+// senderName builds the attribution shown to the model. An explicitly
+// configured name wins: it is the operator stating what this entry is
+// called, which outranks anything inferred. A name learned from the
+// harness comes next, and the product name last, so the field always says
+// something rather than nothing.
+func senderName(learned string) string {
 	name := strings.TrimSpace(os.Getenv(EnvServerName))
+	if name == "" {
+		name = strings.TrimSpace(learned)
+	}
 	if name == "" {
 		name = "mcp-hub"
 	}
@@ -124,10 +172,12 @@ func ClearEnvForTesting() func() {
 // Available reports whether the harness can be reached, with a sentence
 // fit to show a model explaining a negative.
 func (p *Pusher) Available() (bool, string) {
-	if p == nil || p.d == nil {
+	if p == nil {
 		return false, "no harness delivery configured in this process"
 	}
-	return p.d.Available()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.deliverer().Available()
 }
 
 // Adopt latches the target from an inbound MCP request's _meta. A no-op
@@ -136,18 +186,24 @@ func (p *Pusher) Available() (bool, string) {
 // every request rather than at startup: a server that has not yet been
 // called has not yet been told which thread it belongs to.
 func (p *Pusher) Adopt(meta map[string]any) error {
-	if p == nil || p.d == nil || len(meta) == 0 {
+	if p == nil || len(meta) == 0 {
 		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.learned == "" && p.d == nil {
+		// Only before the deliverer exists: its name is fixed at open, so
+		// learning one afterwards would record a name that is not the one
+		// being sent under, which is worse than the default.
+		p.learned = learnServerName(meta)
+	}
 	// Every request is passed through, never short-circuited after the
 	// first. Latching here looked like a harmless optimisation and was
 	// not: the library's own job is to notice when a SECOND thread starts
 	// talking to one MCP process and fail closed, and a caller that stops
 	// calling after the first success guarantees it never sees the second.
 	// A latch that hides the mismatch check is worse than no latch.
-	err := p.d.Adopt(meta)
+	err := p.deliverer().Adopt(meta)
 	if err == nil {
 		p.adopted = true
 	}
@@ -161,11 +217,11 @@ func (p *Pusher) Adopt(meta map[string]any) error {
 // must not treat its absence as a loss — the cursor is the contract, and
 // anything not delivered here is still on the server.
 func (p *Pusher) Push(cursor, body string, more bool) (deliver.Receipt, error) {
-	if p == nil || p.d == nil {
+	if p == nil {
 		return deliver.Receipt{}, fmt.Errorf("no harness delivery configured in this process")
 	}
 	p.mu.Lock()
-	d := p.d
+	d := p.deliverer()
 	p.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), deliverTimeout)
 	defer cancel()
@@ -178,11 +234,11 @@ func (p *Pusher) Push(cursor, body string, more bool) (deliver.Receipt, error) {
 // anything: a floor of N licenses sending N and licenses nothing about
 // N+1. The delivery budget stays well below it by its own reasoning.
 func (p *Pusher) MaxIntactBytes() (int, error) {
-	if p == nil || p.d == nil {
+	if p == nil {
 		return 0, fmt.Errorf("no harness delivery configured in this process")
 	}
 	p.mu.Lock()
-	d := p.d
+	d := p.deliverer()
 	p.mu.Unlock()
 	return d.MaxIntactBytes()
 }
