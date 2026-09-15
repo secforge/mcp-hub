@@ -920,7 +920,16 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 		// For Claude it is a no-op — the target came from the environment
 		// at exec — and calling it anyway keeps one code path.
 		if m := req.Params.Meta; m != nil {
-			h.pusher.Adopt(m.AdditionalFields)
+			if err := h.pusher.Adopt(m.AdditionalFields); err != nil {
+				// A refused adopt means the harness will not accept this
+				// process talking to that target — most importantly when a
+				// SECOND thread reaches one MCP server, which the library
+				// fails closed on. Silence here would turn a deliberate
+				// refusal into delivery that simply stops.
+				h.noteAutoReconnect(fmt.Sprintf("live delivery into this session was refused by "+
+					"the harness (%v) — messages will not be pushed to you until that is "+
+					"resolved; use hub_catch_up() to read.", err))
+			}
 		}
 		res, err := handler(ctx, req)
 		note := h.takeAutoReconnectNote()
@@ -1902,8 +1911,10 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	sentinel := "Every delivered message ends with a marker echoing the cursor its opening line " +
 		"named."
 	if harness.PushMode() {
-		sentinel = "Every delivered message ends with a [cursor: …] line naming where it can be " +
-			"re-fetched from. That line is last on purpose: if it is missing, the message was cut " +
+		sentinel = "Every delivered message ends with a bracketed trailer on its own line — " +
+			"[cursor: …] naming where it can be re-fetched from, or [no cursor: …] where there is " +
+			"nothing to re-fetch, which is what this client's own notices carry. Either form is " +
+			"complete; what matters is that a trailer is there. If none is, the message was cut " +
 			"off in transit."
 	}
 	notes += "\n" + sentinel +
@@ -2069,6 +2080,7 @@ func (h *Hub) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		return
 	}
 	items, _ := conn.DrainForPush()
+	failed := 0
 	for i, it := range items {
 		// An image or a file on a pushed message has to be saved here, by
 		// the same path hub_receive uses. Push mode does not offer
@@ -2076,10 +2088,29 @@ func (h *Hub) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		// chance: the attachment would be named by an event nothing ever
 		// resolved, and unreachable rather than merely inconvenient.
 		it.Text += h.saveReceivedAttachments(conn, []hubconn.Event{it.Event})
+		// Charged here rather than at render time: the attachment notes
+		// above are part of what the reader receives, and a budget that
+		// does not count them is not counting what it delivers.
+		conn.ChargeDelivered(it.Cursor, len(it.Text))
 		// More says another delivery is already on its way, so a reader
 		// that wants to act on a burst knows to wait for the rest of it
 		// rather than treating each arrival as the whole of the news.
-		_, _ = h.pusher.Push(it.Cursor, it.Text, i < len(items)-1)
+		if _, err := h.pusher.Push(it.Cursor, it.Text, i < len(items)-1); err != nil {
+			// The event is already out of the buffer, so a failed push
+			// leaves it delivered nowhere. Nothing is durably lost — the
+			// catch-up position only advances on an explicit confirm, so
+			// the server still holds it — but nothing would otherwise SAY
+			// so, and a silence that recovers itself only if the reader
+			// happens to guess is the failure mode this whole system keeps
+			// relearning.
+			failed++
+		}
+	}
+	if failed > 0 {
+		h.noteAutoReconnect(fmt.Sprintf("%d message(s) could not be delivered to you live — the "+
+			"push into this session failed. Nothing is lost: your catch-up position only moves "+
+			"on an explicit confirm, so the server still holds them. Call hub_catch_up() to read "+
+			"them.", failed))
 	}
 }
 
@@ -2206,6 +2237,12 @@ func (h *Hub) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string
 	h.recordHandedOver(events)
 	h.confirmLiveDelivery(events)
 	conn.MarkConsumed(events)
+	// A pulled cursor needs a POSITION in the delivery ledger even though
+	// it spends no push budget: a confirm locates a prefix by position, so
+	// without this, confirming something read via hub_catch_up released
+	// nothing and a closed delivery window never reopened — while
+	// hub_confirm reported success.
+	conn.NoteHandedOver(events)
 	return mcp.NewToolResultText(formatted + h.saveReceivedAttachments(conn, events))
 }
 
@@ -3341,6 +3378,12 @@ func formatBehindNote(behind *int) string {
 // with a pending count, where a standalone one does.
 func (h *Hub) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
 	behind, err := conn.ConfirmReceived(cursor)
+	if conn.TakeSkippedHeldNotice() {
+		h.noteAutoReconnect("that confirm moved your read position PAST message(s) live delivery " +
+			"had held back, so they will not be delivered and will not be walked to. They are " +
+			"still on the server: hub_read(after: <a cursor from before the hold>) retrieves " +
+			"them. Said once — nothing will mention this gap again.")
+	}
 	if err != nil {
 		return nil, err
 	}

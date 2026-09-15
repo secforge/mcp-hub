@@ -74,6 +74,11 @@ type budget struct {
 type charge struct {
 	cursor string
 	bytes  int
+	// held marks an entry the window refused to deliver. It occupies no
+	// budget — nothing was sent — but it holds a POSITION, so a confirm
+	// that releases a prefix containing one can report that the reader has
+	// just moved past something they were never shown.
+	held bool
 }
 
 // newBudget returns the default policy. Values are deliberately far apart:
@@ -118,13 +123,30 @@ func (b *budget) charge(cursor string, n int) {
 }
 
 // release drops every charge at or before cursor and subtracts exactly
-// those bytes. Everything after stays charged — see outstanding.
-func (b *budget) release(cursor string) {
+// those bytes. It reports whether the released prefix contained a HELD
+// entry — a message the window refused to deliver — because confirming
+// past one moves the read position over content the reader never saw, and
+// silence is exactly what that must not produce.
+func (b *budget) release(cursor string) (skipped bool) {
 	if cursor == "" {
-		return
+		return false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// Release a PREFIX located by position. The ledger is in delivery
+	// order — this client's own arrival sequence — so "everything up to
+	// and including that cursor" is an index, and no comparison of one
+	// opaque cursor against another is needed. That matters: a cursor's
+	// format and precision belong to the server, today's happen to be
+	// sortable ticks, and a client that ordered them would be depending on
+	// an accident it was told not to rely on.
+	//
+	// For the index to exist, every cursor handed to the model must be in
+	// the ledger — pulled ones at zero cost (see note) and held ones at
+	// zero cost (see hold), not only pushed ones. Without that, a reader
+	// that followed the notice's own advice and called hub_catch_up
+	// confirmed a cursor this ledger had never heard of, released nothing,
+	// and left the window shut forever while hub_confirm reported success.
 	cut := -1
 	for i, ch := range b.outstanding {
 		if ch.cursor == cursor {
@@ -133,7 +155,18 @@ func (b *budget) release(cursor string) {
 		}
 	}
 	if cut < 0 {
+		// An unknown cursor cannot locate a prefix, so nothing is
+		// released — under-releasing costs headroom, over-releasing costs
+		// the exhaustion this whole file exists to prevent. But it is
+		// evidence the reader is reading, so the closure becomes
+		// announceable again rather than staying silent forever.
+		b.announced = false
 		return
+	}
+	for _, ch := range b.outstanding[:cut+1] {
+		if ch.held {
+			skipped = true
+		}
 	}
 	for _, ch := range b.outstanding[:cut+1] {
 		b.bytes -= ch.bytes
@@ -145,6 +178,54 @@ func (b *budget) release(cursor string) {
 	if b.bytes < b.windowBytes && len(b.outstanding) < b.windowCount {
 		b.held, b.announced = 0, false
 	}
+	return skipped
+}
+
+// adjust corrects an entry's cost once the caller knows the true size.
+// The estimate charged at render time is what enforces the window DURING
+// a burst — without it a single large batch would pass entirely before
+// anything was counted — and this replaces it with what was actually
+// delivered, rather than adding a second entry for the same message.
+func (b *budget) adjust(cursor string, n int) {
+	if cursor == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, ch := range b.outstanding {
+		if ch.cursor == cursor {
+			b.bytes += n - ch.bytes
+			b.outstanding[i].bytes = n
+			if b.bytes < 0 {
+				b.bytes = 0
+			}
+			return
+		}
+	}
+	b.outstanding = append(b.outstanding, charge{cursor: cursor, bytes: n})
+	b.bytes += n
+}
+
+// note records a cursor handed to the model by a path that spends no push
+// budget — hub_catch_up, hub_read, a synchronous tool result. It costs
+// nothing and exists purely so the cursor has a POSITION in the ledger,
+// which is what lets a later confirm of it locate a prefix.
+//
+// Without this, the two halves of the design contradict each other: the
+// held-window notice tells the reader to pull and confirm, and confirming
+// what was pulled released nothing at all.
+func (b *budget) note(cursor string) {
+	if cursor == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, ch := range b.outstanding {
+		if ch.cursor == cursor {
+			return
+		}
+	}
+	b.outstanding = append(b.outstanding, charge{cursor: cursor})
 }
 
 // closed reports whether the window is full.
@@ -156,9 +237,12 @@ func (b *budget) closed() bool {
 
 // hold records one withheld event and reports whether the closure still
 // needs announcing.
-func (b *budget) hold() (announce bool, heldNow int) {
+func (b *budget) hold(cursor string) (announce bool, heldNow int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if cursor != "" {
+		b.outstanding = append(b.outstanding, charge{cursor: cursor, held: true})
+	}
 	b.held++
 	if b.announced {
 		return false, b.held

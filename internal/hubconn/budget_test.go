@@ -89,16 +89,16 @@ func TestTheWindowClosesOnCountEvenWhenTheBytesAreTiny(t *testing.T) {
 // waiting rather than merely that something is.
 func TestAClosedWindowIsAnnouncedOnceAndKeepsCounting(t *testing.T) {
 	b := testBudget(t)
-	announce, held := b.hold()
+	announce, held := b.hold("held-cursor")
 	if !announce || held != 1 {
 		t.Fatalf("first hold = (%v, %d), want (true, 1)", announce, held)
 	}
 	for i := 0; i < 4; i++ {
-		if announce, _ = b.hold(); announce {
+		if announce, _ = b.hold(fmt.Sprintf("held-%d", i)); announce {
 			t.Fatal("the closure was announced a second time")
 		}
 	}
-	if _, held = b.hold(); held != 6 {
+	if _, held = b.hold("held-last"); held != 6 {
 		t.Fatalf("held = %d, want 6", held)
 	}
 }
@@ -107,9 +107,9 @@ func TestReopeningTheWindowRearmsTheAnnouncement(t *testing.T) {
 	b := testBudget(t)
 	b.windowBytes = 100
 	b.charge("c1", 200)
-	b.hold()
+	b.hold("held-cursor")
 	b.release("c1")
-	announce, held := b.hold()
+	announce, held := b.hold("held-cursor")
 	if !announce || held != 1 {
 		t.Fatalf("hold after reopening = (%v, %d), want (true, 1) — a new closure is news again",
 			announce, held)
@@ -302,5 +302,126 @@ func TestABurstOfShortMessagesClosesTheWindowOnFramingAlone(t *testing.T) {
 	if held == 0 {
 		t.Fatalf("delivered all 60 messages (%d bytes of body) without closing a %d-byte window",
 			body, 10*1024)
+	}
+}
+
+// The bug this pins was the worst of the set: the window closed, the
+// notice told the reader to call hub_catch_up, the reader did, confirmed
+// what the walk returned — and release matched cursors EXACTLY, so a
+// pulled cursor was absent from the ledger, nothing was released, the
+// window stayed shut, and the closure was never announced again. The
+// documented cure silently did nothing, permanently.
+func TestConfirmingACursorThatWasPulledRatherThanPushedReopensTheWindow(t *testing.T) {
+	b := testBudget(t)
+	b.windowBytes = 1000
+	b.charge("pushed-1", 1200)
+	if !b.closed() {
+		t.Fatal("window did not close")
+	}
+	b.hold("held-2")
+
+	// What hub_catch_up hands over is recorded at zero cost — it spends no
+	// push budget, but it must have a POSITION.
+	b.note("held-2")
+	b.note("walked-3")
+
+	if skipped := b.release("walked-3"); !skipped {
+		t.Error("releasing past a held message did not report the skip")
+	}
+	if b.closed() {
+		t.Fatal("the window is still shut after confirming what the reader actually read")
+	}
+}
+
+// Confirming past a message the window refused to deliver moves the read
+// position over content the reader never saw. That must be reported, not
+// silent — it is the same contiguous-watermark rule a live message shown
+// mid-gap obeys.
+func TestReleasingPastAHeldMessageReportsTheSkip(t *testing.T) {
+	b := testBudget(t)
+	b.charge("a", 1)
+	b.hold("b")
+	b.note("c")
+
+	if skipped := b.release("a"); skipped {
+		t.Error("releasing before the held message reported a skip")
+	}
+	if skipped := b.release("c"); !skipped {
+		t.Error("releasing past the held message did not report a skip")
+	}
+}
+
+// An unknown cursor cannot locate a prefix, so nothing may be released —
+// but it is evidence the reader is reading, and a closure that is
+// announced once and never again leaves the channel looking alive while
+// everything is held.
+func TestAnUnknownCursorReleasesNothingButMakesTheClosureAnnounceableAgain(t *testing.T) {
+	b := testBudget(t)
+	b.windowBytes = 100
+	b.charge("known", 500)
+	if announce, _ := b.hold("h1"); !announce {
+		t.Fatal("first closure was not announced")
+	}
+	if announce, _ := b.hold("h2"); announce {
+		t.Fatal("announced twice in a row")
+	}
+
+	b.release("a-cursor-this-ledger-never-saw")
+
+	if b.bytes != 500 {
+		t.Fatalf("bytes = %d, want 500 — an unlocatable cursor must not release", b.bytes)
+	}
+	if announce, _ := b.hold("h3"); !announce {
+		t.Fatal("the closure stayed silent after an unlocatable confirm")
+	}
+}
+
+// Holding this client's own notices meant the mechanism suppressed the
+// only messages that could reopen it: the held-window announcement and
+// the confirm reminder are the escape hatch.
+func TestAClosedWindowStillDeliversThisClientsOwnNotices(t *testing.T) {
+	c := &Conn{budget: newBudget()}
+	c.budget.windowBytes = 100
+	c.budget.charge("c0", 500)
+
+	out := c.applyBudget([]Event{
+		msg("m1", 10),
+		{Kind: "confirmReminder", Text: "c0"},
+		{Kind: "rosterComplete"},
+	}, pushDeliveredCost)
+
+	var kinds []string
+	for _, e := range out {
+		kinds = append(kinds, e.Kind)
+	}
+	for _, want := range []string{"confirmReminder", "rosterComplete"} {
+		found := false
+		for _, k := range kinds {
+			if k == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("a closed window swallowed %q, which is how it reopens; got %v", want, kinds)
+		}
+	}
+	for _, k := range kinds {
+		if k == "msg" {
+			t.Error("a closed window delivered an ordinary message")
+		}
+	}
+}
+
+// The estimate charged at render time enforces the window during a burst;
+// the correction replaces it rather than adding a second entry.
+func TestAdjustingACostCorrectsTheEntryRatherThanDoubleCharging(t *testing.T) {
+	b := testBudget(t)
+	b.charge("c1", 100)
+	b.adjust("c1", 180)
+	if b.bytes != 180 {
+		t.Fatalf("bytes = %d, want 180", b.bytes)
+	}
+	if len(b.outstanding) != 1 {
+		t.Fatalf("ledger has %d entries, want 1 — the message was counted twice", len(b.outstanding))
 	}
 }

@@ -368,7 +368,11 @@ type Conn struct {
 	// budget governs what may be PUSHED to a reader unbidden — see
 	// budget's own doc comment for why the receiver's context, rather than
 	// the transport, is the scarce resource here.
-	budget          *budget
+	budget *budget
+	// skippedHeld records that a confirm released a prefix containing a
+	// message the window had held back, so the next tool result can tell
+	// the reader their position moved over something they never saw.
+	skippedHeld     bool
 	peers           map[string]PeerInfo
 	rosterAnnounced bool
 	// pendingAcks holds at most one outstanding claim per expected ack
@@ -1034,8 +1038,15 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	// A confirm names a POSITION, so it releases a prefix of the ledger
 	// rather than clearing it: bytes delivered after this cursor are still
 	// occupying the reader's context, unread rather than freed.
-	if c.budget != nil {
-		c.budget.release(cursor)
+	if c.budget != nil && c.budget.release(cursor) {
+		// The confirm just moved the read position past a message the
+		// delivery window refused to send. Nothing is lost — the server
+		// still holds it and the gap is retrievable — but the reader
+		// believes they are caught up, and a gap nobody mentions again is
+		// indistinguishable from no gap. Recorded so the caller can say so.
+		c.mu.Lock()
+		c.skippedHeld = true
+		c.mu.Unlock()
 	}
 	// The server's own declaration (wire.Joined.Features) settles this
 	// whenever it's available: never infer a capability from silence at
@@ -1998,6 +2009,45 @@ func (c *Conn) DrainBatch() (chunks []string, connected bool) {
 	return FormatEventsBatch(c.applyBudget(events, deliveredCost)), connected
 }
 
+// TakeSkippedHeldNotice reports — once — that a confirm moved the read
+// position past a message live delivery had withheld, and clears the
+// flag. Read once rather than left set, because it describes an event
+// that happened, not a state that persists: repeating it after the reader
+// has been told would make a resolved gap look like an unresolved one.
+func (c *Conn) TakeSkippedHeldNotice() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	skipped := c.skippedHeld
+	c.skippedHeld = false
+	return skipped
+}
+
+// NoteHandedOver records cursors delivered to the model by a path that
+// spends no push budget — hub_catch_up, hub_read, a synchronous tool
+// result. It costs nothing and is not optional: a confirm locates a
+// prefix by POSITION in the delivery ledger, so a cursor that was pulled
+// rather than pushed must still have a position, or confirming it
+// releases nothing and the delivery window never reopens.
+func (c *Conn) NoteHandedOver(events []Event) {
+	if c.budget == nil {
+		return
+	}
+	for _, e := range events {
+		c.budget.note(e.Cursor)
+	}
+}
+
+// ChargeDelivered records what a pushed message actually cost, once the
+// caller has finished assembling it. Rendering is not the last step —
+// attachment notes are appended afterwards — and a budget that charges
+// before the text is final is measuring something the reader never sees.
+func (c *Conn) ChargeDelivered(cursor string, n int) {
+	if c.budget == nil || cursor == "" {
+		return
+	}
+	c.budget.adjust(cursor, n)
+}
+
 // PushItem is one event ready to be pushed into a model harness: the
 // formatted text, and the cursor that text can be re-fetched from.
 //
@@ -2053,8 +2103,14 @@ func (c *Conn) applyBudget(events []Event, cost func(Event) int) []Event {
 	}
 	out := make([]Event, 0, len(events))
 	for _, e := range events {
-		if !(e.IsOperator || e.MentionedMe) && c.budget.closed() {
-			if announce, held := c.budget.hold(); announce {
+		// Only peer MESSAGES are held. This client's own notices — the
+		// held-window announcement, the confirm reminder, roster and
+		// shutdown notices — are the escape hatch from a closed window,
+		// and holding them meant the mechanism suppressed the only thing
+		// that could reopen it. They are a line or two each; withholding
+		// them saves nothing worth having.
+		if e.Kind == "msg" && !(e.IsOperator || e.MentionedMe) && c.budget.closed() {
+			if announce, held := c.budget.hold(e.Cursor); announce {
 				out = append(out, Event{Kind: "deliveryHeld", HeldCount: held})
 			}
 			continue

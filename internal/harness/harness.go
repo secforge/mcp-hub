@@ -24,6 +24,7 @@ package harness
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -113,18 +114,23 @@ func (p *Pusher) Available() (bool, string) {
 // to learn it where it does not (Codex), which is why it is called on
 // every request rather than at startup: a server that has not yet been
 // called has not yet been told which thread it belongs to.
-func (p *Pusher) Adopt(meta map[string]any) {
+func (p *Pusher) Adopt(meta map[string]any) error {
 	if p == nil || p.d == nil || len(meta) == 0 {
-		return
+		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.adopted {
-		return
-	}
-	if err := p.d.Adopt(meta); err == nil {
+	// Every request is passed through, never short-circuited after the
+	// first. Latching here looked like a harmless optimisation and was
+	// not: the library's own job is to notice when a SECOND thread starts
+	// talking to one MCP process and fail closed, and a caller that stops
+	// calling after the first success guarantees it never sees the second.
+	// A latch that hides the mismatch check is worse than no latch.
+	err := p.d.Adopt(meta)
+	if err == nil {
 		p.adopted = true
 	}
+	return err
 }
 
 // Push delivers one event. The returned observation is what was actually
@@ -134,6 +140,9 @@ func (p *Pusher) Adopt(meta map[string]any) {
 // must not treat its absence as a loss — the cursor is the contract, and
 // anything not delivered here is still on the server.
 func (p *Pusher) Push(cursor, body string, more bool) (deliver.Receipt, error) {
+	if p == nil || p.d == nil {
+		return deliver.Receipt{}, fmt.Errorf("no harness delivery configured in this process")
+	}
 	p.mu.Lock()
 	d := p.d
 	p.mu.Unlock()
@@ -148,6 +157,9 @@ func (p *Pusher) Push(cursor, body string, more bool) (deliver.Receipt, error) {
 // anything: a floor of N licenses sending N and licenses nothing about
 // N+1. The delivery budget stays well below it by its own reasoning.
 func (p *Pusher) MaxIntactBytes() (int, error) {
+	if p == nil || p.d == nil {
+		return 0, fmt.Errorf("no harness delivery configured in this process")
+	}
 	p.mu.Lock()
 	d := p.d
 	p.mu.Unlock()
