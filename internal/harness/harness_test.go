@@ -2,6 +2,7 @@ package harness
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -57,5 +58,29 @@ func TestAnExplicitNameOutranksOneOfferedByTheHarness(t *testing.T) {
 	t.Setenv(EnvServerName, "chosen")
 	if got := senderName("offered"); got != "mcp:chosen" {
 		t.Fatalf("senderName = %q, want the configured name to win", got)
+	}
+}
+
+// The receiving harness rewrites this field silently — stripping quotes
+// and angle brackets, removing invisibles, truncating past 64 — so a name
+// set by hand can arrive as something else with nothing reporting the
+// difference. Normalising here makes the transformation ours and visible.
+func TestAConfiguredNameSurvivesDisplayUnchanged(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{`mcp-hub2`, "mcp:mcp-hub2"},
+		{`"mcp-hub2"`, "mcp:mcp-hub2"},
+		{`<hub>`, "mcp:hub"},
+		{"hub​two", "mcp:hubtwo"},
+		{"  spaced  ", "mcp:spaced"},
+		{strings.Repeat("x", 200), "mcp:" + strings.Repeat("x", 60)},
+		{`"<>`, "mcp:mcp-hub"}, // nothing usable left: the default, not an empty label
+	} {
+		t.Setenv(EnvServerName, tc.raw)
+		if got := senderName(""); got != tc.want {
+			t.Errorf("senderName() for %q = %q, want %q", tc.raw, got, tc.want)
+		}
+		if n := len(senderName("")); n > 64 {
+			t.Errorf("attribution for %q is %d chars — the harness will truncate it", tc.raw, n)
+		}
 	}
 }

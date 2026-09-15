@@ -127,14 +127,50 @@ const EnvServerName = "MCP_HUB_SERVER_NAME"
 // harness comes next, and the product name last, so the field always says
 // something rather than nothing.
 func senderName(learned string) string {
-	name := strings.TrimSpace(os.Getenv(EnvServerName))
+	name := safeServerName(os.Getenv(EnvServerName))
 	if name == "" {
-		name = strings.TrimSpace(learned)
+		name = safeServerName(learned)
 	}
 	if name == "" {
 		name = "mcp-hub"
 	}
 	return "mcp:" + name
+}
+
+// maxServerName keeps "mcp:" + the name inside the 64 characters the
+// receiving harness allows before it truncates and appends an ellipsis.
+const maxServerName = 64 - len("mcp:")
+
+// safeServerName reduces a configured or learned name to what will survive
+// display unchanged.
+//
+// The receiving harness sanitises this field itself: it strips quotes and
+// angle brackets rather than escaping them, removes invisibles, trims, and
+// truncates past 64 characters. All of that is silent and happens only in
+// the display, so a name set by hand can arrive as something else with
+// nothing anywhere reporting the difference — the attribution would then
+// be wrong in exactly the situation it exists for, telling a reader which
+// of several identical servers spoke.
+//
+// Normalising here makes the transformation ours and visible in one place,
+// rather than someone else's and invisible. Anything outside a plain
+// identifier is dropped instead of substituted: a name that loses a
+// character is obviously wrong to whoever configured it, while one whose
+// characters were quietly replaced looks deliberate.
+func safeServerName(raw string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(raw) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		}
+		if b.Len() >= maxServerName {
+			break
+		}
+	}
+	return b.String()
 }
 
 // PushMode reports whether this process should deliver hub events by
