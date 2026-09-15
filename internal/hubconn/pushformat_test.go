@@ -90,10 +90,18 @@ func TestThePushHeaderDropsWhatTheEnvelopeAlreadyCarries(t *testing.T) {
 			t.Errorf("push header dropped %q, which nothing else carries:\n%s", kept, got)
 		}
 	}
-	// The tail sentinel is the same rule in every mode — that sameness is
-	// worth more than the bytes it costs.
-	if !strings.HasSuffix(got, "[end cursor=639251041520391000.44985]") {
-		t.Errorf("push rendering lost its end marker:\n%s", got)
+	// No end marker here, deliberately: the deliver library appends its own
+	// "[cursor: …]" line after the body, and a tail sentinel works by being
+	// LAST, so a second one detects nothing while putting the same value on
+	// two adjacent lines. Two readers on two delivery paths reported seeing
+	// it doubled. See docs/known-issues.md — the library's line is not yet
+	// pinned by a test, and if it ever stops being emitted this renderer
+	// must grow its end marker back rather than the guidance being softened.
+	if strings.Contains(got, "[end cursor=") {
+		t.Errorf("push rendering still duplicates the trailing cursor:\n%s", got)
+	}
+	if strings.Contains(got, "639251041520391000.44985") {
+		t.Errorf("push rendering still carries a cursor the envelope supplies:\n%s", got)
 	}
 	if len(got) >= len(FormatEvent(sampleMsg())) {
 		t.Errorf("push rendering is not smaller: %d vs %d", len(got), len(FormatEvent(sampleMsg())))
