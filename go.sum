@@ -24,6 +24,8 @@ github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 h1:KRzFb2m7YtdldCEkzs6KqmJw4nqEV
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.2/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=
 github.com/secforge/harness-transport v0.1.0 h1:A26BYfB+pPd4D2Fiit9c6ildgI9U9NZy0gN3C15PSd0=
 github.com/secforge/harness-transport v0.1.0/go.mod h1:36eCcE6bkO5GeEQulkNn1oWH2Jg7qfHmrfSyddeIrHA=
+github.com/secforge/harness-transport v0.1.1 h1:I+Q/ONcw21qv02xBaxF4aGzJLGIRLy0/aQA2DKaSxwg=
+github.com/secforge/harness-transport v0.1.1/go.mod h1:36eCcE6bkO5GeEQulkNn1oWH2Jg7qfHmrfSyddeIrHA=
 github.com/spf13/cast v1.7.1 h1:cuNEagBQEHWN1FnbGEjCXL2szYEXqfJPbP2HNUaca9Y=
 github.com/spf13/cast v1.7.1/go.mod h1:ancEpBxwJDODSW/UG4rDrAqiKolqNNh2DX3mk86cAdo=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=

@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,21 +52,41 @@ type Pusher struct {
 // never fails: "no harness launched me" is a state to report to a model,
 // not an error to retry, so it is reported through Available.
 func Open() *Pusher {
-	// The sender name is rendered in the harness's own wrapper, and that
-	// wrapper describes what arrives as coming from another Claude session
-	// working on the user's behalf. That is true of the session-to-session
-	// traffic the channel was built for and false of an arbitrary hub
-	// peer, so this field — whose job is exactly sender identity — says
-	// what the thing actually is rather than restating a name the model
-	// already has.
+	// The sender name is rendered in the harness's own wrapper, and is
+	// what the model sees attributing a delivered message. It is
+	// "mcp:<server>" so a reader can tell at a glance which MCP server
+	// spoke and that an MCP server is what spoke — the wrapper otherwise
+	// describes an arbitrary hub peer as another Claude session working on
+	// the user's behalf, which is true of the session-to-session traffic
+	// that channel was built for and false of our cargo.
 	//
-	// It is deliberately over-broad: set once at Open, it labels
-	// everything pushed, including the notices this client itself authors.
-	// Those carry a "[hub: …]" prefix inside the payload, which a static
-	// envelope field cannot, so the two compose — the envelope states the
-	// default and the worst case, the prefix marks the exceptions. An
-	// inaccurate static name would be worse than an over-broad one.
-	return &Pusher{d: deliver.Open(deliver.WithSenderName("mcp-hub relay (external peer)"))}
+	// The name is short on purpose: the field is truncated in display, so
+	// a long one loses its distinguishing tail, which is the half that
+	// says WHICH server. The trust framing it replaces is not lost — every
+	// relayed message carries "untrusted" as the first word of its own
+	// header, in the payload, where truncation cannot reach.
+	//
+	// It has to be configured because it cannot be derived: the harness
+	// tells an MCP server nothing about the alias it was registered under
+	// (verified against a live process environment — only the socket,
+	// token, session id and project dir are passed), and two entries can
+	// run the same binary with identical arguments.
+	return &Pusher{d: deliver.Open(deliver.WithSenderName(senderName()))}
+}
+
+// EnvServerName names this MCP server as the model's own config registered
+// it — "mcp-hub2" for the second entry, say. Set it in the server's env
+// block; without it every entry running this binary is indistinguishable
+// in the attribution line.
+const EnvServerName = "MCP_HUB_SERVER_NAME"
+
+// senderName builds the attribution shown to the model.
+func senderName() string {
+	name := strings.TrimSpace(os.Getenv(EnvServerName))
+	if name == "" {
+		name = "mcp-hub"
+	}
+	return "mcp:" + name
 }
 
 // PushMode reports whether this process should deliver hub events by
