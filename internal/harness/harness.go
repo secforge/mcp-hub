@@ -175,8 +175,23 @@ func safeServerName(raw string) string {
 
 // PushMode reports whether this process should deliver hub events by
 // pushing them into its parent harness rather than by waiting to be
-// asked. It is keyed on the harness having handed us a messaging socket,
-// because that is the same fact that makes pushing possible at all.
+// asked. It is keyed on the CLAUDE harness having handed us a messaging
+// socket, and deliberately not on the pusher merely being available.
+//
+// CODEX PUSH IS NOT BUILT. Under Codex this is false, so pushToHarness
+// returns before draining and nothing is ever delivered — while Adopt
+// still runs on every request and still latches a thread id, because that
+// is how the library learns a target it was not given at exec. The
+// machinery therefore exists and is exercised on the one harness that
+// does not need it, which reads as built and behaves as unbuilt.
+//
+// Keying this on Available() instead would switch Codex into push mode
+// as a side effect: hub_wait and hub_receive would stop being registered
+// for a harness that cannot background a process and depends on the
+// blocking call. That is a real feature with a real verification cost,
+// not a one-line change, and it has never been exercised against a Codex
+// session. Stated here rather than left to be inferred from behaviour —
+// see docs/known-issues.md.
 //
 // Where this is true the pull machinery is not merely redundant, it is
 // harmful: a follower and a push are two consumers of one event buffer,
@@ -191,18 +206,42 @@ func PushMode() bool {
 // from the MCP server that ought to be pushing there — see the mcptools
 // TestMain for what that cost once.
 func ClearEnvForTesting() func() {
-	sock, sockOK := os.LookupEnv(deliver.EnvClaudeSocket)
-	tok, tokOK := os.LookupEnv(deliver.EnvClaudeToken)
-	os.Unsetenv(deliver.EnvClaudeSocket)
-	os.Unsetenv(deliver.EnvClaudeToken)
-	return func() {
-		if sockOK {
-			os.Setenv(deliver.EnvClaudeSocket, sock)
+	saved := make(map[string]string, len(harnessEnv))
+	for _, name := range harnessEnv {
+		if v, ok := os.LookupEnv(name); ok {
+			saved[name] = v
 		}
-		if tokOK {
-			os.Setenv(deliver.EnvClaudeToken, tok)
+		os.Unsetenv(name)
+	}
+	return func() {
+		for name, v := range saved {
+			os.Setenv(name, v)
 		}
 	}
+}
+
+// harnessEnv is every variable deliver.Open reads to decide which harness
+// launched this process and how to reach it.
+//
+// CODEX_THREAD_ID is on this list for a reason worth keeping: the first
+// version cleared only the Claude pair, which is what deliver.Open checks
+// FIRST. With no Claude socket it falls through and constructs the Codex
+// backend, latching its target from this variable — so on a machine where
+// a Codex app-server is running, a guard that cleared "the harness
+// environment" had in fact cleared the half that happened to be in use
+// here and left the other half live.
+//
+// The deeper defect is that this list lives in a different package from
+// the code that decides which variables matter, so it gets to be wrong
+// quietly every time the library learns a new one. Reported by
+// harness-transport, who offered a ClearAllHarnessEnv upstream; until
+// that exists, the constants below are at least taken from the library
+// rather than spelled out here, so a rename breaks the build instead of
+// the guard.
+var harnessEnv = []string{
+	deliver.EnvClaudeSocket,
+	deliver.EnvClaudeToken,
+	deliver.EnvCodexThread,
 }
 
 // Available reports whether the harness can be reached, with a sentence

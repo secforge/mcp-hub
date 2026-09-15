@@ -84,3 +84,28 @@ func TestAConfiguredNameSurvivesDisplayUnchanged(t *testing.T) {
 		}
 	}
 }
+
+// The guard must clear every variable deliver.Open reads, not the subset
+// that happened to matter on the machine where it was written: Open
+// checks the Claude socket first and falls through to the Codex backend,
+// which latches its target from CODEX_THREAD_ID.
+func TestClearEnvForTestingClearsEveryHarnessVariable(t *testing.T) {
+	for _, name := range harnessEnv {
+		t.Setenv(name, "set")
+	}
+	restore := ClearEnvForTesting()
+	for _, name := range harnessEnv {
+		if v := os.Getenv(name); v != "" {
+			t.Errorf("%s survived the guard as %q — a test could still reach a live harness", name, v)
+		}
+	}
+	if PushMode() {
+		t.Error("push mode still engaged after the guard")
+	}
+	restore()
+	for _, name := range harnessEnv {
+		if os.Getenv(name) != "set" {
+			t.Errorf("%s was not restored", name)
+		}
+	}
+}

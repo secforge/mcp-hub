@@ -54,3 +54,27 @@ sentinel from every pushed message, and the connect guidance would be
 describing a marker that never arrives — which reads as every message being
 truncated. If that happens, mcp-hub must render its own end marker again;
 adjusting the guidance instead would be treating the symptom.
+
+## Codex push mode is not built, but the code reads as though it were
+
+`PushMode` keys on `CLAUDE_CODE_MESSAGING_SOCKET` alone, and
+`pushToHarness` returns before draining unless it is true. Under a Codex
+harness the socket is absent, so nothing is ever pushed — while `Adopt`
+still runs on every request and still latches a thread id, since that is
+the only way the library learns a Codex target. The thread-id plumbing and
+the second-thread mismatch check are therefore reachable only on the
+harness that does not need them.
+
+Found by chat-relay, 2026-09-15, reviewing the push path.
+
+**Why it was not simply switched on.** Keying `PushMode` on the pusher
+being available would put Codex into push mode as a side effect, which
+also unregisters `hub_wait` and `hub_receive` — and Codex cannot background
+a process, so the blocking call is what it depends on. That is a feature
+with a verification cost, not a one-line change, and it has never been
+exercised against a Codex session.
+
+**Until then** the honest statement is the one in `PushMode`'s doc comment:
+Codex push is unbuilt. The failure this avoids is the one the codebase
+keeps meeting — code that looks built and behaves unbuilt produces an
+absence nobody can attribute.
