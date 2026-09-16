@@ -267,24 +267,26 @@ func (s *Server) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError("not connected"), nil
 	}
 	events := peer.Drain()
-	note := droppedNote(peer.TakeDropped())
+	note := abandonedNote(peer.Abandoned())
 	if len(events) == 0 {
 		return mcp.NewToolResultText("no new events" + note), nil
 	}
 	return resultWithAttachments(hubconn.FormatEvents(events)+note, events), nil
 }
 
-// droppedNote states a gap rather than leaving one. A buffer that
-// overflowed and said nothing hands a reader a stream with a hole in it
-// that reads exactly like a quiet conversation; saying so makes it
-// recoverable, since everything dropped is still on the server.
-func droppedNote(n int) string {
-	if n == 0 {
+// abandonedNote says the connection was given up rather than dropped, so
+// a reader knows it was not a network event and knows what to do. States
+// it rather than leaving it to be inferred from a connection that simply
+// stops answering.
+func abandonedNote(abandoned bool) string {
+	if !abandoned {
 		return ""
 	}
-	return fmt.Sprintf("\n\n[hub: %d event(s) were DROPPED before this — this connection's buffer "+
-		"filled up while nothing was reading it. They are still on the server: hub_catch_up "+
-		"retrieves them. Do not treat what follows as contiguous with what you read last.]", n)
+	return "\n\n[hub: this connection was CLOSED by this client because its buffer grew past " +
+		"what a reader that is reading would ever leave undrained — nothing was taking these " +
+		"events. Nothing is lost: everything is on the server and your position only moved for " +
+		"what you confirmed. Call hub_connect again and then hub_catch_up if you still want this " +
+		"conversation.]"
 }
 
 func (s *Server) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -301,9 +303,9 @@ func (s *Server) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	defer cancel()
 	events, err := peer.Wait(waitCtx)
 	if err != nil {
-		return mcp.NewToolResultText("no new events" + droppedNote(peer.TakeDropped())), nil
+		return mcp.NewToolResultText("no new events" + abandonedNote(peer.Abandoned())), nil
 	}
-	return resultWithAttachments(hubconn.FormatEvents(events)+droppedNote(peer.TakeDropped()), events), nil
+	return resultWithAttachments(hubconn.FormatEvents(events)+abandonedNote(peer.Abandoned()), events), nil
 }
 
 // resultWithAttachments builds a CallToolResult carrying formatted as its

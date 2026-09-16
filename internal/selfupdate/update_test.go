@@ -279,3 +279,85 @@ func TestAPreReleaseIsBehindItsOwnRelease(t *testing.T) {
 		}
 	}
 }
+
+// The ordering a development build has to obey, stated by the owner:
+//
+//	1.4.1 < 1.4.1.20260916170302 < 1.4.1.20260916170303 < 1.4.2
+//
+// A dev build stays ahead of the release it came from and behind the next
+// one, so it is offered real updates without a published build ever
+// replacing something newer.
+func TestADevBuildSortsAboveItsReleaseAndBelowTheNext(t *testing.T) {
+	for _, tc := range []struct {
+		candidate, running string
+		want               bool
+	}{
+		{"v1.4.1.20260916170302", "v1.4.1", true},  // dev is newer than its release
+		{"v1.4.1", "v1.4.1.20260916170302", false}, // and that release is not newer than it
+		{"v1.4.1.20260916170303", "v1.4.1.20260916170302", true},
+		{"v1.4.1.20260916170302", "v1.4.1.20260916170303", false},
+		{"v1.4.2", "v1.4.1.20260916170302", true},  // the next release still wins
+		{"v1.4.1.20260916170302", "v1.4.2", false}, // and is not undercut by a dev build
+	} {
+		got, err := isNewer(tc.candidate, tc.running)
+		if err != nil {
+			t.Fatalf("isNewer(%q, %q): %v", tc.candidate, tc.running, err)
+		}
+		if got != tc.want {
+			t.Errorf("isNewer(%q, %q) = %v, want %v", tc.candidate, tc.running, got, tc.want)
+		}
+	}
+}
+
+// Three parts and four are both accepted — every released build has
+// exactly three — and the missing fourth is -1, so a release sorts
+// strictly below any dev build of it rather than tying with .0.
+func TestAMissingFourthPartIsAcceptedAndSortsLowest(t *testing.T) {
+	three, _, err := parseSemver("v1.4.1")
+	if err != nil {
+		t.Fatalf("three-part version rejected: %v", err)
+	}
+	four, _, err := parseSemver("v1.4.1.0")
+	if err != nil {
+		t.Fatalf("four-part version rejected: %v", err)
+	}
+	if three[3] != -1 {
+		t.Fatalf("expected an absent fourth part to be -1, got %v", three)
+	}
+	if !(three[3] < four[3]) {
+		t.Fatalf("expected 1.4.1 to sort below 1.4.1.0, got %v and %v", three, four)
+	}
+}
+
+// Numerically, never as text — a 14-digit timestamp against a one-digit
+// patch orders backwards as a string.
+func TestPartsCompareNumericallyNotAsStrings(t *testing.T) {
+	got, err := isNewer("v1.4.2", "v1.4.1.20260916170302")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got {
+		t.Fatal("expected 1.4.2 to be newer than 1.4.1.20260916170302")
+	}
+}
+
+// An absent fourth part is -1 rather than 0, so nothing can tie. Zero
+// would make v1.4.1 and v1.4.1.0 compare EQUAL, and equal is the one
+// answer that stops an update while saying nothing: isNewer returns false
+// and Apply reports nothing available.
+func TestAReleaseSortsBelowEvenADotZeroDevBuild(t *testing.T) {
+	got, err := isNewer("v1.4.1.0", "v1.4.1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got {
+		t.Fatal("expected 1.4.1.0 to be newer than 1.4.1 — a tie hides the update")
+	}
+	back, err := isNewer("v1.4.1", "v1.4.1.0")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if back {
+		t.Fatal("expected 1.4.1 NOT to be newer than 1.4.1.0")
+	}
+}

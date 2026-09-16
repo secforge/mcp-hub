@@ -24,6 +24,7 @@ package version
 
 import (
 	"fmt"
+	"os"
 	"runtime/debug"
 	"strings"
 )
@@ -37,6 +38,34 @@ import (
 // deliberately not defaulted: an empty Release means "this is not a
 // release", which is a true and useful thing to say.
 var Release string
+
+// LastRelease names the most recent published release, and exists so a
+// development build can say what it is a development build OF. Updated by
+// scripts/release.sh when a release is cut; a stale value costs a
+// misleading prefix on dev builds only, never on a release, which gets
+// its number from Release above.
+const LastRelease = "v2.4.1"
+
+// devStamp is when the running binary's file was written, as
+// yyyymmddhhmmss, or "" when that cannot be read.
+//
+// The BINARY's timestamp rather than the commit's: two dev builds from
+// one commit are two different binaries, and the reason to number them
+// at all is to tell those apart. vcs.time would give both the same
+// string — which is exactly the case that defeated a staleness check
+// this morning, where a rebuilt client and the one it replaced reported
+// identical versions.
+func devStamp() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	fi, err := os.Stat(exe)
+	if err != nil {
+		return ""
+	}
+	return fi.ModTime().UTC().Format("20060102150405")
+}
 
 // info is read once — BuildInfo is fixed at link time and cannot change
 // while the process runs.
@@ -95,6 +124,30 @@ func Short() string {
 		return Release
 	case Release != "":
 		return Release + "+modified"
+	}
+	// A development build is numbered from the last release plus the
+	// moment this binary was built: 2.4.1.20260916170302. It sorts after
+	// that release, reads as "newer than 2.4.1 and not itself a
+	// release", and is unique per build rather than per commit.
+	//
+	// FOUR parts, which self-update compares as a dev suffix on the
+	// release this was built from:
+	//
+	//	1.4.1 < 1.4.1.20260916170302 < 1.4.1.20260916170303 < 1.4.2
+	//
+	// So a dev build is offered the next real release, and no published
+	// build ever replaces something newer than itself.
+	if stamp := devStamp(); stamp != "" {
+		v := strings.TrimPrefix(LastRelease, "v") + "." + stamp
+		if revision == "" {
+			return v
+		}
+		if modified {
+			return v + "+" + shortRevision() + "+modified"
+		}
+		return v + "+" + shortRevision()
+	}
+	switch {
 	case revision != "" && modified:
 		return shortRevision() + "+modified"
 	case revision != "":

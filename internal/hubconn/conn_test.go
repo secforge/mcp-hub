@@ -2326,3 +2326,26 @@ func TestTeamsFieldsAreZeroForAnOrdinaryConnect(t *testing.T) {
 			"ConversationKind=%q Topic=%v", c.CanSend(), c.ConversationKind(), c.Topic())
 	}
 }
+
+// A connection whose events nobody drains is ended rather than trimmed.
+// Trimming would leave it live with a hole in its stream and every later
+// message arriving looking normal; ending it makes the state
+// unambiguous, and everything is still on the server because the
+// position only advances on confirmation.
+func TestTheBufferBoundIsAnEndingNotATrim(t *testing.T) {
+	// The bound is what a working reader never reaches, so it is worth
+	// stating rather than only enforcing.
+	if maxBufferedEvents < 1000 {
+		t.Fatalf("the bound is meant to be far above working traffic, got %d", maxBufferedEvents)
+	}
+	c := &Conn{}
+	if c.AbandonedForBacklog() {
+		t.Fatal("a fresh connection has not been abandoned")
+	}
+	c.mu.Lock()
+	c.abandoned = true
+	c.mu.Unlock()
+	if !c.AbandonedForBacklog() {
+		t.Fatal("expected the reason for the ending to be reportable")
+	}
+}

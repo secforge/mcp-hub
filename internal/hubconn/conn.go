@@ -393,7 +393,10 @@ type Conn struct {
 	// looked up once, applied correctly to the exempt case, and not to the
 	// thirteen call sites that needed it.
 	writeMu sync.Mutex
-	budget  *budget
+	// abandoned records that this connection was ended by the client
+	// itself because nothing was draining its buffer — see abandon.
+	abandoned bool
+	budget    *budget
 	// budgetOwner identifies this connection inside a SHARED window, so a
 	// confirm releases what this connection delivered rather than a
 	// prefix of everyone's. Empty where the window is this connection's
@@ -1286,6 +1289,12 @@ func (c *Conn) readLoop() {
 			ev.IsOperator = true
 		}
 		c.buffer = append(c.buffer, ev)
+		// A buffer nobody is draining is a reader that has stopped, and
+		// past a point the honest thing is to stop pretending to be
+		// connected — see maxBufferedEvents. Recorded here, acted on
+		// after the lock is released, because ending the connection
+		// takes a write.
+		abandoned := len(c.buffer) > maxBufferedEvents
 		if ev.Cursor != "" {
 			c.lastSeenCursor = ev.Cursor
 			if !c.liveUnconfirmed {
@@ -1309,10 +1318,63 @@ func (c *Conn) readLoop() {
 		}
 		f := c.onActivity
 		c.mu.Unlock()
+		if abandoned {
+			c.abandon()
+			return
+		}
 		if f != nil {
 			f()
 		}
 	}
+}
+
+// maxBufferedEvents is how much undelivered traffic this connection will
+// hold before giving up on being read at all.
+//
+// Deliberately far above any working session: a reader that is reading
+// never approaches it, and the number exists for the case where nothing
+// is draining — a harness that stopped accepting deliveries, a follower
+// that died unnoticed, a pull client that never calls hub_receive. Left
+// alone that buffer grows with traffic and is freed only when the
+// process ends, which for a long-lived MCP server is not a bound.
+const maxBufferedEvents = 5000
+
+// abandon ends a connection whose reader has plainly stopped.
+//
+// Dropping the oldest events instead would keep a live connection whose
+// stream has a hole in it, and every later message would arrive looking
+// perfectly normal — the reader would have no way to know it had missed
+// anything. Disconnecting makes the state unambiguous: not connected.
+// Nothing is lost, because everything is on the server and the position
+// only advances on confirmation, so a reconnect plus catch-up rebuilds
+// exactly what was missed.
+//
+// No special close code. A close frame is a write, and the condition
+// being announced is precisely that writes are not being consumed — so
+// an ordinary close is what can be relied on. (chat-relay reserved one
+// for this and withdrew it for the same reason.)
+func (c *Conn) abandon() {
+	c.mu.Lock()
+	c.abandoned = true
+	f := c.onActivity
+	c.mu.Unlock()
+	_ = c.Close()
+	// The callback runs AFTER the close, so whoever wakes on it sees a
+	// connection that is already ended rather than one about to be.
+	if f != nil {
+		f()
+	}
+}
+
+// AbandonedForBacklog reports whether this connection ended because its
+// events were piling up unread, rather than for any other reason. The
+// difference matters to a reader: everything else is "the connection
+// dropped", while this one is "you were not reading, and reconnecting is
+// only worth it if you still want this conversation".
+func (c *Conn) AbandonedForBacklog() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.abandoned
 }
 
 // DecodeEvent decodes a single raw wire-protocol JSON event into an Event —

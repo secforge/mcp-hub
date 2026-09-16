@@ -362,10 +362,11 @@ func isNewer(candidate, running string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// A development build carries a revision, not a tag. It cannot be
-	// compared, and anything published is by definition more official
-	// than an unreleased local build — but that is the caller's decision
-	// to describe, not something to smuggle through a version compare.
+	// A development build carries a NUMBER now — the release it was built
+	// from plus a build timestamp — so it compares like anything else:
+	// ahead of that release, behind the next one. What still cannot be
+	// compared is a build that carries only a revision, and that stays an
+	// error rather than a guess.
 	r, runningPre, err := parseSemver(running)
 	if err != nil {
 		return false, fmt.Errorf("this build reports %q, which is not a release version", running)
@@ -383,8 +384,8 @@ func isNewer(candidate, running string) (bool, error) {
 	return runningPre && !candidatePre, nil
 }
 
-func parseSemver(v string) (nums [3]int, preRelease bool, err error) {
-	var out [3]int
+func parseSemver(v string) (nums [4]int, preRelease bool, err error) {
+	var out [4]int
 	s := strings.TrimPrefix(strings.TrimSpace(v), "v")
 	// Anything after a "+" or "-" (build metadata, a +modified marker, a
 	// pre-release suffix) is not part of the NUMBERS this compares — but
@@ -402,13 +403,37 @@ func parseSemver(v string) (nums [3]int, preRelease bool, err error) {
 		s = s[:i]
 	}
 	parts := strings.Split(s, ".")
-	if len(parts) != 3 {
-		return out, preRelease, fmt.Errorf("%q is not a three-part version", v)
+	// THREE or FOUR. The fourth is a development build's timestamp,
+	// making it a dev suffix ON the release it was built from:
+	//
+	//	1.4.1 < 1.4.1.20260916170302 < 1.4.1.20260916170303 < 1.4.2
+	//
+	// A released build keeps three parts and the missing fourth reads as
+	// 0, so it sorts below any dev build of the same release and the
+	// next patch still wins. That is what keeps a dev build ahead of what
+	// it was built from and behind what comes next, rather than being
+	// incomparable — which would have meant a dev build never being
+	// offered an update at all.
+	if len(parts) < 3 || len(parts) > 4 {
+		return out, preRelease, fmt.Errorf("%q is not a three- or four-part version", v)
+	}
+	// An ABSENT fourth part is -1, not 0. Zero would make a release and a
+	// dev build stamped .0 compare EQUAL, and equal is the one answer
+	// that stops an update without saying anything: isNewer returns
+	// false and Apply reports nothing available. With -1 the release sits
+	// strictly below every dev build made from it, including the
+	// degenerate .0, and no value of the fourth part can tie:
+	//
+	//	1.4.1 < 1.4.1.0 < 1.4.1.20260916170302 < 1.4.2
+	if len(parts) == 3 {
+		out[3] = -1
 	}
 	for i, p := range parts {
+		// Numerically, never as text: a 14-digit timestamp compared as a
+		// string against a one-digit patch orders backwards.
 		n, err := strconv.Atoi(p)
 		if err != nil {
-			return out, preRelease, fmt.Errorf("%q is not a three-part version", v)
+			return out, preRelease, fmt.Errorf("%q is not a three- or four-part version", v)
 		}
 		out[i] = n
 	}

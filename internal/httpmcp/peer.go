@@ -14,11 +14,21 @@ import (
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
-// maxBufferedEvents bounds what one HTTP-MCP peer may hold undrained.
+// maxBufferedEvents is how much undelivered traffic one HTTP-MCP peer
+// will hold before its connection is given up entirely.
 //
 // Generous — a reader that is working never approaches it — and finite,
 // because the alternative is one abandoned MCP session holding every
 // message of a busy conversation until the process ends.
+//
+// Past it the peer is DISCONNECTED rather than trimmed. Dropping the
+// oldest would leave a live connection whose stream has a hole in it,
+// and every later message would arrive looking perfectly normal; the
+// reader would have no way to know it had missed anything. Ending the
+// connection makes the state unambiguous, and nothing is lost: the
+// server holds the messages and the position only advances on
+// confirmation, so reconnecting and catching up rebuilds exactly what
+// was missed.
 const maxBufferedEvents = 2000
 
 // httpPeer implements hubsession.Peer directly, buffering delivered events
@@ -39,12 +49,13 @@ type httpPeer struct {
 
 	mu     sync.Mutex
 	buffer []hubconn.Event
-	// dropped counts events discarded because the buffer was full, so the
-	// reader is TOLD rather than handed a silently incomplete stream. A
-	// gap nobody mentions is the one thing this project refuses to
-	// produce; the count turns it into a stated one, recoverable with
-	// hub_catch_up.
-	dropped int
+	// abandoned records that this peer was given up because its buffer
+	// grew past what a reader that is reading could ever leave undrained
+	// — see maxBufferedEvents.
+	abandoned bool
+	// onAbandon ends the connection when that happens. Set by whoever
+	// owns the peer, since the peer itself knows nothing about sessions.
+	onAbandon func()
 	// woken is closed (and immediately replaced) every time Deliver adds to
 	// buffer, waking anything blocked in Wait — the same
 	// close-and-replace-a-channel pattern used to broadcast "something
@@ -82,33 +93,28 @@ func (p *httpPeer) Deliver(event any) {
 		return
 	}
 	p.mu.Lock()
-	// Bounded, because this buffer belongs to a reader that may never
-	// come back: an MCP session that stopped calling hub_receive leaves
-	// this growing for the life of the process, holding every message of
-	// a busy conversation. Past the bound the OLDEST are dropped — what
-	// is dropped is still on the server and reachable by catch-up, while
-	// the newest is what a returning reader actually needs.
-	if len(p.buffer) >= maxBufferedEvents {
-		drop := len(p.buffer) - maxBufferedEvents + 1
-		p.buffer = append([]hubconn.Event(nil), p.buffer[drop:]...)
-		p.dropped += drop
-	}
 	p.buffer = append(p.buffer, ev)
+	abandoned := len(p.buffer) > maxBufferedEvents
+	if abandoned {
+		p.abandoned = true
+	}
 	close(p.woken)
 	p.woken = make(chan struct{})
 	p.mu.Unlock()
+	if abandoned && p.onAbandon != nil {
+		// Outside the lock: giving up the connection reaches back into
+		// the session, which takes locks of its own.
+		p.onAbandon()
+	}
 }
 
-// TakeDropped reports how many events this peer discarded since the last
-// call, and clears the count. Callers surface it to the reader: a
-// truncated stream that says so is recoverable, one that does not is the
-// failure this whole codebase exists to prevent.
-func (p *httpPeer) TakeDropped() int {
+// Abandoned reports whether this peer was given up because nothing was
+// draining it. A reader needs the difference: every other ending is "the
+// connection dropped", while this one is "you were not reading".
+func (p *httpPeer) Abandoned() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	n := p.dropped
-	p.dropped = 0
-	return n
+	return p.abandoned
 }
 
 // Close implements hubsession.Peer — see its doc comment. httpPeer has no

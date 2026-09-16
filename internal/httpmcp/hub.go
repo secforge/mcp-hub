@@ -106,6 +106,12 @@ func (s *Server) connect(mcpSessionID, sessionID, name, agePublicKey, reconnectS
 	var peer *httpPeer
 	hubSession.Join(reconnectSecret, func(id string) hubsession.Peer {
 		peer = newHTTPPeer(id, name, agePublicKey)
+		// Giving up on a peer nothing is draining ends its connection
+		// the same way an explicit hub_disconnect would: the state
+		// becomes unambiguously "not connected" rather than a live
+		// session with a hole in its stream. The peer keeps its
+		// abandoned flag, so the next tool call can say WHY.
+		peer.onAbandon = func() { s.disconnect(mcpSessionID) }
 		return peer
 	}, nil)
 

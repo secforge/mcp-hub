@@ -48,6 +48,19 @@ if [[ -n "$(git status --porcelain)" ]]; then
 	exit 1
 fi
 
+# LastRelease is what a DEVELOPMENT build numbers itself from
+# (2.4.1.20260916170302), so it has to name the release about to be cut —
+# not the one before it. Checked rather than edited here: editing it would
+# dirty the tree this script just refused to build from, so the bump
+# belongs in the commit being released.
+CURRENT_LAST="$(go run ./internal/version/cmd/last 2>/dev/null || true)"
+if [[ "$CURRENT_LAST" != "$VERSION" ]]; then
+	echo "refusing: internal/version.LastRelease is ${CURRENT_LAST:-unset}, not $VERSION —" >&2
+	echo "          dev builds would number themselves from the wrong release." >&2
+	echo "          Update the constant, commit it, then run this again." >&2
+	exit 1
+fi
+
 if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
 	echo "refusing: tag $VERSION already exists" >&2
 	exit 1

@@ -95,3 +95,35 @@ func TestWaitReturnsImmediatelyIfAlreadyBuffered(t *testing.T) {
 		t.Fatalf("expected 1 already-buffered event, got %d", len(events))
 	}
 }
+
+// A peer nothing is draining is given up, not trimmed. Dropping the
+// oldest would leave a live connection whose stream has a hole in it and
+// every later message arriving looking normal; ending it makes the state
+// unambiguous, and everything is still on the server.
+func TestAnUndrainedPeerIsAbandonedRatherThanTrimmed(t *testing.T) {
+	p := newHTTPPeer("p1", "test", "")
+	ended := 0
+	p.onAbandon = func() { ended++ }
+
+	for i := 0; i < maxBufferedEvents; i++ {
+		p.Deliver(wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "hello", "2026-09-16T00:00:00Z", nil, "", "", nil))
+	}
+	if p.Abandoned() || ended != 0 {
+		t.Fatalf("expected a peer within the bound to be left alone, abandoned=%v ended=%d",
+			p.Abandoned(), ended)
+	}
+
+	p.Deliver(wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "one too many", "2026-09-16T00:00:00Z", nil, "", "", nil))
+	if !p.Abandoned() {
+		t.Fatal("expected the peer to be abandoned past the bound")
+	}
+	if ended != 1 {
+		t.Fatalf("expected the connection to be ended exactly once, got %d", ended)
+	}
+
+	// Nothing was thrown away on the way: what it held is still there to
+	// be read, which is what makes "reconnect and catch up" honest.
+	if got := len(p.Drain()); got != maxBufferedEvents+1 {
+		t.Fatalf("expected everything buffered to survive, got %d", got)
+	}
+}

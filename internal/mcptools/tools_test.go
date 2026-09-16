@@ -1961,11 +1961,17 @@ func TestSelfUpdateReportsAnAlreadyInstalledUpdateWithoutTouchingTheNetwork(t *t
 	}
 }
 
-// A development build carries a revision, not a release version, so there
-// is nothing to compare a published tag against. It must refuse rather
-// than guess — guessing "older" would let a connect failure silently
-// replace someone's working-tree build with a release.
-func TestSelfUpdateRefusesToCompareADevelopmentBuild(t *testing.T) {
+// A development build IS comparable now — it is numbered from the release
+// it was built from plus a build stamp, so it sorts above that release
+// and below the next one. What this asserts is that the comparison
+// happens at all rather than being refused: the run must get past the
+// version check and fail on something later, not stop at "not a release
+// version".
+//
+// It used to assert the opposite, when a dev build carried only a
+// revision. The premise changed with the numbering; the test says what is
+// true now.
+func TestSelfUpdateComparesADevelopmentBuild(t *testing.T) {
 	exe := selfUpdateStubBinary(t, version.Short())
 	restore := selfupdate.SetExecutablePathForTest(exe)
 	// The stand-in is written during this test, so it is newer than this
@@ -1988,8 +1994,12 @@ func TestSelfUpdateRefusesToCompareADevelopmentBuild(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("expected a refusal rather than an update, got: %s", textOf(res))
 	}
-	if !strings.Contains(textOf(res), "not a release version") {
-		t.Fatalf("expected the reason to be an uncomparable version, got: %s", textOf(res))
+	if strings.Contains(textOf(res), "not a release version") {
+		t.Fatalf("expected the version to be compared, not refused as uncomparable: %s", textOf(res))
+	}
+	// It got past the comparison and stopped for a real reason, stated.
+	if !strings.Contains(textOf(res), "publishes no mcp-hub-client") {
+		t.Fatalf("expected it to fail on the missing asset, got: %s", textOf(res))
 	}
 	if !strings.Contains(textOf(res), "binary is untouched") {
 		t.Fatalf("expected it to state the binary was untouched, got: %s", textOf(res))
