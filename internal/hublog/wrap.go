@@ -1,6 +1,9 @@
 package hublog
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 const wrapWidth = 100
 
@@ -96,7 +99,12 @@ func wrapLine(line string, width int) []string {
 	lines := make([]string, 0, len(words))
 	cur := words[0]
 	for _, w := range words[1:] {
-		if len(cur)+1+len(w) > width {
+		// Runes, because width is a column count: len() counts bytes, so
+		// a line of German or Japanese wrapped at roughly a third of the
+		// intended width. Same mistake as the secret bounds, different
+		// file — which is why it was worth sweeping for rather than
+		// fixing where it was noticed.
+		if utf8.RuneCountInString(cur)+1+utf8.RuneCountInString(w) > width {
 			lines = append(lines, cur)
 			cur = w
 			continue

@@ -14,6 +14,13 @@ import (
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
+// maxBufferedEvents bounds what one HTTP-MCP peer may hold undrained.
+//
+// Generous — a reader that is working never approaches it — and finite,
+// because the alternative is one abandoned MCP session holding every
+// message of a busy conversation until the process ends.
+const maxBufferedEvents = 2000
+
 // httpPeer implements hubsession.Peer directly, buffering delivered events
 // for hub_receive/hub_wait/the /watch endpoint to drain — a lighter,
 // in-process sibling of hubconn.Conn's own buffer/Peek/Drain, minus
@@ -32,6 +39,12 @@ type httpPeer struct {
 
 	mu     sync.Mutex
 	buffer []hubconn.Event
+	// dropped counts events discarded because the buffer was full, so the
+	// reader is TOLD rather than handed a silently incomplete stream. A
+	// gap nobody mentions is the one thing this project refuses to
+	// produce; the count turns it into a stated one, recoverable with
+	// hub_catch_up.
+	dropped int
 	// woken is closed (and immediately replaced) every time Deliver adds to
 	// buffer, waking anything blocked in Wait — the same
 	// close-and-replace-a-channel pattern used to broadcast "something
@@ -69,10 +82,33 @@ func (p *httpPeer) Deliver(event any) {
 		return
 	}
 	p.mu.Lock()
+	// Bounded, because this buffer belongs to a reader that may never
+	// come back: an MCP session that stopped calling hub_receive leaves
+	// this growing for the life of the process, holding every message of
+	// a busy conversation. Past the bound the OLDEST are dropped — what
+	// is dropped is still on the server and reachable by catch-up, while
+	// the newest is what a returning reader actually needs.
+	if len(p.buffer) >= maxBufferedEvents {
+		drop := len(p.buffer) - maxBufferedEvents + 1
+		p.buffer = append([]hubconn.Event(nil), p.buffer[drop:]...)
+		p.dropped += drop
+	}
 	p.buffer = append(p.buffer, ev)
 	close(p.woken)
 	p.woken = make(chan struct{})
 	p.mu.Unlock()
+}
+
+// TakeDropped reports how many events this peer discarded since the last
+// call, and clears the count. Callers surface it to the reader: a
+// truncated stream that says so is recoverable, one that does not is the
+// failure this whole codebase exists to prevent.
+func (p *httpPeer) TakeDropped() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := p.dropped
+	p.dropped = 0
+	return n
 }
 
 // Close implements hubsession.Peer — see its doc comment. httpPeer has no

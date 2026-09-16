@@ -202,6 +202,15 @@ func (s *Session) Leave(p Peer) (empty bool) {
 	return empty
 }
 
+// isEmpty reports whether nobody is in this session right now. Used by
+// Manager.Remove to re-check at the moment of deletion rather than act on
+// an answer that was true when Leave returned it.
+func (s *Session) isEmpty() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.peers) == 0
+}
+
 // Peers returns a snapshot of everyone currently in the session, in no
 // particular order.
 func (s *Session) Peers() []Peer {
@@ -286,6 +295,24 @@ func (m *Manager) GetOrCreate(id string) *Session {
 // (also never rotated/cleaned) — see identitystore's own doc comment.
 func (m *Manager) Remove(id string) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return
+	}
+	// Re-checked HERE, under the manager's own lock, rather than trusted
+	// from Leave's answer. Leave reports "empty" and the caller then asks
+	// for removal; a peer joining between those two calls is admitted to
+	// this Session and would then be evicted with it. The next join
+	// builds a SECOND Session under the same id, and two peers correctly
+	// joined to the same session sit in different objects — invisible to
+	// each other, with no error anywhere to say so.
+	//
+	// The interleaving needs a drop and an immediate redial, which is
+	// exactly the fast reconnect a stored secret exists to make work. So
+	// the failure is reserved for the path most likely to be taken.
+	if !s.isEmpty() {
+		return
+	}
 	delete(m.sessions, id)
-	m.mu.Unlock()
 }

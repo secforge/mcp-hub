@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -118,7 +119,11 @@ func (h *Handler) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reconnectSecret := r.URL.Query().Get("reconnectSecret")
-	if len(reconnectSecret) > MaxReconnectSecretRunes {
+	// Runes, as the constant says. len() counts BYTES, so a secret in
+	// German or CJK was refused at roughly a third of the documented
+	// limit — a limit that means something different depending on the
+	// language it is written in.
+	if utf8.RuneCountInString(reconnectSecret) > MaxReconnectSecretRunes {
 		http.Error(w, "reconnectSecret too long", http.StatusBadRequest)
 		return
 	}
@@ -157,7 +162,10 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 	_, reused := session.Join(reconnectSecret,
 		func(id string) hubsession.Peer {
 			peerID = id
-			p = &peer{id: id, conn: conn, done: done, name: name, agePublicKey: agePublicKey, pingPeriod: snapPingPeriod, writeWait: snapWriteWait}
+			p = &peer{id: id, conn: conn, done: done, name: name, agePublicKey: agePublicKey,
+				pingPeriod: snapPingPeriod, writeWait: snapWriteWait,
+				out: make(chan any, outboundQueue)}
+			go p.writeLoop()
 			return p
 		},
 		func(existingCount int) {
@@ -171,6 +179,8 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 		logger.AppendJoined(peerID, name, agePublicKey, reused, reconnectSecret != "", time.Now().UTC().Format(time.RFC3339))
 	}
 	defer func() {
+		// Stops the writer goroutine; safe to call more than once.
+		p.closeOut()
 		if logger != nil {
 			logger.AppendLeft(peerID, time.Now().UTC().Format(time.RFC3339))
 		}
@@ -215,6 +225,21 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 	}
 }
 
+// outboundQueue bounds what one peer may have waiting to be written.
+//
+// A peer that has stopped reading is the case this exists for: TCP stops
+// accepting, the write blocks, and before this every other peer's
+// delivery queued up behind it — while the SESSION LOCK was held, so the
+// whole conversation stopped for one dead socket. The queue turns "every
+// peer waits for the slowest" into "the slowest peer loses its own
+// messages", which is the trade a chat wants.
+//
+// Deep enough to absorb an ordinary burst, shallow enough that a peer
+// which has genuinely stopped is disconnected rather than accumulating a
+// backlog nobody will ever read — and what a dropped peer misses is
+// recoverable: the server holds the messages, and catch-up walks them.
+const outboundQueue = 64
+
 type peer struct {
 	id           string
 	mu           sync.Mutex
@@ -224,16 +249,64 @@ type peer struct {
 	agePublicKey string
 	pingPeriod   time.Duration
 	writeWait    time.Duration
+	// out carries events to the single goroutine that writes them, so a
+	// Deliver never blocks on the network. Closed once, by closeOut.
+	out       chan any
+	closeOnce sync.Once
 }
 
 func (p *peer) ID() string           { return p.id }
 func (p *peer) Name() string         { return p.name }
 func (p *peer) AgePublicKey() string { return p.agePublicKey }
 
+// Deliver hands an event to this peer's writer goroutine and returns
+// immediately. It never touches the network, so a caller holding a
+// session lock cannot be stalled by a socket.
+//
+// A full queue means this peer has stopped consuming: it is disconnected
+// rather than served, because the alternative is an unbounded buffer for
+// a reader that is not reading. Nothing is lost that cannot be recovered
+// — the server still holds the messages and catch-up walks them — and a
+// peer told nothing would sit there looking alive.
 func (p *peer) Deliver(event any) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_ = p.conn.WriteJSON(event)
+	select {
+	case p.out <- event:
+	default:
+		p.closeOut()
+	}
+}
+
+// closeOut ends this peer's outbound side once, which stops the writer
+// goroutine and closes the socket, so the blocked ReadMessage in serve
+// returns and the ordinary teardown runs.
+func (p *peer) closeOut() {
+	p.closeOnce.Do(func() {
+		close(p.out)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		_ = p.conn.Close()
+	})
+}
+
+// writeLoop is the ONLY place this peer's socket is written for events.
+// One goroutine, so writes cannot interleave, and a deadline on each so a
+// wedged connection ends instead of holding this goroutine forever.
+func (p *peer) writeLoop() {
+	for event := range p.out {
+		p.mu.Lock()
+		_ = p.conn.SetWriteDeadline(time.Now().Add(p.writeWait))
+		err := p.conn.WriteJSON(event)
+		p.mu.Unlock()
+		if err != nil {
+			// The connection is gone or wedged. Closing makes the reader
+			// return and run the normal teardown; draining the rest keeps
+			// this loop from blocking a Deliver that is already in flight.
+			p.closeOut()
+			for range p.out {
+			}
+			return
+		}
+	}
 }
 
 // Close implements hubsession.Peer — see its doc comment on why this must

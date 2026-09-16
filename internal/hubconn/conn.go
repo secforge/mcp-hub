@@ -394,6 +394,11 @@ type Conn struct {
 	// thirteen call sites that needed it.
 	writeMu sync.Mutex
 	budget  *budget
+	// budgetOwner identifies this connection inside a SHARED window, so a
+	// confirm releases what this connection delivered rather than a
+	// prefix of everyone's. Empty where the window is this connection's
+	// alone — see ShareDeliveryBudget.
+	budgetOwner string
 	// skippedHeld records that a confirm released a prefix containing a
 	// message the window had held back, so the next tool result can tell
 	// the reader their position moved over something they never saw.
@@ -1095,7 +1100,7 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	// A confirm names a POSITION, so it releases a prefix of the ledger
 	// rather than clearing it: bytes delivered after this cursor are still
 	// occupying the reader's context, unread rather than freed.
-	if c.budget != nil && c.budget.release(cursor) {
+	if c.budget != nil && c.budget.release(c.budgetOwner, cursor) {
 		// The confirm just moved the read position past a message the
 		// delivery window refused to send. Nothing is lost — the server
 		// still holds it and the gap is retrievable — but the reader
@@ -2156,7 +2161,7 @@ func (c *Conn) NoteHandedOver(events []Event) {
 		return
 	}
 	for _, e := range events {
-		c.budget.note(e.Cursor)
+		c.budget.note(c.budgetOwner, e.Cursor)
 	}
 }
 
@@ -2233,7 +2238,7 @@ func (c *Conn) applyBudget(events []Event, cost func(Event) int) []Event {
 		// that could reopen it. They are a line or two each; withholding
 		// them saves nothing worth having.
 		if e.Kind == "msg" && !(e.IsOperator || e.MentionedMe) && c.budget.closed() {
-			if announce, held := c.budget.hold(e.Cursor); announce {
+			if announce, held := c.budget.hold(c.budgetOwner, e.Cursor); announce {
 				out = append(out, Event{Kind: "deliveryHeld", HeldCount: held})
 			}
 			continue
@@ -2241,7 +2246,7 @@ func (c *Conn) applyBudget(events []Event, cost func(Event) int) []Event {
 		shaped := c.budget.shape(e)
 		out = append(out, shaped)
 		if shaped.Cursor != "" {
-			c.budget.charge(shaped.Cursor, cost(shaped))
+			c.budget.charge(c.budgetOwner, shaped.Cursor, cost(shaped))
 		}
 	}
 	return out

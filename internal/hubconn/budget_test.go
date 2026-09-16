@@ -27,11 +27,11 @@ func msg(cursor string, size int) Event {
 // context — the exact overspend the window exists to prevent.
 func TestConfirmReleasesOnlyThePrefixUpToTheConfirmedCursor(t *testing.T) {
 	b := testBudget(t)
-	b.charge("c1", 100)
-	b.charge("c2", 200)
-	b.charge("c3", 400)
+	b.charge("", "c1", 100)
+	b.charge("", "c2", 200)
+	b.charge("", "c3", 400)
 
-	b.release("c2")
+	b.release("", "c2")
 
 	if b.bytes != 400 {
 		t.Fatalf("bytes after confirming c2 = %d, want 400 (c3 still unread)", b.bytes)
@@ -46,9 +46,9 @@ func TestConfirmReleasesOnlyThePrefixUpToTheConfirmedCursor(t *testing.T) {
 // push budget and therefore frees none.
 func TestConfirmingAnUnchargedCursorReleasesNothing(t *testing.T) {
 	b := testBudget(t)
-	b.charge("c1", 100)
+	b.charge("", "c1", 100)
 
-	b.release("pulled-not-pushed")
+	b.release("", "pulled-not-pushed")
 
 	if b.bytes != 100 || len(b.outstanding) != 1 {
 		t.Fatalf("bytes=%d outstanding=%d, want the ledger untouched", b.bytes, len(b.outstanding))
@@ -58,15 +58,15 @@ func TestConfirmingAnUnchargedCursorReleasesNothing(t *testing.T) {
 func TestTheWindowClosesOnBytesAndReopensOnConfirm(t *testing.T) {
 	b := testBudget(t)
 	b.windowBytes = 1000
-	b.charge("c1", 600)
+	b.charge("", "c1", 600)
 	if b.closed() {
 		t.Fatal("window closed at 600 of 1000")
 	}
-	b.charge("c2", 500)
+	b.charge("", "c2", 500)
 	if !b.closed() {
 		t.Fatal("window still open at 1100 of 1000")
 	}
-	b.release("c1")
+	b.release("", "c1")
 	if b.closed() {
 		t.Fatal("window still closed at 500 of 1000 after confirming c1")
 	}
@@ -76,7 +76,7 @@ func TestTheWindowClosesOnCountEvenWhenTheBytesAreTiny(t *testing.T) {
 	b := testBudget(t)
 	b.windowCount = 3
 	for _, c := range []string{"c1", "c2", "c3"} {
-		b.charge(c, 1)
+		b.charge("", c, 1)
 	}
 	if !b.closed() {
 		t.Fatalf("window open at 3 messages of 3 (bytes=%d)", b.bytes)
@@ -89,16 +89,16 @@ func TestTheWindowClosesOnCountEvenWhenTheBytesAreTiny(t *testing.T) {
 // waiting rather than merely that something is.
 func TestAClosedWindowIsAnnouncedOnceAndKeepsCounting(t *testing.T) {
 	b := testBudget(t)
-	announce, held := b.hold("held-cursor")
+	announce, held := b.hold("", "held-cursor")
 	if !announce || held != 1 {
 		t.Fatalf("first hold = (%v, %d), want (true, 1)", announce, held)
 	}
 	for i := 0; i < 4; i++ {
-		if announce, _ = b.hold(fmt.Sprintf("held-%d", i)); announce {
+		if announce, _ = b.hold("", fmt.Sprintf("held-%d", i)); announce {
 			t.Fatal("the closure was announced a second time")
 		}
 	}
-	if _, held = b.hold("held-last"); held != 6 {
+	if _, held = b.hold("", "held-last"); held != 6 {
 		t.Fatalf("held = %d, want 6", held)
 	}
 }
@@ -106,10 +106,10 @@ func TestAClosedWindowIsAnnouncedOnceAndKeepsCounting(t *testing.T) {
 func TestReopeningTheWindowRearmsTheAnnouncement(t *testing.T) {
 	b := testBudget(t)
 	b.windowBytes = 100
-	b.charge("c1", 200)
-	b.hold("held-cursor")
-	b.release("c1")
-	announce, held := b.hold("held-cursor")
+	b.charge("", "c1", 200)
+	b.hold("", "held-cursor")
+	b.release("", "c1")
+	announce, held := b.hold("", "held-cursor")
 	if !announce || held != 1 {
 		t.Fatalf("hold after reopening = (%v, %d), want (true, 1) — a new closure is news again",
 			announce, held)
@@ -209,7 +209,7 @@ func TestApplyBudgetHoldsOrdinaryMessagesOnceTheWindowIsClosed(t *testing.T) {
 func TestMentionsAndOperatorMessagesCrossAClosedWindow(t *testing.T) {
 	c := &Conn{budget: newBudget()}
 	c.budget.windowBytes = 100
-	c.budget.charge("c0", 500)
+	c.budget.charge("", "c0", 500)
 
 	mention := msg("c1", 10)
 	mention.MentionedMe = true
@@ -236,7 +236,7 @@ func TestConfirmingThroughTheConnReopensThePushWindow(t *testing.T) {
 	if !c.budget.closed() {
 		t.Fatal("the window did not close")
 	}
-	c.budget.release("c1")
+	c.budget.release("", "c1")
 	out := c.applyBudget([]Event{msg("c2", 10)}, deliveredCost)
 	if len(out) != 1 || out[0].Kind != "msg" {
 		t.Fatalf("after confirming, delivery gave %+v, want the message through", out)
@@ -314,18 +314,18 @@ func TestABurstOfShortMessagesClosesTheWindowOnFramingAlone(t *testing.T) {
 func TestConfirmingACursorThatWasPulledRatherThanPushedReopensTheWindow(t *testing.T) {
 	b := testBudget(t)
 	b.windowBytes = 1000
-	b.charge("pushed-1", 1200)
+	b.charge("", "pushed-1", 1200)
 	if !b.closed() {
 		t.Fatal("window did not close")
 	}
-	b.hold("held-2")
+	b.hold("", "held-2")
 
 	// What hub_catch_up hands over is recorded at zero cost — it spends no
 	// push budget, but it must have a POSITION.
-	b.note("held-2")
-	b.note("walked-3")
+	b.note("", "held-2")
+	b.note("", "walked-3")
 
-	if skipped := b.release("walked-3"); !skipped {
+	if skipped := b.release("", "walked-3"); !skipped {
 		t.Error("releasing past a held message did not report the skip")
 	}
 	if b.closed() {
@@ -339,14 +339,14 @@ func TestConfirmingACursorThatWasPulledRatherThanPushedReopensTheWindow(t *testi
 // mid-gap obeys.
 func TestReleasingPastAHeldMessageReportsTheSkip(t *testing.T) {
 	b := testBudget(t)
-	b.charge("a", 1)
-	b.hold("b")
-	b.note("c")
+	b.charge("", "a", 1)
+	b.hold("", "b")
+	b.note("", "c")
 
-	if skipped := b.release("a"); skipped {
+	if skipped := b.release("", "a"); skipped {
 		t.Error("releasing before the held message reported a skip")
 	}
-	if skipped := b.release("c"); !skipped {
+	if skipped := b.release("", "c"); !skipped {
 		t.Error("releasing past the held message did not report a skip")
 	}
 }
@@ -358,20 +358,20 @@ func TestReleasingPastAHeldMessageReportsTheSkip(t *testing.T) {
 func TestAnUnknownCursorReleasesNothingButMakesTheClosureAnnounceableAgain(t *testing.T) {
 	b := testBudget(t)
 	b.windowBytes = 100
-	b.charge("known", 500)
-	if announce, _ := b.hold("h1"); !announce {
+	b.charge("", "known", 500)
+	if announce, _ := b.hold("", "h1"); !announce {
 		t.Fatal("first closure was not announced")
 	}
-	if announce, _ := b.hold("h2"); announce {
+	if announce, _ := b.hold("", "h2"); announce {
 		t.Fatal("announced twice in a row")
 	}
 
-	b.release("a-cursor-this-ledger-never-saw")
+	b.release("", "a-cursor-this-ledger-never-saw")
 
 	if b.bytes != 500 {
 		t.Fatalf("bytes = %d, want 500 — an unlocatable cursor must not release", b.bytes)
 	}
-	if announce, _ := b.hold("h3"); !announce {
+	if announce, _ := b.hold("", "h3"); !announce {
 		t.Fatal("the closure stayed silent after an unlocatable confirm")
 	}
 }
@@ -382,7 +382,7 @@ func TestAnUnknownCursorReleasesNothingButMakesTheClosureAnnounceableAgain(t *te
 func TestAClosedWindowStillDeliversThisClientsOwnNotices(t *testing.T) {
 	c := &Conn{budget: newBudget()}
 	c.budget.windowBytes = 100
-	c.budget.charge("c0", 500)
+	c.budget.charge("", "c0", 500)
 
 	out := c.applyBudget([]Event{
 		msg("m1", 10),
@@ -416,7 +416,7 @@ func TestAClosedWindowStillDeliversThisClientsOwnNotices(t *testing.T) {
 // the correction replaces it rather than adding a second entry.
 func TestAdjustingACostCorrectsTheEntryRatherThanDoubleCharging(t *testing.T) {
 	b := testBudget(t)
-	b.charge("c1", 100)
+	b.charge("", "c1", 100)
 	b.adjust("c1", 180)
 	if b.bytes != 180 {
 		t.Fatalf("bytes = %d, want 180", b.bytes)
@@ -467,5 +467,63 @@ func TestASecondClaimOfTheSameKindIsRefusedRatherThanReplacingTheFirst(t *testin
 		t.Fatalf("an unrelated ack kind was refused: %v", err)
 	} else {
 		cancelOther()
+	}
+}
+
+// One window shared by several connections must release per CONNECTION,
+// not per position. A confirm says "I have read up to here" about one
+// conversation; another connection's entries interleaved before it are
+// still unread and still occupying the reader. Releasing them credits
+// back budget nobody confirmed — and does it exactly when several
+// conversations are busy, which is when the ceiling is load-bearing.
+func TestASharedWindowReleasesOnlyTheConfirmingConnection(t *testing.T) {
+	b := newBudget()
+	b.charge("alpha", "a1", 100)
+	b.charge("beta", "b1", 100)
+	b.charge("alpha", "a2", 100)
+	b.charge("beta", "b2", 100)
+
+	// alpha confirms its latest. Only alpha's 200 bytes come back.
+	b.release("alpha", "a2")
+	b.mu.Lock()
+	gotBytes, gotEntries := b.bytes, len(b.outstanding)
+	b.mu.Unlock()
+	if gotBytes != 200 {
+		t.Fatalf("expected beta's 200 bytes to stay charged, window holds %d", gotBytes)
+	}
+	if gotEntries != 2 {
+		t.Fatalf("expected beta's two entries to remain, got %d", gotEntries)
+	}
+	for _, ch := range b.outstanding {
+		if ch.owner != "beta" {
+			t.Fatalf("expected only beta's entries to survive, found %q", ch.owner)
+		}
+	}
+
+	// And beta's own confirm releases beta's.
+	b.release("beta", "b2")
+	b.mu.Lock()
+	gotBytes, gotEntries = b.bytes, len(b.outstanding)
+	b.mu.Unlock()
+	if gotBytes != 0 || gotEntries != 0 {
+		t.Fatalf("expected an empty window after both confirmed, got %d bytes / %d entries",
+			gotBytes, gotEntries)
+	}
+}
+
+// A cursor belonging to another connection locates nothing, so it
+// releases nothing — the client refuses such a confirm before it reaches
+// here, and this is the second line of that defence.
+func TestAForeignCursorReleasesNothing(t *testing.T) {
+	b := newBudget()
+	b.charge("alpha", "a1", 100)
+	b.charge("beta", "b1", 100)
+
+	b.release("beta", "a1")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.bytes != 200 || len(b.outstanding) != 2 {
+		t.Fatalf("expected nothing released for a foreign cursor, got %d bytes / %d entries",
+			b.bytes, len(b.outstanding))
 	}
 }

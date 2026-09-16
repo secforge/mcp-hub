@@ -791,7 +791,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	// reader's own budget by the reader's own decision. The spill
 	// directory is the same one received attachments use, and dies with
 	// the connection for the same reason.
-	conn.ShareDeliveryBudget(s.hub.budget)
+	conn.ShareDeliveryBudget(s.hub.budget, s.name)
 	conn.SetDeliveryBudget(s.hub.spillDir, 0, 0, 0)
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
@@ -1788,7 +1788,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// reader's own budget by the reader's own decision. The spill
 	// directory is the same one received attachments use, and dies with
 	// the connection for the same reason.
-	conn.ShareDeliveryBudget(s.hub.budget)
+	conn.ShareDeliveryBudget(s.hub.budget, s.name)
 	conn.SetDeliveryBudget(s.hub.spillDir, 0, 0, 0)
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers

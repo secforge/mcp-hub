@@ -267,10 +267,24 @@ func (s *Server) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError("not connected"), nil
 	}
 	events := peer.Drain()
+	note := droppedNote(peer.TakeDropped())
 	if len(events) == 0 {
-		return mcp.NewToolResultText("no new events"), nil
+		return mcp.NewToolResultText("no new events" + note), nil
 	}
-	return resultWithAttachments(hubconn.FormatEvents(events), events), nil
+	return resultWithAttachments(hubconn.FormatEvents(events)+note, events), nil
+}
+
+// droppedNote states a gap rather than leaving one. A buffer that
+// overflowed and said nothing hands a reader a stream with a hole in it
+// that reads exactly like a quiet conversation; saying so makes it
+// recoverable, since everything dropped is still on the server.
+func droppedNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("\n\n[hub: %d event(s) were DROPPED before this — this connection's buffer "+
+		"filled up while nothing was reading it. They are still on the server: hub_catch_up "+
+		"retrieves them. Do not treat what follows as contiguous with what you read last.]", n)
 }
 
 func (s *Server) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -287,9 +301,9 @@ func (s *Server) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	defer cancel()
 	events, err := peer.Wait(waitCtx)
 	if err != nil {
-		return mcp.NewToolResultText("no new events"), nil
+		return mcp.NewToolResultText("no new events" + droppedNote(peer.TakeDropped())), nil
 	}
-	return resultWithAttachments(hubconn.FormatEvents(events), events), nil
+	return resultWithAttachments(hubconn.FormatEvents(events)+droppedNote(peer.TakeDropped()), events), nil
 }
 
 // resultWithAttachments builds a CallToolResult carrying formatted as its

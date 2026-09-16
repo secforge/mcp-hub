@@ -79,6 +79,15 @@ type budget struct {
 }
 
 type charge struct {
+	// owner names the connection this charge belongs to. It exists
+	// because one window is now shared by several connections, and a
+	// confirm is a statement about ONE of them: releasing a prefix of the
+	// whole ledger would credit back budget for messages another
+	// connection's reader has not confirmed and which are still occupying
+	// the context this window exists to protect. Empty for a client that
+	// never shared its window, where the ledger has one owner by
+	// construction.
+	owner  string
 	cursor string
 	bytes  int
 	// held marks an entry the window refused to deliver. It occupies no
@@ -110,11 +119,16 @@ func newBudget() *budget {
 // Deliberately a replacement rather than a second layer: two windows
 // would each be satisfied while their sum was not, which is the exact
 // arithmetic that made a per-connection window wrong.
-func (c *Conn) ShareDeliveryBudget(b *Budget) {
+func (c *Conn) ShareDeliveryBudget(b *Budget, owner string) {
 	if b == nil {
 		return
 	}
 	c.budget = b
+	// The owner is this connection's identity INSIDE the shared ledger,
+	// so a confirm releases what this connection delivered and nothing
+	// else. Unshared windows leave it empty, which is correct: a ledger
+	// with one owner needs no filter.
+	c.budgetOwner = owner
 }
 
 // SetDeliveryBudget configures the push policy. spillDir is called only
@@ -140,10 +154,10 @@ func (c *Conn) SetDeliveryBudget(spillDir func() (string, error), spillBytes, wi
 // what a reader fetches for itself with hub_catch_up or hub_read is its
 // own decision to spend, and charging for it would make reading feel
 // expensive, which is the opposite of the intent.
-func (b *budget) charge(cursor string, n int) {
+func (b *budget) charge(owner, cursor string, n int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.outstanding = append(b.outstanding, charge{cursor: cursor, bytes: n})
+	b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor, bytes: n})
 	b.bytes += n
 }
 
@@ -152,19 +166,26 @@ func (b *budget) charge(cursor string, n int) {
 // entry — a message the window refused to deliver — because confirming
 // past one moves the read position over content the reader never saw, and
 // silence is exactly what that must not produce.
-func (b *budget) release(cursor string) (skipped bool) {
+func (b *budget) release(owner, cursor string) (skipped bool) {
 	if cursor == "" {
 		return false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// Release a PREFIX located by position. The ledger is in delivery
-	// order — this client's own arrival sequence — so "everything up to
-	// and including that cursor" is an index, and no comparison of one
-	// opaque cursor against another is needed. That matters: a cursor's
-	// format and precision belong to the server, today's happen to be
-	// sortable ticks, and a client that ordered them would be depending on
-	// an accident it was told not to rely on.
+	// Release a PREFIX located by position, WITHIN ONE OWNER. The ledger
+	// is in delivery order — this client's own arrival sequence — so
+	// "everything up to and including that cursor" is an index, and no
+	// comparison of one opaque cursor against another is needed. That
+	// matters: a cursor's format and precision belong to the server,
+	// today's happen to be sortable ticks, and a client that ordered them
+	// would be depending on an accident it was told not to rely on.
+	//
+	// The owner filter is what makes one window safe to share. A confirm
+	// says "I have read up to here" about ONE conversation; the entries
+	// another connection interleaved before it are still unread and still
+	// occupying the reader. Releasing them would credit back budget for
+	// messages nobody confirmed — a ceiling that rises exactly when
+	// several conversations are busy, which is when it is load-bearing.
 	//
 	// For the index to exist, every cursor handed to the model must be in
 	// the ledger — pulled ones at zero cost (see note) and held ones at
@@ -174,7 +195,7 @@ func (b *budget) release(cursor string) (skipped bool) {
 	// and left the window shut forever while hub_confirm reported success.
 	cut := -1
 	for i, ch := range b.outstanding {
-		if ch.cursor == cursor {
+		if ch.owner == owner && ch.cursor == cursor {
 			cut = i
 			break
 		}
@@ -188,18 +209,22 @@ func (b *budget) release(cursor string) (skipped bool) {
 		b.announced = false
 		return
 	}
-	for _, ch := range b.outstanding[:cut+1] {
+	kept := make([]charge, 0, len(b.outstanding))
+	for i, ch := range b.outstanding {
+		if i > cut || ch.owner != owner {
+			kept = append(kept, ch)
+			continue
+		}
+		// At or before the cut AND this owner's: released.
 		if ch.held {
 			skipped = true
 		}
-	}
-	for _, ch := range b.outstanding[:cut+1] {
 		b.bytes -= ch.bytes
 	}
 	if b.bytes < 0 {
 		b.bytes = 0
 	}
-	b.outstanding = append([]charge(nil), b.outstanding[cut+1:]...)
+	b.outstanding = kept
 	if b.bytes < b.windowBytes && len(b.outstanding) < b.windowCount {
 		b.held, b.announced = 0, false
 	}
@@ -239,7 +264,7 @@ func (b *budget) adjust(cursor string, n int) {
 // Without this, the two halves of the design contradict each other: the
 // held-window notice tells the reader to pull and confirm, and confirming
 // what was pulled released nothing at all.
-func (b *budget) note(cursor string) {
+func (b *budget) note(owner, cursor string) {
 	if cursor == "" {
 		return
 	}
@@ -250,7 +275,7 @@ func (b *budget) note(cursor string) {
 			return
 		}
 	}
-	b.outstanding = append(b.outstanding, charge{cursor: cursor})
+	b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor})
 }
 
 // closed reports whether the window is full.
@@ -262,11 +287,11 @@ func (b *budget) closed() bool {
 
 // hold records one withheld event and reports whether the closure still
 // needs announcing.
-func (b *budget) hold(cursor string) (announce bool, heldNow int) {
+func (b *budget) hold(owner, cursor string) (announce bool, heldNow int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if cursor != "" {
-		b.outstanding = append(b.outstanding, charge{cursor: cursor, held: true})
+		b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor, held: true})
 	}
 	b.held++
 	if b.announced {

@@ -1,6 +1,10 @@
 package hublog
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 func TestFormatEntryBasic(t *testing.T) {
 	got := FormatEntry("2026-08-21T10:00:00Z", "peer-1", "hello world")
@@ -159,4 +163,19 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// The width is a COLUMN count, so it counts runes. With len() it counted
+// bytes, and a line of German or Japanese wrapped at roughly a third of
+// the intended width — a limit that quietly meant something different
+// depending on the language it was written in.
+func TestWrapCountsColumnsNotBytes(t *testing.T) {
+	// Ten words of four multi-byte runes each: 49 columns, 98 bytes.
+	word := "südäöü"[:8] // 4 runes, 8 bytes
+	line := strings.TrimSpace(strings.Repeat(word+" ", 10))
+	got := wrapLine(line, 100)
+	if len(got) != 1 {
+		t.Fatalf("expected one wrapped line for %d columns at width 100, got %d: %q",
+			utf8.RuneCountInString(line), len(got), got)
+	}
 }

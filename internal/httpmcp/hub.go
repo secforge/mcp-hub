@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/server"
@@ -72,10 +73,18 @@ func (s *Server) hubFor(mcpSessionID string) *httpHub {
 func (s *Server) connect(mcpSessionID, sessionID, name, agePublicKey, reconnectSecret string) (peerID, joinedSessionID, watchToken string, err error) {
 	hub := s.hubFor(mcpSessionID)
 
+	// Held for the WHOLE connect, not just the check.
+	//
+	// Checking, releasing, then joining let two concurrent hub_connect
+	// calls both pass the check and both join the session — after which
+	// the second overwrote hub.p and the first peer was orphaned: still a
+	// member, still accumulating events into a buffer nobody would ever
+	// read, and never left because nothing remembered it. Nothing here
+	// touches a network, so holding the lock across the join costs an
+	// in-process mutex and closes the window entirely.
 	hub.mu.Lock()
-	alreadyConnected := hub.p != nil
-	hub.mu.Unlock()
-	if alreadyConnected {
+	defer hub.mu.Unlock()
+	if hub.p != nil {
 		return "", "", "", fmt.Errorf("already connected — call hub_disconnect first")
 	}
 
@@ -88,7 +97,8 @@ func (s *Server) connect(mcpSessionID, sessionID, name, agePublicKey, reconnectS
 		return "", "", "", fmt.Errorf("agePublicKey is not a validly formatted age public key")
 	}
 	name = sanitize.Text(name, wsserver.MaxNameRunes)
-	if len(reconnectSecret) > wsserver.MaxReconnectSecretRunes {
+	// Runes, not bytes — see wsserver's own bound for why the two differ.
+	if utf8.RuneCountInString(reconnectSecret) > wsserver.MaxReconnectSecretRunes {
 		return "", "", "", fmt.Errorf("reconnectSecret too long")
 	}
 
@@ -100,11 +110,8 @@ func (s *Server) connect(mcpSessionID, sessionID, name, agePublicKey, reconnectS
 	}, nil)
 
 	s.tokens.Store(peer.watchToken, peer)
-
-	hub.mu.Lock()
 	hub.p = peer
 	hub.sess = hubSession
-	hub.mu.Unlock()
 
 	return peer.ID(), sessionID, peer.watchToken, nil
 }
@@ -119,6 +126,13 @@ func (s *Server) disconnect(mcpSessionID string) {
 	peer, hubSession := hub.p, hub.sess
 	hub.p, hub.sess = nil, nil
 	hub.mu.Unlock()
+
+	// The record goes with the connection. Nilling its fields and keeping
+	// the key left one empty entry per MCP session this process had ever
+	// served, for the life of the process — the same shape as the session
+	// bug above: a cleanup path that exists and does not finish. hubFor
+	// creates a fresh one if this MCP session connects again.
+	s.hubs.Delete(mcpSessionID)
 
 	if peer == nil {
 		return

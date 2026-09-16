@@ -540,3 +540,43 @@ func TestManagerGetOrCreateReturnsSameSession(t *testing.T) {
 		t.Fatal("GetOrCreate should create a fresh session after Remove")
 	}
 }
+
+// Leave says "empty" and the caller then asks for removal. A peer joining
+// between those two calls was admitted to the session that was then
+// evicted, and the next join built a SECOND session under the same id —
+// two peers correctly joined to one session, in different objects,
+// invisible to each other, with nothing anywhere reporting it.
+func TestRemoveDoesNotEvictASessionSomeoneJustJoined(t *testing.T) {
+	m := NewManager()
+	s := m.GetOrCreate("s1")
+
+	first := joinFake(s, "first", "", "", nil)
+	empty := s.Leave(first)
+	if !empty {
+		t.Fatal("expected the session to report empty after its only peer left")
+	}
+
+	// The interleaving: someone joins before the caller acts on "empty".
+	// A drop and an immediate redial is exactly this, which is the fast
+	// reconnect a stored secret exists to make work.
+	joinFake(s, "second", "", "", nil)
+
+	m.Remove("s1")
+
+	if got := m.GetOrCreate("s1"); got != s {
+		t.Fatal("expected the session holding a live peer to survive Remove — " +
+			"a second object under the same id splits the conversation in two")
+	}
+}
+
+// And the ordinary case still cleans up: genuinely empty, genuinely gone.
+func TestRemoveStillDropsAnEmptySession(t *testing.T) {
+	m := NewManager()
+	s := m.GetOrCreate("s2")
+	p := joinFake(s, "only", "", "", nil)
+	s.Leave(p)
+	m.Remove("s2")
+	if got := m.GetOrCreate("s2"); got == s {
+		t.Fatal("expected an empty session to be removed")
+	}
+}
