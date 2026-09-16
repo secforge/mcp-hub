@@ -179,7 +179,7 @@ func TestReportingClearsTheMarkSoItIsNotSaidAgain(t *testing.T) {
 	}
 	// And the entry itself survives — only the mark was cleared, so the
 	// link, name and read position are all still there to reconnect with.
-	stored, ok := connstore.Get(target)
+	stored, ok, _ := connstore.Get(target)
 	if !ok {
 		t.Fatal("expected the entry to survive being reported")
 	}

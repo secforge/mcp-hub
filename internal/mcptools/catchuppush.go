@@ -1,6 +1,8 @@
 package mcptools
 
 import (
+	"github.com/secforge/harness-transport/deliver"
+
 	"fmt"
 	"time"
 
@@ -114,21 +116,39 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 
 		text := conn.ShapeForPush(ev)
 		text += s.saveReceivedAttachments(conn, []hubconn.Event{ev})
-		if _, err := s.pusher.Push(ev.Cursor, text, true); err != nil {
+		receipt, err := s.pusher.Push(ev.Cursor, text, true)
+		if err != nil {
 			// The message is still on the server and the position has not
 			// moved, so this is recoverable — but only if it is said.
 			res.Err = err
 			break
 		}
 
-		// The push IS the hand-over, so the position advances here, the
-		// same way a synchronous delivery advances it.
-		s.mu.Lock()
-		s.lastHandedOverCursor = ev.Cursor
-		s.mu.Unlock()
-		setCatchUpCursor(id, ev.Cursor)
+		// A PUSH IS NOT A HAND-OVER unless the transport says more than
+		// "the bytes left". Its own contract is explicit: a nil error
+		// with ObservedNothing means the write succeeded and arrival is
+		// unverified — which is the case for every push into Claude. So
+		// a nil error alone must not move the persisted position: a
+		// harness that accepts the socket write and then fails to present
+		// the message would leave the position past content nobody read,
+		// and the reconnect that should re-walk it would skip it instead,
+		// while the closing summary promised the opposite.
+		//
+		// The walk's own fetch position is the local anchor below and
+		// moves regardless, so this costs no progress here. What the
+		// cursor gets instead is the "delivered, not confirmed" set,
+		// which an explicit hub_confirm turns into position — the same
+		// route every other unverified delivery takes.
 		conn.NoteHandedOver([]hubconn.Event{ev})
-		s.noteDelivered(ev.Cursor)
+		if receipt.Observation > deliver.ObservedNothing {
+			s.mu.Lock()
+			s.lastHandedOverCursor = ev.Cursor
+			s.mu.Unlock()
+			setCatchUpCursor(id, ev.Cursor)
+			s.noteDelivered(ev.Cursor)
+		} else {
+			s.recordHandedOver([]hubconn.Event{ev})
+		}
 
 		anchor = wire.Anchor{Cursor: ev.Cursor}
 		res.Delivered++

@@ -76,11 +76,11 @@ func TestDifferentProjectsWithTheSameLinkAreDistinctEntries(t *testing.T) {
 		t.Fatalf("upsert b: %v", err)
 	}
 
-	gotA, ok := Get(targetA)
+	gotA, ok, _ := Get(targetA)
 	if !ok || gotA.ReconnectSecret != "secret-a" {
 		t.Fatalf("expected project a's own entry, got %+v (ok=%v)", gotA, ok)
 	}
-	gotB, ok := Get(targetB)
+	gotB, ok, _ := Get(targetB)
 	if !ok || gotB.ReconnectSecret != "secret-b" {
 		t.Fatalf("expected project b's own entry, got %+v (ok=%v)", gotB, ok)
 	}
@@ -106,7 +106,7 @@ func TestSameProjectAndLinkOverwritesNotDuplicates(t *testing.T) {
 		t.Fatalf("second upsert: %v", err)
 	}
 
-	got, ok := Get(target)
+	got, ok, _ := Get(target)
 	if !ok || got.PeerID != "peer-2" {
 		t.Fatalf("expected the second upsert to overwrite the first within the same project, got %+v (ok=%v)", got, ok)
 	}
@@ -131,7 +131,7 @@ func TestUpsertThenGetRoundTrips(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	got, ok := Get(target)
+	got, ok, _ := Get(target)
 	if !ok {
 		t.Fatal("expected an entry to be found")
 	}
@@ -164,7 +164,7 @@ func TestUpsertPreservesExistingCatchUpState(t *testing.T) {
 	if !ok || cs.Cursor != "cursor-1" {
 		t.Fatalf("expected the catch-up cursor to survive a reconnect's Upsert, got %+v (ok=%v)", cs, ok)
 	}
-	got, ok := Get(target)
+	got, ok, _ := Get(target)
 	if !ok || got.PeerID != "peer-2" || !got.Connected {
 		t.Fatalf("expected the identity fields to still update, got %+v (ok=%v)", got, ok)
 	}
@@ -173,7 +173,7 @@ func TestUpsertPreservesExistingCatchUpState(t *testing.T) {
 func TestGetReturnsFalseWhenNothingStored(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	_, ok := Get(Target{Link: "wss://never-seen/hub/join"})
+	_, ok, _ := Get(Target{Link: "wss://never-seen/hub/join"})
 	if ok {
 		t.Fatal("expected no entry to be found")
 	}
@@ -190,7 +190,7 @@ func TestUpsertOverwritesExistingEntryForSameTarget(t *testing.T) {
 		t.Fatalf("second upsert: %v", err)
 	}
 
-	got, ok := Get(target)
+	got, ok, _ := Get(target)
 	if !ok || got.PeerID != "peer-2" {
 		t.Fatalf("expected the second upsert to overwrite the first, got %+v (ok=%v)", got, ok)
 	}
@@ -208,7 +208,7 @@ func TestMarkDisconnectedClearsConnectedFlag(t *testing.T) {
 		t.Fatalf("markDisconnected: %v", err)
 	}
 
-	got, ok := Get(target)
+	got, ok, _ := Get(target)
 	if !ok {
 		t.Fatal("expected the entry to still exist")
 	}
@@ -264,7 +264,7 @@ func TestGetReturnsFalseWhenStoreFileIsMissing(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "state.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected no file to exist yet, stat err: %v", err)
 	}
-	if _, ok := Get(Target{Link: "wss://x/hub/join"}); ok {
+	if _, ok, _ := Get(Target{Link: "wss://x/hub/join"}); ok {
 		t.Fatal("expected no entry when the store file doesn't exist")
 	}
 }
@@ -340,7 +340,7 @@ func TestEntryTopicRoundTrips(t *testing.T) {
 	if err := Upsert(target, Entry{PeerID: "peer-1", Topic: "Q3 Planning"}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	got, ok := Get(target)
+	got, ok, _ := Get(target)
 	if !ok || got.Topic != "Q3 Planning" {
 		t.Fatalf("got %+v (ok=%v)", got, ok)
 	}
@@ -381,7 +381,7 @@ func TestSetCatchUpGapAndAheadRoundTrip(t *testing.T) {
 	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join"}
 	cs := CatchUpState{
 		Cursor: "cursor-1",
-		Gap:    &GapState{From: "2026-09-01T00:00:00Z", To: "2026-09-01T01:00:00Z"},
+		Gap:    &GapState{FromAt: "2026-09-01T00:00:00Z", To: "2026-09-01T01:00:00Z"},
 		Ahead:  []string{"cursor-2", "cursor-3"},
 	}
 	if err := SetCatchUp(target, cs); err != nil {
@@ -392,7 +392,7 @@ func TestSetCatchUpGapAndAheadRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("expected catch-up state to be found")
 	}
-	if got.Cursor != "cursor-1" || got.Gap == nil || got.Gap.From != "2026-09-01T00:00:00Z" || len(got.Ahead) != 2 {
+	if got.Cursor != "cursor-1" || got.Gap == nil || got.Gap.FromAt != "2026-09-01T00:00:00Z" || len(got.Ahead) != 2 {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -415,4 +415,116 @@ func TestCatchUpForDifferentLinksIsIndependent(t *testing.T) {
 	if !ok || cs.Cursor != "cursor-one" {
 		t.Fatalf("got %+v (ok=%v)", cs, ok)
 	}
+}
+
+// A gap recorded by an older build carries its start in one field that
+// held either a cursor or a timestamp. Dropping those records on upgrade
+// would lose the one thing they exist to keep: a range nothing has
+// walked to, which nobody would otherwise know to go looking for.
+func TestALegacyGapRecordIsSortedIntoTheRightField(t *testing.T) {
+	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir())
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
+
+	for _, tc := range []struct {
+		name       string
+		legacy     string
+		wantCursor string
+		wantAt     string
+	}{
+		{"a timestamp stays a timestamp", "2026-09-01T00:00:00Z", "", "2026-09-01T00:00:00Z"},
+		{"anything else is a cursor", "639251841733942000.45797", "639251841733942000.45797", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := GapState{LegacyFrom: tc.legacy, To: "2026-09-01T01:00:00Z"}
+			g.normalise()
+			if g.FromCursor != tc.wantCursor || g.FromAt != tc.wantAt {
+				t.Fatalf("got cursor=%q at=%q, want cursor=%q at=%q",
+					g.FromCursor, g.FromAt, tc.wantCursor, tc.wantAt)
+			}
+			if g.LegacyFrom != "" {
+				t.Fatalf("expected the legacy field to be cleared once sorted, got %q", g.LegacyFrom)
+			}
+			if !g.Started() {
+				t.Fatal("expected the migrated gap to still count as a recorded gap")
+			}
+		})
+	}
+}
+
+// A store that cannot be parsed must not be replaced by the next write.
+// Quarantining it from a READ left no file at all, so the following
+// write saw "nothing stored", created a fresh store, and every other
+// identity and reading position stopped being active state — silently,
+// with connect reporting success.
+func TestAnUnreadableStoreIsNotReplacedByTheNextWrite(t *testing.T) {
+	// MCP_HUB_CONNSTORE_DIR is what moves the file this test WRITES OVER.
+	// Setting anything else points path() at the real store, and this
+	// test destroys whatever it finds there.
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
+
+	keep := Target{Link: "wss://example.test/hub/join#keep", Project: "p"}
+	if err := SetReconnectSecret(keep, "the-secret-that-must-survive"); err != nil {
+		t.Fatalf("seeding the store: %v", err)
+	}
+
+	if err := os.WriteFile(path(), []byte("{not json at all"), 0o600); err != nil {
+		t.Fatalf("corrupting the store: %v", err)
+	}
+
+	if _, _, err := Get(keep); err == nil {
+		t.Fatal("expected a read of an unreadable store to report the failure, not an empty answer")
+	}
+	// The file is still there to be recovered from.
+	if _, err := os.Stat(path()); err != nil {
+		t.Fatalf("expected the unreadable store to be left in place, got: %v", err)
+	}
+
+	other := Target{Link: "wss://example.test/hub/join#other", Project: "p"}
+	if err := SetReconnectSecret(other, "a-new-secret"); err == nil {
+		t.Fatal("expected a write against an unreadable store to be refused, not to replace it")
+	}
+
+	// The unreadable bytes are still the ones on disk — nothing replaced
+	// them, which is what leaves a repair possible at all.
+	raw, err := os.ReadFile(path())
+	if err != nil {
+		t.Fatalf("reading the store: %v", err)
+	}
+	if string(raw) != "{not json at all" {
+		t.Fatalf("the unreadable store was modified: %s", raw)
+	}
+	// And moving it aside is available, but only as a deliberate act.
+	aside, err := MoveAside()
+	if err != nil {
+		t.Fatalf("MoveAside: %v", err)
+	}
+	if _, err := os.Stat(aside); err != nil {
+		t.Fatalf("expected the old bytes to be kept at %s: %v", aside, err)
+	}
+	if err := SetReconnectSecret(other, "a-new-secret"); err != nil {
+		t.Fatalf("expected writes to work once the store was moved aside: %v", err)
+	}
+}
+
+// TestMain refuses to run this package's tests against the REAL store.
+//
+// These tests write to path(), and one of them deliberately corrupts what
+// it finds there. The isolation is one environment variable, and setting
+// a plausible-looking wrong one (MCP_HUB_LOG_DIR, say) points path() at
+// the user's own file with no warning at all — which is how this package
+// destroyed a real store holding every identity and reading position on
+// this machine. A default that must be overridden correctly by every
+// test, forever, is not isolation; this is.
+func TestMain(m *testing.M) {
+	if os.Getenv("MCP_HUB_CONNSTORE_DIR") == "" {
+		tmp, err := os.MkdirTemp("", "connstore-tests-")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cannot create a temp store dir: %v\n", err)
+			os.Exit(1)
+		}
+		os.Setenv("MCP_HUB_CONNSTORE_DIR", tmp)
+		defer os.RemoveAll(tmp)
+	}
+	os.Exit(m.Run())
 }

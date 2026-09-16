@@ -1090,7 +1090,7 @@ func TestTeamsRelayConnectMintsAndStoresASecretWhenCallerGivesNone(t *testing.T)
 	hub.handleDisconnect(ctx, connReqFor(testConn))
 
 	target := connstore.Target{Link: link, Project: connstore.CurrentProject()}
-	stored, ok := connstore.Get(target)
+	stored, ok, _ := connstore.Get(target)
 	if !ok || stored.ReconnectSecret != sent {
 		t.Fatalf("expected the minted secret %q to be stored, got %+v (ok=%v)", sent, stored, ok)
 	}
@@ -1788,7 +1788,7 @@ func TestBehindNoteSurfacesRecordedGapAtConnect(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	setCatchUpGap(id, "2026-09-01T09:12:00Z", "2026-09-04T15:00:00Z")
+	setCatchUpGapFromAt(id, "2026-09-01T09:12:00Z", "2026-09-04T15:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
@@ -1893,7 +1893,7 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	setCatchUpGap(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
+	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
@@ -1997,7 +1997,7 @@ func TestCatchUpGapRetrievesPeerlessSystemMsg(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	setCatchUpGap(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
+	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
@@ -2067,7 +2067,7 @@ func TestCatchUpGapDedupBranchPrunesHandedOverAhead(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	setCatchUpGap(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
+	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
@@ -2296,7 +2296,7 @@ func TestDiscardGapWritesItOffAndRecordsTheDecision(t *testing.T) {
 	sess.mu.Lock()
 	id := sess.catchUpID
 	sess.mu.Unlock()
-	setCatchUpGap(id, "2026-09-01T09:00:00Z", "2026-09-08T09:00:00Z")
+	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-08T09:00:00Z")
 
 	discardReq := mcp.CallToolRequest{}
 	discardReq.Params.Arguments = map[string]any{"connection": testConn, "discardGap": true}
@@ -2527,7 +2527,7 @@ func TestReadRecordsTheDeliveryWithoutConsumingTheBacklog(t *testing.T) {
 	sess.lastHandedOverCursor = "cursor-position"
 	sess.knownContiguous = true
 	sess.mu.Unlock()
-	setCatchUpGap(id, "2026-09-10T18:00:00Z", "2026-09-10T20:00:00Z")
+	setCatchUpGapFromAt(id, "2026-09-10T18:00:00Z", "2026-09-10T20:00:00Z")
 	before, _ := connstore.GetCatchUp(id)
 
 	readReq := mcp.CallToolRequest{}
@@ -3079,14 +3079,14 @@ func TestSecondSeekWidensTheGapInsteadOfReplacingIt(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
 
-	setCatchUpGap(id, "2026-09-13T14:40:17Z", "2026-09-13T15:51:22Z")
+	setCatchUpGapFromAt(id, "2026-09-13T14:40:17Z", "2026-09-13T15:51:22Z")
 	from, to, ok := getCatchUpGap(id)
 	if !ok || from != "2026-09-13T14:40:17Z" || to != "2026-09-13T15:51:22Z" {
 		t.Fatalf("expected the first gap recorded, got from=%q to=%q ok=%v", from, to, ok)
 	}
 
 	// A second seek, before anything walked the first range.
-	setCatchUpGap(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
+	setCatchUpGapFromAt(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
 	from, to, ok = getCatchUpGap(id)
 	if !ok {
 		t.Fatal("expected a gap to still be recorded after a second seek")
@@ -3106,13 +3106,13 @@ func TestWideningKeepsRetrievalProgress(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
 
-	setCatchUpGap(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
+	setCatchUpGapFromAt(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
 	// Retrieval gets a third of the way in.
 	g, _ := loadCatchUpGap(id)
 	g.AnchorCursor = "639249632127954000.44361"
 	saveCatchUpGap(id, g)
 
-	setCatchUpGap(id, "2026-09-14T08:00:00Z", "2026-09-14T09:30:00Z")
+	setCatchUpGapFromAt(id, "2026-09-14T08:00:00Z", "2026-09-14T09:30:00Z")
 
 	got, ok := loadCatchUpGap(id)
 	if !ok {
@@ -3121,8 +3121,8 @@ func TestWideningKeepsRetrievalProgress(t *testing.T) {
 	if got.AnchorCursor != "639249632127954000.44361" {
 		t.Fatalf("expected retrieval progress preserved, got anchorCursor=%q", got.AnchorCursor)
 	}
-	if got.From != "2026-09-14T05:35:55Z" || got.To != "2026-09-14T09:30:00Z" {
-		t.Fatalf("expected the union of both ranges, got from=%q to=%q", got.From, got.To)
+	if got.FromAt != "2026-09-14T05:35:55Z" || got.To != "2026-09-14T09:30:00Z" {
+		t.Fatalf("expected the union of both ranges, got from=%q to=%q", got.From(), got.To)
 	}
 }
 
@@ -3132,9 +3132,9 @@ func TestSeekAfterAFullyRetrievedGapStartsClean(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
 
-	setCatchUpGap(id, "2026-09-13T14:40:17Z", "2026-09-13T15:51:22Z")
+	setCatchUpGapFromAt(id, "2026-09-13T14:40:17Z", "2026-09-13T15:51:22Z")
 	clearCatchUpGap(id)
-	setCatchUpGap(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
+	setCatchUpGapFromAt(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
 
 	from, to, ok := getCatchUpGap(id)
 	if !ok || from != "2026-09-14T05:35:55Z" || to != "2026-09-14T07:17:34Z" {
@@ -3531,19 +3531,16 @@ func TestUnannouncedDropDetachesTheConnectionButKeepsTheChannel(t *testing.T) {
 	}
 	defer hub.handleDisconnect(ctx, connReqFor(testConn))
 
-	// A connection that dies during connect's own setup is torn down at
-	// the next tool call rather than instantly — so ask, the way a caller
-	// would, instead of asserting a promptness the code does not make.
-	// Held now, because a teardown releases the name: after the drop there
-	// is nothing to look up, which is itself the point.
-	sess := sole(t, hub)
+	// The teardown runs on its own goroutine now, so it lands without
+	// waiting for a tool call — and it RELEASES THE NAME, which is the
+	// point: a connection that is not coming back gives its name up so
+	// reconnecting under it works.
 	if !waitFor(t, "teardown", func() bool {
-		hub.handleReceive(ctx, connReqFor(testConn))
-		sess.mu.Lock()
-		defer sess.mu.Unlock()
-		return sess.conn == nil
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return len(hub.sessions) == 0
 	}) {
-		t.Fatal("expected the dead connection to be torn down")
+		t.Fatal("expected the dead connection to be torn down and its name released")
 	}
 	w := hub.currentWaiter()
 	if w == nil {
@@ -4193,4 +4190,209 @@ func TestReadResolvesAnAttachmentOnTheMessageItReturns(t *testing.T) {
 	if !strings.Contains(text, "saved to ") {
 		t.Fatalf("expected the read to fetch and save the attachment, got: %s", text)
 	}
+}
+
+// A gap recorded from this client's own stored position starts at a
+// CURSOR, not a timestamp. Sending that cursor as `at` gets it rejected
+// as a bad anchor, which makes the one advertised recovery path for
+// skipped history fail outright — seen live against chat-relay, and the
+// range stays unreachable however many times it is retried.
+func TestAGapThatStartsAtACursorIsRetrievedByCursor(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	gotAnchor := make(chan wire.Anchor, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			gotAnchor <- wire.Anchor{At: m.At, Cursor: m.Cursor}
+			// A server that validates anchors refuses a cursor sent as a
+			// timestamp, which is exactly what produced bad_anchor live.
+			if m.At != "" && !strings.Contains(m.At, "T") {
+				conn.WriteJSON(wire.Error{Type: wire.TypeError, Code: "bad_anchor",
+					Message: "at is not a timestamp"})
+				continue
+			}
+			conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	id := targetForLink(ctx, link)
+	// Recorded the way the seek branch records it: the start is this
+	// client's own stored cursor, the end is the seek's landing time.
+	setCatchUpGapFromCursor(id, "639251841733942000.45797", "2026-09-16T19:40:00Z")
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	gapReq := mcp.CallToolRequest{}
+	gapReq.Params.Arguments = map[string]any{"connection": testConn, "gap": true}
+	res, err := hub.handleCatchUp(ctx, gapReq)
+	if err != nil {
+		t.Fatalf("hub_catch_up(gap: true) failed: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("gap retrieval was refused: %s", textOf(res))
+	}
+
+	select {
+	case a := <-gotAnchor:
+		if a.Cursor != "639251841733942000.45797" {
+			t.Fatalf("expected the gap to be walked by cursor, got anchor %+v", a)
+		}
+		if a.At != "" {
+			t.Fatalf("expected no timestamp anchor alongside the cursor, got %+v", a)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the server never received a gap-retrieval request")
+	}
+}
+
+// hub_catch_up used to guard the session's reading position with the
+// HUB's map lock while every other path guarded it with the session's
+// own. Two mutexes are not mutual exclusion: a catch-up running beside a
+// confirm raced on the position and on the dedup map, which can also
+// panic outright. Run under -race, this is the regression guard; run
+// without, it still exercises both paths concurrently.
+func TestCatchUpAndConfirmDoNotRaceOnTheReadingPosition(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for i := 0; ; i++ {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			conn.WriteJSON(wire.Msg{
+				Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+				Text: fmt.Sprintf("message %d", i), TS: "2026-09-16T20:00:00Z", Historical: true,
+				Cursor: fmt.Sprintf("cursor-%d", i), ExternalID: fmt.Sprintf("ext-%d", i),
+				Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor},
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hub.handleCatchUp(ctx, connReqFor(testConn))
+		}()
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			confirmReq := mcp.CallToolRequest{}
+			confirmReq.Params.Arguments = map[string]any{
+				"connection": testConn, "cursor": fmt.Sprintf("cursor-%d", n)}
+			hub.handleConfirmReceived(ctx, confirmReq)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// The read loop calls its activity callback SYNCHRONOUSLY, and that
+// callback fetches reference attachments and waits for the reply — which
+// the same read loop has to consume. If the loop cannot proceed until the
+// callback returns, the reply can never arrive and every pushed
+// attachment fails, deadline or no deadline. This is the claim under
+// test: a server that answers an attachment request instantly must
+// produce a saved file on the PUSH path.
+func TestAPushedAttachmentIsFetchedWhileTheReaderIsInItsCallback(t *testing.T) {
+	inPushMode(t)
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		conn.WriteJSON(wire.Msg{
+			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "look",
+			TS: "ts1", Cursor: "cursor-1", ExternalID: "ext-1",
+			Attachments: []wire.Attachment{{Token: "att-1", ContentType: "text/markdown",
+				Name: "note.md", Kind: "file"}},
+		})
+		for {
+			var req wire.AttachmentRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			if req.Type != wire.TypeAttachment {
+				continue
+			}
+			conn.WriteJSON(wire.AttachmentData{
+				Type: wire.TypeAttachmentData, Token: req.Token, Name: "note.md",
+				ContentType:  "text/markdown",
+				ContentBytes: base64.StdEncoding.EncodeToString([]byte("the bytes")),
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	// The push itself goes nowhere in a test (no harness socket), but the
+	// attachment fetch that precedes it is the thing under test: it either
+	// resolves or it deadlocks against its own reader.
+	sess := sole(t, hub)
+	conn, _ := sess.activeConn()
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		ev, ok, err := conn.RequestAttachment("att-1")
+		if err == nil && ok && ev.AttachmentContentBytes != "" {
+			return // fetched while the read loop was live
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the attachment was never fetched — the request and its reply cannot both use the read loop")
 }

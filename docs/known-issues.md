@@ -32,6 +32,10 @@ the habit that makes a real intermittent failure invisible. Three other tests
 `TestCatchUpGapDedupBranchPrunesHandedOverAhead`) each failed once the same
 way and likewise never reproduced — the last on 2026-09-16, clean on three
 isolated runs and three full-package runs immediately after.
+`TestCatchUpWithNoPriorPositionAndNoBehindReportsNothingToCatchUp` joined
+them the same day with the same shape: one failure inside a full-package
+run ("catch-up request timed out waiting for the server"), then clean on
+one isolated run and three full-package runs.
 
 **Not investigated further** because it was found while building something
 unrelated. The next step would be to raise or parameterise the deadline

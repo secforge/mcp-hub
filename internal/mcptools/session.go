@@ -112,6 +112,14 @@ type session struct {
 	// caller that chose to leave must not be dragged back in.
 	redialLink string
 	redialName string
+	// redialTarget is the connstore.Target the successful connect
+	// actually resolved, kept so a reconnect reuses it rather than
+	// recomputing one. Recomputing happens off a background context with
+	// no MCP session in it, so the roots the first connect asked for are
+	// unavailable and the answer falls back to this process's working
+	// directory — a DIFFERENT project whenever the two differ, whose
+	// identity for the same link is somebody else's.
+	redialTarget connstore.Target
 	// reconnecting guards against two automatic attempts overlapping, and
 	// against one racing a hub_connect the model issued itself.
 	reconnecting bool

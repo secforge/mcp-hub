@@ -67,16 +67,76 @@ type Target struct {
 	Project string
 }
 
+// ErrUnreadable reports a store file that exists but cannot be parsed.
+// Distinguished from "nothing stored" because the two call for opposite
+// responses: one is an ordinary first run, the other is a file holding
+// credentials that must not be written over.
+var ErrUnreadable = errors.New("connection store is unreadable")
+
 // GapState is a persisted record of a hub_catch_up seek's abandoned
 // range — see mcptools' catchUpGap for the full rationale (recorded as
 // ongoing state, not a one-time notice). Nil (not a zero-value struct) on
 // CatchUpState.Gap when there is no open gap, so a caller doesn't need a
 // separate boolean to tell "no gap" from "a gap with blank fields."
 type GapState struct {
-	From         string `json:"from,omitempty"`
-	To           string `json:"to,omitempty"`
+	// From is where the skipped range STARTS, and the two fields are
+	// separate because a cursor and a timestamp are not
+	// interchangeable: a cursor is opaque, and a server asked to treat
+	// one as a timestamp refuses the request outright (bad_anchor),
+	// which made the one advertised recovery path for skipped history
+	// fail. Exactly one is set — FromCursor when the seek started from a
+	// position this client had actually reached, FromAt when all that is
+	// known is how far back the server said the backlog went.
+	FromCursor string `json:"fromCursor,omitempty"`
+	FromAt     string `json:"fromAt,omitempty"`
+	To         string `json:"to,omitempty"`
+	// AnchorCursor is how far INTO the gap this client has walked, and
+	// takes precedence over both fields above once set.
 	AnchorCursor string `json:"anchorCursor,omitempty"`
+	// legacyFrom is the single field these two replaced, which held
+	// either kind of value with nothing to say which. Read on load and
+	// sorted into the right one (see normalise) rather than dropped: a
+	// gap record says messages exist that nothing has walked to, and
+	// discarding it on upgrade would lose exactly the range it was
+	// recorded to keep reachable.
+	LegacyFrom string `json:"from,omitempty"`
 }
+
+// normalise sorts a legacy start value into the field it belongs in. The
+// test is whether it parses as a timestamp — the one property that
+// actually distinguishes the two, rather than a guess about how cursors
+// tend to look.
+func (g *GapState) normalise() {
+	if g.LegacyFrom == "" {
+		return
+	}
+	if _, err := time.Parse(time.RFC3339, g.LegacyFrom); err == nil {
+		if g.FromAt == "" {
+			g.FromAt = g.LegacyFrom
+		}
+	} else if g.FromCursor == "" {
+		g.FromCursor = g.LegacyFrom
+	}
+	g.LegacyFrom = ""
+}
+
+// From renders where the gap starts for a reader. A cursor is shown as
+// one rather than dressed up as a time, because a reader who is told a
+// time that is actually a cursor cannot tell that anything is wrong.
+func (g GapState) From() string {
+	if g.FromAt != "" {
+		return g.FromAt
+	}
+	if g.FromCursor != "" {
+		return "cursor " + g.FromCursor
+	}
+	return ""
+}
+
+// Started reports whether this gap records a start at all — the one
+// thing every caller has to check before using it, since a gap with
+// neither is not a gap.
+func (g GapState) Started() bool { return g.FromCursor != "" || g.FromAt != "" }
 
 // DiscardedGap records a skipped range that was deliberately written off
 // instead of retrieved. Kept rather than deleted so the decision stays
@@ -273,18 +333,28 @@ func load() (state, error) {
 	}
 	var s state
 	if err := json.Unmarshal(data, &s); err != nil {
-		// Renamed aside rather than overwritten: whatever is in there is
-		// the only copy of credentials that cannot be regenerated, and a
-		// parse failure is exactly when a human needs to see the bytes.
-		aside := path() + ".corrupt"
-		renameErr := os.Rename(path(), aside)
-		if renameErr != nil {
-			return state{}, fmt.Errorf("parsing %s: %w (and it could not be moved aside: %v)",
-				path(), err, renameErr)
+		// LEFT EXACTLY WHERE IT IS. Moving it aside from a read looked
+		// like protecting the bytes, and did the opposite: the next
+		// write found no file, concluded nothing was stored, and created
+		// a fresh store — so every identity and reading position stopped
+		// being active state while connect reported success. The file is
+		// the only copy of credentials that cannot be regenerated, so
+		// nothing here touches it; recovery is a deliberate act (see
+		// MoveAside), taken under an exclusive lock, by someone who has
+		// been told.
+		return state{}, fmt.Errorf("%w: parsing %s: %v — stored identities and positions are "+
+			"unavailable until it is repaired, restored from a backup, or moved aside "+
+			"(nothing here will overwrite it)", ErrUnreadable, path(), err)
+	}
+	// A gap written by an older build carries its start in one field
+	// that held either kind of value; sort it out once, here, where
+	// every reader goes through.
+	for _, byLink := range s {
+		for _, e := range byLink {
+			if e.CatchUp.Gap != nil {
+				e.CatchUp.Gap.normalise()
+			}
 		}
-		return state{}, fmt.Errorf("parsing %s: %w — moved aside to %s so it is not overwritten; "+
-			"stored identities and positions are unavailable until it is restored or removed",
-			path(), err, aside)
 	}
 	return s, nil
 }
@@ -343,10 +413,14 @@ func setEntry(s *state, project, key string, e Entry) {
 }
 
 // Get returns the stored entry for target, if any.
-func Get(target Target) (Entry, bool) {
+func Get(target Target) (Entry, bool, error) {
 	var e Entry
 	var ok bool
-	_ = withLock(false, func() error {
+	// The error is RETURNED, not swallowed. Reporting "nothing stored"
+	// for a store that could not be read states an absence that was never
+	// established — and it is the one answer that makes a caller go on to
+	// mint a new identity over the top of the old one.
+	err := withLock(false, func() error {
 		st, err := load()
 		if err != nil {
 			return err
@@ -354,7 +428,20 @@ func Get(target Target) (Entry, bool) {
 		e, ok = getEntry(st, target.Project, target.Link)
 		return nil
 	})
-	return e, ok
+	return e, ok, err
+}
+
+// MoveAside renames an unreadable store so a fresh one can be created,
+// and is the only thing here that does: it is a deliberate act, taken
+// under the exclusive lock, never a side effect of reading. Returns where
+// the old bytes went so a caller can say it.
+func MoveAside() (string, error) {
+	aside := path() + ".corrupt"
+	err := withLock(true, func() error { return os.Rename(path(), aside) })
+	if err != nil {
+		return "", err
+	}
+	return aside, nil
 }
 
 // Upsert records identity for target, preserving whatever catch-up state

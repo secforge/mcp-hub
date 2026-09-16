@@ -808,14 +808,22 @@ func TestHubWaitNewCallSupersedesInFlightOne(t *testing.T) {
 
 func TestDisconnectedTextHintsHubCatchUp(t *testing.T) {
 	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
 		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
-		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-xyz"})
-		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text: "hi", TS: "ts1", Cursor: "cursor-xyz"})
+		// Held open until the test has the connection in hand: the
+		// teardown that follows a drop releases the name promptly, so a
+		// test that looked the session up afterwards would find nothing.
+		<-release
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		conn.Close()
 	}))
 	defer srv.Close()
 
@@ -828,22 +836,21 @@ func TestDisconnectedTextHintsHubCatchUp(t *testing.T) {
 	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
+	sess := sole(t, hub)
+	deadlinePoll(t, func() bool {
+		conn, _ := sess.activeConn()
+		return conn != nil && conn.LastSeenCursor() == "cursor-xyz"
+	})
+	conn, _ := sess.activeConn()
+	close(release)
 
-	deadlinePoll(t, func() bool { return sole(t, hub).conn.LastSeenCursor() == "cursor-xyz" })
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		res, _ := hub.handleReceive(ctx, connReqFor(testConn))
-		if strings.Contains(textOf(res), "disconnected") {
-			if !strings.Contains(textOf(res), `"cursor-xyz"`) || !strings.Contains(textOf(res), "hub_catch_up()") {
-				t.Fatalf("expected the disconnect text to hint at hub_catch_up() with the last seen cursor, got: %s", textOf(res))
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("never observed a disconnected result, last: %s", textOf(res))
-		}
-		time.Sleep(5 * time.Millisecond)
+	deadlinePoll(t, func() bool { return !conn.Connected() })
+	got := disconnectedText(conn)
+	if !strings.Contains(got, "disconnected") {
+		t.Fatalf("expected a disconnected result, got: %s", got)
+	}
+	if !strings.Contains(got, `"cursor-xyz"`) || !strings.Contains(got, "hub_catch_up()") {
+		t.Fatalf("expected the disconnect text to hint at hub_catch_up() with the last seen cursor, got: %s", got)
 	}
 }
 
@@ -1361,7 +1368,7 @@ func TestHandleListConnectionsShowsEntriesWithoutLeakingSecret(t *testing.T) {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
-	stored, ok := connstore.Get(connstore.Target{Link: hubLink(url, sessionID), Project: connstore.CurrentProject()})
+	stored, ok, _ := connstore.Get(connstore.Target{Link: hubLink(url, sessionID), Project: connstore.CurrentProject()})
 	if !ok {
 		t.Fatal("expected an entry to be stored")
 	}
@@ -1418,7 +1425,7 @@ func TestHandleListConnectionsIncludesTeamsSessionsAndTopics(t *testing.T) {
 	hub.handleDisconnect(ctx, connReqFor(testConn))
 
 	target := connstore.Target{Link: hubLink(url, sessionID), Project: project}
-	entry, ok := connstore.Get(target)
+	entry, ok, _ := connstore.Get(target)
 	if !ok {
 		t.Fatal("expected an entry to be stored")
 	}
@@ -1492,7 +1499,7 @@ func TestShutdownClosesActiveConnectionButLeavesTheStoreMarked(t *testing.T) {
 	if conn != nil {
 		t.Fatal("expected Shutdown to clear the active connection")
 	}
-	stored, ok := connstore.Get(connstore.Target{Link: hubLink(url, sessionID), Project: connstore.CurrentProject()})
+	stored, ok, _ := connstore.Get(connstore.Target{Link: hubLink(url, sessionID), Project: connstore.CurrentProject()})
 	if !ok {
 		t.Fatal("expected the entry to still exist")
 	}

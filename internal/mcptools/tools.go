@@ -299,10 +299,22 @@ func targetForLink(ctx context.Context, link string) connstore.Target {
 // between the two seeks, so retrieving it can re-deliver a few messages
 // already seen. That is the safe direction and the same trade gap
 // retrieval already makes.
-func setCatchUpGap(id connstore.Target, from, to string) {
-	g := connstore.GapState{From: from, To: to}
+func setCatchUpGapFromAt(id connstore.Target, at, to string) {
+	carryForwardGap(id, connstore.GapState{FromAt: at, To: to})
+}
+
+// setCatchUpGapFromCursor records a gap whose start is a position this
+// client actually reached. Kept apart from the timestamp form all the
+// way to the wire: a cursor is opaque, and one sent as `at` is refused
+// as a bad anchor, which left the skipped range unreachable through the
+// very call that exists to reach it.
+func setCatchUpGapFromCursor(id connstore.Target, cursor, to string) {
+	carryForwardGap(id, connstore.GapState{FromCursor: cursor, To: to})
+}
+
+func carryForwardGap(id connstore.Target, g connstore.GapState) {
 	if prev, ok := loadCatchUpGap(id); ok {
-		g.From = prev.From
+		g.FromCursor, g.FromAt = prev.FromCursor, prev.FromAt
 		g.AnchorCursor = prev.AnchorCursor
 	}
 	saveCatchUpGap(id, g)
@@ -397,7 +409,7 @@ func saveCatchUpGap(id connstore.Target, g connstore.GapState) {
 	// record, which says messages exist that nothing will walk to, as the
 	// thing most worth losing.
 	if err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
-		if g.From == "" {
+		if !g.Started() {
 			cs.Gap = nil
 		} else {
 			cs.Gap = &g
@@ -428,17 +440,30 @@ func discardCatchUpGap(id connstore.Target) (connstore.GapState, bool) {
 	if id.Link == "" {
 		return connstore.GapState{}, false
 	}
-	cs, _ := connstore.GetCatchUp(id)
-	if cs.Gap == nil || cs.Gap.From == "" {
+	// Read and write under one lock: the record being removed here is the
+	// only thing that says a range went unread, and losing the write that
+	// removes it — or having this overwrite someone else's — turns a
+	// deliberate decision back into silence.
+	var discarded connstore.GapState
+	var found bool
+	err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
+		if cs.Gap == nil || !cs.Gap.Started() {
+			return
+		}
+		discarded, found = *cs.Gap, true
+		cs.Gap = nil
+		cs.Discarded = append(cs.Discarded, connstore.DiscardedGap{
+			From: discarded.From(), To: discarded.To, At: time.Now().UTC(),
+		})
+	})
+	if err != nil {
+		// Reported as "not discarded", because it was not: saying it was
+		// while the record survives is the one answer that leaves a
+		// reader believing a decision was taken that was not.
+		noteCatchUpWriteFailure(err)
 		return connstore.GapState{}, false
 	}
-	discarded := *cs.Gap
-	cs.Gap = nil
-	cs.Discarded = append(cs.Discarded, connstore.DiscardedGap{
-		From: discarded.From, To: discarded.To, At: time.Now().UTC(),
-	})
-	_ = connstore.SetCatchUp(id, cs)
-	return discarded, true
+	return discarded, found
 }
 
 // loadCatchUpGap returns id's full currently-recorded gap record, if
@@ -452,7 +477,7 @@ func discardCatchUpGap(id connstore.Target) (connstore.GapState, bool) {
 // walk-forward-by-cursor logic the ordinary (non-gap) walk already uses.
 func loadCatchUpGap(id connstore.Target) (connstore.GapState, bool) {
 	cs, ok := connstore.GetCatchUp(id)
-	if !ok || cs.Gap == nil || cs.Gap.From == "" {
+	if !ok || cs.Gap == nil || !cs.Gap.Started() {
 		return connstore.GapState{}, false
 	}
 	return *cs.Gap, true
@@ -467,7 +492,7 @@ func getCatchUpGap(id connstore.Target) (from, to string, ok bool) {
 	if !ok {
 		return "", "", false
 	}
-	return g.From, g.To, true
+	return g.From(), g.To, true
 }
 
 // setCatchUpCursor persists cursor as id's hub_catch_up position,
@@ -508,9 +533,17 @@ func saveHandedOverAhead(id connstore.Target, ahead map[string]bool) {
 	for c := range ahead {
 		cursors = append(cursors, c)
 	}
-	cs, _ := connstore.GetCatchUp(id)
-	cs.Ahead = cursors
-	_ = connstore.SetCatchUp(id, cs)
+	// ONE transaction, changing only this field. Reading the whole
+	// snapshot and writing it back released the lock in between, so a
+	// cursor or gap saved by anyone else in that window was overwritten
+	// by a snapshot taken before it existed — and the gap record, which
+	// says messages exist that nothing will walk to, is the thing most
+	// worth not losing.
+	if err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
+		cs.Ahead = cursors
+	}); err != nil {
+		noteCatchUpWriteFailure(err)
+	}
 }
 
 // loadHandedOverAhead returns id's persisted set, or nil if there isn't
@@ -752,8 +785,25 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		return reconnectDone
 	}
 
-	target := targetForLink(context.Background(), link)
-	stored, _ := connstore.Get(target)
+	// The target the successful connect resolved, not one recomputed
+	// here — see session.redialTarget.
+	s.mu.Lock()
+	target := s.redialTarget
+	s.mu.Unlock()
+	if target.Link == "" {
+		target = targetForLink(context.Background(), link)
+	}
+	stored, _, storeErr := connstore.Get(target)
+	if storeErr != nil {
+		// "No identity stored" and "the store could not be read" call for
+		// opposite responses, and only the first is a reason to go on.
+		s.abandonReconnect(fmt.Sprintf("Automatic reconnect was not attempted after the "+
+			"server's restart: this client's connection store could not be read (%v), so it "+
+			"cannot tell whether an identity for that link exists. Reconnecting anyway would "+
+			"take a NEW identity and leave the old one stranded. Fix or move the file aside, "+
+			"then call hub_connect.", storeErr))
+		return reconnectFatal
+	}
 	secret := stored.ReconnectSecret
 	if secret == "" {
 		s.abandonReconnect("Automatic reconnect was not attempted after the server's restart: " +
@@ -1736,7 +1786,22 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// a connection that was never established is a name nobody can use
 	// and nothing can explain.
 	defer func() {
-		if conn, _ := s.activeConn(); conn == nil {
+		conn, _ := s.activeConn()
+		if conn != nil {
+			return
+		}
+		// NEVER ESTABLISHED is the case this releases. A connection that
+		// did connect and then dropped is a different thing entirely, and
+		// the session has to survive it: the drop is what the reader is
+		// told about on its next call — what the last cursor was, and to
+		// call hub_catch_up — and a released name answers "unknown
+		// connection" instead. The teardown that clears conn can land
+		// here before this runs, so the question has to be "was it ever
+		// up", not "is it up now".
+		s.mu.Lock()
+		dialled := s.everConnected
+		s.mu.Unlock()
+		if !dialled {
 			h.close(as)
 		}
 	}()
@@ -1751,7 +1816,18 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 
 	target := targetForLink(ctx, link)
-	stored, _ := connstore.Get(target)
+	stored, _, storeErr := connstore.Get(target)
+	if storeErr != nil {
+		// Refused rather than served with a new identity: minting one
+		// here is what silently retires whatever the unreadable file
+		// holds, and it holds the only copy of every identity and
+		// reading position this project has.
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"this client's connection store could not be read, so connecting now would mint a "+
+				"NEW identity and leave every stored one unreachable: %v. Nothing has been "+
+				"changed. Repair or restore that file, or move it aside deliberately, and "+
+				"connect again.", storeErr)), nil
+	}
 	// The secret is mandatory on the wire but never the caller's to
 	// remember: reuse the one stored for this link, or mint one now.
 	// Presenting the same one every time is what keeps the identity
@@ -1830,6 +1906,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	s.openReturnPath()
 	s.mu.Lock()
 	s.redialLink, s.redialName = link, name
+	s.redialTarget = target
 	s.mu.Unlock()
 	// A server can close between Dial returning and the callback above
 	// being registered — a restart announced moments after a join does
@@ -2649,6 +2726,7 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	// untrustworthy in general, not just here.
 	s.mu.Lock()
 	s.redialLink, s.redialName = "", ""
+	s.redialTarget = connstore.Target{}
 	s.reconnecting, s.reconnectAt = false, time.Time{}
 	s.mu.Unlock()
 	// The name and the address are both free again the moment the
@@ -3110,8 +3188,8 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 			line += " (still marked open — meaning nothing recorded it closing," +
 				" which a killed process never does; not proof it is live)"
 		}
-		if gap := le.Entry.CatchUp.Gap; gap != nil && gap.From != "" {
-			line += fmt.Sprintf("\n    unretrieved gap: %s to %s — hub_catch_up(gap: true) once connected", gap.From, gap.To)
+		if gap := le.Entry.CatchUp.Gap; gap != nil && gap.Started() {
+			line += fmt.Sprintf("\n    unretrieved gap: %s to %s — hub_catch_up(gap: true) once connected", gap.From(), gap.To)
 		}
 		for _, d := range le.Entry.CatchUp.Discarded {
 			line += fmt.Sprintf("\n    gap written off unread: %s to %s (decided %s)",
@@ -3336,9 +3414,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 
 	if req.GetBool("discardGap", false) {
-		h.mu.Lock()
+		s.mu.Lock()
 		catchUpIDNow := s.catchUpID
-		h.mu.Unlock()
+		s.mu.Unlock()
 		discarded, ok := discardCatchUpGap(catchUpIDNow)
 		if !ok {
 			return mcp.NewToolResultText(
@@ -3350,21 +3428,21 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				"nothing here will mention them again. The decision is recorded against this "+
 				"connection so it stays visible as a choice rather than looking like there was "+
 				"never a gap. Normal hub_catch_up is unaffected.]",
-			discarded.From, discarded.To)), nil
+			discarded.From(), discarded.To)), nil
 	}
 
 	if req.GetBool("gap", false) {
-		h.mu.Lock()
+		s.mu.Lock()
 		catchUpIDNow := s.catchUpID
-		h.mu.Unlock()
+		s.mu.Unlock()
 		return s.handleCatchUpGap(conn, catchUpIDNow)
 	}
 
-	h.mu.Lock()
+	s.mu.Lock()
 	cursor := s.lastHandedOverCursor
 	catchUpIDNow := s.catchUpID
 	alreadySeeked := s.seekedSinceConnect
-	h.mu.Unlock()
+	s.mu.Unlock()
 
 	// Included in every terminal "you're done" message below, not just
 	// the seek that created it — a recorded gap doesn't stop existing
@@ -3403,9 +3481,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// Only when the server declares ackReplies, and an absent answer stays
 	// unknown rather than becoming zero — the whole defect here was a
 	// silence read as a number.
-	h.mu.Lock()
+	s.mu.Lock()
 	project := s.catchUpID.Project
-	h.mu.Unlock()
+	s.mu.Unlock()
 
 	measuredBehind := 0
 	if cursor != "" && conn.HasFeature("ackReplies") {
@@ -3454,12 +3532,12 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		branch = "seek (measured from this client's own stored position)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
-		h.mu.Lock()
+		s.mu.Lock()
 		id := s.catchUpID
 		s.seekedSinceConnect = true
 		s.knownContiguous = false
-		h.mu.Unlock()
-		setCatchUpGap(id, cursor, seekAt)
+		s.mu.Unlock()
+		setCatchUpGapFromCursor(id, cursor, seekAt)
 		// The prose must describe what happened, not what usually
 		// happens. This branch also fires when the server DID state a
 		// count — its measurement is simply from a different position —
@@ -3483,16 +3561,16 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		branch = "seek (the server reported the backlog)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
-		h.mu.Lock()
+		s.mu.Lock()
 		id := s.catchUpID
 		s.seekedSinceConnect = true
-		h.mu.Unlock()
+		s.mu.Unlock()
 		// A seek leaves a range nobody has walked, so live traffic is no
 		// longer known to follow the confirmed position.
-		h.mu.Lock()
+		s.mu.Lock()
 		s.knownContiguous = false
-		h.mu.Unlock()
-		setCatchUpGap(id, conn.BehindSince(), seekAt)
+		s.mu.Unlock()
+		setCatchUpGapFromAt(id, conn.BehindSince(), seekAt)
 		seekNote = fmt.Sprintf(
 			"You were %d messages behind — seeking to recent context (%s) instead of walking the "+
 				"whole backlog. Everything before that point is not lost, just not fetched here: "+
@@ -3511,9 +3589,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			"instead of walking from the start.\n\n"
 	default:
 		branch = "nothing to do"
-		h.mu.Lock()
+		s.mu.Lock()
 		s.knownContiguous = true
-		h.mu.Unlock()
+		s.mu.Unlock()
 		// "Nothing to catch up" is a statement about the SERVER's unread
 		// position. This client's own buffer is a different store, and a
 		// pull-only reader can be holding undelivered events while the
@@ -3594,9 +3672,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			// position by itself. A recorded gap does not change that:
 			// the gap is a separate, explicitly-tracked range, not an
 			// unknown one.
-			h.mu.Lock()
+			s.mu.Lock()
 			s.knownContiguous = true
-			h.mu.Unlock()
+			s.mu.Unlock()
 			return mcp.NewToolResultText(seekNote +
 				"[hub: caught up — no more messages after your last known position]" + gapNote), nil
 		case "error":
@@ -3604,9 +3682,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				fmt.Sprintf("catch-up refused (code=%s, retryable=%t): %s", ev.Code, ev.Retryable, ev.Text),
 			), nil
 		case "msg":
-			h.mu.Lock()
+			s.mu.Lock()
 			alreadyHandedOver := ev.Cursor != "" && s.handedOverAhead[ev.Cursor]
-			h.mu.Unlock()
+			s.mu.Unlock()
 			if alreadyHandedOver {
 				// Already shown to the model via a synchronous
 				// hub_receive/hub_wait — the hand-over moment already
@@ -3614,7 +3692,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				// silently (this IS a confirmed hand-over, so the mark
 				// legitimately moves) and try the next position instead
 				// of showing a duplicate the model has already read.
-				h.mu.Lock()
+				s.mu.Lock()
 				s.lastHandedOverCursor = ev.Cursor
 				delete(s.handedOverAhead, ev.Cursor)
 				id := s.catchUpID
@@ -3622,7 +3700,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				for c := range s.handedOverAhead {
 					snapshot[c] = true
 				}
-				h.mu.Unlock()
+				s.mu.Unlock()
 				setCatchUpCursor(id, ev.Cursor)
 				saveHandedOverAhead(id, snapshot)
 				anchor = wire.Anchor{Cursor: ev.Cursor}
@@ -3635,10 +3713,10 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			// so a process restart resumes from here rather than
 			// falling back to a seek.
 			if ev.Cursor != "" {
-				h.mu.Lock()
+				s.mu.Lock()
 				s.lastHandedOverCursor = ev.Cursor
 				id := s.catchUpID
-				h.mu.Unlock()
+				s.mu.Unlock()
 				setCatchUpCursor(id, ev.Cursor)
 			}
 			formatted := decisionNote(cursor, project, conn, measuredBehind, branch) +
@@ -3687,9 +3765,15 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 		), nil
 	}
 
-	anchor := wire.Anchor{At: gap.From}
-	if gap.AnchorCursor != "" {
+	// Whichever kind of start this gap has, it goes out as that kind.
+	// AnchorCursor wins once the walk has moved, since it is the most
+	// precise position and always a cursor.
+	anchor := wire.Anchor{At: gap.FromAt}
+	switch {
+	case gap.AnchorCursor != "":
 		anchor = wire.Anchor{Cursor: gap.AnchorCursor}
+	case gap.FromCursor != "":
+		anchor = wire.Anchor{Cursor: gap.FromCursor}
 	}
 
 	for skipped := 0; skipped < catchUpDedupSkipLimit; skipped++ {
@@ -3708,7 +3792,7 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 			clearCatchUpGap(id)
 			return mcp.NewToolResultText(fmt.Sprintf(
 				"[hub: gap fully retrieved — nothing more between %s and %s. Normal hub_catch_up "+
-					"already covers everything from here onward]", gap.From, gap.To,
+					"already covers everything from here onward]", gap.From(), gap.To,
 			)), nil
 		case "error":
 			return mcp.NewToolResultError(
@@ -3745,7 +3829,7 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 					clearCatchUpGap(id)
 					return mcp.NewToolResultText(fmt.Sprintf(
 						"[hub: gap fully retrieved (the remainder was already shown to you earlier) — "+
-							"nothing more between %s and %s]", gap.From, gap.To,
+							"nothing more between %s and %s]", gap.From(), gap.To,
 					)), nil
 				}
 				gap.AnchorCursor = ev.Cursor
@@ -3763,12 +3847,12 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 			if reachedEnd {
 				formatted += fmt.Sprintf(
 					"\n\n[hub: gap fully retrieved — this was the last message between %s and %s]",
-					gap.From, gap.To,
+					gap.From(), gap.To,
 				)
 			} else {
 				formatted += fmt.Sprintf(
 					"\n\n[hub: more of the gap (%s to %s) may remain — call hub_catch_up(gap: true) "+
-						"again to continue retrieving it]", gap.From, gap.To,
+						"again to continue retrieving it]", gap.From(), gap.To,
 				)
 			}
 			return s.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
