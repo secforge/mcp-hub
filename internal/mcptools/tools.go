@@ -334,14 +334,30 @@ func decisionNote(cursor, project string, conn *hubconn.Conn, measured int, bran
 // caughtUpText renders the nothing-to-do answer, saying which store it is
 // answering about. See its call site for the live failure that made the
 // distinction necessary.
+//
+// What it says about the buffer depends on who can do something about it.
+// In pull mode the reader must take those events itself, and naming the
+// call is the whole point. In push mode hub_receive is not registered at
+// all, so the same sentence sends a reader looking for a tool it does not
+// have — and, worse, invites it to conclude the events are stuck when
+// they are already on their way. Found live within a minute by two
+// separate clients, 2026-09-16.
 func caughtUpText(buffered bool) string {
 	base := "nothing to catch up — no prior position recorded and the server reports nothing behind"
-	if buffered {
-		return base + " — BUT this client is already holding buffered events and nothing is " +
-			"delivering them: call hub_receive to take them. That is a different store from the " +
-			"catch-up position, which is why this call reports nothing"
+	if !buffered {
+		return base + "; live traffic will arrive normally"
 	}
-	return base + "; live traffic will arrive normally"
+	// The honest half is the same either way: the buffer is a DIFFERENT
+	// store from the catch-up position, which is why this call reports
+	// nothing while events exist.
+	if harness.PushMode() {
+		return base + " — but this client is holding buffered events, which will arrive by push " +
+			"on their own. Nothing is stuck and there is nothing to call: that buffer is a " +
+			"different store from the catch-up position, which is why this call reports nothing"
+	}
+	return base + " — BUT this client is already holding buffered events and nothing is " +
+		"delivering them: call hub_receive to take them. That is a different store from the " +
+		"catch-up position, which is why this call reports nothing"
 }
 
 // noteCatchUpWriteFailure surfaces a failed write of the persisted

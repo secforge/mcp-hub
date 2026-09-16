@@ -1653,9 +1653,13 @@ func TestSendToolReportsDisconnectInsteadOfAttemptingASend(t *testing.T) {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
-	conn, _ := sole(t, hub).activeConn()
+	// Held before closing: a teardown releases the name, so afterwards
+	// there is nothing to look up — which is what the send below then
+	// has to report clearly rather than attempt.
+	sess := sole(t, hub)
+	conn, _ := sess.activeConn()
 	conn.Close()
-	deadlinePoll(t, func() bool { c, _ := sole(t, hub).activeConn(); return c == nil })
+	deadlinePoll(t, func() bool { c, _ := sess.activeConn(); return c == nil })
 
 	sendReq := mcp.CallToolRequest{}
 	sendReq.Params.Arguments = map[string]any{"connection": testConn, "text": "hello"}

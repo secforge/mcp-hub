@@ -283,3 +283,24 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// In push mode the buffered-events answer must name no tool. hub_receive
+// is not registered there, so the pull wording sends a reader looking for
+// a call it does not have — and invites it to conclude the events are
+// stuck, when they are already on their way. Two separate clients hit
+// this within a minute of each other, live.
+func TestBufferedEventsAdviceMatchesTheDeliveryMode(t *testing.T) {
+	t.Setenv(harness.EnvClaudeSocketName, "/tmp/does-not-need-to-exist.sock")
+	if !harness.PushMode() {
+		t.Fatal("expected push mode with the harness socket set")
+	}
+	text := caughtUpText(true)
+	if strings.Contains(text, "hub_receive") {
+		t.Errorf("push mode must not name a tool that is not registered:\n%s", text)
+	}
+	for _, want := range []string{"arrive by push", "Nothing is stuck", "different store"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected the push wording to say %q:\n%s", want, text)
+		}
+	}
+}
