@@ -125,6 +125,14 @@ type Event struct {
 	// So the three states stay apart: succeeded, refused, and didn't say.
 	// Only the first two are claims about the world.
 	ActionOKStated bool
+
+	// Mirrored says the connection this event arrived on is a mirror of
+	// some other conversation (a teams link), where a message we send is
+	// echoed back as its own "msg" event once it lands over there. On a
+	// plain hub connection nothing echoes back, so an ack is the whole
+	// story — and telling a reader to expect a second copy that will
+	// never come is the kind of instruction that gets waited on.
+	Mirrored bool
 	// Behind carries a standalone ack's reply's own wire.Ack.Behind, if
 	// the server sent one — see that field's doc comment. Nil on every
 	// other event kind, and on an "ack" from a server that doesn't send
@@ -1257,6 +1265,10 @@ func (c *Conn) readLoop() {
 		}
 		c.mu.Lock()
 		c.lastFrameKind, c.lastFrameAt = ev.Kind, time.Now()
+		// Stamped here, before the ack claim can divert the event, because
+		// this is where the connection's own nature is known and the
+		// formatter only ever sees the event.
+		ev.Mirrored = c.conversationKind != ""
 		if c.handleAckPlumbingLocked(ev) {
 			c.mu.Unlock()
 			continue

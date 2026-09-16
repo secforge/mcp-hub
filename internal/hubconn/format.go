@@ -268,9 +268,15 @@ func FormatEvent(e Event) string {
 			e.Text, confirmReminderCost(e))
 	case "sendAck":
 		if e.ActionOK {
-			return fmt.Sprintf("[hub: send acknowledged — it left the building (externalId=%s). "+
-				"The canonical message will still arrive separately, once, when it's actually "+
-				"reflected in the conversation.]", e.ExternalID)
+			// The second copy is a property of a mirrored conversation, not
+			// of sending. On a hub connection there is no echo, and saying
+			// there is invites a reader to wait for it.
+			if e.Mirrored {
+				return fmt.Sprintf("[hub: send acknowledged — it left the building (externalId=%s). "+
+					"The canonical message will still arrive separately, once, when it's actually "+
+					"reflected in the conversation.]", e.ExternalID)
+			}
+			return fmt.Sprintf("[hub: send acknowledged (externalId=%s)]", e.ExternalID)
 		}
 		if !e.ActionOKStated {
 			return fmt.Sprintf("[hub: the server answered the send (externalId=%s) without saying "+

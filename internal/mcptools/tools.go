@@ -2292,21 +2292,39 @@ func (h *Hub) sendFromInbox(text string) {
 		return
 	}
 
-	send := func() error {
-		if header.To != "" {
-			return conn.SendTo(body, header.To, nil, header.Format, header.ReplyTo, nil)
-		}
-		return conn.Send(body, nil, header.Format, header.ReplyTo, nil)
-	}
-	if err := send(); err != nil {
+	// Awaiting the ack rather than firing and forgetting, because this is
+	// the ONE path where the model gets no tool result: SendMessage tells
+	// it the reply reached this client and can say nothing about the hub.
+	// The ack is that missing half, so it is read here and reported, and
+	// the pushed copy of it is redundant everywhere.
+	ack, gotAck, err := conn.SendAwaitingAck(body, header.To, nil, header.Format, header.ReplyTo, nil)
+	if err != nil {
 		h.noteAutoReconnect(fmt.Sprintf("a reply sent to this session's hub inbox could not be "+
 			"relayed (%v) — it did not reach the hub. Send it again with hub_send.", err))
 		return
 	}
-	// Echoed so a misparse is visible now rather than inferred later from
+	// A send that worked says nothing. The reader wrote the message and
+	// knows what it said; an acknowledgement it never asked for is one
+	// more thing to read, every single time, to learn what it already
+	// assumed. Only the three outcomes it could NOT assume are spoken.
+	//
+	// Directives are the exception: those were parsed out of prose, and a
+	// misparse has to be visible now rather than inferred later from
 	// where the message turned out to go.
-	if d := header.Summary(); d != "" {
-		h.noteAutoReconnect("relayed your reply with: " + d)
+	switch {
+	case !gotAck:
+		h.noteAutoReconnect("your reply was sent, but the hub did not acknowledge it in time — " +
+			"it may still have arrived; hub_read or hub_catch_up can tell you.")
+	case ack.ActionOKStated && !ack.ActionOK:
+		h.noteAutoReconnect("your reply was REFUSED by the hub — it did not arrive. Send it again " +
+			"with hub_send.")
+	case !ack.ActionOKStated:
+		h.noteAutoReconnect("your reply was sent, and the hub answered without saying whether it " +
+			"succeeded — neither a confirmation nor a refusal.")
+	default:
+		if d := header.Summary(); d != "" {
+			h.noteAutoReconnect("relayed your reply with: " + d)
+		}
 	}
 }
 
