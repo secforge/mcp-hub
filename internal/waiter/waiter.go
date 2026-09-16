@@ -84,6 +84,9 @@ type Waiter struct {
 // purpose and will be replaced. Followers are kept open across the gap
 // rather than released.
 func (w *Waiter) ExpectReconnect() {
+	if w == nil {
+		return
+	}
 	w.mu.Lock()
 	w.expecting, w.held = true, false
 	w.mu.Unlock()
@@ -93,6 +96,9 @@ func (w *Waiter) ExpectReconnect() {
 // built on, ending the hold. The socket path never changes, so a follower
 // that survived the gap keeps receiving without knowing anything happened.
 func (w *Waiter) SetSource(s Source) {
+	if w == nil {
+		return
+	}
 	w.mu.Lock()
 	w.source = s
 	w.expecting, w.held = false, false
@@ -106,6 +112,9 @@ func (w *Waiter) SetSource(s Source) {
 // to wait for a message that nothing will send is worse than telling
 // them to poll.
 func (w *Waiter) Following() bool {
+	if w == nil {
+		return false
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.current != nil && w.current.follow
@@ -121,6 +130,9 @@ func (w *Waiter) Following() bool {
 // not a record, and anything that must not be lost belongs in the
 // catch-up position instead.
 func (w *Waiter) Announce(msg string) {
+	if w == nil {
+		return
+	}
 	w.mu.Lock()
 	rw := w.current
 	w.mu.Unlock()
@@ -296,6 +308,9 @@ func socketPath() string {
 // WaitCommand is the exact command Claude should run in the background to
 // receive the next event (the default, "once" mode).
 func (w *Waiter) WaitCommand() string {
+	if w == nil {
+		return ""
+	}
 	return w.waitCommand("")
 }
 
@@ -305,6 +320,9 @@ func (w *Waiter) WaitCommand() string {
 // output (e.g. a "Monitor"-style tool) better than the once-mode
 // run-it-again loop WaitCommand is meant for.
 func (w *Waiter) WaitFollowCommand() string {
+	if w == nil {
+		return ""
+	}
 	return w.waitCommand(" --follow")
 }
 
@@ -367,6 +385,9 @@ func (w *Waiter) handleAccept(conn net.Conn) {
 // the registration is left in place untouched, to be woken by a later
 // Poke call once the source's own state changes.
 func (w *Waiter) Poke() {
+	if w == nil {
+		return
+	}
 	w.mu.Lock()
 	if hasEvents, connected := w.source.Peek(); !hasEvents && connected {
 		w.mu.Unlock()
@@ -506,6 +527,9 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 }
 
 func (w *Waiter) Close() error {
+	if w == nil {
+		return nil
+	}
 	w.mu.Lock()
 	// Set before releasing the lock, and checked by deliver before it
 	// re-registers. A delivery in flight has UNREGISTERED its reader —

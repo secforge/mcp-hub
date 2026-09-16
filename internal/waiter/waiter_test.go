@@ -652,3 +652,28 @@ func TestIsStaleSocketDetectsAbsentAndDeadSockets(t *testing.T) {
 		t.Fatal("expected a nonexistent path to be reported stale")
 	}
 }
+
+// A nil *Waiter is a valid state: in push mode no wait socket is bound,
+// so every method must tolerate being called on nothing. Guarding at the
+// call sites instead cost an MCP server crash — ten sites, one missed,
+// and Poke ran on the first connection event.
+func TestEveryMethodToleratesANilWaiter(t *testing.T) {
+	var w *Waiter
+	// Each of these ran on a live path in push mode.
+	w.Poke()
+	w.ExpectReconnect()
+	w.Announce("anything")
+	w.SetSource(nil)
+	if w.Following() {
+		t.Error("a nil waiter reported a follower")
+	}
+	if got := w.WaitCommand(); got != "" {
+		t.Errorf("WaitCommand on nil = %q, want empty", got)
+	}
+	if got := w.WaitFollowCommand(); got != "" {
+		t.Errorf("WaitFollowCommand on nil = %q, want empty", got)
+	}
+	if err := w.Close(); err != nil {
+		t.Errorf("Close on nil = %v, want nil", err)
+	}
+}
