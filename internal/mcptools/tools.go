@@ -3465,17 +3465,29 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// instructions exactly, called hub_catch_up, was told it was
 		// caught up, and was holding nine buffered events — including the
 		// message it was being asked whether it had received.
-		tail := "; live traffic will arrive normally"
-		if has, _ := conn.Peek(); has {
-			tail = " — BUT this client is already holding buffered events and nothing is " +
-				"delivering them: call hub_receive to take them. That is a different store from " +
-				"the catch-up position, which is why this call reports nothing"
-		}
+		buffered, _ := conn.Peek()
 		return mcp.NewToolResultText(
 			decisionNote(cursor, project, conn, measuredBehind, branch) +
-				"nothing to catch up — no prior position recorded and the server reports nothing " +
-				"behind" + tail + gapNote,
+				caughtUpText(buffered) + gapNote,
 		), nil
+	}
+
+	// In push mode the whole backlog is delivered rather than returned one
+	// call at a time: the harness already takes deliveries, so a reader
+	// asking to catch up should be handed the messages instead of being
+	// made to ask for each. The per-call contract is unchanged everywhere
+	// else — see catchuppush.go for why the two differ.
+	if harness.PushMode() {
+		h.mu.Lock()
+		id := h.catchUpID
+		h.mu.Unlock()
+		go h.runCatchUpPush(conn, id, anchor)
+		return mcp.NewToolResultText(decisionNote(cursor, project, conn, measuredBehind, branch) +
+			seekNote +
+			"catching up — the messages are being DELIVERED to you one at a time, as live traffic " +
+			"is, rather than returned here. A closing message says when it is done and whether " +
+			"anything remains. Do not call hub_catch_up again until you see it: a second run " +
+			"would walk the same position twice."), nil
 	}
 
 	for skipped := 0; skipped < catchUpDedupSkipLimit; skipped++ {

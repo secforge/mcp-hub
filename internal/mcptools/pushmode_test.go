@@ -243,3 +243,37 @@ func TestQueuedNotesAreBoundedAndSayWhenTrimmed(t *testing.T) {
 		t.Errorf("trimming was silent:\n%s", got[:200])
 	}
 }
+
+// The push-mode branch must not fall through to the per-call walk, and
+// the per-call walk must not disappear for everyone else. Asserted
+// against the source because the difference is which branch runs, and a
+// behavioural test would need a live server on both paths to show it.
+func TestCatchUpDeliversByPushOnlyInPushMode(t *testing.T) {
+	src, err := os.ReadFile("tools.go")
+	if err != nil {
+		t.Fatalf("reading tools.go: %v", err)
+	}
+	text := string(src)
+
+	idx := strings.Index(text, "go h.runCatchUpPush(")
+	if idx < 0 {
+		t.Fatal("the push-mode catch-up branch is gone")
+	}
+	// The guard must be the push-mode check, not something else that
+	// happens to be nearby.
+	before := text[max(0, idx-400):idx]
+	if !strings.Contains(before, "harness.PushMode()") {
+		t.Error("the push drain is not gated on push mode")
+	}
+	// The per-call walk still has to exist for pull clients.
+	if !strings.Contains(text, "catchUpDedupSkipLimit") {
+		t.Error("the one-message-per-call walk is gone, which pull clients depend on")
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

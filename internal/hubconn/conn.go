@@ -2117,6 +2117,22 @@ func (c *Conn) writeJSON(v any) error {
 	return c.ws.WriteJSON(v)
 }
 
+// ShapeForPush renders one event for the push path, spilling an
+// oversized body to a file exactly as live delivery does — so a backlog
+// message and a live message of the same size arrive the same way, and a
+// catch-up cannot hand a reader something live delivery would have
+// refused to.
+//
+// Not charged against the delivery window: this is a backlog the reader
+// ASKED for, and the run that drives it has a budget of its own. Charging
+// twice would close the live window on the strength of a pull.
+func (c *Conn) ShapeForPush(e Event) string {
+	if c.budget == nil {
+		return FormatEventForPush(e)
+	}
+	return FormatEventForPush(c.budget.shape(e))
+}
+
 // NoteHandedOver records cursors delivered to the model by a path that
 // spends no push budget — hub_catch_up, hub_read, a synchronous tool
 // result. It costs nothing and is not optional: a confirm locates a
