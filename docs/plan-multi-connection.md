@@ -166,9 +166,22 @@ risk in the plan.
 
 ## 6. Wait socket (pull-mode harnesses only)
 
-One socket per connection would mean N follower processes. Instead one
-wait socket per process, multiplexing all connections, each line carrying
-its name. In push mode no socket is bound, unchanged.
+Still ONE SOCKET PER CONNECTION, deliberately, and this is a change from
+what this section first proposed.
+
+Multiplexing would save follower processes and cost correctness in the
+worst place to spend it. The waiter's state machine is built on one
+source: "the connection is coming back" (`expecting`), "the connection
+ended" and "we are holding" are each a fact about one conversation, and
+one socket serving eight would have to answer a follower asking about all
+of them at once — telling it alpha has gone while beta is fine, without
+releasing it, and without a silence that means either. That is the same
+class of ambiguity this whole client exists to remove, introduced into
+the one component whose entire job is to make silence mean something.
+
+The cost of not doing it is one `wait --follow` per connection, which a
+pull harness can run. Claude binds no socket at all here, so nothing in
+this project pays it today.
 
 ## 7. Limits
 
@@ -181,6 +194,11 @@ the honest way to say so.
 `mcp-hub2` exists only to hold a second connection, and becomes
 redundant. `MCP_HUB_SERVER_NAME` stays — it names the inbox and the
 registry row — but the second MCP registration can go.
+
+## Status
+
+Phases 1–4 are built and released in this repository; §6 is the pull-mode
+socket, which is still one per connection — see the note there.
 
 ## Phases
 

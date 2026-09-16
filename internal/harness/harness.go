@@ -150,10 +150,15 @@ func learnServerName(meta map[string]any) string {
 	return ""
 }
 
-// EnvServerName names this MCP server as the model's own config registered
-// it — "mcp-hub2" for the second entry, say. Set it in the server's env
-// block; without it every entry running this binary is indistinguishable
-// in the attribution line.
+// EnvServerName names this MCP server as the model's own config
+// registered it. Set it in the server's env block; without it two entries
+// running this binary are indistinguishable in the attribution line.
+//
+// It is the FALLBACK attribution now, not the usual one: a delivered
+// message is attributed to the connection it came from (see OpenAs), and
+// this names the server only where there is no connection to name —
+// which is also why a second registration is no longer how a session
+// holds a second conversation.
 const EnvServerName = "MCP_HUB_SERVER_NAME"
 
 // senderName builds the attribution shown to the model. An explicitly
