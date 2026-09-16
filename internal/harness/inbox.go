@@ -226,13 +226,40 @@ func (i *Inbox) handleUser(_ context.Context, p *udsmsg.Peer, f *udsmsg.Frame) {
 	// Whether the sender asserted a permission mode is the other half of
 	// the gate question, and it is in the bytes rather than in anyone's
 	// reading of the docs.
-	i.mu.Lock()
-	if f != nil && f.FromMode == "" {
-		i.diagnostic = "the last reply arrived with NO from_mode on the frame"
-	} else if f != nil {
-		i.diagnostic = "the last reply asserted from_mode=" + string(f.FromMode)
+	// The frame field and the ENVELOPE are different lanes, and the gated
+	// one is the envelope: the receiver parses <cross-session-message …>
+	// out of the content and reads from-mode from there. The frame's own
+	// fromMode belongs to host-injection on local stdin.
+	//
+	// The envelope only counts if it round-trips byte for byte — the
+	// receiver re-renders what it parsed and compares, and any mismatch
+	// silently discards the attribution, mode included. So "no mode
+	// asserted" and "mode discarded by a failed parse" are different
+	// facts that look identical downstream, and only here can they be
+	// told apart.
+	if f != nil {
+		frameMode := "none"
+		if f.FromMode != "" {
+			frameMode = string(f.FromMode)
+		}
+		envelope := "no envelope parsed — attribution would be discarded"
+		if f.Message != nil {
+			if cs, _, ok := udsmsg.Unwrap(f.Message.Content); ok {
+				mode := string(cs.Mode)
+				if mode == "" {
+					mode = "none"
+				}
+				envelope = "envelope parsed, from-mode=" + mode
+			} else if f.Message.Content != "" &&
+				strings.Contains(f.Message.Content, "cross-session-message") {
+				envelope = "envelope PRESENT but did not round-trip — attribution discarded, " +
+					"which is indistinguishable downstream from no mode being asserted"
+			}
+		}
+		i.mu.Lock()
+		i.diagnostic = "last reply: frame from_mode=" + frameMode + "; " + envelope
+		i.mu.Unlock()
 	}
-	i.mu.Unlock()
 	if text := frameText(f); text != "" {
 		fn(text)
 	}
