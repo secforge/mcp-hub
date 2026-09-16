@@ -110,6 +110,29 @@ func OpenInbox() (*Inbox, error) {
 		// Never: a peer whose credentials the kernel will not report
 		// cannot be compared to our parent, so it cannot be accepted.
 		AllowUnidentifiedPeers: false,
+		// Derive the permission posture from the session that spawned
+		// this process, and bind anyway when it cannot be derived.
+		//
+		// Parity is what decides whether a reply is delivered or held for
+		// the user's approval: a frame asserting a mode equal to the
+		// receiver's is accepted, a different one is held, and one
+		// asserting nothing is held only by a bypass receiver. An inbox
+		// that asserted nothing was therefore held by construction, which
+		// is what made every reply cost an approval round-trip.
+		//
+		// DERIVED rather than REQUIRED because detection reads
+		// /proc/<pid>/cmdline, which darwin and windows do not have.
+		// Requiring it would refuse to bind on three of the five
+		// platforms this ships on — losing the return path entirely to
+		// avoid a hold that on those platforms is merely noise. Failing
+		// to detect costs a hold; failing to bind costs the feature.
+		//
+		// The posture is never a value this code chooses: the field names
+		// a SOURCE and cannot name a mode, so nothing here can claim to
+		// be something it is not. Asserting one outright is possible only
+		// through Server.AssertModeUnverified, which logs that it was
+		// used.
+		ModeSource: inboxModeSource(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("could not bind a return-path inbox: %w", err)
@@ -148,6 +171,10 @@ func (i *Inbox) Publish(mcpName string) error {
 	i.mu.Unlock()
 	return nil
 }
+
+// inboxModeSource is the posture source every inbox binds with, named so
+// a test can assert the choice rather than re-reading the literal.
+func inboxModeSource() udsmsg.ModeSource { return udsmsg.ModeSourceDerived }
 
 // Address is the string to advertise as this delivery's reply address,
 // in the "uds:<path>" form the harness hands the model as from=.

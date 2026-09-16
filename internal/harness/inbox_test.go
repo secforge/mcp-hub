@@ -170,3 +170,35 @@ func TestThePublishedEntryDoesNotClaimToBeASession(t *testing.T) {
 		t.Errorf("the entry is not addressable: %v", got)
 	}
 }
+
+// The inbox must derive its posture and bind regardless. Parity decides
+// whether a reply is delivered or held: an inbox asserting nothing is
+// held by construction wherever the receiver bypasses permissions, which
+// is what made every reply cost an approval round-trip. But detection
+// reads /proc, which darwin and windows lack — so requiring it would
+// refuse to bind on three of the five platforms this ships on, losing the
+// return path to avoid a hold that is merely noise there.
+func TestTheInboxDerivesItsModeAndBindsEvenWhenItCannot(t *testing.T) {
+	if got := inboxModeSource(); got != udsmsg.ModeSourceDerived {
+		t.Fatalf("ModeSource = %v, want ModeSourceDerived — Required would refuse to bind "+
+			"wherever /proc is absent, and None would be held by construction", got)
+	}
+}
+
+// DetectParentMode reads launch flags, so it cannot see a session that
+// changed posture at runtime — and it fails toward a hold rather than
+// toward a claim, which is the safe direction for something the receiver
+// treats as an assertion.
+func TestDetectingTheParentModeNeverGuesses(t *testing.T) {
+	restore := ClearEnvForTesting()
+	defer restore()
+
+	mode, err := udsmsg.DetectParentMode()
+	if err == nil && mode == "" {
+		t.Fatal("detection reported success with no posture — an empty mode asserted as a " +
+			"success is the one answer that reads as a claim without being one")
+	}
+	if err != nil && mode != "" {
+		t.Fatalf("detection failed but still produced %q, which would be asserted", mode)
+	}
+}

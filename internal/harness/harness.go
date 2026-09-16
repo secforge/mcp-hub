@@ -93,7 +93,15 @@ func Open() *Pusher {
 // the best name known by then. Caller must hold p.mu.
 func (p *Pusher) deliverer() deliver.Deliverer {
 	if p.d == nil {
-		opts := []deliver.Option{deliver.WithSenderName(senderName(p.learned))}
+		// WithDetectedMode asserts the spawning session's real posture,
+		// or nothing when it cannot be told. Never WithAssertedMode: the
+		// mode is a claim rather than a proof, and asserting one this
+		// process is not entitled to would launder the user's permission
+		// decision past a gate that exists to ask them.
+		opts := []deliver.Option{
+			deliver.WithSenderName(senderName(p.learned)),
+			deliver.WithDetectedMode(),
+		}
 		if p.replyAddress != "" {
 			opts = append(opts, deliver.WithReplyAddress(p.replyAddress))
 		}
