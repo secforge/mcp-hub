@@ -1679,6 +1679,15 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 			"directly. Use SendMessage — do NOT write to that socket yourself from a shell. It " +
 			"speaks a framed protocol with an auth handshake, a raw write is dropped without an " +
 			"error, and the address is only an address because a tool knows what to do with it.\n" +
+			"SendMessage carries text only, so anything structural goes in a FIRST LINE of the " +
+			"form: #hub to=<peerId> replyTo=<externalId> confirm=<cursor> format=html — any " +
+			"subset, recognised only as the first line, with your message from the next line on. " +
+			"An unknown or mistyped directive is REFUSED and nothing is sent, rather than being " +
+			"relayed as prose. A message that merely mentions to= in its body is prose and stays " +
+			"prose.\n" +
+			"Two things that line cannot do: @-mentions and attachments. Both need hub_send, " +
+			"which takes them as real arguments — a filename inside a message would turn a typo " +
+			"into a file read.\n" +
 			"One difference worth knowing: a reply reports that it reached this client, never " +
 			"that it reached the hub, so if it matters that something was actually said, use " +
 			"hub_send and read the acknowledgement.\n" +
@@ -2215,9 +2224,47 @@ func (h *Hub) sendFromInbox(text string) {
 	// but not forwarded is recoverable rather than lost. What is NOT
 	// recoverable is the model believing the stronger thing, so a failure
 	// is surfaced on the next tool call instead.
-	if err := conn.Send(text, nil, "", "", nil); err != nil {
+	// A first line of "#hub key=value …" asks for what SendMessage cannot
+	// express. Refused rather than guessed at: a mistyped directive
+	// relayed as prose would put a private message on the broadcast, and
+	// the sender would never know.
+	header, body, err := parseInboxHeader(text)
+	if err != nil {
+		h.noteAutoReconnect(fmt.Sprintf("a reply's #hub line was refused (%v), so NOTHING was "+
+			"sent. Fix the line and send again, or use hub_send.", err))
+		return
+	}
+	if header.Confirm != "" {
+		if _, err := h.confirmCursor(conn, header.Confirm); err != nil {
+			h.noteAutoReconnect(fmt.Sprintf("a reply asked to confirm %s and that failed (%v); "+
+				"the message itself is still being sent.", header.Confirm, err))
+		}
+	}
+	if body == "" {
+		// Directives with no text: a confirm-only reply is legitimate,
+		// but sending an empty message to the hub is not.
+		if header.Confirm == "" {
+			h.noteAutoReconnect("a reply carried directives but no message text, so nothing was " +
+				"sent.")
+		}
+		return
+	}
+
+	send := func() error {
+		if header.To != "" {
+			return conn.SendTo(body, header.To, nil, header.Format, header.ReplyTo, nil)
+		}
+		return conn.Send(body, nil, header.Format, header.ReplyTo, nil)
+	}
+	if err := send(); err != nil {
 		h.noteAutoReconnect(fmt.Sprintf("a reply sent to this session's hub inbox could not be "+
 			"relayed (%v) — it did not reach the hub. Send it again with hub_send.", err))
+		return
+	}
+	// Echoed so a misparse is visible now rather than inferred later from
+	// where the message turned out to go.
+	if d := header.Summary(); d != "" {
+		h.noteAutoReconnect("relayed your reply with: " + d)
 	}
 }
 
