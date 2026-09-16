@@ -34,7 +34,7 @@ func (f *fakePeer) Close(code int, reason string) {
 // reconnectSecret matches a still-alive-session but currently-disconnected
 // earlier peer's — see the identity-reuse tests). agePublicKey is
 // deliberately independent of peerID resolution — see those same tests.
-func joinFake(s *Session, name, agePublicKey, reconnectSecret string, beforeVisible func(int)) *fakePeer {
+func joinFake(s *Session, name, agePublicKey, reconnectSecret string, beforeVisible func()) *fakePeer {
 	var fp *fakePeer
 	s.Join(reconnectSecret, func(id string) Peer {
 		fp = &fakePeer{id: id, name: name, agePublicKey: agePublicKey}
@@ -43,31 +43,34 @@ func joinFake(s *Session, name, agePublicKey, reconnectSecret string, beforeVisi
 	return fp
 }
 
-func TestJoinNeverTellsAPeerAboutItself(t *testing.T) {
+// The roster states the session's membership, so it INCLUDES the peer
+// receiving it — a list that silently omitted the reader would be a view
+// each client has to mentally correct, and the correction is what used
+// to be got wrong.
+func TestTheRosterStatesTheWholeMembershipIncludingTheReceiver(t *testing.T) {
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
 	a := joinFake(s, "", "", "", nil)
 	b := joinFake(s, "", "", "", nil)
 
-	// a: rosterComplete (immediately, empty roster of its own), then told
-	// about b's later join.
+	// a: a roster naming only itself, then the roster again once b joins.
 	if len(a.received) != 2 {
-		t.Fatalf("a should have received its own rosterComplete plus b's join event, got %d events: %+v", len(a.received), a.received)
+		t.Fatalf("a should have received its own roster plus the one b's join produced, got %d events: %+v", len(a.received), a.received)
 	}
-	if _, ok := a.received[0].(wire.RosterComplete); !ok {
-		t.Fatalf("expected a's first event to be rosterComplete, got %+v", a.received[0])
+	r, ok := a.received[0].(wire.Roster)
+	if !ok || len(r.Members) != 1 || r.Members[0].PeerID != a.ID() {
+		t.Fatalf("expected a's first event to be a roster naming just itself, got %+v", a.received[0])
 	}
-	if ev, ok := a.received[1].(wire.PeerEvent); !ok || ev.PeerID != b.ID() {
+	r2, ok := a.received[1].(wire.Roster)
+	if !ok || len(r2.Members) != 2 {
 		t.Fatalf("unexpected second event for a: %+v", a.received[1])
 	}
-	if len(b.received) != 2 {
-		t.Fatalf("b should be told about the one existing peer (a) then rosterComplete, got %d events: %+v", len(b.received), b.received)
+	if len(b.received) != 1 {
+		t.Fatalf("b should get the whole membership in ONE roster message, got %d events: %+v", len(b.received), b.received)
 	}
-	if ev, ok := b.received[0].(wire.PeerEvent); !ok || ev.PeerID != a.ID() {
-		t.Fatalf("unexpected first event for b: %+v", b.received[0])
-	}
-	if _, ok := b.received[1].(wire.RosterComplete); !ok {
-		t.Fatalf("expected b's second event to be rosterComplete, got %+v", b.received[1])
+	r, ok = b.received[0].(wire.Roster)
+	if !ok || len(r.Members) != 2 {
+		t.Fatalf("unexpected roster for b: %+v", b.received[0])
 	}
 }
 
@@ -78,22 +81,19 @@ func TestJoinNotifiesNewPeerAboutExistingPeers(t *testing.T) {
 	b := joinFake(s, "", "", "", nil)
 	c := joinFake(s, "", "", "", nil)
 
-	if len(c.received) != 3 {
-		t.Fatalf("c should be told about both existing peers plus rosterComplete, got %d events: %+v", len(c.received), c.received)
+	if len(c.received) != 1 {
+		t.Fatalf("c should get the whole membership in ONE roster message, got %d events: %+v", len(c.received), c.received)
+	}
+	r, ok := c.received[0].(wire.Roster)
+	if !ok {
+		t.Fatalf("expected a roster event, got %+v", c.received[0])
 	}
 	seen := map[string]bool{}
-	for _, ev := range c.received[:2] {
-		pe, ok := ev.(wire.PeerEvent)
-		if !ok || pe.Type != wire.TypePeerJoined {
-			t.Fatalf("expected a peerJoined event, got %+v", ev)
-		}
-		seen[pe.PeerID] = true
+	for _, rp := range r.Members {
+		seen[rp.PeerID] = true
 	}
-	if !seen[a.ID()] || !seen[b.ID()] {
-		t.Fatalf("expected to be told about both a and b, got %+v", c.received)
-	}
-	if _, ok := c.received[2].(wire.RosterComplete); !ok {
-		t.Fatalf("expected c's last event to be rosterComplete, got %+v", c.received[2])
+	if len(r.Members) != 3 || !seen[a.ID()] || !seen[b.ID()] || !seen[c.ID()] {
+		t.Fatalf("expected the roster to name a, b and c, got %+v", r)
 	}
 }
 
@@ -108,33 +108,58 @@ func TestJoinIncludesNameAndAgePublicKeyInPeerEvents(t *testing.T) {
 	if len(b.received) < 1 {
 		t.Fatalf("expected b to receive at least one event, got %+v", b.received)
 	}
-	pe, ok := b.received[0].(wire.PeerEvent)
-	if !ok || pe.PeerID != a.ID() || pe.Name != "Alice" || pe.AgePublicKey != pubkeyA {
-		t.Fatalf("expected b's roster entry for a to carry name/pubkey, got %+v", b.received[0])
+	r, ok := b.received[0].(wire.Roster)
+	if !ok {
+		t.Fatalf("expected b's first event to be the roster, got %+v", b.received[0])
+	}
+	var aEntry wire.RosterMember
+	for _, m := range r.Members {
+		if m.PeerID == a.ID() {
+			aEntry = m
+		}
+	}
+	if aEntry.Name != "Alice" || aEntry.AgePublicKey != pubkeyA {
+		t.Fatalf("expected b's roster entry for a to carry name/pubkey, got %+v", r.Members)
 	}
 
-	// a is told about b's join (broadcast), which must carry b's (empty)
-	// name/pubkey fields consistently, i.e. no crash/mixup.
+	// a is re-sent the whole membership when b joins, which must carry
+	// b's (empty) name/pubkey fields consistently, i.e. no crash/mixup.
 	if len(a.received) != 2 {
-		t.Fatalf("expected a to have 2 events (own rosterComplete, then b's join), got %+v", a.received)
+		t.Fatalf("expected a to have 2 events (own roster, then the roster b's join produced), got %+v", a.received)
 	}
-	joinedB, ok := a.received[1].(wire.PeerEvent)
-	if !ok || joinedB.PeerID != b.ID() || joinedB.Name != "" || joinedB.AgePublicKey != "" {
+	after, ok := a.received[1].(wire.Roster)
+	if !ok || len(after.Members) != 2 {
 		t.Fatalf("unexpected event for a about b: %+v", a.received[1])
+	}
+	var bEntry wire.RosterMember
+	for _, m := range after.Members {
+		if m.PeerID == b.ID() {
+			bEntry = m
+		}
+	}
+	if bEntry.PeerID != b.ID() || bEntry.Name != "" || bEntry.AgePublicKey != "" {
+		t.Fatalf("unexpected entry for b: %+v", after.Members)
 	}
 }
 
-func TestJoinReportsExistingCountViaBeforeVisibleCallback(t *testing.T) {
+// beforeVisible runs under the roster lock, before the newcomer is
+// visible to anyone — which is what lets the "joined" confirmation and
+// the roster leave together and makes a membership change unable to
+// interleave between them.
+func TestJoinRunsBeforeVisibleWhileStillHoldingTheRosterLock(t *testing.T) {
 	m := NewManager()
 	s := m.GetOrCreate("session-1")
-	joinFake(s, "", "", "", nil)
+	first := joinFake(s, "", "", "", nil)
 
-	var reportedCount int
-	joinFake(s, "", "", "", func(count int) { reportedCount = count })
+	var sawMembership int
+	joinFake(s, "", "", "", func() { sawMembership = len(s.peers) })
 
-	if reportedCount != 1 {
-		t.Fatalf("expected beforeVisible to report 1 existing peer, got %d", reportedCount)
+	// The newcomer is not in the map yet, so what beforeVisible can see is
+	// exactly the membership the roster is about to be built from.
+	if sawMembership != 1 {
+		t.Fatalf("expected beforeVisible to run before the newcomer was visible, saw %d peers", sawMembership)
 	}
+	_ = first
 }
 
 func TestJoinReusesPeerIDForSameReconnectSecretAfterLeaving(t *testing.T) {
@@ -192,14 +217,12 @@ func TestJoinSupersedeDoesNotBroadcastLeaveOrJoin(t *testing.T) {
 
 	joinFake(s, "Alice", "", secret, nil)
 
-	for _, ev := range bystander.received {
-		switch e := ev.(type) {
-		case wire.PeerEvent:
-			if e.PeerID == first.ID() {
-				t.Fatalf("expected no peerJoined/peerLeft for the superseded identity, got %+v", e)
-			}
-		}
+	// A supersede changes which connection holds an identity, not who is
+	// present, so nobody else is told anything at all.
+	if len(bystander.received) != 0 {
+		t.Fatalf("expected no roster re-send for a superseded identity, got %+v", bystander.received)
 	}
+	_ = first
 }
 
 func TestJoinReportsReusedAccurately(t *testing.T) {
@@ -402,17 +425,30 @@ func TestJoinIsAtomicAgainstConcurrentLeave(t *testing.T) {
 	// something that should have erased it from c's already-delivered
 	// roster event. c then separately gets told about a's departure too,
 	// since c is a member of the session by then.
-	if len(c.received) != 3 {
-		t.Fatalf("expected c to have received 1 roster event, rosterComplete, then a's departure, got %d: %+v", len(c.received), c.received)
+	if len(c.received) != 2 {
+		t.Fatalf("expected c to have received its roster then a's departure, got %d: %+v", len(c.received), c.received)
 	}
-	if pe, ok := c.received[0].(wire.PeerEvent); !ok || pe.PeerID != a.ID() || pe.Type != wire.TypePeerJoined {
+	first, ok := c.received[0].(wire.Roster)
+	if !ok {
 		t.Fatalf("unexpected first event for c: %+v", c.received[0])
 	}
-	if _, ok := c.received[1].(wire.RosterComplete); !ok {
-		t.Fatalf("expected c's second event to be rosterComplete, got %+v", c.received[1])
+	sawA := false
+	for _, m := range first.Members {
+		if m.PeerID == a.ID() {
+			sawA = true
+		}
 	}
-	if pe, ok := c.received[2].(wire.PeerEvent); !ok || pe.PeerID != a.ID() || pe.Type != wire.TypePeerLeft {
-		t.Fatalf("expected c's third event to be a's departure, got %+v", c.received[2])
+	if !sawA {
+		t.Fatalf("expected c's roster snapshot to still include a, got %+v", first)
+	}
+	left, ok := c.received[1].(wire.Roster)
+	if !ok {
+		t.Fatalf("expected c's second event to be the roster a's departure produced, got %+v", c.received[1])
+	}
+	for _, m := range left.Members {
+		if m.PeerID == a.ID() {
+			t.Fatalf("expected a to be gone from the re-sent roster, got %+v", left)
+		}
 	}
 }
 

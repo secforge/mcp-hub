@@ -9,12 +9,12 @@ import (
 )
 
 func TestJoinedRoundTrip(t *testing.T) {
-	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 3, "", "")
+	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 	raw, err := json.Marshal(j)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","peerCount":3,"serverVersion":3}` {
+	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","serverVersion":4}` {
 		t.Fatalf("unexpected json: %s", got)
 	}
 	typ, err := DecodeType(raw)
@@ -27,7 +27,7 @@ func TestJoinedRoundTrip(t *testing.T) {
 }
 
 func TestJoinedIncludesNameAndAgePublicKey(t *testing.T) {
-	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "Alice", "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk")
+	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", "Alice", "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk")
 	raw, _ := json.Marshal(j)
 	var decoded Joined
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -39,19 +39,22 @@ func TestJoinedIncludesNameAndAgePublicKey(t *testing.T) {
 }
 
 func TestNewJoinedStampsCurrentProtocolVersion(t *testing.T) {
-	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 	if j.ServerVersion != ProtocolVersion {
 		t.Fatalf("got ServerVersion %d, want %d", j.ServerVersion, ProtocolVersion)
 	}
 }
 
 func TestProtocolVersionIsCurrent(t *testing.T) {
-	// Bumped 2026-09-08 for Joined.Features — see ProtocolVersion's doc
-	// comment. A client/server that doesn't send a version at all is
-	// still treated as v1 (see wsserver's clientVersion parsing) — that
-	// baseline is unaffected by this bump.
-	if ProtocolVersion != 3 {
-		t.Fatalf("got ProtocolVersion %d, want 3", ProtocolVersion)
+	// Bumped for the roster becoming state (wire.Roster) and the
+	// peerJoined/peerLeft/rosterComplete frames going away with it. There
+	// is no compatibility path: an older client waits for a
+	// rosterComplete that will never arrive, which is exactly why the
+	// version says so at connect. A client/server that doesn't send a
+	// version at all is still treated as v1 (see wsserver's clientVersion
+	// parsing) — that baseline is unaffected by this bump.
+	if ProtocolVersion != 4 {
+		t.Fatalf("got ProtocolVersion %d, want 4", ProtocolVersion)
 	}
 }
 
@@ -105,15 +108,27 @@ func TestBroadcastMsgIsNotPrivate(t *testing.T) {
 	}
 }
 
-func TestPeerJoinedIncludesNameAndAgePublicKey(t *testing.T) {
-	pe := NewPeerJoined("peer-1", "Alice", "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk")
-	raw, _ := json.Marshal(pe)
-	var decoded PeerEvent
+func TestRosterMemberIncludesNameAndAgePublicKey(t *testing.T) {
+	r := NewRoster([]RosterMember{{PeerID: "peer-1", Name: "Alice",
+		AgePublicKey: "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk"}})
+	raw, _ := json.Marshal(r)
+	var decoded Roster
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if decoded.Name != "Alice" || decoded.AgePublicKey != "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk" {
+	if len(decoded.Members) != 1 || decoded.Members[0].Name != "Alice" ||
+		decoded.Members[0].AgePublicKey != "age1scdm7mae5t68c9ch0sqfzlusqyflpgxlrgk3zwl44zwl9vvq2guqtdv4fk" {
 		t.Fatalf("unexpected round trip: %+v", decoded)
+	}
+}
+
+// An empty membership must survive the wire as a list, not as null: the
+// receiving side reads "nobody" from an empty list, and null is an
+// absence it would have to interpret.
+func TestAnEmptyRosterEncodesAsAnEmptyList(t *testing.T) {
+	raw, _ := json.Marshal(NewRoster(nil))
+	if !strings.Contains(string(raw), `"members":[]`) {
+		t.Fatalf("expected an empty list on the wire, got %s", raw)
 	}
 }
 
@@ -137,7 +152,7 @@ func TestJoinedDecodesTeamsFields(t *testing.T) {
 }
 
 func TestJoinedOmitsTeamsFieldsWhenUnset(t *testing.T) {
-	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+	j := NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 	raw, _ := json.Marshal(j)
 	for _, field := range []string{"canSend", "conversationKind", "topic"} {
 		if strings.Contains(string(raw), field) {
@@ -146,10 +161,9 @@ func TestJoinedOmitsTeamsFieldsWhenUnset(t *testing.T) {
 	}
 }
 
-func TestPeerJoinedOmitsEmptyNameAndAgePublicKey(t *testing.T) {
-	pe := NewPeerJoined("peer-1", "", "")
-	raw, _ := json.Marshal(pe)
-	if got := string(raw); got != `{"type":"peerJoined","peerId":"peer-1"}` {
+func TestRosterMemberOmitsEmptyNameAndAgePublicKey(t *testing.T) {
+	raw, _ := json.Marshal(NewRoster([]RosterMember{{PeerID: "peer-1"}}))
+	if got := string(raw); got != `{"type":"roster","members":[{"peerId":"peer-1"}]}` {
 		t.Fatalf("expected empty name/agePublicKey to be omitted, got: %s", got)
 	}
 }
@@ -569,7 +583,7 @@ func TestMsgOmitsAnswersWhenUnset(t *testing.T) {
 }
 
 func TestJoinedBehindRoundTrip(t *testing.T) {
-	j := NewJoined("peer-1", 0, "", "")
+	j := NewJoined("peer-1", "", "")
 	j.Behind = BehindCount(3)
 	j.BehindSince = "2026-09-01T09:12:00Z"
 	raw, err := json.Marshal(j)
@@ -586,7 +600,7 @@ func TestJoinedBehindRoundTrip(t *testing.T) {
 }
 
 func TestJoinedOmitsBehindWhenZero(t *testing.T) {
-	raw, _ := json.Marshal(NewJoined("peer-1", 0, "", ""))
+	raw, _ := json.Marshal(NewJoined("peer-1", "", ""))
 	if strings.Contains(string(raw), "behind") {
 		t.Fatalf("expected behind/behindSince to be omitted when unset, got: %s", raw)
 	}

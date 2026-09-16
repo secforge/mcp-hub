@@ -509,7 +509,7 @@ func TestReceiveResolvesReferenceFormAttachment(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		conn.WriteJSON(wire.Msg{
 			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "look", TS: "ts1",
 			Attachments: []wire.Attachment{{Token: "att-3142", ContentType: "image/webp", Name: "shot.png", Kind: "image"}},
@@ -813,7 +813,7 @@ func TestDisconnectedTextHintsHubCatchUp(t *testing.T) {
 		if err != nil {
 			return
 		}
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-xyz"})
 		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 	}))
@@ -1090,7 +1090,7 @@ func TestConnectWithReconnectSecretReusesPeerIDNotAgePublicKey(t *testing.T) {
 	}
 }
 
-func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T) {
+func TestConnectResultSaysTheMembershipArrivesSeparately(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 	ctx := context.Background()
@@ -1103,8 +1103,14 @@ func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T)
 		t.Fatalf("connect a failed: err=%v result=%+v", err, res)
 	}
 	defer hubA.handleDisconnect(ctx, connReqFor(testConn))
-	if !strings.Contains(textOf(res), "No other peers are in this session yet") {
-		t.Fatalf("expected a-no-existing-peers note, got: %s", textOf(res))
+	// No claim about who is here: joined carries no count any more, and a
+	// count inferred from its absence is exactly what this protocol
+	// change removed.
+	if strings.Contains(textOf(res), "No other peers are in this session yet") {
+		t.Fatalf("expected no claim about membership on connect, got: %s", textOf(res))
+	}
+	if !strings.Contains(textOf(res), "arrives as ONE message") {
+		t.Fatalf("expected the connect note to say the membership is stated separately, got: %s", textOf(res))
 	}
 	// Nothing is claimed about what other peers can SEE when neither a
 	// name nor a key was given — there is nothing for them to see. The
@@ -1123,11 +1129,8 @@ func TestConnectResultStatesExpectedPeerCountAndRosterNotification(t *testing.T)
 		t.Fatalf("connect b failed: err=%v result=%+v", err, res)
 	}
 	defer hubB.handleDisconnect(ctx, connReqFor(testConn))
-	if !strings.Contains(textOf(res), "1 other peer(s) already in this session") {
-		t.Fatalf("expected b-1-existing-peer note, got: %s", textOf(res))
-	}
-	if !strings.Contains(textOf(res), "roster complete") {
-		t.Fatalf("expected a mention of the roster-complete notification, got: %s", textOf(res))
+	if !strings.Contains(textOf(res), "ONE message") {
+		t.Fatalf("expected the membership to be described as arriving whole, got: %s", textOf(res))
 	}
 }
 
@@ -1176,7 +1179,7 @@ func TestConnectResultNotesOutdatedClientVersion(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		joined.ServerVersion = wire.ProtocolVersion + 1
 		conn.WriteJSON(joined)
 		// Keep the connection open briefly so the client's background read
@@ -1518,7 +1521,7 @@ func TestConnectPassesCreateTokenAsHeader(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 	}))
 	defer srv.Close()
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")

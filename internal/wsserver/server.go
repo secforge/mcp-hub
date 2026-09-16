@@ -168,8 +168,8 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 			go p.writeLoop()
 			return p
 		},
-		func(existingCount int) {
-			writeErr = conn.WriteJSON(wire.NewJoined(peerID, existingCount, name, agePublicKey))
+		func() {
+			writeErr = conn.WriteJSON(wire.NewJoined(peerID, name, agePublicKey))
 		},
 	)
 	if writeErr != nil {

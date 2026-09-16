@@ -31,9 +31,7 @@ const (
 	TypeJoined          Type = "joined"
 	TypeError           Type = "error"
 	TypeMsg             Type = "msg"
-	TypePeerJoined      Type = "peerJoined"
-	TypePeerLeft        Type = "peerLeft"
-	TypeRosterComplete  Type = "rosterComplete"
+	TypeRoster          Type = "roster"
 	TypeSendAck         Type = "sendAck"
 	TypeReactionChanged Type = "reactionChanged"
 	TypeMessageEdited   Type = "messageEdited"
@@ -89,7 +87,7 @@ const (
 // this mechanism" — 3 is a floor meaning "this server declares its
 // features," after which an individual additive feature needs no
 // further bump.
-const ProtocolVersion = 3
+const ProtocolVersion = 4
 
 type envelope struct {
 	Type Type `json:"type"`
@@ -107,11 +105,6 @@ func DecodeType(raw []byte) (Type, error) {
 type Joined struct {
 	Type   Type   `json:"type"`
 	PeerID string `json:"peerId"`
-	// PeerCount is how many other peers were already in the session at the
-	// moment this peer joined — i.e. how many peerJoined events (the
-	// "roster") will follow. Computed atomically server-side so it can never
-	// drift from what's actually delivered.
-	PeerCount int `json:"peerCount"`
 	// ServerVersion is this server's ProtocolVersion, so the client can tell
 	// if it's behind and surface that to the model.
 	ServerVersion int `json:"serverVersion"`
@@ -246,9 +239,9 @@ func (j Joined) AttachmentsFeature() (AttachmentsFeature, bool) {
 	return af, true
 }
 
-func NewJoined(peerID string, peerCount int, name, agePublicKey string) Joined {
+func NewJoined(peerID string, name, agePublicKey string) Joined {
 	return Joined{
-		Type: TypeJoined, PeerID: peerID, PeerCount: peerCount, ServerVersion: ProtocolVersion,
+		Type: TypeJoined, PeerID: peerID, ServerVersion: ProtocolVersion,
 		Name: name, AgePublicKey: agePublicKey,
 	}
 }
@@ -682,35 +675,50 @@ func NewDirectedMsg(peerID, text, ts string, attachments []Attachment, format, r
 	return Msg{Type: TypeMsg, PeerID: peerID, Text: text, TS: ts, Private: true, Attachments: attachments, Format: format, ReplyTo: replyTo, Mentions: mentions}
 }
 
-type PeerEvent struct {
-	Type   Type   `json:"type"`
-	PeerID string `json:"peerId"`
-	// Name and AgePublicKey are that peer's own sanitized/validated values
-	// from when it connected (see Joined). Both are empty if that peer
-	// didn't supply them.
+// Roster is the membership of a session as STATE: the whole list, in one
+// message, re-sent in full whenever it changes.
+//
+// It replaces three frames — a peerJoined per existing peer, a
+// rosterComplete terminating that burst, and the peerJoined/peerLeft
+// deltas that followed. Deltas asked every client to reassemble a list
+// from a stream and to know when the stream had ended, and a client
+// cannot answer the second question from its own side: where a server's
+// roster burst is not serialised ahead of live traffic, a newcomer's
+// join is indistinguishable from a roster entry, so "that is everyone"
+// was never provable by counting or by waiting.
+//
+// State removes the question instead of bounding it. Every frame carries
+// the whole truth, so a client that misses one repairs on the next
+// rather than drifting silently — which is also why there is no count
+// here: the list IS the count, and two ways to say the same thing is
+// what made that question necessary.
+//
+// Members includes the receiving peer itself, so the list is the session's
+// membership rather than a view that has to be mentally corrected. An
+// empty list never occurs for that reason; a list of one means you are
+// alone. Built under the same lock that owns the roster, so it cannot
+// interleave with a membership change.
+type Roster struct {
+	Type    Type           `json:"type"`
+	Members []RosterMember `json:"members"`
+	// ReadAt is when the conversation behind a teams link was last read,
+	// where the server knows. Absent means no answer about it — not
+	// "never read".
+	ReadAt string `json:"readAt,omitempty"`
+}
+
+// RosterMember is one entry of a Roster.
+type RosterMember struct {
+	PeerID       string `json:"peerId"`
 	Name         string `json:"name,omitempty"`
 	AgePublicKey string `json:"agePublicKey,omitempty"`
 }
 
-func NewPeerJoined(peerID, name, agePublicKey string) PeerEvent {
-	return PeerEvent{Type: TypePeerJoined, PeerID: peerID, Name: name, AgePublicKey: agePublicKey}
-}
-
-func NewPeerLeft(peerID string) PeerEvent {
-	return PeerEvent{Type: TypePeerLeft, PeerID: peerID}
-}
-
-// RosterComplete is sent by the server to a newly joined peer once it has
-// finished delivering that peer's initial roster (one peerJoined per
-// existing peer) — it is always the last message from that delivery,
-// emitted under the same lock as the roster itself, so it can never race
-// ahead of or behind the events it's promising are complete.
-type RosterComplete struct {
-	Type Type `json:"type"`
-}
-
-func NewRosterComplete() RosterComplete {
-	return RosterComplete{Type: TypeRosterComplete}
+func NewRoster(members []RosterMember) Roster {
+	if members == nil {
+		members = []RosterMember{}
+	}
+	return Roster{Type: TypeRoster, Members: members}
 }
 
 // History is a client request for messages relative to its own

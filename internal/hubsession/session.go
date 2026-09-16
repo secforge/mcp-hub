@@ -2,6 +2,7 @@ package hubsession
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/google/uuid"
@@ -74,22 +75,26 @@ func newSession(id string) *Session {
 // Join resolves the peerID to use (reusing the ID a previous, now-departed
 // connection that presented the same reconnectSecret, if any — see
 // secretToPeerID — otherwise a fresh UUID), constructs the peer via
-// makePeer, registers it, delivers it the current roster (one peerJoined
-// per existing peer, terminated by a RosterComplete), and announces its own
-// join to everyone else — all while holding the session lock for the
-// entire sequence. That atomicity is what makes this safe: no other peer
-// can Join or Leave in the middle of it, so the roster the new peer
-// receives is exactly the set of peers still present when RosterComplete is
-// sent, with no gap in which a peer from the snapshot could vanish (a
-// phantom peerJoined with no way to correct it) or a concurrent joiner
-// could be missed.
+// makePeer, registers it, and states the new membership to everyone
+// present as ONE message (see wire.Roster) — all while holding the
+// session lock for the entire sequence. That atomicity
+// is what makes this safe: no other peer can Join or Leave in the middle
+// of it, so the roster the new peer receives is exactly the set of peers
+// present at that instant, with no gap in which a peer from the snapshot
+// could vanish (a phantom peerJoined with no way to correct it) or a
+// concurrent joiner could be missed.
+//
+// One message rather than a burst with a terminator because the end of a
+// burst is not something a client can establish for itself: where a
+// server's roster delivery is not serialised ahead of live traffic, a
+// newcomer's join is indistinguishable from a roster entry. Stating the
+// list removes the question.
 //
 // makePeer runs first (so beforeVisible, wsserver's own code, and this
 // method can all refer to the resolved peerID), then beforeVisible, if
 // non-nil, runs under the same lock before the peer becomes visible to
-// anyone else — e.g. to write a "joined" confirmation with an
-// existing-peer count that's guaranteed consistent with the roster that
-// follows.
+// anyone else — e.g. to write the "joined" confirmation that precedes the
+// roster, so the two cannot be interleaved with a membership change.
 // Join's second return value, reused, reports whether peerID was reclaimed
 // from a matching reconnectSecret (true) or freshly generated (false) — the
 // caller (wsserver) surfaces this in the session log so a reconnect with a
@@ -97,7 +102,7 @@ func newSession(id string) *Session {
 // peerId across entries. reused is also true in the supersede case (see
 // resolvePeerIDLocked) — the peerID itself really was reclaimed, just by
 // force rather than because the old holder had already gone.
-func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer, beforeVisible func(existingCount int)) (p Peer, reused bool) {
+func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer, beforeVisible func()) (p Peer, reused bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -121,13 +126,9 @@ func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer
 		delete(s.peers, peerID)
 		supersede.Close(SupersededCloseCode, "superseded by a new connection with the same identity")
 	}
-	existing := make([]Peer, 0, len(s.peers))
-	for _, ep := range s.peers {
-		existing = append(existing, ep)
-	}
 	p = makePeer(peerID)
 	if beforeVisible != nil {
-		beforeVisible(len(existing))
+		beforeVisible()
 	}
 	s.peers[peerID] = p
 	if reconnectSecret != "" {
@@ -141,14 +142,43 @@ func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer
 		_ = identitystore.Save(s.id, s.secretToPeerID)
 	}
 
-	for _, ep := range existing {
-		p.Deliver(wire.NewPeerJoined(ep.ID(), ep.Name(), ep.AgePublicKey()))
-	}
-	p.Deliver(wire.NewRosterComplete())
+	// The membership changed, so everyone gets the new membership — the
+	// newcomer included, and by the same statement rather than a
+	// different one. A supersede changed which connection holds an
+	// identity, not who is present, so it re-sends nothing to anyone
+	// else.
+	roster := wire.NewRoster(s.membersLocked())
+	p.Deliver(roster)
 	if supersede == nil {
-		s.broadcastExceptLocked(peerID, wire.NewPeerJoined(peerID, p.Name(), p.AgePublicKey()))
+		s.broadcastExceptLocked(peerID, roster)
 	}
 	return p, reused
+}
+
+// membersLocked is the session's membership as the wire states it —
+// everyone present, including whoever is about to receive it. Called with
+// s.mu already held.
+func (s *Session) membersLocked() []wire.RosterMember {
+	members := make([]wire.RosterMember, 0, len(s.peers))
+	for _, p := range s.peers {
+		members = append(members, wire.RosterMember{
+			PeerID: p.ID(), Name: p.Name(), AgePublicKey: p.AgePublicKey()})
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].PeerID < members[j].PeerID })
+	return members
+}
+
+// broadcastRoster states the membership to everyone still present, and is
+// how a departure is announced: not "X left" but "here is who is here",
+// recomputed at send time. A client that missed the last one is repaired
+// by this one, and a peer whose identity was reclaimed while its old
+// connection was still tearing down cannot be announced as gone, because
+// the list is what is true now rather than a delta about what changed.
+func (s *Session) broadcastRoster() {
+	s.mu.Lock()
+	roster := wire.NewRoster(s.membersLocked())
+	s.mu.Unlock()
+	s.broadcastExcept("", roster)
 }
 
 // resolvePeerIDLocked returns the peerID a joining connection should use,
@@ -198,7 +228,7 @@ func (s *Session) Leave(p Peer) (empty bool) {
 	if stale {
 		return empty
 	}
-	s.broadcastExcept(p.ID(), wire.NewPeerLeft(p.ID()))
+	s.broadcastRoster()
 	return empty
 }
 

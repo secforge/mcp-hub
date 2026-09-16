@@ -61,16 +61,16 @@ func TestJoinRelayAndTeardown(t *testing.T) {
 	if typ, _ := readTyped(t, a); typ != wire.TypeJoined {
 		t.Fatalf("a: expected joined, got %s", typ)
 	}
-	if typ, _ := readTyped(t, a); typ != wire.TypeRosterComplete {
-		t.Fatalf("a: expected rosterComplete, got %s", typ)
+	if typ, _ := readTyped(t, a); typ != wire.TypeRoster {
+		t.Fatalf("a: expected the roster, got %s", typ)
 	}
 
 	b := dial(t, url, sessionID)
 	if typ, _ := readTyped(t, b); typ != wire.TypeJoined {
 		t.Fatalf("b: expected joined, got %s", typ)
 	}
-	if typ, _ := readTyped(t, a); typ != wire.TypePeerJoined {
-		t.Fatalf("a: expected peerJoined for b, got %s", typ)
+	if typ, _ := readTyped(t, a); typ != wire.TypeRoster {
+		t.Fatalf("a: expected the roster again once b joined, got %s", typ)
 	}
 
 	b.WriteJSON(wire.NewOutgoingMsg("hello from b"))
@@ -85,8 +85,8 @@ func TestJoinRelayAndTeardown(t *testing.T) {
 	}
 
 	b.Close()
-	if typ, _ := readTyped(t, a); typ != wire.TypePeerLeft {
-		t.Fatalf("a: expected peerLeft for b, got %s", typ)
+	if typ, _ := readTyped(t, a); typ != wire.TypeRoster {
+		t.Fatalf("a: expected the roster again once b left, got %s", typ)
 	}
 
 	data, err := os.ReadFile(dir + "/" + sessionID + ".log")
@@ -111,13 +111,13 @@ func TestJoinAndLeaveAreLogged(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
-	readTyped(t, a) // a: rosterComplete
+	readTyped(t, a) // a: the roster
 
 	b := dial(t, url, sessionID)
 	_, rawJoinedB := readTyped(t, b) // b: joined
 	var joinedB wire.Joined
 	decodeJSON(t, rawJoinedB, &joinedB)
-	readTyped(t, a) // a: peerJoined for b (broadcast) — by now b's join is logged
+	readTyped(t, a) // a: the roster again, now naming b (broadcast) — by now b's join is logged
 
 	b.Close()
 	readTyped(t, a) // a: peerLeft for b — by now b's leave is logged
@@ -149,7 +149,7 @@ func TestLogMarksNameAgePublicKeyAndReconnectSecretStatus(t *testing.T) {
 	anchor := dial(t, url, sessionID)
 	defer anchor.Close()
 	readTyped(t, anchor) // anchor: joined
-	readTyped(t, anchor) // anchor: rosterComplete
+	readTyped(t, anchor) // anchor: the roster
 
 	first, _, err := websocket.DefaultDialer.Dial(
 		url+"/"+sessionID+"?name=Alice&agePublicKey="+testAgePublicKey+"&reconnectSecret="+secret, nil)
@@ -196,30 +196,31 @@ func TestJoinTellsNewPeerAboutExistingRoster(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
-	readTyped(t, a) // a: rosterComplete
+	readTyped(t, a) // a: the roster
 
 	b := dial(t, url, sessionID)
 	defer b.Close()
 	readTyped(t, b) // b: joined
-	readTyped(t, a) // a: peerJoined for b
+	readTyped(t, a) // a: the roster again, now naming b
 
 	c := dial(t, url, sessionID)
 	defer c.Close()
 	readTyped(t, c) // c: joined
 
-	// c should be told about both a and b, in some order, before anything else.
-	seen := map[string]bool{}
-	for i := 0; i < 2; i++ {
-		typ, raw := readTyped(t, c)
-		if typ != wire.TypePeerJoined {
-			t.Fatalf("c: expected peerJoined, got %s", typ)
-		}
-		var pe wire.PeerEvent
-		decodeJSON(t, raw, &pe)
-		seen[pe.PeerID] = true
+	// c should be told about both a and b in ONE roster message, before
+	// anything else.
+	typ, raw := readTyped(t, c)
+	if typ != wire.TypeRoster {
+		t.Fatalf("c: expected the roster, got %s", typ)
 	}
-	if len(seen) != 2 {
-		t.Fatalf("expected c to be told about 2 distinct existing peers, got: %+v", seen)
+	var r wire.Roster
+	decodeJSON(t, raw, &r)
+	seen := map[string]bool{}
+	for _, rp := range r.Members {
+		seen[rp.PeerID] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("expected c's roster to name all 3 members, got: %+v", r)
 	}
 }
 
@@ -235,9 +236,6 @@ func TestJoinedIncludesAccuratePeerCountAndServerVersion(t *testing.T) {
 	_, rawJoinedA := readTyped(t, a)
 	var joinedA wire.Joined
 	decodeJSON(t, rawJoinedA, &joinedA)
-	if joinedA.PeerCount != 0 {
-		t.Fatalf("a: expected peerCount 0 (first in session), got %d", joinedA.PeerCount)
-	}
 	if joinedA.ServerVersion != wire.ProtocolVersion {
 		t.Fatalf("a: expected serverVersion %d, got %d", wire.ProtocolVersion, joinedA.ServerVersion)
 	}
@@ -247,8 +245,14 @@ func TestJoinedIncludesAccuratePeerCountAndServerVersion(t *testing.T) {
 	_, rawJoinedB := readTyped(t, b)
 	var joinedB wire.Joined
 	decodeJSON(t, rawJoinedB, &joinedB)
-	if joinedB.PeerCount != 1 {
-		t.Fatalf("b: expected peerCount 1 (a already present), got %d", joinedB.PeerCount)
+	if joinedB.ServerVersion != wire.ProtocolVersion {
+		t.Fatalf("b: expected serverVersion %d, got %d", wire.ProtocolVersion, joinedB.ServerVersion)
+	}
+	// The membership is the roster's to state, and joined says nothing
+	// about it: a count there was a second way to say the same thing, and
+	// its absence decoded as zero.
+	if strings.Contains(string(rawJoinedB), "peerCount") {
+		t.Fatalf("expected no peerCount on joined, got: %s", rawJoinedB)
 	}
 }
 
@@ -300,24 +304,21 @@ func TestDirectedMessageGoesOnlyToTarget(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
-	readTyped(t, a) // a: rosterComplete
+	readTyped(t, a) // a: the roster
 
 	b := dial(t, url, sessionID)
 	defer b.Close()
 	_, rawJoinedB := readTyped(t, b) // b: joined
 	var joinedB wire.Joined
 	decodeJSON(t, rawJoinedB, &joinedB)
-	readTyped(t, b) // b: peerJoined for a (roster notification)
-	readTyped(t, b) // b: rosterComplete
-	readTyped(t, a) // a: peerJoined for b
+	readTyped(t, b) // b: the roster (names a)
+	readTyped(t, a) // a: the roster again, now naming b
 
 	c := dial(t, url, sessionID)
 	defer c.Close()
 	readTyped(t, c) // c: joined
-	readTyped(t, c) // c: peerJoined for a
-	readTyped(t, c) // c: peerJoined for b
-	readTyped(t, c) // c: rosterComplete
-	readTyped(t, a) // a: peerJoined for c
+	readTyped(t, c) // c: the roster (names a and b)
+	readTyped(t, a) // a: the roster again, now naming c
 	readTyped(t, b) // b: peerJoined for c
 
 	// a sends a private message to b only.
@@ -365,7 +366,7 @@ func TestDirectedMessageToUnknownPeerReturnsErrorToSender(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
-	readTyped(t, a) // a: rosterComplete
+	readTyped(t, a) // a: the roster
 
 	a.WriteJSON(wire.NewOutgoingDirectedMsg("hello?", "00000000-0000-0000-0000-000000000000"))
 	typ, _ := readTyped(t, a)
@@ -390,18 +391,24 @@ func TestDeadPeerIsDroppedViaPingPongTimeout(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
-	readTyped(t, a) // a: rosterComplete
+	readTyped(t, a) // a: the roster
 
 	b := dial(t, url, sessionID)
 	defer b.Close()
 	readTyped(t, b) // b: joined
-	readTyped(t, a) // a: peerJoined for b
+	readTyped(t, a) // a: the roster again, now naming b
 
 	// b never reads again, so it never responds to the server's pings. The
-	// server should give up on it once pongWait elapses, and a should see a
-	// peerLeft as a result.
-	if typ, _ := readTyped(t, a); typ != wire.TypePeerLeft {
-		t.Fatalf("expected peerLeft after b's ping/pong keepalive times out, got %s", typ)
+	// server should give up on it once pongWait elapses, and a should be
+	// re-sent a roster without b in it as a result.
+	typ, raw := readTyped(t, a)
+	if typ != wire.TypeRoster {
+		t.Fatalf("expected the roster after b's ping/pong keepalive times out, got %s", typ)
+	}
+	var r wire.Roster
+	decodeJSON(t, raw, &r)
+	if len(r.Members) != 1 {
+		t.Fatalf("expected b to be gone from the re-sent roster, got %+v", r)
 	}
 }
 
@@ -495,7 +502,7 @@ func TestPeerJoinedCarriesNameAndAgePublicKeyToOtherPeers(t *testing.T) {
 	a := dial(t, url, sessionID)
 	defer a.Close()
 	readTyped(t, a) // a: joined
-	readTyped(t, a) // a: rosterComplete
+	readTyped(t, a) // a: the roster
 
 	b, _, err := websocket.DefaultDialer.Dial(
 		url+"/"+sessionID+"?name=Alice&agePublicKey="+testAgePublicKey, nil)
@@ -505,11 +512,17 @@ func TestPeerJoinedCarriesNameAndAgePublicKeyToOtherPeers(t *testing.T) {
 	defer b.Close()
 	readTyped(t, b) // b: joined
 
-	_, raw := readTyped(t, a) // a: peerJoined for b
-	var pe wire.PeerEvent
-	decodeJSON(t, raw, &pe)
-	if pe.Name != "Alice" || pe.AgePublicKey != testAgePublicKey {
-		t.Fatalf("expected a to be told b's name/agePublicKey, got %+v", pe)
+	_, raw := readTyped(t, a) // a: the roster again, now naming b
+	var r wire.Roster
+	decodeJSON(t, raw, &r)
+	var bEntry wire.RosterMember
+	for _, m := range r.Members {
+		if m.Name != "" {
+			bEntry = m
+		}
+	}
+	if bEntry.Name != "Alice" || bEntry.AgePublicKey != testAgePublicKey {
+		t.Fatalf("expected a to be told b's name/agePublicKey, got %+v", r.Members)
 	}
 }
 
@@ -528,7 +541,7 @@ func TestReconnectingWithSameReconnectSecretReusesPeerID(t *testing.T) {
 	other := dial(t, url, sessionID)
 	defer other.Close()
 	readTyped(t, other) // other: joined
-	readTyped(t, other) // other: rosterComplete
+	readTyped(t, other) // other: the roster
 
 	first, _, err := websocket.DefaultDialer.Dial(
 		url+"/"+sessionID+"?reconnectSecret="+secret, nil)
@@ -580,7 +593,7 @@ func TestReconnectingWithSameReconnectSecretWhileStillLiveSupersedes(t *testing.
 	_, raw := readTyped(t, first)
 	var joinedFirst wire.Joined
 	decodeJSON(t, raw, &joinedFirst)
-	readTyped(t, first) // first: rosterComplete (empty roster, no other peers yet)
+	readTyped(t, first) // first: the roster (empty — no other peers yet)
 
 	second, _, err := websocket.DefaultDialer.Dial(url+"/"+sessionID+"?reconnectSecret="+secret, nil)
 	if err != nil {
@@ -622,7 +635,7 @@ func TestObservingAgePublicKeyDoesNotAllowImpersonation(t *testing.T) {
 	other := dial(t, url, sessionID)
 	defer other.Close()
 	readTyped(t, other) // other: joined
-	readTyped(t, other) // other: rosterComplete
+	readTyped(t, other) // other: the roster
 
 	first, _, err := websocket.DefaultDialer.Dial(
 		url+"/"+sessionID+"?agePublicKey="+testAgePublicKey, nil)

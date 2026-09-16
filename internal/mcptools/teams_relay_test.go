@@ -2,6 +2,7 @@ package mcptools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -47,7 +48,7 @@ func startRelayTestServer(t *testing.T) (link string, gotHeaders func() http.Hea
 			return
 		}
 		defer conn.Close()
-		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		joined.Features = teamsTestFeatures()
 		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
@@ -136,7 +137,7 @@ func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T)
 			return
 		}
 		defer conn.Close()
-		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		joined.Features = teamsTestFeatures()
 		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
@@ -207,7 +208,7 @@ func startRelayTestServerCapturingClientMessages(t *testing.T) (link string, got
 			return
 		}
 		defer conn.Close()
-		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		joined.Features = teamsTestFeatures()
 		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
@@ -239,7 +240,7 @@ func startRelayTestServerEchoingAcks(t *testing.T) (link string) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		joined.Features = teamsTestFeatures()
 		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
@@ -614,7 +615,7 @@ func TestHubConfirmSurfacesBehindFromServerReply(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var raw json.RawMessage
 		if err := conn.ReadJSON(&raw); err != nil {
 			return
@@ -1018,7 +1019,7 @@ func TestHubEditErrorsWhenNotConnected(t *testing.T) {
 
 func TestTeamsRelayConnectSurfacesTeamsFields(t *testing.T) {
 	topic := "Support chat"
-	joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+	joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 	joined.CanSend = true
 	joined.ConversationKind = "oneOnOne"
 	joined.Topic = &topic
@@ -1046,7 +1047,7 @@ func TestTeamsRelayConnectSurfacesTeamsFields(t *testing.T) {
 }
 
 func TestTeamsRelayConnectNotesSendRefused(t *testing.T) {
-	joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+	joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 	joined.CanSend = false
 	joined.ConversationKind = "group"
 	link := startRelayTestServerWithJoined(t, joined)
@@ -1771,7 +1772,7 @@ func TestBehindNoteSurfacesRecordedGapAtConnect(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		joined.Features = teamsTestFeatures()
 		joined.ConversationKind = "group"
 		raw, _ := json.Marshal(joined)
@@ -4120,5 +4121,76 @@ func TestASeekDoesNotClaimSilenceFromAServerThatSpoke(t *testing.T) {
 	}
 	if !strings.Contains(text, "33 behind") || !strings.Contains(text, "35 messages") {
 		t.Errorf("the prose does not state both counts and which position each is from:\n%s", text)
+	}
+}
+
+// A message read out of history carries its attachment exactly as a
+// delivered one does. hub_read used to render only the text: the
+// attachment was never fetched and nothing said so, so the message looked
+// complete and simply was not — a silent absence, which is worse than the
+// timeout it sat next to, because there is nothing to retry and no reason
+// to suspect anything is missing.
+func TestReadResolvesAnAttachmentOnTheMessageItReturns(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		var m wire.MessageAfter
+		if err := conn.ReadJSON(&m); err != nil {
+			return
+		}
+		conn.WriteJSON(wire.Msg{
+			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text: "review attached", TS: "ts1", Historical: true, Cursor: "cursor-2",
+			ExternalID: "ext-1", Answers: &wire.Anchor{Cursor: "cursor-1"},
+			Attachments: []wire.Attachment{{Token: "att-16510", ContentType: "text/markdown",
+				Name: "review.md", Kind: "file"}},
+		})
+		var req wire.AttachmentRequest
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+		conn.WriteJSON(wire.AttachmentData{
+			Type: wire.TypeAttachmentData, Token: req.Token, Name: "review.md",
+			ContentType:  "text/markdown",
+			ContentBytes: base64.StdEncoding.EncodeToString([]byte("# findings")),
+		})
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	readReq := mcp.CallToolRequest{}
+	readReq.Params.Arguments = map[string]any{"connection": testConn, "after": "cursor-1"}
+	res, err := hub.handleRead(ctx, readReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_read failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "review attached") {
+		t.Fatalf("expected the message text, got: %s", text)
+	}
+	if !strings.Contains(text, "saved to ") {
+		t.Fatalf("expected the read to fetch and save the attachment, got: %s", text)
 	}
 }

@@ -69,7 +69,7 @@ func formatMentions(e Event) string {
 	return tag
 }
 
-// formatOperatorTag flags a "msg"/"peerJoined"/"peerLeft" whose PeerID is
+// formatOperatorTag flags a "msg" whose PeerID is
 // one of the two well-known system/operator constants (see
 // SystemPeerIDOperator/SystemPeerIDSystem). Keyed on those constants
 // directly rather than on anything the server advertises: every peerId is
@@ -172,14 +172,6 @@ func FormatEvent(e Event) string {
 			return fmt.Sprintf("[HUB PRIVATE MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 		}
 		return fmt.Sprintf("[HUB MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
-	case "peerJoined":
-		operator := formatOperatorTag(e)
-		if e.Name != "" {
-			return fmt.Sprintf("[peer %s%s (%q) joined]", e.PeerID, operator, e.Name)
-		}
-		return fmt.Sprintf("[peer %s%s joined]", e.PeerID, operator)
-	case "peerLeft":
-		return fmt.Sprintf("[peer %s%s left]", e.PeerID, formatOperatorTag(e))
 	case "error":
 		if e.Code != "" {
 			return fmt.Sprintf("[HUB ERROR — code=%s, retryable=%t] %s", e.Code, e.Retryable, e.Text)
@@ -240,8 +232,22 @@ func FormatEvent(e Event) string {
 			"delivered here. Nothing is lost: they are on the server. Call hub_confirm with the "+
 			"last cursor you have COMPLETE to resume, or hub_catch_up to read on regardless. "+
 			"Mentions and operator messages still come through]", e.HeldCount)
-	case "rosterComplete":
-		return "[hub: initial roster complete — you now know everyone who was already in the session]"
+	case "roster":
+		// Names them, because this is the ONLY line the reader gets about
+		// who was already here, and a list of names is what makes it
+		// worth its space: "the roster is complete" says nothing a reader
+		// can act on. The server states the whole membership in one
+		// message, so there is no partial form and nothing to hedge.
+		if len(e.RosterPeers) == 0 {
+			return "[hub: you are alone in this session for now — nobody else is here. A join " +
+				"from here on is someone actually arriving]"
+		}
+		who := make([]string, 0, len(e.RosterPeers))
+		for _, p := range e.RosterPeers {
+			who = append(who, rosterName(p))
+		}
+		return fmt.Sprintf("[hub: %d already here — %s. That is everyone; a join or leave from "+
+			"here on is a real change]", len(who), strings.Join(who, ", "))
 	case "confirmReminder":
 		// Deliberately a cross-check, not a value to echo back — found
 		// live, 2026-09-07: handing the model an exact cursor to paste
@@ -562,4 +568,14 @@ func FormatEvents(events []Event) string {
 		"lost by the hub itself — check for a gap in the \"i/N\" sequence (a missing event), and for each "+
 		"event's own matching \"end i/N\" marker (that event itself was cut if it's missing)]", n, n)
 	return header + "\n\n" + strings.Join(chunks, "\n\n")
+}
+
+// rosterName renders one peer for a roster line: the name where there is
+// one, since a bare uuid tells a reader nothing about who it is, and the
+// id alongside it because that is what every other call takes.
+func rosterName(p PeerInfo) string {
+	if p.Name != "" {
+		return fmt.Sprintf("%s (%s)", p.Name, p.ID)
+	}
+	return p.ID
 }

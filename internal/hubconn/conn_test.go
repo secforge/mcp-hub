@@ -56,7 +56,8 @@ func waitForActivity(t *testing.T, ch <-chan struct{}) {
 }
 
 func TestDecodeEventExportedWrapperMatchesInternalDecode(t *testing.T) {
-	raw, err := json.Marshal(wire.NewPeerJoined("550e8400-e29b-41d4-a716-446655440000", "Alice", ""))
+	raw, err := json.Marshal(wire.NewRoster([]wire.RosterMember{
+		{PeerID: "550e8400-e29b-41d4-a716-446655440000", Name: "Alice"}}))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -64,7 +65,9 @@ func TestDecodeEventExportedWrapperMatchesInternalDecode(t *testing.T) {
 	if !ok {
 		t.Fatal("expected DecodeEvent to succeed")
 	}
-	if ev.Kind != "peerJoined" || ev.PeerID != "550e8400-e29b-41d4-a716-446655440000" || ev.Name != "Alice" {
+	if ev.Kind != "roster" || len(ev.RosterPeers) != 1 ||
+		ev.RosterPeers[0].ID != "550e8400-e29b-41d4-a716-446655440000" ||
+		ev.RosterPeers[0].Name != "Alice" {
 		t.Fatalf("unexpected decoded event: %+v", ev)
 	}
 }
@@ -195,7 +198,7 @@ func TestLastSeenCursorTracksMostRecentDeliveredMsg(t *testing.T) {
 		if err != nil {
 			return
 		}
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "first", TS: "ts1", Cursor: "cursor-1"})
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "second", TS: "ts2", Cursor: "cursor-2"})
 		select {}
@@ -230,7 +233,7 @@ func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
 		var m wire.Msg
 		for {
@@ -291,7 +294,7 @@ func TestAckCursorOmittedBeforeAnythingConsumed(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var m wire.Msg
 		for {
 			if err := conn.ReadJSON(&m); err != nil {
@@ -343,7 +346,7 @@ func TestDrainDoesNotMarkConsumed(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
 		time.Sleep(2 * time.Second)
 	}))
@@ -398,7 +401,7 @@ func TestConfirmReminderFiresWhenSeenPastConsumed(t *testing.T) {
 	}
 	defer c.Close()
 
-	// Drain the connect-time rosterComplete out of the way first, so it
+	// Drain the connect-time roster out of the way first, so it
 	// doesn't get mistaken below for the reminder this test is waiting on.
 	rosterDeadline := time.Now().Add(2 * time.Second)
 	for {
@@ -406,7 +409,7 @@ func TestConfirmReminderFiresWhenSeenPastConsumed(t *testing.T) {
 			break
 		}
 		if time.Now().After(rosterDeadline) {
-			t.Fatal("never saw the connect-time rosterComplete")
+			t.Fatal("never saw the connect-time roster")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -528,7 +531,7 @@ func TestConfirmReceivedSendsImmediateAckAndMarksConsumed(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		for {
 			var raw json.RawMessage
 			if err := conn.ReadJSON(&raw); err != nil {
@@ -639,7 +642,7 @@ func TestConfirmReceivedDoesNotRatchetOnASingleTransientMiss(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		for {
 			var raw json.RawMessage
 			if err := conn.ReadJSON(&raw); err != nil {
@@ -705,7 +708,7 @@ func TestConfirmReceivedOnPlainConnReturnsBehindFromReply(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var raw json.RawMessage
 		if err := conn.ReadJSON(&raw); err != nil {
 			return
@@ -750,7 +753,7 @@ func TestConfirmReceivedSkipsWaitImmediatelyWhenFeatureDeclaredUnsupported(t *te
 			return
 		}
 		defer conn.Close()
-		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		j.Features = map[string]json.RawMessage{"messageAfter": json.RawMessage("{}")}
 		conn.WriteJSON(j)
 		for {
@@ -804,7 +807,7 @@ func TestConfirmReceivedWaitsWhenFeatureDeclaredSupported(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		j.Features = map[string]json.RawMessage{"ackReplies": json.RawMessage("{}")}
 		conn.WriteJSON(j)
 		var raw json.RawMessage
@@ -927,7 +930,7 @@ func TestAckLoopSendsStandaloneAckWhenIdleAndConsumedMoved(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
 		for {
 			var raw json.RawMessage
@@ -981,7 +984,7 @@ func TestAckReplyRejectionAdoptsServerReportedCursor(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
 		var m wire.Msg
 		for {
@@ -1032,7 +1035,7 @@ func TestBadAckCursorErrorDisablesFurtherAcks(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
 		var m wire.Msg
 		for {
@@ -1100,7 +1103,7 @@ func TestUnrelatedBadCursorErrorDoesNotDisableAcks(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		// Simulates an unrelated request (e.g. a malformed reaction, or a
 		// history request naming both before and after) being refused with
 		// the same generic codes an ack failure could also use.
@@ -1149,7 +1152,7 @@ func TestCloseSendsNormalClosureCloseFrame(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				if ce, ok := err.(*websocket.CloseError); ok {
@@ -1196,7 +1199,7 @@ func TestCloseWaitsForFlushGraceAfterSuccessfulWrite(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				return
@@ -1228,7 +1231,7 @@ func TestCloseReturnsWriteControlErrorWhenFrameCannotBeSent(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				return
@@ -1264,7 +1267,7 @@ func TestDialSendsCreateTokenHeaderWhenGiven(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 	}))
 	defer srv.Close()
 
@@ -1290,7 +1293,7 @@ func TestDialOmitsCreateTokenHeaderWhenNotGiven(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 	}))
 	defer srv.Close()
 
@@ -1330,7 +1333,7 @@ func TestDialSendsProtocolVersionHeader(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 	}))
 	defer srv.Close()
 
@@ -1371,7 +1374,7 @@ func TestMsgFromSystemConstantsIsMarkedOperator(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "", ""))
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: SystemPeerIDOperator, Text: "go ahead", TS: "ts1"})
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: SystemPeerIDSystem, Text: "auto note", TS: "ts2"})
 		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440000", Text: "ordinary peer", TS: "ts3"})
@@ -1414,30 +1417,7 @@ func TestMsgFromSystemConstantsIsMarkedOperator(t *testing.T) {
 	}
 }
 
-func TestExpectedPeerCountMatchesJoinedPeerCount(t *testing.T) {
-	url := startTestServer(t)
-	sessionID := "550e8400-e29b-41d4-a716-446655440000"
-
-	a, err := dialTest(url, sessionID, DialOptions{})
-	if err != nil {
-		t.Fatalf("dial a: %v", err)
-	}
-	defer a.Close()
-	if a.ExpectedPeerCount() != 0 {
-		t.Fatalf("a: expected 0, got %d", a.ExpectedPeerCount())
-	}
-
-	b, err := dialTest(url, sessionID, DialOptions{})
-	if err != nil {
-		t.Fatalf("dial b: %v", err)
-	}
-	defer b.Close()
-	if b.ExpectedPeerCount() != 1 {
-		t.Fatalf("b: expected 1, got %d", b.ExpectedPeerCount())
-	}
-}
-
-func TestRosterCompleteImmediatelyWhenNoExistingPeers(t *testing.T) {
+func TestARosterForASessionOfOneSaysYouAreAlone(t *testing.T) {
 	url := startTestServer(t)
 	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
 	if err != nil {
@@ -1447,17 +1427,17 @@ func TestRosterCompleteImmediatelyWhenNoExistingPeers(t *testing.T) {
 	activity := make(chan struct{}, 8)
 	c.OnActivity(func() { activity <- struct{}{} })
 
-	waitForActivity(t, activity) // the server's rosterComplete for an empty roster
+	waitForActivity(t, activity) // the server's roster for an empty roster
 	if !c.RosterComplete() {
-		t.Fatal("expected RosterComplete to be true once the server's rosterComplete event arrives")
+		t.Fatal("expected RosterComplete to be true once the server's roster event arrives")
 	}
 
 	formatted, connected := c.Drain()
 	if !connected {
 		t.Fatal("expected still connected")
 	}
-	if !strings.Contains(formatted, "roster complete") {
-		t.Fatalf("expected a rosterComplete notification already buffered, got: %q", formatted)
+	if !strings.Contains(formatted, "you are alone") {
+		t.Fatalf("expected the empty roster to be reported as being alone, got: %q", formatted)
 	}
 }
 
@@ -1483,8 +1463,9 @@ func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
 	if b.RosterComplete() {
 		t.Fatal("expected RosterComplete to be false before the roster catch-up event arrives")
 	}
-	waitForActivity(t, activity) // b is told about a (roster entry)
-	waitForActivity(t, activity) // b's rosterComplete
+	// One activity, not two: a's roster entry is held and folded into the
+	// roster that ends the enumeration, so b is woken once.
+	waitForActivity(t, activity)
 
 	if !b.RosterComplete() {
 		t.Fatal("expected RosterComplete to be true after catching up on the existing roster")
@@ -1493,8 +1474,8 @@ func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
 	if !connected {
 		t.Fatal("expected still connected")
 	}
-	if !strings.Contains(formatted, "roster complete") {
-		t.Fatalf("expected a rosterComplete notification in the drained events, got: %q", formatted)
+	if !strings.Contains(formatted, "1 already here") {
+		t.Fatalf("expected the folded roster to name the one existing peer, got: %q", formatted)
 	}
 }
 
@@ -1510,7 +1491,7 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 
 	activity := make(chan struct{}, 8)
 	a.OnActivity(func() { activity <- struct{}{} })
-	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
+	waitForActivity(t, activity) // a's own roster (no peers yet)
 
 	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
@@ -1518,7 +1499,7 @@ func TestSendAndReceiveBetweenTwoConns(t *testing.T) {
 	}
 	defer b.Close()
 
-	waitForActivity(t, activity) // a sees b's peerJoined
+	waitForActivity(t, activity) // a is re-sent the roster, now naming b
 
 	if err := b.Send("hello", nil, "", "", nil); err != nil {
 		t.Fatalf("send: %v", err)
@@ -1546,14 +1527,14 @@ func TestSendWithAttachmentsDeliversThem(t *testing.T) {
 
 	activity := make(chan struct{}, 8)
 	a.OnActivity(func() { activity <- struct{}{} })
-	waitForActivity(t, activity) // a's own rosterComplete
+	waitForActivity(t, activity) // a's own roster
 
 	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
 	defer b.Close()
-	waitForActivity(t, activity) // a sees b's peerJoined
+	waitForActivity(t, activity) // a is re-sent the roster, now naming b
 
 	attachments := []wire.Attachment{{ContentType: "image/png", ContentBytes: "aGVsbG8="}}
 	if err := b.Send("a picture", attachments, "", "", nil); err != nil {
@@ -1592,7 +1573,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	defer a.Close()
 	activityA := make(chan struct{}, 8)
 	a.OnActivity(func() { activityA <- struct{}{} })
-	waitForActivity(t, activityA) // a's own rosterComplete (no peers yet)
+	waitForActivity(t, activityA) // a's own roster (no peers yet)
 
 	b, err := dialTest(url, sessionID, DialOptions{})
 	if err != nil {
@@ -1602,7 +1583,7 @@ func TestSendToDeliversOnlyToTargetAndMarksPrivate(t *testing.T) {
 	activityB := make(chan struct{}, 8)
 	b.OnActivity(func() { activityB <- struct{}{} })
 
-	waitForActivity(t, activityA) // a sees b's peerJoined
+	waitForActivity(t, activityA) // a is re-sent the roster, now naming b
 	a.Drain()
 
 	if err := b.SendTo("just for you", a.PeerID(), nil, "", "", nil); err != nil {
@@ -1630,7 +1611,7 @@ func TestSendToUnknownPeerSurfacesAsErrorEvent(t *testing.T) {
 	defer a.Close()
 	activity := make(chan struct{}, 8)
 	a.OnActivity(func() { activity <- struct{}{} })
-	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
+	waitForActivity(t, activity) // a's own roster (no peers yet)
 
 	if err := a.SendTo("hello?", "00000000-0000-0000-0000-000000000000", nil, "", "", nil); err != nil {
 		t.Fatalf("sendTo: %v", err)
@@ -1657,7 +1638,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 	defer a.Close()
 	activity := make(chan struct{}, 8)
 	a.OnActivity(func() { activity <- struct{}{} })
-	waitForActivity(t, activity) // a's own rosterComplete (no peers yet)
+	waitForActivity(t, activity) // a's own roster (no peers yet)
 
 	if peers := a.Peers(); len(peers) != 0 {
 		t.Fatalf("expected no peers before anyone else joins, got %v", peers)
@@ -1667,7 +1648,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
-	waitForActivity(t, activity) // a sees b's peerJoined
+	waitForActivity(t, activity) // a is re-sent the roster, now naming b
 
 	peers := a.Peers()
 	if len(peers) != 1 || peers[0].ID != b.PeerID() {
@@ -1679,7 +1660,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 		t.Fatalf("dial c: %v", err)
 	}
 	defer c.Close()
-	waitForActivity(t, activity) // a sees c's peerJoined
+	waitForActivity(t, activity) // a is re-sent the roster, now naming c
 
 	peers = a.Peers()
 	if len(peers) != 2 {
@@ -1687,7 +1668,7 @@ func TestPeersTracksRosterAsPeersJoinAndLeave(t *testing.T) {
 	}
 
 	b.Close()
-	waitForActivity(t, activity) // a sees b's peerLeft
+	waitForActivity(t, activity) // a is re-sent the roster without b
 
 	peers = a.Peers()
 	if len(peers) != 1 || peers[0].ID != c.PeerID() {
@@ -1709,13 +1690,13 @@ func TestPeekAndDrainReflectDisconnect(t *testing.T) {
 		t.Fatalf("dial b: %v", err)
 	}
 	b.Close()
-	// server closing the connection propagates as a peerLeft to a, then
+	// server closing the connection propagates as a re-sent roster to a, then
 	// (separately) a's own socket must be closed by the test to observe its
 	// own disconnect:
 	a.Close()
 
 	// a's readLoop goroutine notices the close asynchronously (it's still
-	// mid-flight on whatever roster/peerJoined/peerLeft traffic arrived
+	// mid-flight on whatever roster traffic arrived
 	// before the close), so poll briefly instead of checking Peek()
 	// immediately.
 	deadline := time.Now().Add(2 * time.Second)
@@ -1750,7 +1731,7 @@ func TestSilentDropIsDetectedViaReadDeadline(t *testing.T) {
 		if err != nil {
 			return
 		}
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		// go silent forever — no more frames, no ping, no close.
 		select {}
 	}))
@@ -1805,7 +1786,7 @@ func TestDialSendsIdentityHeaders(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "Alice", testAgePublicKey))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "Alice", testAgePublicKey))
 	}))
 	defer srv.Close()
 
@@ -1838,7 +1819,7 @@ func TestPeekSuppressesOwnReactionChangedAndMessageEdited(t *testing.T) {
 	if hasEvents, _ := c.Peek(); hasEvents {
 		t.Fatal("expected own reactionChanged/messageEdited to be suppressed like own msg")
 	}
-	c.buffer = append(c.buffer, Event{Kind: "peerJoined", PeerID: "peer-1"})
+	c.buffer = append(c.buffer, Event{Kind: "roster", PeerID: "peer-1"})
 	if hasEvents, _ := c.Peek(); !hasEvents {
 		t.Fatal("expected a non-own event to make the buffer wake-worthy")
 	}
@@ -1895,8 +1876,7 @@ func TestPeekTreatsNonMsgEventsAsAlwaysWakeWorthy(t *testing.T) {
 	for _, e := range []Event{
 		{Kind: "sendAck", ExternalID: "ext-1", ActionOK: true},
 		{Kind: "error", Text: "nope"},
-		{Kind: "peerJoined", PeerID: "peer-1"},
-		{Kind: "rosterComplete"},
+		{Kind: "roster", PeerID: "peer-1"},
 	} {
 		c := &Conn{buffer: []Event{e}}
 		if hasEvents, _ := c.Peek(); !hasEvents {
@@ -1921,7 +1901,7 @@ func TestBufferCarriesHistoricalFlagAndErrorCodeThroughToDrain(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		historical := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "old news", "ts", nil, "", "", nil)
 		historical.Historical = true
 		conn.WriteJSON(historical)
@@ -2007,7 +1987,7 @@ func TestReactSendsReactionMessage(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var rq wire.Reaction
 		if err := conn.ReadJSON(&rq); err == nil {
 			gotReaction <- rq
@@ -2046,7 +2026,7 @@ func TestEditMessageSendsEditMessage(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var e wire.Edit
 		if err := conn.ReadJSON(&e); err == nil {
 			gotEdit <- e
@@ -2085,7 +2065,7 @@ func TestEditMessageSendsAttachments(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var e wire.Edit
 		if err := conn.ReadJSON(&e); err == nil {
 			gotEdit <- e
@@ -2125,7 +2105,7 @@ func TestSendWithReplyToSetsField(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var m wire.Msg
 		if err := conn.ReadJSON(&m); err == nil {
 			gotMsg <- m
@@ -2164,7 +2144,7 @@ func TestEditMessageSendsReplyTo(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var e wire.Edit
 		if err := conn.ReadJSON(&e); err == nil {
 			gotEdit <- e
@@ -2202,7 +2182,7 @@ func TestRequestAttachmentReturnsFetchedBytes(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var req wire.AttachmentRequest
 		if err := conn.ReadJSON(&req); err != nil {
 			return
@@ -2246,7 +2226,7 @@ func TestRequestAttachmentSurfacesServerError(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", ""))
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
 		var req wire.AttachmentRequest
 		if err := conn.ReadJSON(&req); err != nil {
 			return
@@ -2286,7 +2266,7 @@ func TestTeamsFieldsOnJoinedFlowThroughToAccessors(t *testing.T) {
 		}
 		defer conn.Close()
 		topic := "Support chat"
-		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		j.CanSend = true
 		j.ConversationKind = "oneOnOne"
 		j.Topic = &topic
@@ -2347,5 +2327,197 @@ func TestTheBufferBoundIsAnEndingNotATrim(t *testing.T) {
 	c.mu.Unlock()
 	if !c.AbandonedForBacklog() {
 		t.Fatal("expected the reason for the ending to be reportable")
+	}
+}
+
+// The initial roster is ONE message, and the server states it: the
+// client no longer reassembles a list from a stream, because the end of
+// a stream is not something a client can establish for itself.
+func TestTheRosterArrivesAsOneStatedList(t *testing.T) {
+	ev, ok := decodeEvent([]byte(`{"type":"roster","members":[` +
+		`{"peerId":"550e8400-e29b-41d4-a716-446655440001","name":"alice"},` +
+		`{"peerId":"550e8400-e29b-41d4-a716-446655440002","name":"bob"}]}`))
+	if !ok {
+		t.Fatal("the roster frame did not decode")
+	}
+	if ev.Kind != "roster" || len(ev.RosterPeers) != 2 {
+		t.Fatalf("unexpected roster event: %+v", ev)
+	}
+	got := FormatEvent(ev)
+	for _, want := range []string{"2 already here", "alice", "bob"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected the roster line to contain %q, got: %s", want, got)
+		}
+	}
+}
+
+func TestAnEmptyRosterSaysYouAreAlone(t *testing.T) {
+	got := FormatEvent(Event{Kind: "roster"})
+	if !strings.Contains(got, "alone") {
+		t.Fatalf("expected an empty roster to say so plainly, got: %s", got)
+	}
+}
+
+// A control-plane ack and a file transfer are not the same kind of wait.
+// The first is a server saying "yes"; the second may be the server
+// fetching bytes from somewhere else entirely before it can answer at
+// all. Sizing the second by the first lost a whole report to a 5s
+// deadline that had nothing to do with how long the work takes.
+func TestASlowAttachmentIsStillFetched(t *testing.T) {
+	defer swapTimeouts(t, 100*time.Millisecond, 3*time.Second)()
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
+		var req wire.AttachmentRequest
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+		// Longer than the ack deadline, well inside the attachment one.
+		time.Sleep(600 * time.Millisecond)
+		conn.WriteJSON(wire.AttachmentData{
+			Type: wire.TypeAttachmentData, Token: req.Token, Name: "review.md",
+			ContentType: "text/markdown", ContentBytes: "aGVsbG8=",
+		})
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestAttachment("att-16510")
+	if err != nil {
+		t.Fatalf("RequestAttachment: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected a slow attachment reply to still be waited for, not timed out at the ack deadline")
+	}
+	if ev.AttachmentContentBytes != "aGVsbG8=" {
+		t.Fatalf("unexpected attachmentData event: %+v", ev)
+	}
+}
+
+// The claim is keyed by event kind, so an attachmentData answering an
+// EARLIER request this client already gave up on matches the claim of a
+// later one. Handing those bytes back would answer "fetch token B" with
+// the contents of token A — a wrong file returned as if it were the right
+// one, which is worse than the timeout it would be papering over.
+func TestAnAttachmentReplyForAnotherTokenIsNotHandedBack(t *testing.T) {
+	defer swapTimeouts(t, 100*time.Millisecond, 3*time.Second)()
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
+		var req wire.AttachmentRequest
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+		// The late answer to a request that was abandoned earlier...
+		conn.WriteJSON(wire.AttachmentData{
+			Type: wire.TypeAttachmentData, Token: "att-stale", Name: "old.png",
+			ContentType: "image/png", ContentBytes: "c3RhbGU=",
+		})
+		// ...followed by the answer actually asked for.
+		time.Sleep(200 * time.Millisecond)
+		conn.WriteJSON(wire.AttachmentData{
+			Type: wire.TypeAttachmentData, Token: req.Token, Name: "review.md",
+			ContentType: "text/markdown", ContentBytes: "ZnJlc2g=",
+		})
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestAttachment("att-16510")
+	if err != nil {
+		t.Fatalf("RequestAttachment: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected the reply for the requested token to arrive")
+	}
+	if ev.AttachmentToken != "att-16510" || ev.AttachmentContentBytes != "ZnJlc2g=" {
+		t.Fatalf("got another token's bytes handed back: %+v", ev)
+	}
+}
+
+// swapTimeouts shortens both deadlines for a test and restores them.
+func swapTimeouts(t *testing.T, ack, attachment time.Duration) func() {
+	t.Helper()
+	oldAck, oldAttachment := AckWaitTimeout, AttachmentWaitTimeout
+	AckWaitTimeout, AttachmentWaitTimeout = ack, attachment
+	return func() { AckWaitTimeout, AttachmentWaitTimeout = oldAck, oldAttachment }
+}
+
+// A connect fills the buffer before anyone is listening: the roster
+// frames arrive on the read loop while the caller is still wiring up its
+// callback. Registering that callback therefore has to ASK whether news
+// is already waiting, not just arrange to hear the next lot — otherwise
+// what arrived first is delivered only when something else happens to
+// come along, which for a quiet session can be never. This was invisible
+// while the roster was N separate events (each one another chance to
+// arrive after the wiring) and became a lost message the moment it
+// became one.
+func TestRegisteringForActivityReportsWhatAlreadyArrived(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
+		conn.WriteJSON(map[string]any{"type": "roster", "members": []map[string]any{
+			{"peerId": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "name": "Alice"}}})
+		time.Sleep(3 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// Nobody is listening yet — exactly the window a real connect sits in.
+	deadline := time.Now().Add(2 * time.Second)
+	for !c.RosterComplete() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !c.RosterComplete() {
+		t.Fatal("the roster never arrived; the test server is wrong, not the code under test")
+	}
+
+	activity := make(chan struct{}, 4)
+	c.OnActivity(func() { activity <- struct{}{} })
+	select {
+	case <-activity:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registering for activity did not report the roster that had already arrived")
+	}
+	formatted, _ := c.Drain()
+	if !strings.Contains(formatted, "1 already here") {
+		t.Fatalf("expected the roster to be waiting in the buffer, got: %q", formatted)
 	}
 }

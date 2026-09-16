@@ -1869,18 +1869,20 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	mirrored := conn.ConversationKind() != ""
 
 	var rosterNote string
-	who, whose := "peer", "session"
+	whose := "session"
 	if mirrored {
-		who, whose = "participant", "conversation"
+		whose = "conversation"
 	}
-	if n := conn.ExpectedPeerCount(); n == 0 {
-		rosterNote = fmt.Sprintf("No other %ss are in this %s yet.", who, whose)
-	} else {
-		rosterNote = fmt.Sprintf(
-			"%d other %s(s) already in this %s — you'll get a \"roster complete\" "+
-				"notification (via "+deliveryChannels()+") once you've caught up on who they are; "+
-				"call hub_peers() after that to see the list.", n, who, whose)
-	}
+	// No count here, because there is no count on the wire any more and
+	// inventing one from silence is the failure this protocol change
+	// removed: an absent peerCount decodes as zero, and "nobody else is
+	// here" is a claim, not a default. The membership is stated by the
+	// roster that follows, so this says what is coming and leaves the
+	// answer to the message that actually carries it.
+	rosterNote = fmt.Sprintf(
+		"Who else is in this %s arrives as ONE message (via "+deliveryChannels()+") naming "+
+			"everyone, and is re-sent whole whenever it changes; hub_peers() asks for it "+
+			"outright at any time.", whose)
 
 	versionNote := ""
 	if sv := conn.ServerVersion(); sv > wire.ProtocolVersion {
@@ -1949,8 +1951,8 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			"things behave differently: a directed hub_send (`to`) has no meaning here and " +
 			"will be refused rather than delivered; sends may be routinely refused for policy " +
 			"reasons (e.g. a participant outside the relay's home organization) — expected, " +
-			"not a bug, and won't succeed on retry; peerJoined/peerLeft reflect real " +
-			"membership changes, not other clients connecting; and this link may be " +
+			"not a bug, and won't succeed on retry; the roster reflects real " +
+			"membership changes here, not other clients connecting; and this link may be " +
 			"single-use — keep the exact link, since resuming after a drop means presenting " +
 			"it again. What authorizes that resumption is stored and presented for you."
 		notes += "\nConversation kind: " + conn.ConversationKind()
@@ -2879,7 +2881,13 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// it recovered, and without a position that confirm released nothing
 	// and the window stayed shut.
 	conn.NoteHandedOver([]hubconn.Event{ev})
-	return mcp.NewToolResultText(hubconn.FormatEvent(ev) + "\n\n[hub: this was a read, not a " +
+	// An attachment on a message read out of history is fetched and saved
+	// exactly as one on a delivered message is. Only the RECEIPT half of
+	// resultWithReceivedAttachments must be kept away from this path;
+	// leaving the attachment out with it rendered the message as though
+	// it had none, which is a silence with nothing to retry against.
+	attachments := s.saveReceivedAttachments(conn, []hubconn.Event{ev})
+	return mcp.NewToolResultText(hubconn.FormatEvent(ev) + attachments + "\n\n[hub: this was a read, not a " +
 		"catch-up — your unread position is unchanged, so nothing you still have to read was " +
 		"consumed. This message is recorded as delivered to you, so a later hub_catch_up will " +
 		"skip past it rather than show it again. To keep reading forward, pass this message's " +

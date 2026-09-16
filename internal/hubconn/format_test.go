@@ -93,13 +93,6 @@ func TestFormatEventMsgOmitsOperatorTagWhenNotOperator(t *testing.T) {
 	}
 }
 
-func TestFormatEventPeerJoinedFlagsOperator(t *testing.T) {
-	got := FormatEvent(Event{Kind: "peerJoined", PeerID: SystemPeerIDSystem, IsOperator: true})
-	if !strings.Contains(got, "OPERATOR") {
-		t.Fatalf("got %q", got)
-	}
-}
-
 func TestFormatEventPrivateMsgIsMarked(t *testing.T) {
 	e := Event{Kind: "msg", PeerID: "peer-1", Text: "hush", TS: "ts", Private: true}
 	got := FormatEvent(e)
@@ -117,18 +110,26 @@ func TestFormatEventErrorIsPlain(t *testing.T) {
 	}
 }
 
-func TestFormatEventPeerJoinedIsPlain(t *testing.T) {
-	got := FormatEvent(Event{Kind: "peerJoined", PeerID: "peer-2"})
-	if got != "[peer peer-2 joined]" {
-		t.Fatalf("got %q", got)
+// The roster line NAMES people, because it is now the only line a reader
+// gets about who was already here — the per-peer joins are folded into
+// it. "The roster is complete" said nothing anyone could act on.
+func TestFormatEventRosterCompleteNamesWhoIsHere(t *testing.T) {
+	got := FormatEvent(Event{Kind: "roster", RosterPeers: []PeerInfo{
+		{ID: "550e8400-e29b-41d4-a716-446655440001", Name: "Alice"},
+		{ID: "550e8400-e29b-41d4-a716-446655440002"},
+	}})
+	for _, want := range []string{"2 already here", "Alice", "550e8400-e29b-41d4-a716-446655440002"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in the roster line, got %q", want, got)
+		}
 	}
 }
 
-func TestFormatEventRosterCompleteIsPlain(t *testing.T) {
-	got := FormatEvent(Event{Kind: "rosterComplete"})
-	want := "[hub: initial roster complete — you now know everyone who was already in the session]"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+// An empty roster answers the question rather than leaving it to be
+// inferred from the absence of join lines.
+func TestFormatEventEmptyRosterSaysAlone(t *testing.T) {
+	if got := FormatEvent(Event{Kind: "roster"}); !strings.Contains(got, "alone") {
+		t.Fatalf("expected an empty roster to say so, got %q", got)
 	}
 }
 
@@ -328,7 +329,7 @@ func TestFormatEventSendAckNotOK(t *testing.T) {
 
 func TestFormatEventsJoinsMultiple(t *testing.T) {
 	events := []Event{
-		{Kind: "peerJoined", PeerID: "a"},
+		{Kind: "roster", RosterPeers: []PeerInfo{{ID: "a", Name: "Alice"}}},
 		{Kind: "msg", PeerID: "a", Text: "hi", TS: "ts"},
 	}
 	got := FormatEvents(events)
@@ -338,7 +339,7 @@ func TestFormatEventsJoinsMultiple(t *testing.T) {
 	if !strings.Contains(got, `"i/N" sequence`) || !strings.Contains(got, `"end i/N" marker`) {
 		t.Fatalf("expected the burst header to point at per-event start/end markers, got: %q", got)
 	}
-	if !strings.Contains(got, "[hub: event 1/2 in this delivery,") || !strings.Contains(got, "[peer a joined]") ||
+	if !strings.Contains(got, "[hub: event 1/2 in this delivery,") || !strings.Contains(got, "1 already here") ||
 		!strings.Contains(got, "[hub: end 1/2 boundary=") {
 		t.Fatalf("expected event 1 with its own start+end marker, got: %q", got)
 	}
@@ -349,7 +350,7 @@ func TestFormatEventsJoinsMultiple(t *testing.T) {
 }
 
 func TestFormatEventsOmitsCountHeaderForSingleEvent(t *testing.T) {
-	got := FormatEvents([]Event{{Kind: "peerJoined", PeerID: "a"}})
+	got := FormatEvents([]Event{{Kind: "roster", RosterPeers: []PeerInfo{{ID: "a", Name: "Alice"}}}})
 	if strings.Contains(got, "delivering") || strings.Contains(got, "in this delivery") {
 		t.Fatalf("expected no count/per-event header for a single event, got: %s", got)
 	}
@@ -364,9 +365,9 @@ func TestFormatEventsOmitsCountHeaderForEmpty(t *testing.T) {
 
 func TestFormatEventsBatchReturnsOneChunkPerEventWithMarkers(t *testing.T) {
 	events := []Event{
-		{Kind: "peerJoined", PeerID: "a"},
+		{Kind: "roster", RosterPeers: []PeerInfo{{ID: "a", Name: "Alice"}}},
 		{Kind: "msg", PeerID: "a", Text: "hi", TS: "ts"},
-		{Kind: "peerLeft", PeerID: "a"},
+		{Kind: "error", Text: "nope"},
 	}
 	chunks := FormatEventsBatch(events)
 	if len(chunks) != 3 {
@@ -381,8 +382,8 @@ func TestFormatEventsBatchReturnsOneChunkPerEventWithMarkers(t *testing.T) {
 
 func TestFormatEventsBatchEndBoundaryMatchesStartBoundary(t *testing.T) {
 	chunks := FormatEventsBatch([]Event{
-		{Kind: "peerJoined", PeerID: "a"},
-		{Kind: "peerLeft", PeerID: "a"},
+		{Kind: "roster", RosterPeers: []PeerInfo{{ID: "a", Name: "Alice"}}},
+		{Kind: "error", Text: "nope"},
 	})
 	for i, c := range chunks {
 		startRe := regexp.MustCompile(`boundary=([0-9a-f]+)\]`)
@@ -399,8 +400,8 @@ func TestFormatEventsBatchEndBoundaryMatchesStartBoundary(t *testing.T) {
 
 func TestFormatEventsBatchBoundariesDifferAcrossEvents(t *testing.T) {
 	chunks := FormatEventsBatch([]Event{
-		{Kind: "peerJoined", PeerID: "a"},
-		{Kind: "peerLeft", PeerID: "a"},
+		{Kind: "roster", RosterPeers: []PeerInfo{{ID: "a", Name: "Alice"}}},
+		{Kind: "error", Text: "nope"},
 	})
 	re := regexp.MustCompile(`boundary=([0-9a-f]+)\]`)
 	b0 := re.FindStringSubmatch(chunks[0])[1]
@@ -411,8 +412,8 @@ func TestFormatEventsBatchBoundariesDifferAcrossEvents(t *testing.T) {
 }
 
 func TestFormatEventsBatchReturnsSingleChunkUnmarkedForOneEvent(t *testing.T) {
-	chunks := FormatEventsBatch([]Event{{Kind: "peerJoined", PeerID: "a"}})
-	if len(chunks) != 1 || chunks[0] != "[peer a joined]" {
+	chunks := FormatEventsBatch([]Event{{Kind: "roster", RosterPeers: []PeerInfo{{ID: "a", Name: "Alice"}}}})
+	if len(chunks) != 1 || !strings.Contains(chunks[0], "1 already here") {
 		t.Fatalf("got %v", chunks)
 	}
 }

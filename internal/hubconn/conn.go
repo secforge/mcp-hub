@@ -126,6 +126,19 @@ type Event struct {
 	// Only the first two are claims about the world.
 	ActionOKStated bool
 
+	// RosterPeers carries the session's membership on a "roster" event —
+	// the server stating the whole list in one message, re-sent in full
+	// whenever it changes. It INCLUDES this connection itself as the
+	// server sent it; the read loop removes that entry before the event
+	// is buffered, so a reader is never handed a list it has to mentally
+	// correct. Empty on every other kind.
+	RosterPeers []PeerInfo
+
+	// RosterReadAt is when the conversation behind a teams link was last
+	// read, where the server says. Empty means no answer about it, which
+	// is not the same as never read.
+	RosterReadAt string
+
 	// Mirrored says the connection this event arrived on is a mirror of
 	// some other conversation (a teams link), where a message we send is
 	// echoed back as its own "msg" event once it lands over there. On a
@@ -249,7 +262,6 @@ type Conn struct {
 	name          string
 	agePublicKey  string
 	serverVersion int
-	expectedPeers int
 	// The fields below are only ever set for a teams session (see
 	// wire.Joined) — zero-valued for every mcp-hub-server connection.
 	canSend          bool
@@ -425,6 +437,16 @@ type Conn struct {
 // specific ack kind (or a generic "error") — see claimNextAck.
 type ackClaim struct {
 	result chan Event // buffered, size 1; written to exactly once
+	// token, where set, narrows this claim to one attachmentData: the
+	// claim is keyed by event kind and is consumed by the FIRST event of
+	// that kind, so without this a late answer to an abandoned request
+	// satisfies the next one and the wrong file is handed back as
+	// confidently as the right one. Matching here rather than in the
+	// caller is what keeps the claim alive for the answer it is actually
+	// waiting for — a caller that filtered after the fact would find the
+	// claim already deleted and wait out its whole deadline for an
+	// answer that had gone to the buffer.
+	token string
 }
 
 // relayCloseNotes maps close codes a teams relay may use to signal a
@@ -729,7 +751,6 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		name:                    joined.Name,
 		agePublicKey:            joined.AgePublicKey,
 		serverVersion:           joined.ServerVersion,
-		expectedPeers:           joined.PeerCount,
 		peers:                   make(map[string]PeerInfo),
 		pongWait:                snapPongWait,
 		canSend:                 joined.CanSend,
@@ -787,11 +808,6 @@ func (c *Conn) HasFeature(name string) bool {
 	_, ok := c.features[name]
 	return ok
 }
-
-// ExpectedPeerCount is how many peers were already in the session at join
-// time, as reported by the server's "joined" message — i.e. how many
-// peerJoined events make up the initial roster catch-up.
-func (c *Conn) ExpectedPeerCount() int { return c.expectedPeers }
 
 // The accessors below only ever return a non-zero/non-nil value for a
 // teams session (see wire.Joined) — nil/zero for every
@@ -886,10 +902,22 @@ func (c *Conn) Peers() []PeerInfo {
 
 // OnActivity registers a callback invoked (from the background read
 // goroutine) after every new buffered event and on disconnect.
+//
+// Registering also reports what is ALREADY waiting, because a connect
+// fills the buffer before anyone is listening: the read loop takes the
+// roster frames while the caller is still wiring this up, and a callback
+// that only arranges to hear the NEXT event leaves those undelivered
+// until something else happens to arrive — on a quiet session, never.
+// Firing here rather than at each call site keeps a future caller from
+// having to remember it.
 func (c *Conn) OnActivity(f func()) {
 	c.mu.Lock()
 	c.onActivity = f
+	waiting := len(c.buffer) > 0 || c.closed
 	c.mu.Unlock()
+	if f != nil && waiting {
+		f()
+	}
 }
 
 // claimNextAck registers to intercept the next event of kind ackKind for
@@ -918,6 +946,12 @@ func (c *Conn) OnActivity(f func()) {
 // caller has stopped waiting — after cancel, or once the claim has fired,
 // everything reverts to the normal buffer path.
 func (c *Conn) claimNextAck(ackKind string) (result <-chan Event, cancel func(), err error) {
+	return c.claimNextAckForToken(ackKind, "")
+}
+
+// claimNextAckForToken is claimNextAck narrowed to one attachment token —
+// see ackClaim.token for why the narrowing has to live in the claim.
+func (c *Conn) claimNextAckForToken(ackKind, token string) (result <-chan Event, cancel func(), err error) {
 	ch := make(chan Event, 1)
 	c.mu.Lock()
 	if c.pendingAcks == nil {
@@ -943,7 +977,7 @@ func (c *Conn) claimNextAck(ackKind string) (result <-chan Event, cancel func(),
 			"another %s request is already awaiting its answer on this connection; "+
 				"retry once it has returned", ackKind)
 	}
-	claim := &ackClaim{result: ch}
+	claim := &ackClaim{result: ch, token: token}
 	c.pendingAcks[ackKind] = claim
 	c.mu.Unlock()
 	cancel = func() {
@@ -991,6 +1025,13 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 		}
 	}
 	if claim, ok := c.pendingAcks[ev.Kind]; ok {
+		// A token-narrowed claim keeps waiting rather than swallowing
+		// somebody else's answer; the mismatched event falls through to
+		// the buffer, where it is reported as unsolicited — which is
+		// exactly what it is.
+		if claim.token != "" && ev.AttachmentToken != claim.token {
+			return false
+		}
 		delete(c.pendingAcks, ev.Kind)
 		claim.result <- ev
 		return true
@@ -1288,6 +1329,20 @@ func (c *Conn) readLoop() {
 		if ev.PeerID == SystemPeerIDOperator || ev.PeerID == SystemPeerIDSystem {
 			ev.IsOperator = true
 		}
+		// The wire states the whole membership, this connection included.
+		// Everything above works on that list; everything a READER is
+		// shown is about the others, so this connection's own entry comes
+		// out here — once, rather than at each place that renders or
+		// counts it.
+		if ev.Kind == "roster" {
+			others := make([]PeerInfo, 0, len(ev.RosterPeers))
+			for _, p := range ev.RosterPeers {
+				if p.ID != c.peerID {
+					others = append(others, p)
+				}
+			}
+			ev.RosterPeers = others
+		}
 		c.buffer = append(c.buffer, ev)
 		// A buffer nobody is draining is a reader that has stopped, and
 		// past a point the honest thing is to stop pretending to be
@@ -1309,11 +1364,16 @@ func (c *Conn) readLoop() {
 			// Not what decides "was this graceful" — the close code is,
 			// and it arrives whether or not this frame did.
 			c.reconnectAfter = ev.ReconnectAfter
-		case "peerJoined":
-			c.peers[ev.PeerID] = PeerInfo{ID: ev.PeerID, Name: ev.Name, AgePublicKey: ev.AgePublicKey}
-		case "peerLeft":
-			delete(c.peers, ev.PeerID)
-		case "rosterComplete":
+		case "roster":
+			// The server stated the membership, so this REPLACES what is
+			// known rather than adding to it — that is the whole point of
+			// sending state instead of deltas, and the reason a client
+			// that missed a frame repairs on the next one instead of
+			// drifting.
+			c.peers = make(map[string]PeerInfo, len(ev.RosterPeers))
+			for _, p := range ev.RosterPeers {
+				c.peers[p.ID] = p
+			}
 			c.rosterAnnounced = true
 		}
 		f := c.onActivity
@@ -1441,20 +1501,19 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "error", Text: e.Message, Code: e.Code, Retryable: e.Retryable}, true
-	case wire.TypePeerJoined:
-		var p wire.PeerEvent
-		if err := json.Unmarshal(raw, &p); err != nil || !wire.IsValidID(p.PeerID) {
+	case wire.TypeRoster:
+		var r wire.Roster
+		if err := json.Unmarshal(raw, &r); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "peerJoined", PeerID: p.PeerID, Name: p.Name, AgePublicKey: p.AgePublicKey}, true
-	case wire.TypePeerLeft:
-		var p wire.PeerEvent
-		if err := json.Unmarshal(raw, &p); err != nil || !wire.IsValidID(p.PeerID) {
-			return Event{}, false
+		members := make([]PeerInfo, 0, len(r.Members))
+		for _, m := range r.Members {
+			if !wire.IsValidID(m.PeerID) {
+				return Event{}, false
+			}
+			members = append(members, PeerInfo{ID: m.PeerID, Name: m.Name, AgePublicKey: m.AgePublicKey})
 		}
-		return Event{Kind: "peerLeft", PeerID: p.PeerID}, true
-	case wire.TypeRosterComplete:
-		return Event{Kind: "rosterComplete"}, true
+		return Event{Kind: "roster", RosterPeers: members, RosterReadAt: r.ReadAt}, true
 	case wire.TypeSendAck:
 		var a wire.SendAck
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -1784,6 +1843,26 @@ func (c *Conn) DeleteMessage(externalID string) error {
 // these methods already do first.
 var AckWaitTimeout = 5 * time.Second
 
+// AttachmentWaitTimeout is how long RequestAttachment waits, and it is
+// deliberately NOT AckWaitTimeout. An ack is the server saying "yes" to
+// something it has already done, so five seconds is generous. An
+// attachment reply carries the bytes themselves, and the server may have
+// to fetch them from somewhere else — a relay backed by Teams/Graph goes
+// out to that API on demand — before it can answer at all. Sizing a
+// transfer by the deadline for a "yes" cost a whole report: the request
+// timed out at 5s, the data arrived a moment later, and by then the claim
+// was gone and the bytes were discarded as unsolicited.
+//
+// No size is available to scale this by: the reference form carries
+// contentType, token, name and kind, and no length. So this is one bound,
+// and the number comes from the serving side rather than from taste: a
+// relay's own outbound writer gives up on a frame it cannot hand to the
+// kernel within 20s and closes that peer. Past that point no answer is
+// coming on this connection at all, so waiting longer buys nothing. This
+// sits just above it — long enough to cover a large frame that is still
+// moving, short enough not to outlive the connection that would carry it.
+var AttachmentWaitTimeout = 30 * time.Second
+
 // SendAwaitingAck sends text (broadcast, or to a single peer if to is
 // non-empty) and, only against a server declaring actionAcks (see
 // WantsActionAcks — a server that emits no ack at all would make waiting
@@ -1886,7 +1965,11 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 // all; a caller should only ever call this for a Token actually seen on
 // an Attachment.IsReference()==true entry.
 func (c *Conn) RequestAttachment(token string) (Event, bool, error) {
-	resultCh, cancel, claimErr := c.claimNextAck("attachmentData")
+	// Narrowed to this token: an attachmentData for any other one is not
+	// this request's answer and must not consume this wait. An error
+	// event carries no token, so it is still taken as this request's
+	// outcome — the only reading available for it.
+	resultCh, cancel, claimErr := c.claimNextAckForToken("attachmentData", token)
 	if claimErr != nil {
 		return Event{}, false, claimErr
 	}
@@ -1897,7 +1980,7 @@ func (c *Conn) RequestAttachment(token string) (Event, bool, error) {
 	select {
 	case ev := <-resultCh:
 		return ev, true, nil
-	case <-time.After(AckWaitTimeout):
+	case <-time.After(AttachmentWaitTimeout):
 		return Event{}, false, nil
 	}
 }

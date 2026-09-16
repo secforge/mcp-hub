@@ -29,7 +29,7 @@ func startRelayTestServer(t *testing.T, onConnected func(*websocket.Conn)) (wsUR
 			return
 		}
 		defer conn.Close()
-		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", 0, "", "")
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
 		// Declares that it answers each action with its own ack, and that
 		// it replies to a standalone ack too — what makes waiting for
 		// either worthwhile.
@@ -181,7 +181,8 @@ func TestClaimNextAckDoesNotStealUnrelatedEvents(t *testing.T) {
 		}
 		// An unrelated event arrives while the claim is pending — must
 		// not be diverted, must still reach Peek/Drain normally.
-		conn.WriteJSON(wire.NewPeerJoined("550e8400-e29b-41d4-a716-446655440099", "Alice", ""))
+		conn.WriteJSON(wire.NewRoster([]wire.RosterMember{
+			{PeerID: "550e8400-e29b-41d4-a716-446655440099", Name: "Alice"}}))
 		time.Sleep(50 * time.Millisecond)
 		conn.WriteJSON(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "ext-1", OK: true})
 		time.Sleep(2 * time.Second)
@@ -209,8 +210,12 @@ func TestClaimNextAckDoesNotStealUnrelatedEvents(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// Alice arrives as part of the initial roster now — folded into one
+	// line rather than delivered as her own event (see readLoop). What
+	// this test is about is unchanged: the claimed ack did not swallow
+	// her, and she still reaches the general buffer.
 	if !strings.Contains(formatted, "Alice") {
-		t.Fatalf("expected the unrelated peerJoined to still reach the general buffer, got: %q", formatted)
+		t.Fatalf("expected the unrelated roster to still reach the general buffer, got: %q", formatted)
 	}
 	if strings.Contains(formatted, "ext-1") {
 		t.Fatalf("expected the claimed sendAck NOT to also appear in the general buffer, got: %q", formatted)
