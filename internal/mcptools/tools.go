@@ -1104,11 +1104,40 @@ func (h *Hub) abandonReconnect(note string) {
 // is delivered on the next tool result rather than pushed, because there
 // is no channel to push down — which is precisely why it must be stored
 // instead of logged and forgotten.
+// noteAutoReconnect queues something for the next tool result to carry.
+//
+// Notes ACCUMULATE rather than replace. Assignment was the original
+// shape, and it silently destroyed whichever note lost the race: a
+// confirm echo and an inbox diagnostic landed in the same turn, the
+// second overwrote the first, and nothing anywhere reported that a
+// message had been produced and dropped. Several independent things now
+// write here — reconnects, push failures, catch-up write failures, the
+// skipped-hold warning, relay outcomes, wire diagnostics — so collisions
+// are ordinary rather than rare.
+//
+// Bounded, because a note nobody reads must not grow without limit: past
+// the cap the oldest go and the reader is told how many, which is a
+// smaller lie than dropping them silently.
 func (h *Hub) noteAutoReconnect(note string) {
+	if note == "" {
+		return
+	}
 	h.mu.Lock()
-	h.autoReconnect = note
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	if h.autoReconnect == "" {
+		h.autoReconnect = note
+		return
+	}
+	combined := h.autoReconnect + "\n" + note
+	if len(combined) > maxQueuedNotes {
+		combined = "[hub: earlier notes were dropped to stay within one result]\n" +
+			combined[len(combined)-maxQueuedNotes:]
+	}
+	h.autoReconnect = combined
 }
+
+// maxQueuedNotes bounds what one tool result will carry of these.
+const maxQueuedNotes = 4096
 
 // takeAutoReconnectNote returns and clears the pending note, so it is
 // reported exactly once.

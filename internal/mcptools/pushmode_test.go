@@ -206,3 +206,40 @@ func TestCaughtUpDoesNotClaimDeliveryWhileEventsSitInTheBuffer(t *testing.T) {
 		})
 	}
 }
+
+// Notes must accumulate. Assignment silently destroyed whichever lost the
+// race — a confirm echo and a wire diagnostic landed in the same turn and
+// the second overwrote the first, with nothing reporting that something
+// had been produced and dropped.
+func TestQueuedNotesAccumulateRatherThanOverwrite(t *testing.T) {
+	h := &Hub{}
+	h.noteAutoReconnect("first thing")
+	h.noteAutoReconnect("second thing")
+	h.noteAutoReconnect("")
+
+	got := h.takeAutoReconnectNote()
+	for _, want := range []string{"first thing", "second thing"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("note %q lost %q", got, want)
+		}
+	}
+	if again := h.takeAutoReconnectNote(); again != "" {
+		t.Errorf("notes survived being taken: %q", again)
+	}
+}
+
+// A note nobody reads must not grow without limit, and dropping some
+// silently is the thing this function exists to stop.
+func TestQueuedNotesAreBoundedAndSayWhenTrimmed(t *testing.T) {
+	h := &Hub{}
+	for i := 0; i < 200; i++ {
+		h.noteAutoReconnect(strings.Repeat("x", 100))
+	}
+	got := h.takeAutoReconnectNote()
+	if len(got) > maxQueuedNotes+200 {
+		t.Errorf("notes grew to %d bytes, past the cap", len(got))
+	}
+	if !strings.Contains(got, "dropped") {
+		t.Errorf("trimming was silent:\n%s", got[:200])
+	}
+}
