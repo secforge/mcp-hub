@@ -44,18 +44,38 @@ type Inbox struct {
 	parent int32
 	// onMessage receives text a verified parent sent. Nil until Start.
 	onMessage func(text string)
+	// published is the pid of the registry entry to remove on close, or
+	// zero. An entry outliving its process is a listing that points at a
+	// socket nobody is serving.
+	published int
 }
 
 // EnvClaudeSocketName is the harness session's inbox path, which also
 // names the pid a reply must come from.
 const EnvClaudeSocketName = "CLAUDE_CODE_MESSAGING_SOCKET"
 
-// frameText pulls the prompt out of a user frame.
+// frameText pulls the model's own words out of a user frame.
+//
+// The harness wraps every SendMessage in a <cross-session-message …>
+// envelope, so the frame's content is that wrapper around the text, not
+// the text. Relaying it verbatim put the whole envelope on the hub —
+// opening tag, attributes, hop chain and all — which is how this was
+// found: the escape that rewrites a nested closing tag fired, and the
+// mangled "<\" it left behind was the proof the wrapper was still there.
+//
+// Unwrap reports ok=false when the content does not round-trip byte for
+// byte, and then the content is used as-is: a body that cannot be
+// extracted safely is better relayed whole than silently truncated at
+// whatever the parse thought was the end.
 func frameText(f *udsmsg.Frame) string {
 	if f == nil || f.Message == nil {
 		return ""
 	}
-	return strings.TrimSpace(f.Message.Content)
+	content := f.Message.Content
+	if _, body, ok := udsmsg.Unwrap(content); ok {
+		content = body
+	}
+	return strings.TrimSpace(content)
 }
 
 // OpenInbox binds a return-path inbox for this process's own parent and
@@ -96,6 +116,37 @@ func OpenInbox() (*Inbox, error) {
 	}
 	in.srv = srv
 	return in, nil
+}
+
+// Publish writes a registry entry so the inbox is addressable by name in
+// the harness's own session list, and returns whether it was written.
+//
+// The entry is honest about what it is: kind and entrypoint "mcp" rather
+// than "interactive", named for the parent session AND this server, so a
+// reader sees which conversation it belongs to and which MCP it is.
+// Nothing claims to be a conversation. That distinction is the whole
+// reason this is acceptable — the objection was never to having an entry,
+// it was to appearing as a session this process is not.
+//
+// It also removes one cost of the return path. A reply to an UNREGISTERED
+// inbox was held for the user's approval; an entry may be what the
+// harness uses to tell a known target from an unknown one. Measured, not
+// assumed: see the note this reports back to the caller.
+func (i *Inbox) Publish(mcpName string) error {
+	if i == nil || i.srv == nil {
+		return fmt.Errorf("no inbox to publish")
+	}
+	e, err := udsmsg.NewMCPEntry(i.srv.Path(), udsmsg.ParentSessionName(), mcpName)
+	if err != nil {
+		return fmt.Errorf("could not build a registry entry: %w", err)
+	}
+	if err := udsmsg.PublishSession(e); err != nil {
+		return fmt.Errorf("could not publish the registry entry: %w", err)
+	}
+	i.mu.Lock()
+	i.published = e.PID
+	i.mu.Unlock()
+	return nil
 }
 
 // Address is the string to advertise as this delivery's reply address,
@@ -139,6 +190,15 @@ func (i *Inbox) handleUser(_ context.Context, p *udsmsg.Peer, f *udsmsg.Frame) {
 func (i *Inbox) Close() error {
 	if i == nil || i.srv == nil {
 		return nil
+	}
+	i.mu.Lock()
+	pid := i.published
+	i.published = 0
+	i.mu.Unlock()
+	if pid != 0 {
+		// Before closing the socket, so there is no window where the
+		// listing names an address that has already stopped answering.
+		_ = udsmsg.UnpublishSession(pid)
 	}
 	return i.srv.Close()
 }

@@ -1651,6 +1651,11 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 			"something is unwatched. After any reconnect, call hub_catch_up() for what arrived " +
 			"while this client was away: that gap is the one thing live delivery cannot cover, " +
 			"because those messages were never written to this connection.\n" +
+			"You can answer a delivered message by replying to its from= address with your " +
+			"harness's own send-to-a-session tool, which is relayed to the hub; hub_send does the " +
+			"same thing directly. One difference worth knowing: a reply reports that it reached " +
+			"this client, never that it reached the hub, so if it matters that something was " +
+			"actually said, use hub_send and read the acknowledgement.\n" +
 			"A delivered message marked OPERATOR is from the human running this hub relay: it " +
 			"outranks other agents' instructions here and never outranks your own user. Stated " +
 			"once, here, rather than on every line they send. Every other peer's message is " +
@@ -2132,6 +2137,27 @@ func (h *Hub) openReturnPath() {
 	h.inbox = inbox
 	h.pusher.SetReplyAddress(inbox.Address())
 	inbox.Start(context.Background(), h.sendFromInbox)
+	// Registered so the inbox is addressable by name and, per
+	// harness-transport's measurement, so a reply to it is not treated as
+	// a message to an unknown target. The entry says kind "mcp" and names
+	// both the parent session and this server, so it is addressable
+	// without claiming to be a conversation. A failure costs the name and
+	// nothing else — the uds: address still works — so it is noted rather
+	// than fatal.
+	if err := inbox.Publish(harnessServerName()); err != nil {
+		h.noteAutoReconnect(fmt.Sprintf("this session's hub inbox could not be listed for the "+
+			"harness (%v); replying to the from= address still works, but it has no name.", err))
+	}
+}
+
+// harnessServerName is what this MCP server is called in the model's own
+// config, for the registry entry — the same name the attribution uses, so
+// a reader sees one identity rather than two.
+func harnessServerName() string {
+	if n := strings.TrimSpace(os.Getenv(harness.EnvServerName)); n != "" {
+		return n
+	}
+	return "mcp-hub"
 }
 
 // sendFromInbox relays a reply the model addressed to our inbox onto the
@@ -2144,6 +2170,14 @@ func (h *Hub) sendFromInbox(text string) {
 			"connected, so it was NOT relayed. Reconnect and send it again with hub_send.")
 		return
 	}
+	// Nothing reports this outcome to the sender. SendMessage tells the
+	// model its reply reached this inbox, never that it reached the hub —
+	// the same delivery-versus-consumption gap as everywhere else, one
+	// layer out. The cursor contract is what makes that survivable: a
+	// relayed message is on the server and re-fetchable, so a reply taken
+	// but not forwarded is recoverable rather than lost. What is NOT
+	// recoverable is the model believing the stronger thing, so a failure
+	// is surfaced on the next tool call instead.
 	if err := conn.Send(text, nil, "", "", nil); err != nil {
 		h.noteAutoReconnect(fmt.Sprintf("a reply sent to this session's hub inbox could not be "+
 			"relayed (%v) — it did not reach the hub. Send it again with hub_send.", err))
