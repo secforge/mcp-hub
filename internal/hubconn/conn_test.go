@@ -856,7 +856,7 @@ func TestFeaturesDeclaredFalseWhenServerOmitsFeatures(t *testing.T) {
 	}
 }
 
-// TestConfirmReceivedOnTeamsSessionReturnsBehindFromReply is the regression
+// TestConfirmReceivedReturnsBehindWhenAckRepliesDeclared is the regression
 // test for chat-relay's server-side extension (found live, 2026-09-08):
 // a standalone ack's reply can carry a Behind count measured from the
 // position just confirmed. On a teams connection, ConfirmReceived must

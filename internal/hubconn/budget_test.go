@@ -425,3 +425,47 @@ func TestAdjustingACostCorrectsTheEntryRatherThanDoubleCharging(t *testing.T) {
 		t.Fatalf("ledger has %d entries, want 1 — the message was counted twice", len(b.outstanding))
 	}
 }
+
+// Overwriting a pending claim produced two wrong outcomes at once: the
+// displaced caller waited out its timeout having never been told, and the
+// surviving one received the FIRST ack of that kind — possibly the answer
+// to the displaced caller's request, carrying an outcome a model is shown
+// as delivered or refused. One timeout and one confidently wrong answer is
+// worse than two timeouts.
+func TestASecondClaimOfTheSameKindIsRefusedRatherThanReplacingTheFirst(t *testing.T) {
+	c := &Conn{}
+	first, cancelFirst, err := c.claimNextAck("sendAck")
+	if err != nil {
+		t.Fatalf("first claim failed: %v", err)
+	}
+	defer cancelFirst()
+
+	_, _, err = c.claimNextAck("sendAck")
+	if err == nil {
+		t.Fatal("a second claim of the same kind was accepted, displacing the first")
+	}
+
+	// The first claim must still be the one that gets the answer.
+	c.mu.Lock()
+	claim := c.pendingAcks["sendAck"]
+	c.mu.Unlock()
+	if claim == nil {
+		t.Fatal("the refused claim removed the one already waiting")
+	}
+	claim.result <- Event{Kind: "sendAck", ActionOK: true, ActionOKStated: true}
+	select {
+	case ev := <-first:
+		if !ev.ActionOK {
+			t.Fatal("the original claimant got the wrong answer")
+		}
+	default:
+		t.Fatal("the original claimant was not delivered to")
+	}
+
+	// A different kind is unaffected — the refusal is per kind, not global.
+	if _, cancelOther, err := c.claimNextAck("editAck"); err != nil {
+		t.Fatalf("an unrelated ack kind was refused: %v", err)
+	} else {
+		cancelOther()
+	}
+}

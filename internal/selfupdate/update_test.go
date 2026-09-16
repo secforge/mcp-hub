@@ -253,3 +253,29 @@ func TestDownloadRefusesSomethingLargerThanTheLimit(t *testing.T) {
 		t.Fatalf("expected the size to be the stated reason, got: %v", err)
 	}
 }
+
+// A pre-release is behind the release of the same numbers — semver's own
+// rule, and the one case where dropping the suffix inverts the answer.
+// Without it a running v1.2.3-rc1 compared EQUAL to the published v1.2.3,
+// so hub_self_update told anyone on an rc there was no update, forever.
+func TestAPreReleaseIsBehindItsOwnRelease(t *testing.T) {
+	for _, tc := range []struct {
+		candidate, running string
+		want               bool
+	}{
+		{"v1.2.3", "v1.2.3-rc1", true},
+		{"v1.2.3", "v1.2.3", false},
+		{"v1.2.3-rc2", "v1.2.3-rc1", false}, // same numbers, both pre: not ordered here
+		{"v1.2.3-rc1", "v1.2.3", false},     // never offer a downgrade to an rc
+		{"v1.2.4", "v1.2.3-rc1", true},
+		{"v1.2.3+modified", "v1.2.3", false}, // build metadata is not a version change
+	} {
+		got, err := isNewer(tc.candidate, tc.running)
+		if err != nil {
+			t.Fatalf("isNewer(%q, %q): %v", tc.candidate, tc.running, err)
+		}
+		if got != tc.want {
+			t.Errorf("isNewer(%q, %q) = %v, want %v", tc.candidate, tc.running, got, tc.want)
+		}
+	}
+}

@@ -55,6 +55,25 @@ describing a marker that never arrives — which reads as every message being
 truncated. If that happens, mcp-hub must render its own end marker again;
 adjusting the guidance instead would be treating the symptom.
 
+**Worse than the gap itself**, for a while: `format.go` claimed a test named
+`TestTheLibraryStillAppendsTheCursorAsTheLastThing` pinned this. No such
+test existed — it was written, failed to compile because `compose` is
+unexported, and was deleted while the comment that named it stayed. A
+comment that states a risk correctly and names an absent mitigation is worse
+than silence, because a reader who checks the reasoning finds it sound and
+stops. Found by harness-transport, 2026-09-16.
+
+**The property is pinned upstream**, by the library's own
+`TestComposeAlwaysEndsWithATrailer`, across every Cursor/More/Body
+combination. So a break fails their suite immediately and reaches this one
+only at a dependency bump. Doubling it here is still worth doing, and needs
+either an exported `Compose` or an end-to-end test through a real socket.
+
+**Assert the shape, not the prefix.** There are two trailer forms since
+v0.1.1: `[cursor: …]` and `[no cursor: this message cannot be re-fetched]`.
+A test matching `[cursor:` would pass today and fail on the first
+client-authored notice.
+
 ## Codex push mode is not built, but the code reads as though it were
 
 `PushMode` keys on `CLAUDE_CODE_MESSAGING_SOCKET` alone, and
@@ -78,3 +97,26 @@ exercised against a Codex session.
 Codex push is unbuilt. The failure this avoids is the one the codebase
 keeps meeting — code that looks built and behaves unbuilt produces an
 absence nobody can attribute.
+
+## The self-update version is not signed
+
+`Apply` compares `rel.TagName` against the running version before
+downloading, and the comment there used to present that ordering as what
+prevents a downgrade. It does not: the tag comes from the same JSON as the
+asset URL and nothing signs it. Whoever can shape that response serves tag
+`v99.0.0` alongside the genuine, genuinely signed `v0.0.1` binary and its
+genuine `.sig` — verification passes because the bytes really were
+published, the comparison passes because the tag says 99, and a
+known-buggy old binary installs over a good one.
+
+Found by chat-relay, 2026-09-15.
+
+**What prevents it today** is TLS to api.github.com. That is a reasonable
+control, and it is a different one from the reasoning the code claimed.
+
+**The fix** is to bind the version into the signed material: sign a small
+manifest carrying the tag plus the asset's digest, verify that, then match
+the tag against it. Not done here because it changes the release process as
+well as the client, and shipping half of it — a client that expects a
+manifest against a release process that does not publish one — would break
+updating entirely.

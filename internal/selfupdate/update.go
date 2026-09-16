@@ -31,12 +31,13 @@ import (
 // is not.
 var releasePublicKey = "poNqohWesbaT8bSnCehwC1ENaDL9decYbP4/djqglPU="
 
-// releasesAPI is the only endpoint consulted. Pinned to this repository
-// rather than derived from anything on disk, so nothing a caller controls
-// can redirect where an executable comes from. A var only so tests can
-// point it at a local server: the code path that fetches and installs a
-// binary is the last one that should be exercised solely against the live
-// internet.
+// releasesAPI is the only endpoint consulted, pinned to this repository
+// rather than derived from anything on disk. That pin is defence in depth,
+// not the control: SetReleasesAPIForTest is exported and compiled into the
+// shipped binary, so the endpoint is redirectable by anything already
+// running code in this process. It is harmless because the SIGNATURE is
+// what gates installation — bytes from anywhere still have to verify
+// against the compiled-in key.
 var releasesAPI = "https://api.github.com/repos/secforge/mcp-hub/releases/latest"
 
 // SetReleasesAPIForTest points this package at a stand-in for GitHub and
@@ -121,13 +122,28 @@ type Result struct {
 // Apply checks for a newer release and, only if one exists AND its
 // signature verifies, replaces this process's own binary with it.
 //
-// The order of the checks is the design. Newer-than-running is enforced
-// before anything is downloaded, because a signature says "we published
-// this", not "this is current" — an old asset stays validly signed
-// forever, so signature alone would allow a downgrade. Verification then
-// happens entirely in memory, before a single byte reaches the executable
-// path: a binary that fails to verify is never written anywhere it could
-// be run from.
+// Verification happens entirely in memory, before a single byte reaches
+// the executable path: a binary that fails to verify is never written
+// anywhere it could be run from. That is the control.
+//
+// The newer-than-running check runs first, and it is worth being exact
+// about what it does NOT buy, because the comment here used to claim more.
+// A signature says "we published this", not "this is current" — an old
+// asset stays validly signed forever — so it is true that a signature
+// alone permits a downgrade. But the version being compared is
+// rel.TagName, which comes from the same response as the asset URL and is
+// signed by nothing. Whoever can shape that response can serve tag
+// v99.0.0 alongside the genuine, genuinely signed v0.0.1 binary and its
+// genuine signature: verification passes because the bytes really were
+// published, the comparison passes because the tag says 99, and a
+// known-buggy old binary installs over a good one.
+//
+// What actually prevents that today is TLS to api.github.com, which is a
+// reasonable control and a different one from the ordering. Making the
+// stated reasoning true needs the version bound into the signed material
+// — a small manifest carrying the tag and the asset's digest, verified,
+// then matched against the tag being installed. Recorded rather than
+// silently relied on; see docs/known-issues.md.
 func Apply(ctx context.Context, running string) (Result, error) {
 	res := Result{Running: running, AssetName: AssetName()}
 
@@ -342,7 +358,7 @@ var runtimeGOOS = func() string { return runtime.GOOS }
 // response to "I don't know" is to refuse to replace a binary, and the
 // response to a wrong guess could be a downgrade.
 func isNewer(candidate, running string) (bool, error) {
-	c, err := parseSemver(candidate)
+	c, candidatePre, err := parseSemver(candidate)
 	if err != nil {
 		return false, err
 	}
@@ -350,7 +366,7 @@ func isNewer(candidate, running string) (bool, error) {
 	// compared, and anything published is by definition more official
 	// than an unreleased local build — but that is the caller's decision
 	// to describe, not something to smuggle through a version compare.
-	r, err := parseSemver(running)
+	r, runningPre, err := parseSemver(running)
 	if err != nil {
 		return false, fmt.Errorf("this build reports %q, which is not a release version", running)
 	}
@@ -359,27 +375,42 @@ func isNewer(candidate, running string) (bool, error) {
 			return c[i] > r[i], nil
 		}
 	}
-	return false, nil
+	// Same numbers: a pre-release is BEHIND the release of those numbers,
+	// which is semver's own rule and the one case where dropping the
+	// suffix inverts the answer. Without this, a running v1.2.3-rc1
+	// compared equal to the published v1.2.3 and hub_self_update reported
+	// no update available — permanently, for anyone on an rc.
+	return runningPre && !candidatePre, nil
 }
 
-func parseSemver(v string) ([3]int, error) {
+func parseSemver(v string) (nums [3]int, preRelease bool, err error) {
 	var out [3]int
 	s := strings.TrimPrefix(strings.TrimSpace(v), "v")
 	// Anything after a "+" or "-" (build metadata, a +modified marker, a
-	// pre-release suffix) is not part of the ordering this compares.
-	if i := strings.IndexAny(s, "+-"); i >= 0 {
+	// pre-release suffix) is not part of the NUMBERS this compares — but
+	// whether a pre-release suffix was there is part of the ordering, and
+	// dropping it silently inverted one case: v1.2.3-rc1 parsed as
+	// [1,2,3], compared EQUAL to the published v1.2.3, and isNewer said
+	// no. Anyone on an rc was told there was no update, permanently.
+	// Semver's own rule is that a pre-release precedes the release of the
+	// same numbers.
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		preRelease = true
+		s = s[:i]
+	}
+	if i := strings.IndexByte(s, '+'); i >= 0 {
 		s = s[:i]
 	}
 	parts := strings.Split(s, ".")
 	if len(parts) != 3 {
-		return out, fmt.Errorf("%q is not a three-part version", v)
+		return out, preRelease, fmt.Errorf("%q is not a three-part version", v)
 	}
 	for i, p := range parts {
 		n, err := strconv.Atoi(p)
 		if err != nil {
-			return out, fmt.Errorf("%q is not a three-part version", v)
+			return out, preRelease, fmt.Errorf("%q is not a three-part version", v)
 		}
 		out[i] = n
 	}
-	return out, nil
+	return out, preRelease, nil
 }

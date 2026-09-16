@@ -452,10 +452,21 @@ func deliveredCost(e Event) int {
 // before this was changed.
 //
 // This does mean the sentinel is now the library's line rather than ours,
-// which is a safety property resting on somebody else's formatting.
-// TestTheLibraryStillAppendsTheCursorAsTheLastThing in internal/harness
-// pins that behaviour, so an upstream change breaks a test instead of
-// quietly removing the only marker a cut message would be missing.
+// which is a safety property resting on somebody else's formatting. That
+// property is NOT pinned by any test in this repository — see
+// docs/known-issues.md. It is pinned upstream, by the library's own
+// TestComposeAlwaysEndsWithATrailer, which means a break fails their suite
+// immediately and reaches this one only at a dependency bump: the moment a
+// reader here is least suspicious.
+//
+// Two shapes, not one: an anchorless delivery gets
+// "[no cursor: this message cannot be re-fetched]" rather than
+// "[cursor: …]". Anything asserting the literal "[cursor:" prefix would
+// pass today and fail on the first client-authored notice, which is
+// exactly the case that arrived looking truncated before the library
+// emitted a trailer for it at all. The invariant is that the LAST LINE IS
+// A BRACKETED TRAILER — not that a bracketed line exists, since a quoted
+// message can contain one, and not that it names a cursor.
 //
 // Non-message events delegate to FormatEvent unchanged: they are already
 // short, and they carry the "[hub: …]" prefix that distinguishes this

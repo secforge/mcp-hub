@@ -371,7 +371,21 @@ type Conn struct {
 	// budget governs what may be PUSHED to a reader unbidden — see
 	// budget's own doc comment for why the receiver's context, rather than
 	// the transport, is the scarce resource here.
-	budget *budget
+	// writeMu serializes every frame written to ws. gorilla/websocket
+	// permits exactly ONE concurrent writer and panics when it detects a
+	// second ("concurrent write to websocket connection"), so this is not
+	// a tidiness lock: ackLoop writes a receipt on a timer for the whole
+	// life of the connection while the MCP request goroutine writes
+	// whatever tool the model just called, and the two coinciding is
+	// ordinary rather than unlucky. A panic inside an MCP server takes the
+	// session's connection with it and reads as a crash rather than a race.
+	//
+	// WriteControl is the one method exempt from that contract, which is
+	// why pingLoop does not take this — see its own comment. The rule was
+	// looked up once, applied correctly to the exempt case, and not to the
+	// thirteen call sites that needed it.
+	writeMu sync.Mutex
+	budget  *budget
 	// skippedHeld records that a confirm released a prefix containing a
 	// message the window had held back, so the next tool result can tell
 	// the reader their position moved over something they never saw.
@@ -887,11 +901,31 @@ func (c *Conn) OnActivity(f func()) {
 // timeout) so a later, unrelated event isn't wrongly attributed once the
 // caller has stopped waiting — after cancel, or once the claim has fired,
 // everything reverts to the normal buffer path.
-func (c *Conn) claimNextAck(ackKind string) (result <-chan Event, cancel func()) {
+func (c *Conn) claimNextAck(ackKind string) (result <-chan Event, cancel func(), err error) {
 	ch := make(chan Event, 1)
 	c.mu.Lock()
 	if c.pendingAcks == nil {
 		c.pendingAcks = make(map[string]*ackClaim)
+	}
+	// REFUSE a second claim rather than replacing the first. Overwriting
+	// produced two wrong outcomes at once: the displaced caller was never
+	// delivered to and never learned — its own cancel found a different
+	// claim in the map and so did not even clean up, it simply waited out
+	// its timeout — while the surviving claim received the FIRST ack of
+	// that kind to arrive, which may be the answer to the displaced
+	// caller's request. That ack carries an outcome a caller renders to a
+	// model as delivered or refused, so two concurrent sends could produce
+	// one timeout and one confidently wrong answer, which is worse than
+	// two timeouts.
+	//
+	// Failing loudly is the right shape here: the caller knows it has an
+	// outstanding request of this kind, and an error it can report beats
+	// inheriting someone else's outcome.
+	if _, taken := c.pendingAcks[ackKind]; taken {
+		c.mu.Unlock()
+		return nil, func() {}, fmt.Errorf(
+			"another %s request is already awaiting its answer on this connection; "+
+				"retry once it has returned", ackKind)
 	}
 	claim := &ackClaim{result: ch}
 	c.pendingAcks[ackKind] = claim
@@ -903,7 +937,7 @@ func (c *Conn) claimNextAck(ackKind string) (result <-chan Event, cancel func())
 		}
 		c.mu.Unlock()
 	}
-	return ch, cancel
+	return ch, cancel, nil
 }
 
 // tryDivertToClaimLocked checks ev against any pending ack claims and, if
@@ -1079,7 +1113,7 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		c.mu.Unlock()
 	}
 	if skipWait {
-		if err := c.ws.WriteJSON(wire.NewAck(cursor)); err != nil {
+		if err := c.writeJSON(wire.NewAck(cursor)); err != nil {
 			return nil, err
 		}
 		c.mu.Lock()
@@ -1087,9 +1121,12 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		c.mu.Unlock()
 		return nil, nil
 	}
-	resultCh, cancel := c.claimNextAck("ack")
+	resultCh, cancel, err := c.claimNextAck("ack")
+	if err != nil {
+		return nil, err
+	}
 	defer cancel()
-	if err := c.ws.WriteJSON(wire.NewAck(cursor)); err != nil {
+	if err := c.writeJSON(wire.NewAck(cursor)); err != nil {
 		return nil, err
 	}
 	c.mu.Lock()
@@ -1131,7 +1168,7 @@ func (c *Conn) ackLoop() {
 		if consumed == "" || consumed == sent {
 			continue
 		}
-		if err := c.ws.WriteJSON(wire.NewAck(consumed)); err != nil {
+		if err := c.writeJSON(wire.NewAck(consumed)); err != nil {
 			return
 		}
 		c.mu.Lock()
@@ -1481,7 +1518,7 @@ func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo 
 	m.Format = format
 	m.ReplyTo = replyTo
 	m.Mentions = mentions
-	return c.ws.WriteJSON(m)
+	return c.writeJSON(m)
 }
 
 // SendTo sends text privately to a single peer, identified by peerId. The
@@ -1495,7 +1532,7 @@ func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format
 	m.Format = format
 	m.ReplyTo = replyTo
 	m.Mentions = mentions
-	return c.ws.WriteJSON(m)
+	return c.writeJSON(m)
 }
 
 // RequestMessageAfterAwaiting sends a wire.MessageAfter request for
@@ -1579,7 +1616,7 @@ func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filte
 	defer cancel()
 
 	m := wire.MessageAfter{Type: wire.TypeMessageAfter, Anchor: anchor, Filter: filter}
-	if err := c.ws.WriteJSON(m); err != nil {
+	if err := c.writeJSON(m); err != nil {
 		debugf("RequestMessageAfterAwaiting: claim=%p write error: %v", claim, err)
 		return Event{}, false, err
 	}
@@ -1627,7 +1664,7 @@ func (c *Conn) React(externalID, reaction, action string) error {
 	}
 	r := wire.NewReactionRequest(externalID, reaction, action)
 	r.AckCursor = c.ackCursorForOutbound()
-	return c.ws.WriteJSON(r)
+	return c.writeJSON(r)
 }
 
 // EditMessage asks the server to change an earlier message's content,
@@ -1642,7 +1679,7 @@ func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachmen
 	}
 	e := wire.NewEditRequest(externalID, text, attachments, format, replyTo, mentions)
 	e.AckCursor = c.ackCursorForOutbound()
-	return c.ws.WriteJSON(e)
+	return c.writeJSON(e)
 }
 
 // DeleteMessage asks the server to remove an earlier message, identified
@@ -1655,7 +1692,7 @@ func (c *Conn) DeleteMessage(externalID string) error {
 	}
 	d := wire.NewDeleteRequest(externalID)
 	d.AckCursor = c.ackCursorForOutbound()
-	return c.ws.WriteJSON(d)
+	return c.writeJSON(d)
 }
 
 // AckWaitTimeout is how long SendAwaitingAck/ReactAwaitingAck/
@@ -1691,7 +1728,10 @@ func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, f
 		}
 		return Event{}, false, c.SendTo(text, to, attachments, format, replyTo, mentions)
 	}
-	resultCh, cancel := c.claimNextAck("sendAck")
+	resultCh, cancel, claimErr := c.claimNextAck("sendAck")
+	if claimErr != nil {
+		return Event{}, false, claimErr
+	}
 	defer cancel()
 	var err error
 	if to == "" {
@@ -1717,7 +1757,10 @@ func (c *Conn) ReactAwaitingAck(externalID, reaction, action string) (Event, boo
 	if !c.WantsActionAcks() {
 		return Event{}, false, c.React(externalID, reaction, action)
 	}
-	resultCh, cancel := c.claimNextAck("reactionAck")
+	resultCh, cancel, claimErr := c.claimNextAck("reactionAck")
+	if claimErr != nil {
+		return Event{}, false, claimErr
+	}
 	defer cancel()
 	if err := c.React(externalID, reaction, action); err != nil {
 		return Event{}, false, err
@@ -1737,7 +1780,10 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 	if !c.WantsActionAcks() {
 		return Event{}, false, c.EditMessage(externalID, text, attachments, format, replyTo, mentions)
 	}
-	resultCh, cancel := c.claimNextAck("editAck")
+	resultCh, cancel, claimErr := c.claimNextAck("editAck")
+	if claimErr != nil {
+		return Event{}, false, claimErr
+	}
 	defer cancel()
 	if err := c.EditMessage(externalID, text, attachments, format, replyTo, mentions); err != nil {
 		return Event{}, false, err
@@ -1761,9 +1807,12 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 // all; a caller should only ever call this for a Token actually seen on
 // an Attachment.IsReference()==true entry.
 func (c *Conn) RequestAttachment(token string) (Event, bool, error) {
-	resultCh, cancel := c.claimNextAck("attachmentData")
+	resultCh, cancel, claimErr := c.claimNextAck("attachmentData")
+	if claimErr != nil {
+		return Event{}, false, claimErr
+	}
 	defer cancel()
-	if err := c.ws.WriteJSON(wire.NewAttachmentRequest(token)); err != nil {
+	if err := c.writeJSON(wire.NewAttachmentRequest(token)); err != nil {
 		return Event{}, false, err
 	}
 	select {
@@ -1808,7 +1857,7 @@ func (c *Conn) Pin(externalID string) error {
 	}
 	r := wire.NewPinRequest(externalID)
 	r.AckCursor = c.ackCursorForOutbound()
-	return c.ws.WriteJSON(r)
+	return c.writeJSON(r)
 }
 
 func (c *Conn) Unpin(externalID string) error {
@@ -1817,7 +1866,7 @@ func (c *Conn) Unpin(externalID string) error {
 	}
 	r := wire.NewUnpinRequest(externalID)
 	r.AckCursor = c.ackCursorForOutbound()
-	return c.ws.WriteJSON(r)
+	return c.writeJSON(r)
 }
 
 // PinAwaitingAck and UnpinAwaitingAck are Pin/Unpin, but wait for the
@@ -1836,7 +1885,10 @@ func (c *Conn) pinAwaiting(externalID string, send func(string) error, ackKind s
 	if !c.WantsActionAcks() {
 		return Event{}, false, send(externalID)
 	}
-	resultCh, cancel := c.claimNextAck(ackKind)
+	resultCh, cancel, claimErr := c.claimNextAck(ackKind)
+	if claimErr != nil {
+		return Event{}, false, claimErr
+	}
 	defer cancel()
 	if err := send(externalID); err != nil {
 		return Event{}, false, err
@@ -1857,11 +1909,14 @@ func (c *Conn) Pins() (Event, bool, error) {
 	if err := c.requireAction("pins"); err != nil {
 		return Event{}, false, err
 	}
-	resultCh, cancel := c.claimNextAck("pins")
+	resultCh, cancel, claimErr := c.claimNextAck("pins")
+	if claimErr != nil {
+		return Event{}, false, claimErr
+	}
 	defer cancel()
 	r := wire.NewPinsRequest()
 	r.AckCursor = c.ackCursorForOutbound()
-	if err := c.ws.WriteJSON(r); err != nil {
+	if err := c.writeJSON(r); err != nil {
 		return Event{}, false, err
 	}
 	select {
@@ -1879,7 +1934,10 @@ func (c *Conn) DeleteMessageAwaitingAck(externalID string) (Event, bool, error) 
 	if !c.WantsActionAcks() {
 		return Event{}, false, c.DeleteMessage(externalID)
 	}
-	resultCh, cancel := c.claimNextAck("deleteAck")
+	resultCh, cancel, claimErr := c.claimNextAck("deleteAck")
+	if claimErr != nil {
+		return Event{}, false, claimErr
+	}
 	defer cancel()
 	if err := c.DeleteMessage(externalID); err != nil {
 		return Event{}, false, err
@@ -1928,9 +1986,17 @@ func SetCloseFlushGraceForTesting(d time.Duration) (restore func()) {
 // discarded, since "did the frame actually go out" is exactly the
 // question a caller debugging an unattributed drop needs answered.
 func (c *Conn) Close() error {
+	// Through writeMu, not around it. WriteControl is exempt from the
+	// single-writer contract and so would be SAFE unsynchronised — but
+	// safety is not the point here: taking the lock orders the goodbye
+	// after whatever frame is currently being written, so a caller cannot
+	// have a send it believes went out overtaken by the close announcing
+	// there will be no more.
+	c.writeMu.Lock()
 	writeErr := c.ws.WriteControl(websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "client disconnect"),
 		time.Now().Add(writeWait))
+	c.writeMu.Unlock()
 	if writeErr == nil {
 		time.Sleep(closeFlushGrace)
 	}
@@ -2040,6 +2106,15 @@ func (c *Conn) TakeSkippedHeldNotice() bool {
 	skipped := c.skippedHeld
 	c.skippedHeld = false
 	return skipped
+}
+
+// writeJSON is the ONLY way a frame should reach the socket. Every write
+// goes through here so the single-writer contract holds by construction
+// rather than by each call site remembering.
+func (c *Conn) writeJSON(v any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.ws.WriteJSON(v)
 }
 
 // NoteHandedOver records cursors delivered to the model by a path that
