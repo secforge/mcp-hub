@@ -816,7 +816,6 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	}
 	_ = connstore.Upsert(target, connstore.Entry{
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
-		HolderPID:       os.Getpid(),
 		ReconnectSecret: secret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
 	// FOUR different facts, and a reader acts differently on each: push
@@ -1858,7 +1857,6 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 	_ = connstore.Upsert(target, connstore.Entry{
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
-		HolderPID:       os.Getpid(),
 		ReconnectSecret: reconnectSecret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
 
@@ -2678,11 +2676,10 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	conn.Close()
 	if target != (connstore.Target{}) {
-		// Left ON PURPOSE, which is not the same as ended — a later run
-		// reports what a previous process was still holding when it
-		// died, and must not nag about a connection its caller chose to
-		// give up.
-		_ = connstore.MarkLeftOnPurpose(target)
+		// Clearing the mark is what says this was given up ON PURPOSE. A
+		// later run reports whatever is still marked held, and must not
+		// nag about a connection its caller chose to leave.
+		_ = connstore.MarkDisconnected(target)
 	}
 	return mcp.NewToolResultText("disconnected"), nil
 }
@@ -2702,9 +2699,14 @@ func (h *Hub) Shutdown() {
 			continue
 		}
 		conn.Close()
-		if target != (connstore.Target{}) {
-			_ = connstore.MarkDisconnected(target)
-		}
+		// The mark is deliberately LEFT SET. "Connected" records that a
+		// run was holding this and did not deliberately let go — which
+		// is precisely what the next process has to learn, and the one
+		// fact that dies with this one if it is cleared here. A drop
+		// clears it (the model was told while it was running) and an
+		// explicit disconnect clears it (that was a decision); a process
+		// simply ending must not, or it looks like neither happened.
+		_ = target
 	}
 	// The channel closes once, here, and only here: the process going
 	// away is the one event that ends every conversation on it at the

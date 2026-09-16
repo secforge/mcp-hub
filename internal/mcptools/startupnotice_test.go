@@ -13,17 +13,17 @@ import (
 // with it and the thing that would report that dies in the same instant.
 // Measured live — four connections ended at 15:29 and the model learned
 // of it half an hour later, from its user.
+//
+// "Connected" is the whole of the test: it means a run was holding this
+// and did not deliberately let go, and at startup this process has
+// connected nothing, so anything still marked belongs to a previous run.
 func TestAPreviousRunsConnectionsAreReportedOnce(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440000", Project: project}
-	// A pid that is certainly not running: 0 is never a process, and
-	// MaxInt is not one either — use a clearly dead one rather than
-	// picking a number and hoping.
-	dead := findDeadPID(t)
 	if err := connstore.Upsert(target, connstore.Entry{
 		PeerID: "550e8400-e29b-41d4-a716-446655440000", LocalName: "relay",
-		HolderPID: dead, LastConnectedAt: time.Now().UTC(), Connected: true,
+		LastConnectedAt: time.Now().UTC(), Connected: true,
 	}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
@@ -45,19 +45,20 @@ func TestAPreviousRunsConnectionsAreReportedOnce(t *testing.T) {
 }
 
 // A connection given up ON PURPOSE is not reported: that was a decision,
-// and repeating it back is nagging about something already done.
+// and repeating it back is nagging about something already done. An
+// explicit disconnect clears the mark, which is what says so.
 func TestADeliberateDisconnectIsNotReported(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440001", Project: project}
 	if err := connstore.Upsert(target, connstore.Entry{
 		PeerID: "550e8400-e29b-41d4-a716-446655440001", LocalName: "ops",
-		HolderPID: findDeadPID(t), LastConnectedAt: time.Now().UTC(), Connected: true,
+		LastConnectedAt: time.Now().UTC(), Connected: true,
 	}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if err := connstore.MarkLeftOnPurpose(target); err != nil {
-		t.Fatalf("MarkLeftOnPurpose: %v", err)
+	if err := connstore.MarkDisconnected(target); err != nil {
+		t.Fatalf("MarkDisconnected: %v", err)
 	}
 
 	h := &Hub{}
@@ -67,46 +68,16 @@ func TestADeliberateDisconnectIsNotReported(t *testing.T) {
 	}
 }
 
-// A holder that is still ALIVE is reported too, because one client holds
-// every connection now: another process holding one is the process this
-// one replaced, not a colleague. A /mcp restart can start the new process
-// before the old has finished exiting, and a notice that fired or not
-// depending on that race would be worse than none.
-func TestALingeringHolderIsStillReported(t *testing.T) {
+// A connection that DROPPED is not reported either: the model was told
+// while the process was still running, and the mark was cleared then.
+// Only what a run was still holding when it ended is news.
+func TestADroppedConnectionIsNotReported(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440002", Project: project}
-	// A pid that IS alive and is not us: the test's own parent will do.
-	alive := os.Getppid()
-	if !processAlive(alive) {
-		t.Skip("no live parent process to stand in for the one being replaced")
-	}
 	if err := connstore.Upsert(target, connstore.Entry{
-		PeerID: "550e8400-e29b-41d4-a716-446655440002", LocalName: "held",
-		HolderPID: alive, LastConnectedAt: time.Now().UTC(), Connected: true,
-	}); err != nil {
-		t.Fatalf("Upsert: %v", err)
-	}
-
-	h := &Hub{}
-	h.reportAbandonedConnections()
-	note := h.takeAutoReconnectNote()
-	if !strings.Contains(note, "held") {
-		t.Fatalf("expected the lingering connection to be named, got: %s", note)
-	}
-	if !strings.Contains(note, "not finished exiting") {
-		t.Fatalf("expected it to say the old process is still around, got: %s", note)
-	}
-}
-
-// This process's own connections are never reported as a previous run's.
-func TestOurOwnConnectionsAreNotReported(t *testing.T) {
-	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
-	project := connstore.CurrentProject()
-	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440003", Project: project}
-	if err := connstore.Upsert(target, connstore.Entry{
-		PeerID: "550e8400-e29b-41d4-a716-446655440003", LocalName: "mine",
-		HolderPID: os.Getpid(), LastConnectedAt: time.Now().UTC(), Connected: true,
+		PeerID: "550e8400-e29b-41d4-a716-446655440002", LocalName: "dropped",
+		LastConnectedAt: time.Now().UTC(), Connected: false,
 	}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
@@ -114,21 +85,32 @@ func TestOurOwnConnectionsAreNotReported(t *testing.T) {
 	h := &Hub{}
 	h.reportAbandonedConnections()
 	if note := h.takeAutoReconnectNote(); note != "" {
-		t.Fatalf("expected silence about our own connection, got: %s", note)
+		t.Fatalf("expected silence about a connection that already ended, got: %s", note)
 	}
 }
 
-// findDeadPID returns a pid nothing is running under, so "abandoned"
-// means abandoned rather than "whatever that number happens to be".
-func findDeadPID(t *testing.T) int {
-	t.Helper()
-	for pid := 1 << 22; pid > 1<<20; pid-- {
-		if !processAlive(pid) {
-			return pid
-		}
+// Shutdown must NOT clear the mark. The process ending is exactly the
+// case nothing else can report, so clearing it there would make a clean
+// exit indistinguishable from a deliberate departure — which is the bug
+// the whole notice exists to fix.
+func TestShutdownLeavesTheMarkForTheNextRun(t *testing.T) {
+	src, err := os.ReadFile("tools.go")
+	if err != nil {
+		t.Fatalf("reading tools.go: %v", err)
 	}
-	t.Fatal("could not find a pid with no process behind it")
-	return 0
+	text := string(src)
+	i := strings.Index(text, "func (h *Hub) Shutdown()")
+	if i < 0 {
+		t.Fatal("Shutdown is gone")
+	}
+	j := strings.Index(text[i:], "\n}\n")
+	if j < 0 {
+		t.Fatal("could not find the end of Shutdown")
+	}
+	if strings.Contains(text[i:i+j], "MarkDisconnected") {
+		t.Error("Shutdown clears the mark, so a process that simply ended reads as one that left " +
+			"on purpose and the next run says nothing")
+	}
 }
 
 // The notice is PUSHED where the harness takes deliveries, and only

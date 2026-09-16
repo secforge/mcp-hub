@@ -2,10 +2,8 @@ package mcptools
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/harness"
@@ -43,29 +41,23 @@ func (h *Hub) reportAbandonedConnections() {
 		return
 	}
 	var abandoned []string
-	lingering := false
 	for _, le := range entries {
-		e := le.Entry
-		// A holder of 0 means nobody was holding it: never connected, or
-		// given up on purpose. Our own pid means this process.
+		// Connected means "a run was holding this and did not
+		// deliberately let go". At startup this process has connected
+		// nothing, so every such entry belongs to a previous run —
+		// which is the whole question, answered without knowing or
+		// caring which process it was.
 		//
-		// ANY OTHER PID is reported, alive or not. One client holds every
-		// connection now, so another process holding one is not a
-		// colleague to defer to — it is the process this one replaced,
-		// either gone or still on its way out. A /mcp restart produces
-		// exactly that, and whether the old process has finished exiting
-		// when the new one starts is a race: staying silent for a live
-		// pid would make the notice fire or not depending on timing,
-		// which is the one thing it exists to stop.
-		if e.HolderPID == 0 || e.HolderPID == os.Getpid() {
+		// A drop clears it, because the model was told while it was
+		// running. An explicit disconnect clears it, because that was a
+		// decision. A process simply ending does NOT, because that is
+		// the case nothing else can report.
+		if !le.Entry.Connected {
 			continue
 		}
-		if processAlive(e.HolderPID) {
-			lingering = true
-		}
-		name := e.LocalName
+		name := le.Entry.LocalName
 		if name == "" {
-			name = e.Topic
+			name = le.Entry.Topic
 		}
 		if name == "" {
 			name = le.Target.Link
@@ -81,29 +73,18 @@ func (h *Hub) reportAbandonedConnections() {
 		"each position only moved for what was confirmed. Reconnect the ones you still want with "+
 		"hub_connect (hub_list_connections shows the link and the name each was last opened as), "+
 		"then hub_catch_up. Said once.", len(abandoned), strings.Join(abandoned, ", "))
-	if lingering {
-		// Worth saying, because the old process may still be delivering
-		// into a harness that no longer routes to it, and because
-		// reconnecting here while it holds the same identity is what the
-		// server resolves by superseding one of them.
-		note += " One of those is still claimed by a process that has not finished exiting; its " +
-			"connections are not this process's either way."
-	}
 	// PUSHED if this harness takes deliveries, rather than queued for
 	// whatever tool happens to be called first.
 	//
-	// The queue was the only route when this was written, and it means
-	// the notice waits for a call that may not come for an hour — or at
-	// all, if the reader has no reason to touch the hub. The whole point
-	// is to say something the reader would otherwise never learn, so
-	// waiting to be asked is the wrong shape for it.
+	// The queue means the notice waits for a call that may not come for
+	// an hour — or at all, since the whole point is to say something the
+	// reader has no reason to ask about.
 	//
 	// Not available everywhere: Codex latches its delivery target from
 	// the first request's _meta, so at startup there is nothing to
-	// address and the queue is still the only way. The queue is
-	// therefore the FALLBACK rather than the alternative, and it is used
-	// when the push does not happen — never as well, which would say it
-	// twice.
+	// address and the queue is the only way. The queue is therefore the
+	// FALLBACK rather than the alternative, and it is used when the push
+	// does not happen — never as well, which would say it twice.
 	pusher := harness.Open()
 	if ok, _ := pusher.Available(); ok {
 		if _, err := pusher.Push("", "[hub: "+note+"]", false); err == nil {
@@ -111,21 +92,4 @@ func (h *Hub) reportAbandonedConnections() {
 		}
 	}
 	h.noteAutoReconnect(note)
-}
-
-// processAlive reports whether pid is a process this user can still see.
-//
-// Signal 0 asks the kernel the question without delivering anything. A
-// permission error is an answer too — something is running under that pid
-// — while "no such process" is the only result that means gone.
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = p.Signal(syscall.Signal(0))
-	return err == nil || err == os.ErrPermission || err == syscall.EPERM
 }
