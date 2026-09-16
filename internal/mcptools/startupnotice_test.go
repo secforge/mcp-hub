@@ -147,3 +147,46 @@ func TestTheStartupNoticeIsPushedWhenItCanBe(t *testing.T) {
 		t.Error("a successful push does not return, so the notice would be delivered twice")
 	}
 }
+
+// Said once means ACROSS restarts, not within one. An entry stays marked
+// until something clears it, so a notice that only reads the mark reports
+// the same connection on every start from then on — and ages into a lie,
+// as it did live: a connection killed an hour earlier, whose session no
+// longer existed, was announced as something a previous run had just been
+// holding.
+func TestReportingClearsTheMarkSoItIsNotSaidAgain(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	project := connstore.CurrentProject()
+	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440003", Project: project}
+	if err := connstore.Upsert(target, connstore.Entry{
+		PeerID: "550e8400-e29b-41d4-a716-446655440003", LocalName: "stale",
+		LastConnectedAt: time.Now().UTC(), Connected: true,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	first := &Hub{}
+	first.reportAbandonedConnections()
+	if note := first.takeAutoReconnectNote(); !strings.Contains(note, "stale") {
+		t.Fatalf("expected the first run to report it, got: %s", note)
+	}
+
+	// A later start reads the same store and must say nothing.
+	second := &Hub{}
+	second.reportAbandonedConnections()
+	if note := second.takeAutoReconnectNote(); note != "" {
+		t.Fatalf("expected silence the second time, got: %s", note)
+	}
+	// And the entry itself survives — only the mark was cleared, so the
+	// link, name and read position are all still there to reconnect with.
+	stored, ok := connstore.Get(target)
+	if !ok {
+		t.Fatal("expected the entry to survive being reported")
+	}
+	if stored.Connected {
+		t.Fatal("expected the mark to be cleared once reported")
+	}
+	if stored.LocalName != "stale" {
+		t.Fatalf("expected the name to survive, got %q", stored.LocalName)
+	}
+}

@@ -41,6 +41,7 @@ func (h *Hub) reportAbandonedConnections() {
 		return
 	}
 	var abandoned []string
+	var reported []connstore.Target
 	for _, le := range entries {
 		// Connected means "a run was holding this and did not
 		// deliberately let go". At startup this process has connected
@@ -63,11 +64,24 @@ func (h *Hub) reportAbandonedConnections() {
 			name = le.Target.Link
 		}
 		abandoned = append(abandoned, name)
+		reported = append(reported, le.Target)
 	}
 	if len(abandoned) == 0 {
 		return
 	}
 	sort.Strings(abandoned)
+	// CLEARED once reported, which is what makes "said once" true across
+	// restarts rather than only within one.
+	//
+	// Seen live: an entry left marked by a process killed an hour
+	// earlier was reported as something "a previous run was holding",
+	// alongside a connection whose session no longer existed at all. The
+	// mark says a run held this and never let go; once that has been
+	// said, it has been said, and leaving it set turns one fact into a
+	// notice that repeats forever and ages into a lie.
+	for _, t := range reported {
+		_ = connstore.MarkDisconnected(t)
+	}
 	note := fmt.Sprintf("a previous run of this client was holding %d connection(s) — %s — and "+
 		"this process has NOT restored them. Nothing was lost: everything is on the server and "+
 		"each position only moved for what was confirmed. Reconnect the ones you still want with "+
