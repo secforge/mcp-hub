@@ -1228,12 +1228,12 @@ type PinsRequest struct {
 }
 
 type PinsResponse struct {
-	Type Type     `json:"type"`
+	Type Type `json:"type"`
 	// A pointer-to-slice so an empty list encodes as [] rather than null,
 	// matching Joined.Pinned. The two answers to "what is pinned" should
 	// not have different empty shapes.
 	List *[]string `json:"list"`
-	At   string   `json:"at,omitempty"`
+	At   string    `json:"at,omitempty"`
 }
 
 func NewPinRequest(externalID string) Pin {
@@ -1245,7 +1245,6 @@ func NewUnpinRequest(externalID string) Unpin {
 }
 
 func NewPinsRequest() PinsRequest { return PinsRequest{Type: TypePins} }
-
 
 // OK returns a pointer to v, for building an ack that STATES its outcome.
 // A nil OK means the sender said nothing, which is a third answer and the
