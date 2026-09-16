@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
+	"github.com/secforge/mcp-hub/internal/harness"
 )
 
 // reportAbandonedConnections tells the model, on its very next tool call,
@@ -87,6 +88,27 @@ func (h *Hub) reportAbandonedConnections() {
 		// server resolves by superseding one of them.
 		note += " One of those is still claimed by a process that has not finished exiting; its " +
 			"connections are not this process's either way."
+	}
+	// PUSHED if this harness takes deliveries, rather than queued for
+	// whatever tool happens to be called first.
+	//
+	// The queue was the only route when this was written, and it means
+	// the notice waits for a call that may not come for an hour — or at
+	// all, if the reader has no reason to touch the hub. The whole point
+	// is to say something the reader would otherwise never learn, so
+	// waiting to be asked is the wrong shape for it.
+	//
+	// Not available everywhere: Codex latches its delivery target from
+	// the first request's _meta, so at startup there is nothing to
+	// address and the queue is still the only way. The queue is
+	// therefore the FALLBACK rather than the alternative, and it is used
+	// when the push does not happen — never as well, which would say it
+	// twice.
+	pusher := harness.Open()
+	if ok, _ := pusher.Available(); ok {
+		if _, err := pusher.Push("", "[hub: "+note+"]", false); err == nil {
+			return
+		}
 	}
 	h.noteAutoReconnect(note)
 }

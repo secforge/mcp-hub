@@ -130,3 +130,38 @@ func findDeadPID(t *testing.T) int {
 	t.Fatal("could not find a pid with no process behind it")
 	return 0
 }
+
+// The notice is PUSHED where the harness takes deliveries, and only
+// queued where it does not. Queued, it waits for whatever tool is called
+// first — which may be an hour away, or never, since the whole point is
+// to say something the reader would otherwise have no reason to ask
+// about.
+//
+// Asserted against the source because the difference is which path runs,
+// and exercising the push half needs a live harness socket this suite
+// deliberately does not have (see TestMain).
+func TestTheStartupNoticeIsPushedWhenItCanBe(t *testing.T) {
+	src, err := os.ReadFile("startupnotice.go")
+	if err != nil {
+		t.Fatalf("reading startupnotice.go: %v", err)
+	}
+	text := string(src)
+
+	push := strings.Index(text, "pusher.Push(")
+	queue := strings.Index(text, "h.noteAutoReconnect(note)")
+	if push < 0 {
+		t.Fatal("the notice is never pushed — it would wait for a tool call that may not come")
+	}
+	if queue < 0 {
+		t.Fatal("the queued fallback is gone — a harness that cannot be pushed to would hear nothing")
+	}
+	if push > queue {
+		t.Error("the queue comes first, so the push is unreachable or duplicates it")
+	}
+	// A push that worked must not also queue: the same notice twice is
+	// worse than late.
+	between := text[push:queue]
+	if !strings.Contains(between, "return") {
+		t.Error("a successful push does not return, so the notice would be delivered twice")
+	}
+}
