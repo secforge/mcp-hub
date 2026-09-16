@@ -3099,6 +3099,38 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			"still on the server but not yet walked — call hub_catch_up(gap: true) to retrieve it]", from, to)
 	}
 
+	// MEASURE before deciding, from OUR OWN stored position.
+	//
+	// conn.Behind() answers a different question than it appears to. It is
+	// computed server-side for a PEER ID, from the position that peer has
+	// acked — which live traffic keeps current — whereas this client's
+	// catch-up cursor is keyed by link+project and can be days older, and
+	// survives a peer-id change entirely. So the server can truthfully
+	// report "3 behind" while the walk about to start has thousands to
+	// cover, and a newly minted peer is told nothing at all. Either way
+	// the seek could not fire, and the walk ran one message per call from
+	// a stale position with nothing saying how far there was to go.
+	//
+	// Measured live, 2026-09-16: three projects still held cursors from
+	// 2026-09-09, -08 and -07 for a session that had been busy since.
+	//
+	// A standalone ack of the stored cursor asks the same question on a
+	// basis the client can supply: the reply's behind is computed
+	// server-side from a position WE name, so no comparison of opaque
+	// cursors is needed. It also repairs the mismatch, since the ack sets
+	// the new peer id's acked position to what this client actually holds,
+	// which makes the joined frame right on the next reconnect.
+	//
+	// Only when the server declares ackReplies, and an absent answer stays
+	// unknown rather than becoming zero — the whole defect here was a
+	// silence read as a number.
+	measuredBehind := 0
+	if cursor != "" && conn.HasFeature("ackReplies") {
+		if behind, err := conn.ConfirmReceived(cursor); err == nil && behind != nil {
+			measuredBehind = *behind
+		}
+	}
+
 	var anchor wire.Anchor
 	var seekNote string
 	switch {
@@ -3115,6 +3147,27 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// position, which can sit earlier than what this client has actually
 	// handed over; retrieving it then re-delivers a few already-seen
 	// messages, which is the safe direction to err in.
+	// A measured distance from our own stored cursor: seek past it rather
+	// than walking, and record the skip so it stays retrievable. No
+	// BehindSince is needed to anchor the record here — the stored cursor
+	// IS the start of what gets skipped, and it is a position this client
+	// genuinely reached.
+	case !alreadySeeked && measuredBehind > catchUpSeekThreshold:
+		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
+		anchor = wire.Anchor{At: seekAt}
+		h.mu.Lock()
+		id := h.catchUpID
+		h.seekedSinceConnect = true
+		h.knownContiguous = false
+		h.mu.Unlock()
+		setCatchUpGap(id, cursor, seekAt)
+		seekNote = fmt.Sprintf(
+			"The server reported nothing about how far behind this session was — that count is "+
+				"kept per peer id, and this one is new — so this client asked it directly, from "+
+				"the position it had stored: %d messages remain after it. Seeking to recent "+
+				"context (%s) rather than walking that one call at a time. Nothing is lost: the "+
+				"skipped range is recorded and hub_catch_up(gap: true) retrieves it.\n\n",
+			measuredBehind, seekAt)
 	case !alreadySeeked && conn.Behind() > catchUpSeekThreshold && conn.BehindSince() != "":
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}

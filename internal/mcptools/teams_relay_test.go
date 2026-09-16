@@ -3874,3 +3874,82 @@ func TestDisconnectStopsTheRetryLoop(t *testing.T) {
 		t.Fatal("expected the pending flag cleared after disconnect")
 	}
 }
+
+// A newly minted peer is told nothing about how far behind it is — the
+// server keeps that count per PEER ID — while this client's own cursor is
+// keyed by link+project and outlives the peer-id change. The seek could
+// therefore never fire, and a day-old cursor was walked one message per
+// call with nothing saying how far there was to go. Asking the server to
+// measure FROM the stored cursor is what makes the decision possible: the
+// count comes back computed server-side from a position the client named,
+// so no opaque cursor is ever compared to another.
+func TestCatchUpMeasuresFromItsOwnCursorWhenTheServerStatedNoBacklog(t *testing.T) {
+	var measuredFrom string
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion,
+			Features:      map[string]json.RawMessage{"ackReplies": json.RawMessage("true")},
+		}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m map[string]any
+			if json.Unmarshal(data, &m) != nil {
+				continue
+			}
+			if m["type"] == "ack" {
+				measuredFrom, _ = m["ackCursor"].(string)
+				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: measuredFrom,
+					OK: wire.OK(true), Behind: wire.BehindCount(500)})
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#measured-backlog"
+
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	// The position this client reached under a PREVIOUS peer id. Set in
+	// memory as well as on disk: connect loads the persisted value once,
+	// and this test is about what happens on the call AFTER that.
+	hub.mu.Lock()
+	id := hub.catchUpID
+	hub.lastHandedOverCursor = "cursor-from-yesterday"
+	hub.mu.Unlock()
+	setCatchUpCursor(id, "cursor-from-yesterday")
+
+	res, err := hub.handleCatchUp(ctx, mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("hub_catch_up failed: %v", err)
+	}
+	text := textOf(res)
+
+	if measuredFrom != "cursor-from-yesterday" {
+		t.Fatalf("the client never asked the server to measure from its stored cursor "+
+			"(it asked from %q)", measuredFrom)
+	}
+	if !strings.Contains(text, "500 messages remain") {
+		t.Errorf("the measured backlog was not reported to the reader:\n%s", text)
+	}
+	if !strings.Contains(text, "gap: true") {
+		t.Errorf("a seek happened without saying how to retrieve what it skipped:\n%s", text)
+	}
+}
