@@ -42,15 +42,25 @@ func (h *Hub) reportAbandonedConnections() {
 		return
 	}
 	var abandoned []string
+	lingering := false
 	for _, le := range entries {
 		e := le.Entry
 		// A holder of 0 means nobody was holding it: never connected, or
-		// given up on purpose. Our own pid means this process, which is
-		// not a previous run. A LIVE pid means someone may still hold it
-		// — a second client in the same project — and nothing is claimed
-		// about that.
-		if e.HolderPID == 0 || e.HolderPID == os.Getpid() || processAlive(e.HolderPID) {
+		// given up on purpose. Our own pid means this process.
+		//
+		// ANY OTHER PID is reported, alive or not. One client holds every
+		// connection now, so another process holding one is not a
+		// colleague to defer to — it is the process this one replaced,
+		// either gone or still on its way out. A /mcp restart produces
+		// exactly that, and whether the old process has finished exiting
+		// when the new one starts is a race: staying silent for a live
+		// pid would make the notice fire or not depending on timing,
+		// which is the one thing it exists to stop.
+		if e.HolderPID == 0 || e.HolderPID == os.Getpid() {
 			continue
+		}
+		if processAlive(e.HolderPID) {
+			lingering = true
 		}
 		name := e.LocalName
 		if name == "" {
@@ -65,12 +75,20 @@ func (h *Hub) reportAbandonedConnections() {
 		return
 	}
 	sort.Strings(abandoned)
-	h.noteAutoReconnect(fmt.Sprintf("a previous run of this client was holding %d connection(s) "+
-		"— %s — and this process has NOT restored them. They ended when that process did; nothing "+
-		"was lost, since everything is on the server and each position only moved for what was "+
-		"confirmed. Reconnect the ones you still want with hub_connect (hub_list_connections "+
-		"shows the link and the name each was last opened as), then hub_catch_up. Said once.",
-		len(abandoned), strings.Join(abandoned, ", ")))
+	note := fmt.Sprintf("a previous run of this client was holding %d connection(s) — %s — and "+
+		"this process has NOT restored them. Nothing was lost: everything is on the server and "+
+		"each position only moved for what was confirmed. Reconnect the ones you still want with "+
+		"hub_connect (hub_list_connections shows the link and the name each was last opened as), "+
+		"then hub_catch_up. Said once.", len(abandoned), strings.Join(abandoned, ", "))
+	if lingering {
+		// Worth saying, because the old process may still be delivering
+		// into a harness that no longer routes to it, and because
+		// reconnecting here while it holds the same identity is what the
+		// server resolves by superseding one of them.
+		note += " One of those is still claimed by a process that has not finished exiting; its " +
+			"connections are not this process's either way."
+	}
+	h.noteAutoReconnect(note)
 }
 
 // processAlive reports whether pid is a process this user can still see.

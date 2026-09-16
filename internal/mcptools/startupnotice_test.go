@@ -67,14 +67,45 @@ func TestADeliberateDisconnectIsNotReported(t *testing.T) {
 	}
 }
 
-// A holder that is still ALIVE says nothing: another client in this
-// project may be holding it, and this process knows nothing about that.
-func TestALiveHolderIsNotReportedAsAbandoned(t *testing.T) {
+// A holder that is still ALIVE is reported too, because one client holds
+// every connection now: another process holding one is the process this
+// one replaced, not a colleague. A /mcp restart can start the new process
+// before the old has finished exiting, and a notice that fired or not
+// depending on that race would be worse than none.
+func TestALingeringHolderIsStillReported(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440002", Project: project}
+	// A pid that IS alive and is not us: the test's own parent will do.
+	alive := os.Getppid()
+	if !processAlive(alive) {
+		t.Skip("no live parent process to stand in for the one being replaced")
+	}
 	if err := connstore.Upsert(target, connstore.Entry{
 		PeerID: "550e8400-e29b-41d4-a716-446655440002", LocalName: "held",
+		HolderPID: alive, LastConnectedAt: time.Now().UTC(), Connected: true,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	h := &Hub{}
+	h.reportAbandonedConnections()
+	note := h.takeAutoReconnectNote()
+	if !strings.Contains(note, "held") {
+		t.Fatalf("expected the lingering connection to be named, got: %s", note)
+	}
+	if !strings.Contains(note, "not finished exiting") {
+		t.Fatalf("expected it to say the old process is still around, got: %s", note)
+	}
+}
+
+// This process's own connections are never reported as a previous run's.
+func TestOurOwnConnectionsAreNotReported(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	project := connstore.CurrentProject()
+	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440003", Project: project}
+	if err := connstore.Upsert(target, connstore.Entry{
+		PeerID: "550e8400-e29b-41d4-a716-446655440003", LocalName: "mine",
 		HolderPID: os.Getpid(), LastConnectedAt: time.Now().UTC(), Connected: true,
 	}); err != nil {
 		t.Fatalf("Upsert: %v", err)
@@ -83,7 +114,7 @@ func TestALiveHolderIsNotReportedAsAbandoned(t *testing.T) {
 	h := &Hub{}
 	h.reportAbandonedConnections()
 	if note := h.takeAutoReconnectNote(); note != "" {
-		t.Fatalf("expected silence about a live holder, got: %s", note)
+		t.Fatalf("expected silence about our own connection, got: %s", note)
 	}
 }
 
