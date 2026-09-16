@@ -119,9 +119,25 @@ func OpenInbox() (*Inbox, error) {
 		// who may send — see the type comment.
 		RequireAuth: true,
 		PublishKey:  true,
-		// A reply carries a from= address and a sender that waits on
-		// delivery status; answering it is what a session does.
-		AutoStatus: true,
+		// OFF, and this is the whole of the "approval notice" mystery.
+		//
+		// AutoStatus answers every accepted frame with a "delivered"
+		// peer_message_status. Claude Code renders that as "approved and
+		// released after approval", because for a real session a
+		// delivered only ever follows a hold — so a bare delivered from
+		// an inbox reads as a hold that was approved. Nothing was ever
+		// held: the notice was this client answering itself.
+		//
+		// It also explains why nothing moved it. Registration, derived
+		// mode, from_mode and the address form were each tested against a
+		// gate that did not exist.
+		//
+		// A real session is silent on the accept path, so silence is the
+		// faithful behaviour. The sender learns delivery from the hub's
+		// own acknowledgement arriving back, which is a stronger signal
+		// than a status frame: it says the message reached the hub rather
+		// than merely reaching this process.
+		AutoStatus: false,
 		// Never: a peer whose credentials the kernel will not report
 		// cannot be compared to our parent, so it cannot be accepted.
 		AllowUnidentifiedPeers: false,
