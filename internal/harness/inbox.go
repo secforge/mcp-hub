@@ -168,7 +168,6 @@ func OpenInbox() (*Inbox, error) {
 	return in, nil
 }
 
-
 // inboxModeSource is the posture source every inbox binds with, named so
 // a test can assert the choice rather than re-reading the literal.
 func inboxModeSource() udsmsg.ModeSource { return udsmsg.ModeSourceDerived }
