@@ -192,7 +192,7 @@ var liveEmissionSpacing = 500 * time.Millisecond
 // SocketDirForTesting overrides the directory wait sockets are created in
 // (and swept from), returning a restore function. For use by *other*
 // packages' tests that exercise a real Listen() call indirectly (e.g.
-// mcptools.Hub.handleConnect) — without this, such a test would sweep the
+// mcptools' Hub.handleConnect) — without this, such a test would sweep the
 // real OS temp dir, which on a dev machine is where other live processes'
 // real wait sockets actually live. internal/waiter's own tests set
 // socketDir directly (same package, no need for this).

@@ -91,17 +91,17 @@ type DiscardedGap struct {
 }
 
 // CatchUpState is hub_catch_up's full persisted state for one session —
-// see mcptools.Hub.lastHandedOverCursor/handedOverAhead/catchUpGap for
+// see mcptools' session.lastHandedOverCursor/handedOverAhead/catchUpGap for
 // what each field backs.
 type CatchUpState struct {
 	// Cursor is the contiguous high-water mark of positions actually
-	// handed over to the model — mcptools.Hub.lastHandedOverCursor.
+	// handed over to the model — mcptools' session.lastHandedOverCursor.
 	Cursor string `json:"cursor,omitempty"`
 	// Gap is the currently-open seek gap, if any — see GapState.
 	Gap *GapState `json:"gap,omitempty"`
 	// Ahead is the set of cursors confirmed handed over to the model at
-	// a position ahead of Cursor (via live delivery) — mcptools.Hub.
-	// handedOverAhead. A slice, not a set, in the JSON form (Go maps
+	// a position ahead of Cursor (via live delivery) — mcptools'
+	// session.handedOverAhead. A slice, not a set, in the JSON form (Go maps
 	// don't round-trip key order and a set-of-strings has no other
 	// fields to key on); mcptools converts to/from its own map[string]bool
 	// at the boundary.
@@ -137,14 +137,21 @@ type Entry struct {
 	// one (wire.Joined.Topic, e.g. a Teams chat's title) — distinct from
 	// Name above, which is this connection's OWN peer display name rather
 	// than what conversation it is in. Empty when the server sets none.
-	Topic   string       `json:"topic,omitempty"`
-	CatchUp CatchUpState `json:"catchUp,omitempty"`
+	Topic string `json:"topic,omitempty"`
+	// LocalName is what this link was last addressed as inside one
+	// client process (hub_connect's "as"). Not an identity and nothing on
+	// the wire — purely so a later session can offer the name this
+	// project used last, rather than the caller having to remember it or
+	// invent a second one for the same conversation.
+	LocalName string       `json:"localName,omitempty"`
+	CatchUp   CatchUpState `json:"catchUp,omitempty"`
 }
 
 // empty reports whether e carries nothing worth keeping on disk.
 func (e Entry) empty() bool {
 	return e.PeerID == "" && e.Name == "" && e.ReconnectSecret == "" &&
-		e.Topic == "" && !e.Connected && e.LastConnectedAt.IsZero() && e.CatchUp.empty()
+		e.Topic == "" && e.LocalName == "" && !e.Connected && e.LastConnectedAt.IsZero() &&
+		e.CatchUp.empty()
 }
 
 // ListedEntry pairs a stored entry with the identity it is stored under,

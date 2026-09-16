@@ -2276,7 +2276,7 @@ func (c *Conn) DrainEvents() (events []Event, connected bool) {
 // chat-relay's Behind) reported truthfully on "reached this process,"
 // not on "reached the model," while claiming the latter. Call this only
 // from a genuinely synchronous hand-over — an MCP tool result the model
-// is about to receive directly, mirroring mcptools.Hub.recordHandedOver's
+// is about to receive directly, mirroring mcptools' session.recordHandedOver's
 // identical reasoning and sharing its call site.
 func (c *Conn) MarkConsumed(events []Event) {
 	c.mu.Lock()

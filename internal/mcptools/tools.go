@@ -769,7 +769,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		topic = *t
 	}
 	_ = connstore.Upsert(target, connstore.Entry{
-		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic,
+		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
 		ReconnectSecret: secret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
 	followerNote := "Your follower was held open across the restart and is already delivering " +
@@ -1784,7 +1784,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		topic = *t
 	}
 	_ = connstore.Upsert(target, connstore.Entry{
-		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic,
+		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
 		ReconnectSecret: reconnectSecret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
 
@@ -2135,7 +2135,9 @@ func (h *Hub) sendFromInbox(text string) {
 	// second connection exists.
 	s, err := h.session(header.Conn)
 	if err != nil {
-		s.note(fmt.Sprintf("a reply could not be relayed (%v), so NOTHING was sent. "+
+		// Reported on the Hub, not the session: there is no session here,
+		// and that IS the report.
+		h.noteAutoReconnect(fmt.Sprintf("a reply could not be relayed (%v), so NOTHING was sent. "+
 			"Name the connection in the first line: #hub conn=<name>", err))
 		return
 	}
@@ -2975,6 +2977,13 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 	lines := make([]string, 0, len(entries))
 	for _, le := range entries {
 		line := fmt.Sprintf("link=%s peerId=%s", le.Target.Link, le.Entry.PeerID)
+		if le.Entry.LocalName != "" {
+			// Offered, not implied: nothing is open under it unless the
+			// list above says so. It is here so a reconnect can reuse the
+			// name this project used last instead of inventing a second
+			// one for the same conversation.
+			line += fmt.Sprintf(" lastOpenedAs=%q", le.Entry.LocalName)
+		}
 		if le.Entry.Name != "" {
 			line += fmt.Sprintf(" name=%q", le.Entry.Name)
 		}
@@ -3177,7 +3186,7 @@ const catchUpSeekWindow = 10 * time.Minute
 
 // handleCatchUp implements the bound=1 "read the next message" pull
 // primitive — see wire.MessageAfter's doc comment for the full protocol
-// contract, and Hub.lastHandedOverCursor's for why the bound is exactly
+// contract, and session.lastHandedOverCursor's for why the bound is exactly
 // one message and never a batch: a returned tool result is the hand-over
 // moment, and a message skimmed inside a larger batch would be
 // permanently marked as seen and never re-delivered — this is what
@@ -3524,7 +3533,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 // (non-gap) walk: it reads its own persisted position (catchUpGap.
 // AnchorCursor, falling back to the coarser catchUpGap.From timestamp
 // until the first message is retrieved) rather than
-// Hub.lastHandedOverCursor, so retrieving the gap never re-delivers or
+// session.lastHandedOverCursor, so retrieving the gap never re-delivers or
 // otherwise interferes with normal hub_catch_up progress, and vice
 // versa. Same bound=1, same dedup-skip-loop shape as the ordinary walk,
 // for the identical reason (see handleCatchUp's own doc comment on why
