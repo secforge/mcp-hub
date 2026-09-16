@@ -363,6 +363,29 @@ func setCatchUpGap(id connstore.Target, from, to string) {
 	saveCatchUpGap(id, g)
 }
 
+// decisionNote renders where this catch-up started and what it chose. See
+// its call site for why this belongs in the result rather than a log.
+func decisionNote(cursor, project string, conn *hubconn.Conn, measured int, branch string) string {
+	from := "no stored position"
+	if cursor != "" {
+		from = "stored position " + cursor
+	}
+	stated := "the server stated no backlog"
+	if conn.BehindStated() {
+		stated = fmt.Sprintf("the server reported %d behind", conn.Behind())
+	}
+	measuredNote := ""
+	if measured > 0 {
+		measuredNote = fmt.Sprintf(", measured %d after that position", measured)
+	}
+	where := ""
+	if project != "" {
+		where = fmt.Sprintf(", loaded for %s", project)
+	}
+	return fmt.Sprintf("[hub: catch-up starting from %s%s — %s%s. Decision: %s]\n\n",
+		from, where, stated, measuredNote, branch)
+}
+
 // noteCatchUpWriteFailure surfaces a failed write of the persisted
 // catch-up state on the next tool call.
 //
@@ -3124,6 +3147,10 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// Only when the server declares ackReplies, and an absent answer stays
 	// unknown rather than becoming zero — the whole defect here was a
 	// silence read as a number.
+	h.mu.Lock()
+	project := h.catchUpID.Project
+	h.mu.Unlock()
+
 	measuredBehind := 0
 	if cursor != "" && conn.HasFeature("ackReplies") {
 		if behind, err := conn.ConfirmReceived(cursor); err == nil && behind != nil {
@@ -3131,8 +3158,23 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		}
 	}
 
+	// decisionNote states, in the RESULT rather than only in a log, which
+	// position this call started from and what it decided to do about it.
+	//
+	// That placement is the lesson of the 2026-09-16 post-mortem rather
+	// than a preference. Three records could have carried what happened:
+	// the server's journal had rotated (bounded by a file count nobody had
+	// set), this client's state file held the position but never the
+	// decision, and the only artefact that survived intact was a model's
+	// own transcript — which could still quote what catch_up returned
+	// eight hours later. A line in the result is in that transcript by
+	// construction; a log line is in a ring somebody has to still have.
+	//
+	// The cursor is printed in full because it is a POSITION, not a
+	// credential — it already appears in the header of every delivered
+	// message. The link never is: it carries its secret in the fragment.
 	var anchor wire.Anchor
-	var seekNote string
+	var seekNote, branch string
 	switch {
 	// A large backlog is seeked past rather than walked, whether or not a
 	// position is known: walking is cheap for a short gap, but a peer back
@@ -3153,6 +3195,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// IS the start of what gets skipped, and it is a position this client
 	// genuinely reached.
 	case !alreadySeeked && measuredBehind > catchUpSeekThreshold:
+		branch = "seek (measured from this client's own stored position)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
 		h.mu.Lock()
@@ -3169,6 +3212,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				"skipped range is recorded and hub_catch_up(gap: true) retrieves it.\n\n",
 			measuredBehind, seekAt)
 	case !alreadySeeked && conn.Behind() > catchUpSeekThreshold && conn.BehindSince() != "":
+		branch = "seek (the server reported the backlog)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
 		h.mu.Lock()
@@ -3189,18 +3233,22 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				"actually walks it — call hub_catch_up(gap: true) to retrieve it.\n\n",
 			conn.Behind(), seekAt, conn.BehindSince(), seekAt)
 	case cursor != "":
+		branch = "walk from the stored position"
 		anchor = wire.Anchor{Cursor: cursor}
 	case conn.Behind() > 0:
+		branch = "seek (no stored position)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
 		seekNote = "No prior position recorded for this session — seeking to recent context " +
 			"instead of walking from the start.\n\n"
 	default:
+		branch = "nothing to do"
 		h.mu.Lock()
 		h.knownContiguous = true
 		h.mu.Unlock()
 		return mcp.NewToolResultText(
-			"nothing to catch up — no prior position recorded and the server reports nothing behind; " +
+			decisionNote(cursor, project, conn, measuredBehind, branch) +
+				"nothing to catch up — no prior position recorded and the server reports nothing behind; " +
 				"live traffic will arrive normally" + gapNote,
 		), nil
 	}
@@ -3269,7 +3317,8 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				h.mu.Unlock()
 				setCatchUpCursor(id, ev.Cursor)
 			}
-			formatted := seekNote + hubconn.FormatEvent(ev) +
+			formatted := decisionNote(cursor, project, conn, measuredBehind, branch) +
+				seekNote + hubconn.FormatEvent(ev) +
 				"\n\n[hub: more may remain — call hub_catch_up again; you'll be told \"caught up\" once " +
 				"there's nothing further]"
 			return h.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
@@ -3277,7 +3326,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			return mcp.NewToolResultError(fmt.Sprintf("unexpected catch-up response kind %q", ev.Kind)), nil
 		}
 	}
-	return mcp.NewToolResultText(seekNote + fmt.Sprintf(
+	return mcp.NewToolResultText(decisionNote(cursor, project, conn, measuredBehind, branch) + seekNote + fmt.Sprintf(
 		"[hub: skipped %d already-seen message(s) without finding a new one — call hub_catch_up "+
 			"again to continue]", catchUpDedupSkipLimit)), nil
 }

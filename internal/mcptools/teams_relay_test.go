@@ -3953,3 +3953,41 @@ func TestCatchUpMeasuresFromItsOwnCursorWhenTheServerStatedNoBacklog(t *testing.
 		t.Errorf("a seek happened without saying how to retrieve what it skipped:\n%s", text)
 	}
 }
+
+// The decision belongs in the RESULT, not only in a log. On 2026-09-16
+// three records could have carried what a catch-up did: the server's
+// journal had rotated, this client's state file held the position but
+// never the decision, and the only artefact that survived was a model's
+// transcript — which could still quote what catch_up returned eight hours
+// later. A line in the result is in that transcript by construction.
+func TestCatchUpResultStatesWhereItStartedAndWhatItDecided(t *testing.T) {
+	link := startRelayTestServerWithJoined(t, wire.Joined{
+		Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+		ServerVersion: wire.ProtocolVersion,
+	})
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, mcp.CallToolRequest{})
+
+	res, err := hub.handleCatchUp(ctx, mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("hub_catch_up failed: %v", err)
+	}
+	text := textOf(res)
+	for _, want := range []string{"catch-up starting from", "no stored position", "Decision:"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the result does not state %q — the decision is unreconstructable:\n%s",
+				want, text)
+		}
+	}
+	// The link carries its credential in the fragment and must never be
+	// echoed; the cursor is a position and must be, in full.
+	if strings.Contains(text, "the-link-secret") {
+		t.Errorf("the result echoed the link secret:\n%s", text)
+	}
+}
