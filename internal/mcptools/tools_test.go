@@ -1468,7 +1468,7 @@ func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 	}
 }
 
-func TestShutdownClosesActiveConnectionAndMarksStoreDisconnected(t *testing.T) {
+func TestShutdownClosesActiveConnectionButLeavesTheStoreMarked(t *testing.T) {
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 	ctx := context.Background()
@@ -1493,8 +1493,13 @@ func TestShutdownClosesActiveConnectionAndMarksStoreDisconnected(t *testing.T) {
 	if !ok {
 		t.Fatal("expected the entry to still exist")
 	}
-	if stored.Connected {
-		t.Fatal("expected Shutdown to mark the connstore entry disconnected")
+	// The mark STAYS. A process ending is the one case nothing else can
+	// report, so it is what the next run reads to say "a previous run
+	// was holding these" — see reportAbandonedConnections. Clearing it
+	// here would make a clean exit look like a deliberate departure and
+	// the next run would say nothing at all.
+	if !stored.Connected {
+		t.Fatal("expected Shutdown to LEAVE the entry marked, so the next run can report it")
 	}
 }
 
