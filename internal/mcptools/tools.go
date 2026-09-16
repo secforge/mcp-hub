@@ -3287,13 +3287,25 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		h.knownContiguous = false
 		h.mu.Unlock()
 		setCatchUpGap(id, cursor, seekAt)
+		// The prose must describe what happened, not what usually
+		// happens. This branch also fires when the server DID state a
+		// count — its measurement is simply from a different position —
+		// and asserting "the server reported nothing" there contradicts
+		// the header printed directly above it, which is the absent-
+		// versus-number distinction this whole line exists to make.
+		why := "The server reported nothing about how far behind this session was — that count is " +
+			"kept per peer id, and this one has none yet"
+		if conn.BehindStated() {
+			why = fmt.Sprintf("The server reported %d behind, measured from the position IT has "+
+				"acked for this peer, which is not the position this client had stored",
+				conn.Behind())
+		}
 		seekNote = fmt.Sprintf(
-			"The server reported nothing about how far behind this session was — that count is "+
-				"kept per peer id, and this one is new — so this client asked it directly, from "+
-				"the position it had stored: %d messages remain after it. Seeking to recent "+
-				"context (%s) rather than walking that one call at a time. Nothing is lost: the "+
-				"skipped range is recorded and hub_catch_up(gap: true) retrieves it.\n\n",
-			measuredBehind, seekAt)
+			"%s — so this client asked directly, from the position it had stored: %d messages "+
+				"remain after it. Seeking to recent context (%s) rather than walking that one "+
+				"call at a time. Nothing is lost: the skipped range is recorded and "+
+				"hub_catch_up(gap: true) retrieves it.\n\n",
+			why, measuredBehind, seekAt)
 	case !alreadySeeked && conn.Behind() > catchUpSeekThreshold && conn.BehindSince() != "":
 		branch = "seek (the server reported the backlog)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
