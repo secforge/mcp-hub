@@ -30,6 +30,8 @@ github.com/secforge/harness-transport v0.1.4 h1:vjbXw+tT8p6ebYqDVnOSB5iBAKyJQn8m
 github.com/secforge/harness-transport v0.1.4/go.mod h1:36eCcE6bkO5GeEQulkNn1oWH2Jg7qfHmrfSyddeIrHA=
 github.com/secforge/harness-transport v0.1.5 h1:A7t9ZiZAd+G3StBa8QeiNrb+RRhh5t90KtHQmzJAWOo=
 github.com/secforge/harness-transport v0.1.5/go.mod h1:36eCcE6bkO5GeEQulkNn1oWH2Jg7qfHmrfSyddeIrHA=
+github.com/secforge/harness-transport v0.1.6 h1:v7UN+cE4F+1k802G+7zHm2DWF7Yz0BJZC7UyYgpIjzY=
+github.com/secforge/harness-transport v0.1.6/go.mod h1:HX6to14HcGLeeFCPnU2U+hfq4ON0/zeurIyzgpxN7To=
 github.com/spf13/cast v1.7.1 h1:cuNEagBQEHWN1FnbGEjCXL2szYEXqfJPbP2HNUaca9Y=
 github.com/spf13/cast v1.7.1/go.mod h1:ancEpBxwJDODSW/UG4rDrAqiKolqNNh2DX3mk86cAdo=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
