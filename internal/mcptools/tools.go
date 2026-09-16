@@ -993,6 +993,14 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 			}
 		}
 		res, err := handler(ctx, req)
+		// A wire fact the inbox observed — the cause a delivery was held,
+		// or whether a reply asserted a permission mode. Surfaced here
+		// because the alternative is inferring it from absences, which
+		// three sessions spent an hour doing while the answer sat in a
+		// field on a frame this process already receives.
+		if d := h.inbox.TakeDiagnostic(); d != "" {
+			h.noteAutoReconnect(d)
+		}
 		note := h.takeAutoReconnectNote()
 		if note == "" || res == nil {
 			return res, err

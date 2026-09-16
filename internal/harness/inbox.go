@@ -48,6 +48,16 @@ type Inbox struct {
 	// zero. An entry outliving its process is a listing that points at a
 	// socket nobody is serving.
 	published int
+	// diagnostic holds the last thing worth telling a reader about the
+	// wire: a held-message status with its cause, or whether an arriving
+	// user frame asserted a permission mode. Read once and cleared.
+	//
+	// It exists because three sessions spent an hour inferring the gate's
+	// cause from absences, while the answer was in a field on a frame
+	// this process already receives. A status carries `cause` naming the
+	// branch that held it; a user frame either carries from_mode or does
+	// not. Both are facts rather than deductions.
+	diagnostic string
 }
 
 // EnvClaudeSocketName is the harness session's inbox path, which also
@@ -98,7 +108,12 @@ func OpenInbox() (*Inbox, error) {
 	// which the socket is accepting with no handler behind it.
 	in := &Inbox{parent: int32(pid)}
 	srv, err := udsmsg.Listen(udsmsg.Config{
-		Handler: udsmsg.Handler{OnUser: in.handleUser},
+		Handler: udsmsg.Handler{
+			OnUser: in.handleUser,
+			// The receiver builds this and sends it back here: it is the
+			// only place the hold's own cause is stated.
+			OnPeerMessageStatus: in.handleStatus,
+		},
 		// Auth is required and the key is published so a reply from the
 		// model's own session can present a token at all. Neither decides
 		// who may send — see the type comment.
@@ -208,9 +223,48 @@ func (i *Inbox) handleUser(_ context.Context, p *udsmsg.Peer, f *udsmsg.Frame) {
 	if fn == nil {
 		return
 	}
+	// Whether the sender asserted a permission mode is the other half of
+	// the gate question, and it is in the bytes rather than in anyone's
+	// reading of the docs.
+	i.mu.Lock()
+	if f != nil && f.FromMode == "" {
+		i.diagnostic = "the last reply arrived with NO from_mode on the frame"
+	} else if f != nil {
+		i.diagnostic = "the last reply asserted from_mode=" + string(f.FromMode)
+	}
+	i.mu.Unlock()
 	if text := frameText(f); text != "" {
 		fn(text)
 	}
+}
+
+// handleStatus records a delivery status verbatim. Held and refused ones
+// carry the reason; a plain "delivered" is not worth reporting.
+func (i *Inbox) handleStatus(_ context.Context, _ *udsmsg.Peer, f *udsmsg.Frame) {
+	if f == nil || len(f.Raw) == 0 {
+		return
+	}
+	raw := string(f.Raw)
+	if !strings.Contains(raw, "held") && !strings.Contains(raw, "refused") &&
+		!strings.Contains(raw, "cause") {
+		return
+	}
+	i.mu.Lock()
+	i.diagnostic = "delivery status from the harness: " + raw
+	i.mu.Unlock()
+}
+
+// TakeDiagnostic returns the last wire fact worth reporting and clears
+// it. Read once: it describes something that happened, not a state.
+func (i *Inbox) TakeDiagnostic() string {
+	if i == nil {
+		return ""
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	d := i.diagnostic
+	i.diagnostic = ""
+	return d
 }
 
 // Close stops serving and removes the socket.
