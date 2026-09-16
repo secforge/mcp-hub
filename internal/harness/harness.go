@@ -59,6 +59,11 @@ type Pusher struct {
 	// adopted records that a thread id has been latched from an MCP
 	// request, so the Codex path is not asked to re-latch on every call.
 	adopted bool
+	// as overrides the configured server name, so one process can speak
+	// for several connections under the name each was given. Empty falls
+	// back to the configured or learned server name, which is what a
+	// process-level pusher wants.
+	as string
 }
 
 // Open returns a Pusher for whichever harness launched this process. It
@@ -89,6 +94,18 @@ func Open() *Pusher {
 	return &Pusher{}
 }
 
+// OpenAs returns a Pusher that attributes its deliveries to one named
+// connection rather than to this MCP server as a whole.
+//
+// One process holds several connections, and "mcp:mcp-hub" said for all
+// of them tells a reader which SERVER spoke when what they need to know
+// is which CONVERSATION spoke. A reply goes back to the address the
+// message came from, so the name and the return path have to describe the
+// same thing or answering the message answers the wrong one.
+func OpenAs(connection string) *Pusher {
+	return &Pusher{as: connection}
+}
+
 // deliverer returns the underlying Deliverer, opening it on first use with
 // the best name known by then. Caller must hold p.mu.
 func (p *Pusher) deliverer() deliver.Deliverer {
@@ -99,7 +116,7 @@ func (p *Pusher) deliverer() deliver.Deliverer {
 		// process is not entitled to would launder the user's permission
 		// decision past a gate that exists to ask them.
 		opts := []deliver.Option{
-			deliver.WithSenderName(senderName(p.learned)),
+			deliver.WithSenderName(senderName(p.as, p.learned)),
 			deliver.WithDetectedMode(),
 		}
 		if p.replyAddress != "" {
@@ -144,8 +161,14 @@ const EnvServerName = "MCP_HUB_SERVER_NAME"
 // called, which outranks anything inferred. A name learned from the
 // harness comes next, and the product name last, so the field always says
 // something rather than nothing.
-func senderName(learned string) string {
-	name := safeServerName(os.Getenv(EnvServerName))
+func senderName(as, learned string) string {
+	// A connection's own name wins over everything: it is the most
+	// specific true thing about where the message came from, and the only
+	// one that matches the address a reply will go back to.
+	name := safeServerName(as)
+	if name == "" {
+		name = safeServerName(os.Getenv(EnvServerName))
+	}
 	if name == "" {
 		name = safeServerName(learned)
 	}

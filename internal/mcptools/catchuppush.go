@@ -114,7 +114,7 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 
 		text := conn.ShapeForPush(ev)
 		text += s.saveReceivedAttachments(conn, []hubconn.Event{ev})
-		if _, err := s.hub.pusher.Push(ev.Cursor, text, true); err != nil {
+		if _, err := s.pusher.Push(ev.Cursor, text, true); err != nil {
 			// The message is still on the server and the position has not
 			// moved, so this is recoverable — but only if it is said.
 			res.Err = err
@@ -128,6 +128,7 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 		s.mu.Unlock()
 		setCatchUpCursor(id, ev.Cursor)
 		conn.NoteHandedOver([]hubconn.Event{ev})
+		s.noteDelivered(ev.Cursor)
 
 		anchor = wire.Anchor{Cursor: ev.Cursor}
 		res.Delivered++
@@ -166,7 +167,7 @@ func (s *session) pushCatchUpSummary(res catchUpResult) {
 	}
 	// No cursor: this is this client's own words about a run, not a
 	// message anyone can re-fetch.
-	if _, err := s.hub.pusher.Push("", text, false); err != nil {
+	if _, err := s.pusher.Push("", text, false); err != nil {
 		s.note(fmt.Sprintf("a catch-up run finished but its summary could not be "+
 			"delivered (%v): %d message(s) were pushed.", err, res.Delivered))
 	}

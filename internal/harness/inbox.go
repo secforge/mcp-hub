@@ -44,10 +44,6 @@ type Inbox struct {
 	parent int32
 	// onMessage receives text a verified parent sent. Nil until Start.
 	onMessage func(text string)
-	// published is the pid of the registry entry to remove on close, or
-	// zero. An entry outliving its process is a listing that points at a
-	// socket nobody is serving.
-	published int
 	// diagnostic holds the last thing worth telling a reader about the
 	// wire: a held-message status with its cause, or whether an arriving
 	// user frame asserted a permission mode. Read once and cleared.
@@ -172,36 +168,6 @@ func OpenInbox() (*Inbox, error) {
 	return in, nil
 }
 
-// Publish writes a registry entry so the inbox is addressable by name in
-// the harness's own session list, and returns whether it was written.
-//
-// The entry is honest about what it is: kind and entrypoint "mcp" rather
-// than "interactive", named for the parent session AND this server, so a
-// reader sees which conversation it belongs to and which MCP it is.
-// Nothing claims to be a conversation. That distinction is the whole
-// reason this is acceptable — the objection was never to having an entry,
-// it was to appearing as a session this process is not.
-//
-// It also removes one cost of the return path. A reply to an UNREGISTERED
-// inbox was held for the user's approval; an entry may be what the
-// harness uses to tell a known target from an unknown one. Measured, not
-// assumed: see the note this reports back to the caller.
-func (i *Inbox) Publish(mcpName string) error {
-	if i == nil || i.srv == nil {
-		return fmt.Errorf("no inbox to publish")
-	}
-	e, err := udsmsg.NewMCPEntry(i.srv.Path(), udsmsg.ParentSessionName(), mcpName)
-	if err != nil {
-		return fmt.Errorf("could not build a registry entry: %w", err)
-	}
-	if err := udsmsg.PublishSession(e); err != nil {
-		return fmt.Errorf("could not publish the registry entry: %w", err)
-	}
-	i.mu.Lock()
-	i.published = e.PID
-	i.mu.Unlock()
-	return nil
-}
 
 // inboxModeSource is the posture source every inbox binds with, named so
 // a test can assert the choice rather than re-reading the literal.
@@ -315,15 +281,12 @@ func (i *Inbox) Close() error {
 	if i == nil || i.srv == nil {
 		return nil
 	}
-	i.mu.Lock()
-	pid := i.published
-	i.published = 0
-	i.mu.Unlock()
-	if pid != 0 {
-		// Before closing the socket, so there is no window where the
-		// listing names an address that has already stopped answering.
-		_ = udsmsg.UnpublishSession(pid)
-	}
+	// Nothing to unpublish: an inbox is never listed in the harness
+	// registry. That registry is keyed by pid and rendered by the harness
+	// itself, so one process could list exactly one inbox — and this
+	// process holds one per connection. Nothing needs the listing anyway:
+	// a reply is validated by the socket's own name and directory, with
+	// no registry lookup on the path.
 	return i.srv.Close()
 }
 

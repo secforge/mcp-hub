@@ -528,6 +528,9 @@ func (s *session) teardown(conn *hubconn.Conn, keepWaiter bool) {
 	// can explain. Where a reconnect IS pending the session keeps its
 	// name, which is what refuses a manual dial racing the automatic one.
 	if !keepWaiter {
+		// The address goes with it: a reply arriving after this would be
+		// for a conversation this process has left.
+		s.closeReturnPath()
 		s.hub.close(s.name)
 	}
 }
@@ -835,7 +838,16 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 		// For Claude it is a no-op — the target came from the environment
 		// at exec — and calling it anyway keeps one code path.
 		if m := req.Params.Meta; m != nil {
-			if err := h.pusher.Adopt(m.AdditionalFields); err != nil {
+			// Every connection's pusher, because each addresses the same
+			// parent under its own name and a thread id latched by one
+			// says nothing about the others.
+			var adoptErr error
+			for _, sess := range h.allSessions() {
+				if err := sess.pusher.Adopt(m.AdditionalFields); err != nil {
+					adoptErr = err
+				}
+			}
+			if err := adoptErr; err != nil {
 				// A refused adopt means the harness will not accept this
 				// process talking to that target — most importantly when a
 				// SECOND thread reaches one MCP server, which the library
@@ -852,8 +864,10 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 		// because the alternative is inferring it from absences, which
 		// three sessions spent an hour doing while the answer sat in a
 		// field on a frame this process already receives.
-		if d := h.inbox.TakeDiagnostic(); d != "" {
-			h.noteAutoReconnect(d)
+		for _, sess := range h.allSessions() {
+			if d := sess.inbox.TakeDiagnostic(); d != "" {
+				sess.note(d)
+			}
 		}
 		note := h.takeAutoReconnectNote()
 		if note == "" || res == nil {
@@ -1040,7 +1054,6 @@ func receiveTools() string {
 
 func (h *Hub) Register(s *server.MCPServer) {
 	activeHub = h
-	h.openReturnPath()
 	sweepStaleAttachmentDirs()
 	// Every tool goes through withReconnectNote so that a reconnection
 	// this client performed on its own is reported on the very next call,
@@ -1756,6 +1769,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	})
 	s.setActiveConn(conn, w, target)
 	s.setCatchUpKey(target)
+	s.openReturnPath()
 	s.mu.Lock()
 	s.redialLink, s.redialName = link, name
 	s.mu.Unlock()
@@ -2072,46 +2086,45 @@ func sweepStaleAttachmentDirs() {
 // rather than swallowed — a return path that silently is not there would
 // leave the model replying into nothing, which is worse than knowing it
 // must use the tool.
-func (h *Hub) openReturnPath() {
+func (s *session) openReturnPath() {
 	if !harness.PushMode() {
 		return
 	}
+	// One inbox PER CONNECTION, and this is the whole of the routing.
+	//
+	// A reply goes back to the address the message it answers came from.
+	// If every connection shares one address, that address cannot say
+	// which conversation is being answered, and the model has to name it
+	// in the text — where a valid-but-wrong name is indistinguishable
+	// from a right one, and a reply lands in a conversation that was
+	// deliberately kept separate. With an address each, answering the
+	// message that was delivered is the correct action and also the
+	// cheapest one.
 	inbox, err := harness.OpenInbox()
 	if err != nil {
-		h.noteAutoReconnect(fmt.Sprintf("replies by SendMessage are not available in this session "+
-			"(%v) — use hub_send to speak to the hub. Receiving is unaffected.", err))
+		s.note(fmt.Sprintf("replies by SendMessage are not available for this connection "+
+			"(%v) — use hub_send to speak to it. Receiving is unaffected.", err))
 		return
 	}
-	h.inbox = inbox
-	h.pusher.SetReplyAddress(inbox.Address())
-	inbox.Start(context.Background(), h.sendFromInbox)
-	// Registered so the inbox is addressable by name and, per
-	// harness-transport's measurement, so a reply to it is not treated as
-	// a message to an unknown target. The entry says kind "mcp" and names
-	// both the parent session and this server, so it is addressable
-	// without claiming to be a conversation. A failure costs the name and
-	// nothing else — the uds: address still works — so it is noted rather
-	// than fatal.
-	if err := inbox.Publish(harnessServerName()); err != nil {
-		h.noteAutoReconnect(fmt.Sprintf("this session's hub inbox could not be listed for the "+
-			"harness (%v); replying to the from= address still works, but it has no name.", err))
-	}
-}
-
-// harnessServerName is what this MCP server is called in the model's own
-// config, for the registry entry — the same name the attribution uses, so
-// a reader sees one identity rather than two.
-func harnessServerName() string {
-	if n := strings.TrimSpace(os.Getenv(harness.EnvServerName)); n != "" {
-		return n
-	}
-	return "mcp-hub"
+	s.inbox = inbox
+	// Opened under the connection's name, so the attribution on a
+	// delivered message and the address a reply returns to describe the
+	// same thing.
+	s.pusher = harness.OpenAs(s.name)
+	s.pusher.SetReplyAddress(inbox.Address())
+	inbox.Start(context.Background(), s.sendFromInbox)
+	// Deliberately NOT listed in the harness registry. That registry is
+	// keyed by pid and rendered by the harness's own reader, so one
+	// process can list exactly one inbox while this one holds up to
+	// eight; a finer key would produce entries that enumerate and are
+	// never displayed. Nothing on the reply path needs the listing:
+	// validation is by the socket's name, its directory and the uid.
 }
 
 // sendFromInbox relays a reply the model addressed to our inbox onto the
 // hub. Only a message from this process's own parent reaches here; see
 // harness.Inbox for why the kernel decides that rather than the token.
-func (h *Hub) sendFromInbox(text string) {
+func (s *session) sendFromInbox(text string) {
 	// SendMessage's result says the reply reached this inbox and nothing
 	// about the hub — the same delivery-versus-consumption gap as
 	// everywhere else, one layer out. This path closes it by reading the
@@ -2124,21 +2137,24 @@ func (h *Hub) sendFromInbox(text string) {
 	// the sender would never know.
 	header, body, err := parseInboxHeader(text)
 	if err != nil {
-		h.noteAutoReconnect(fmt.Sprintf("a reply's #hub line was refused (%v), so NOTHING was "+
+		s.note(fmt.Sprintf("a reply's #hub line was refused (%v), so NOTHING was "+
 			"sent. Fix the line and send again, or use hub_send.", err))
 		return
 	}
-	// One inbox, several connections, so the reply has to say which one it
-	// answers. Refused rather than sent to whichever is open: a reply that
-	// lands in the wrong conversation cannot be recalled, and "the only
-	// one connected" is a rule that silently changes meaning the moment a
-	// second connection exists.
-	s, err := h.session(header.Conn)
-	if err != nil {
-		// Reported on the Hub, not the session: there is no session here,
-		// and that IS the report.
-		h.noteAutoReconnect(fmt.Sprintf("a reply could not be relayed (%v), so NOTHING was sent. "+
-			"Name the connection in the first line: #hub conn=<name>", err))
+	// Which connection this answers is settled by WHICH INBOX it arrived
+	// on, not by anything in the text: this socket belongs to exactly one
+	// connection, so a reply to the address a message came from returns to
+	// the conversation that sent it, and no name can be mistyped into
+	// another one.
+	//
+	// conn= is therefore an assertion rather than a route. A reply that
+	// names a different connection is refused rather than delivered here:
+	// the sender believed it was answering something else, and the two
+	// readings cannot both be honoured.
+	if header.Conn != "" && header.Conn != s.name {
+		s.note(fmt.Sprintf("a reply arrived on %q but its #hub line said conn=%q, so NOTHING was "+
+			"sent. A reply goes to the connection whose address it was sent to; drop the conn= "+
+			"directive, or send it to %q's own address.", s.name, header.Conn, header.Conn))
 		return
 	}
 	conn, _ := s.activeConn()
@@ -2227,7 +2243,7 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 	if w != nil && w.Following() {
 		return
 	}
-	if ok, _ := s.hub.pusher.Available(); !ok {
+	if ok, _ := s.pusher.Available(); !ok {
 		return
 	}
 	items, _ := conn.DrainForPush()
@@ -2243,10 +2259,11 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		// above are part of what the reader receives, and a budget that
 		// does not count them is not counting what it delivers.
 		conn.ChargeDelivered(it.Cursor, len(it.Text))
+		s.noteDelivered(it.Cursor)
 		// More says another delivery is already on its way, so a reader
 		// that wants to act on a burst knows to wait for the rest of it
 		// rather than treating each arrival as the whole of the news.
-		if _, err := s.hub.pusher.Push(it.Cursor, it.Text, i < len(items)-1); err != nil {
+		if _, err := s.pusher.Push(it.Cursor, it.Text, i < len(items)-1); err != nil {
 			// The event is already out of the buffer, so a failed push
 			// leaves it delivered nowhere. Nothing is durably lost — the
 			// catch-up position only advances on an explicit confirm, so
@@ -2451,6 +2468,9 @@ func (s *session) confirmLiveDelivery(events []hubconn.Event) {
 // SYNCHRONOUS tool result, which — unlike wait --follow's async
 // notification path — IS the delivery, not a best-effort guess at one.
 func (s *session) recordHandedOver(events []hubconn.Event) {
+	for _, e := range events {
+		s.noteDelivered(e.Cursor)
+	}
 	s.mu.Lock()
 	changed := false
 	for _, e := range events {
@@ -2571,9 +2591,13 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	s.redialLink, s.redialName = "", ""
 	s.reconnecting, s.reconnectAt = false, time.Time{}
 	s.mu.Unlock()
-	// The name is free again the moment its connection is given up, so
-	// reconnecting under it is an ordinary thing to do next.
-	defer h.close(name)
+	// The name and the address are both free again the moment the
+	// connection is given up, so reconnecting under it is an ordinary
+	// thing to do next.
+	defer func() {
+		s.closeReturnPath()
+		h.close(name)
+	}()
 
 	conn, w, target := s.clearActiveConn()
 	if conn == nil {
@@ -2604,10 +2628,8 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 // about) — but is meant to be called once, at process shutdown, not from
 // a tool call. A no-op if nothing is connected.
 func (h *Hub) Shutdown() {
-	if h.inbox != nil {
-		_ = h.inbox.Close()
-	}
 	for _, s := range h.allSessions() {
+		s.closeReturnPath()
 		h.close(s.name)
 		conn, w, target := s.clearActiveConn()
 		if conn == nil {
@@ -3713,6 +3735,15 @@ func formatBehindNote(behind *int) string {
 // a piggybacked receipt is fire-and-forget by design and never answers
 // with a pending count, where a standalone one does.
 func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
+	// Refused only on proof: another open connection delivered this exact
+	// cursor and this one did not. Confirming it here would move THIS
+	// connection's position to a place derived from another conversation
+	// entirely — past whatever sits between, permanently and silently.
+	if other := s.hub.cursorBelongsElsewhere(s, cursor); other != "" {
+		return nil, fmt.Errorf("that cursor was delivered on %q, not on %q — confirming it here "+
+			"would move %q's read position past messages nothing has read. Confirm it against "+
+			"%q instead", other, s.name, s.name, other)
+	}
 	behind, err := conn.ConfirmReceived(cursor)
 	if conn.TakeSkippedHeldNotice() {
 		s.note("that confirm moved your read position PAST message(s) live delivery " +

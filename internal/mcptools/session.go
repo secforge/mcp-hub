@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
+	"github.com/secforge/mcp-hub/internal/harness"
 	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/waiter"
 )
@@ -97,6 +98,14 @@ type session struct {
 	// by traffic since the last confirm rather than by the whole
 	// conversation's history.
 	handedOverAhead map[string]bool
+	// delivered/deliveredOrder remember which cursors THIS connection has
+	// handed to the model, most recent last. They exist for one check: a
+	// cursor confirmed against the wrong connection would advance a
+	// position past messages nobody read, and nothing about the cursor
+	// itself could reveal that — they are opaque, and two servers' cursors
+	// are not comparable. Who delivered it is knowable, so it is kept.
+	delivered      map[string]bool
+	deliveredOrder []string
 
 	// redialLink/redialName are what a graceful restart needs in order to
 	// come back without the model having to act. Held only after a
@@ -112,6 +121,18 @@ type session struct {
 	// which is true and useless: it reads identically to a hub that is
 	// simply gone.
 	reconnectAt time.Time
+
+	// pusher delivers this connection's events into the harness under this
+	// connection's name, and inbox is the address replies to it come back
+	// to. One of each per connection: the attribution a reader sees and
+	// the address they answer have to describe the same conversation, or
+	// answering a message answers a different one.
+	//
+	// Both are nil where the harness offers no messaging socket, or where
+	// binding failed — in which case hub_send remains the way to speak,
+	// which is what it was before.
+	pusher *harness.Pusher
+	inbox  *harness.Inbox
 
 	// attachMu guards attachDir/attachSeq — the local temp directory
 	// received attachments are saved into and a counter for unique
@@ -387,4 +408,78 @@ func connectionParam() mcp.ToolOption {
 			"hub_connect. hub_list_connections shows what is open. Always name it, even when "+
 			"only one connection is open: there is no default and none is inferred, because a "+
 			"call that picks a conversation for you picks the wrong one eventually."))
+}
+
+// closeReturnPath gives up this connection's inbox address. Called
+// wherever the connection itself is given up: an address that outlives
+// its connection accepts replies for a conversation this process is no
+// longer in, and nothing would report where they went.
+func (s *session) closeReturnPath() {
+	if s.inbox != nil {
+		_ = s.inbox.Close()
+		s.inbox = nil
+	}
+}
+
+// maxRecentCursors bounds what a connection remembers having delivered.
+// The set exists to catch a cursor confirmed against the wrong
+// connection, which is a mistake made within a turn or two of seeing the
+// message — so a long memory buys nothing and an unbounded one grows for
+// the life of the process.
+const maxRecentCursors = 1000
+
+// noteDelivered records that this connection handed cursor to the model.
+func (s *session) noteDelivered(cursor string) {
+	if cursor == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.delivered == nil {
+		s.delivered = map[string]bool{}
+	}
+	if s.delivered[cursor] {
+		return
+	}
+	s.delivered[cursor] = true
+	s.deliveredOrder = append(s.deliveredOrder, cursor)
+	for len(s.deliveredOrder) > maxRecentCursors {
+		delete(s.delivered, s.deliveredOrder[0])
+		s.deliveredOrder = s.deliveredOrder[1:]
+	}
+}
+
+// hasDelivered reports whether this connection handed cursor over.
+func (s *session) hasDelivered(cursor string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.delivered[cursor]
+}
+
+// cursorBelongsElsewhere names another open connection that delivered
+// this cursor, when this one did not.
+//
+// Cursors are opaque and not comparable between servers, so a cursor
+// confirmed against the wrong connection cannot be detected by looking at
+// it — it would simply advance a position past messages nobody read, and
+// the next walk would start after them. What CAN be known is who handed
+// it over, so that is recorded and asked.
+//
+// Deliberately silent when no open connection claims it: that includes a
+// cursor delivered before a restart, which is a legitimate thing to
+// confirm. Only a cursor demonstrably belonging to another live
+// connection is refused — a proof, not a suspicion.
+func (h *Hub) cursorBelongsElsewhere(mine *session, cursor string) string {
+	if cursor == "" {
+		return ""
+	}
+	for _, other := range h.allSessions() {
+		if other == mine {
+			continue
+		}
+		if other.hasDelivered(cursor) {
+			return other.name
+		}
+	}
+	return ""
 }

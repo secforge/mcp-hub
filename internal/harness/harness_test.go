@@ -12,11 +12,11 @@ import (
 // first and the identity where a reader looks for it.
 func TestTheSenderNameIsShortAndNamesTheServer(t *testing.T) {
 	t.Setenv(EnvServerName, "mcp-hub2")
-	if got := senderName(""); got != "mcp:mcp-hub2" {
+	if got := senderName("", ""); got != "mcp:mcp-hub2" {
 		t.Fatalf("senderName() = %q, want %q", got, "mcp:mcp-hub2")
 	}
-	if len(senderName("")) > 24 {
-		t.Errorf("attribution %q is long enough to be truncated in display", senderName(""))
+	if len(senderName("", "")) > 24 {
+		t.Errorf("attribution %q is long enough to be truncated in display", senderName("", ""))
 	}
 }
 
@@ -25,14 +25,14 @@ func TestTheSenderNameIsShortAndNamesTheServer(t *testing.T) {
 // "mcp:" or the executable's path.
 func TestAnUnsetServerNameStillNamesSomething(t *testing.T) {
 	os.Unsetenv(EnvServerName)
-	if got := senderName(""); got != "mcp:mcp-hub" {
+	if got := senderName("", ""); got != "mcp:mcp-hub" {
 		t.Fatalf("senderName() = %q, want the product default", got)
 	}
 }
 
 func TestSurroundingWhitespaceDoesNotLeakIntoTheAttribution(t *testing.T) {
 	t.Setenv(EnvServerName, "  mcp-hub2  ")
-	if got := senderName(""); got != "mcp:mcp-hub2" {
+	if got := senderName("", ""); got != "mcp:mcp-hub2" {
 		t.Fatalf("senderName() = %q, want the trimmed name", got)
 	}
 }
@@ -44,7 +44,7 @@ func TestSurroundingWhitespaceDoesNotLeakIntoTheAttribution(t *testing.T) {
 // entry someone forgot.
 func TestAServerNameOfferedByTheHarnessIsAdopted(t *testing.T) {
 	os.Unsetenv(EnvServerName)
-	if got := senderName(learnServerName(map[string]any{"serverName": "mcp-hub2"})); got != "mcp:mcp-hub2" {
+	if got := senderName("", learnServerName(map[string]any{"serverName": "mcp-hub2"})); got != "mcp:mcp-hub2" {
 		t.Fatalf("senderName = %q, want the harness-offered name", got)
 	}
 	if got := learnServerName(map[string]any{"progressToken": "abc", "threadId": "t1"}); got != "" {
@@ -56,7 +56,7 @@ func TestAServerNameOfferedByTheHarnessIsAdopted(t *testing.T) {
 // which outranks anything inferred from a key matched by shape.
 func TestAnExplicitNameOutranksOneOfferedByTheHarness(t *testing.T) {
 	t.Setenv(EnvServerName, "chosen")
-	if got := senderName("offered"); got != "mcp:chosen" {
+	if got := senderName("", "offered"); got != "mcp:chosen" {
 		t.Fatalf("senderName = %q, want the configured name to win", got)
 	}
 }
@@ -76,10 +76,10 @@ func TestAConfiguredNameSurvivesDisplayUnchanged(t *testing.T) {
 		{`"<>`, "mcp:mcp-hub"}, // nothing usable left: the default, not an empty label
 	} {
 		t.Setenv(EnvServerName, tc.raw)
-		if got := senderName(""); got != tc.want {
+		if got := senderName("", ""); got != tc.want {
 			t.Errorf("senderName() for %q = %q, want %q", tc.raw, got, tc.want)
 		}
-		if n := len(senderName("")); n > 64 {
+		if n := len(senderName("", "")); n > 64 {
 			t.Errorf("attribution for %q is %d chars — the harness will truncate it", tc.raw, n)
 		}
 	}
@@ -107,5 +107,20 @@ func TestClearEnvForTestingClearsEveryHarnessVariable(t *testing.T) {
 		if os.Getenv(name) != "set" {
 			t.Errorf("%s was not restored", name)
 		}
+	}
+}
+
+// A connection's own name outranks the configured server name: it is the
+// most specific true thing about where a message came from, and the only
+// one that matches the address a reply goes back to.
+func TestAConnectionNameOutranksTheServerName(t *testing.T) {
+	t.Setenv(EnvServerName, "mcp-hub2")
+	if got := senderName("chat-relay", "learned"); got != "mcp:chat-relay" {
+		t.Fatalf("senderName() = %q, want the connection's own name", got)
+	}
+	// And it is sanitised like any other, since it reaches a display that
+	// would otherwise transform it silently.
+	if got := senderName("chat relay!", ""); got != "mcp:chatrelay" {
+		t.Fatalf("senderName() = %q, want the reduced form", got)
 	}
 }

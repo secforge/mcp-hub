@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/secforge/mcp-hub/internal/harness"
 )
 
 // testConn is the name every test connects under. One name is enough:
@@ -45,3 +47,10 @@ func connReqFor(name string) mcp.CallToolRequest {
 	req.Params.Arguments = map[string]any{"connection": name}
 	return req
 }
+
+// harnessAvailableForTest reports whether this test process has a harness
+// to bind an inbox against. The suite clears the environment by default
+// (see TestMain), so the answer is normally no — and a test that asserts
+// on addresses has to say which case it is in rather than reading an
+// absent inbox as a failure.
+func harnessAvailableForTest() bool { return harness.PushMode() }

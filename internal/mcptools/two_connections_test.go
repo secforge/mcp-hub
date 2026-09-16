@@ -156,26 +156,119 @@ func TestDisconnectingOneLeavesTheOther(t *testing.T) {
 	}
 }
 
-// A reply relayed from the inbox names its connection, and a reply that
-// names none is refused rather than sent to whichever is open.
-func TestARelayedReplyMustNameItsConnection(t *testing.T) {
+// Which connection a reply answers is settled by the inbox it arrived
+// on, so the name cannot be mistyped into another conversation. A conn=
+// directive is an assertion about that, and a wrong one is refused rather
+// than honoured either way.
+func TestARelayedReplyBelongsToTheInboxItArrivedOn(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	hub := NewHub()
 	defer hub.Shutdown()
 	connectTwo(t, hub)
 
-	hub.sendFromInbox("no directive line here, so no connection named")
-	note := hub.takeAutoReconnectNote()
-	if !strings.Contains(note, "NOTHING was sent") {
-		t.Fatalf("expected an un-addressed reply to be refused outright, got: %s", note)
-	}
-	if !strings.Contains(note, "conn=") {
-		t.Fatalf("expected the refusal to say how to address it, got: %s", note)
+	alpha, err := hub.session("alpha")
+	if err != nil {
+		t.Fatalf("alpha: %v", err)
 	}
 
-	hub.sendFromInbox("#hub conn=gamma\nmeant for a connection that is not open")
-	note = hub.takeAutoReconnectNote()
+	// Naming its own connection is redundant but true, and is relayed.
+	alpha.sendFromInbox("#hub conn=alpha\nthis one is for alpha")
+	if note := hub.takeAutoReconnectNote(); strings.Contains(note, "NOTHING was sent") {
+		t.Fatalf("expected a reply naming its own connection to go through, got: %s", note)
+	}
+
+	// Naming another is refused: the sender believed it was answering
+	// something else, and both readings cannot be honoured.
+	alpha.sendFromInbox("#hub conn=beta\nthis one thinks it is for beta")
+	note := hub.takeAutoReconnectNote()
 	if !strings.Contains(note, "NOTHING was sent") {
-		t.Fatalf("expected an unknown connection to be refused, got: %s", note)
+		t.Fatalf("expected a mismatched conn= to be refused, got: %s", note)
+	}
+	for _, want := range []string{"alpha", "beta"} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("expected the refusal to name both sides (%q missing), got: %s", want, note)
+		}
+	}
+}
+
+// Each connection is attributed and answered under its own name, which is
+// the whole of the routing: the address a reply returns to and the name
+// the reader sees have to describe the same conversation.
+func TestEachConnectionHasItsOwnReturnAddress(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub := NewHub()
+	defer hub.Shutdown()
+	connectTwo(t, hub)
+
+	alpha, _ := hub.session("alpha")
+	beta, _ := hub.session("beta")
+	// Without a harness there is nothing to bind to, and that is a state
+	// to report rather than a failure: the addresses are equal only
+	// because both are absent.
+	if !harnessAvailableForTest() {
+		if alpha.inbox != nil || beta.inbox != nil {
+			t.Fatal("expected no inbox without a harness messaging socket")
+		}
+		return
+	}
+	if alpha.inbox == nil || beta.inbox == nil {
+		t.Fatal("expected each connection to bind its own inbox")
+	}
+	if alpha.inbox.Address() == beta.inbox.Address() {
+		t.Fatalf("expected distinct return addresses, both are %q", alpha.inbox.Address())
+	}
+}
+
+// Confirming a cursor one connection delivered against a DIFFERENT
+// connection would move that connection's read position to a place
+// derived from another conversation — past whatever sits between,
+// permanently and silently. Cursors are opaque, so nothing about the
+// string reveals this; who delivered it is what makes it detectable.
+func TestACursorFromAnotherConnectionIsRefused(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub := NewHub()
+	defer hub.Shutdown()
+	connectTwo(t, hub)
+
+	alpha, _ := hub.session("alpha")
+	beta, _ := hub.session("beta")
+	alpha.noteDelivered("cursor-alpha-42")
+
+	betaConn, _ := beta.activeConn()
+	_, err := beta.confirmCursor(betaConn, "cursor-alpha-42")
+	if err == nil {
+		t.Fatal("expected a cursor delivered on alpha to be refused against beta")
+	}
+	for _, want := range []string{"alpha", "beta"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected the refusal to name both connections (%q missing): %v", want, err)
+		}
+	}
+
+	// A cursor no open connection claims is NOT refused: it may be one
+	// delivered before a restart, which is a legitimate thing to confirm.
+	// Refusing on suspicion rather than proof would block that forever.
+	if other := hub.cursorBelongsElsewhere(beta, "cursor-from-a-previous-run"); other != "" {
+		t.Fatalf("expected an unclaimed cursor to belong nowhere, got %q", other)
+	}
+	// And a connection confirming its own is never refused by this check.
+	if other := hub.cursorBelongsElsewhere(alpha, "cursor-alpha-42"); other != "" {
+		t.Fatalf("expected alpha's own cursor to be fine on alpha, got %q", other)
+	}
+}
+
+// The memory is bounded: the mistake it catches is made within a turn or
+// two of seeing the message, so an unbounded set would grow for the life
+// of the process to catch nothing extra.
+func TestTheDeliveredCursorMemoryIsBounded(t *testing.T) {
+	s := &session{name: "x"}
+	for i := 0; i < maxRecentCursors+50; i++ {
+		s.noteDelivered(strings.Repeat("c", 1) + string(rune('a'+i%26)) + string(rune(i)))
+	}
+	s.mu.Lock()
+	n, order := len(s.delivered), len(s.deliveredOrder)
+	s.mu.Unlock()
+	if n > maxRecentCursors || order > maxRecentCursors {
+		t.Fatalf("expected the set to stay bounded, got %d/%d", n, order)
 	}
 }
