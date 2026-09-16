@@ -818,11 +818,21 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
 		ReconnectSecret: secret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
-	// Three different facts, and a reader acts differently on each: a
-	// follower that survived and is live again, a channel that survived
-	// with nothing attached to it, and no channel at all.
-	followerNote := "The wait channel survived the restart and this connection is back on it — " +
-		"do NOT start a second follower, one channel carries every connection."
+	// FOUR different facts, and a reader acts differently on each: push
+	// mode, where there is no channel and none is wanted; a follower that
+	// survived and is live again; a channel that survived with nothing
+	// attached; and no channel at all.
+	//
+	// Push mode is listed first because it is the case that was wrong:
+	// the message claimed a channel had survived the restart in a mode
+	// that never binds one. A reader told to protect something that does
+	// not exist learns to discount what this says.
+	followerNote := "Messages reach you by push, as before — there is no wait channel in this " +
+		"mode and nothing for you to start."
+	if !harness.PushMode() {
+		followerNote = "The wait channel survived the restart and this connection is back on it — " +
+			"do NOT start a second follower, one channel carries every connection."
+	}
 	if keptFollower {
 		followerNote = "Your follower was held open across the restart and is already delivering " +
 			"again — do NOT start another, it would supersede the one that is working."

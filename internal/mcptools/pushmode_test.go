@@ -304,3 +304,42 @@ func TestBufferedEventsAdviceMatchesTheDeliveryMode(t *testing.T) {
 		}
 	}
 }
+
+// A reconnect report must not promise a wait channel in push mode, where
+// none is ever bound. Seen live: four connections reconnected after an
+// announced restart and each said "the wait channel survived", which was
+// false in the only mode this client actually runs in — and a reader told
+// to protect something that does not exist learns to discount the rest.
+func TestTheReconnectReportDoesNotInventAWaitChannelInPushMode(t *testing.T) {
+	src, err := os.ReadFile("tools.go")
+	if err != nil {
+		t.Fatalf("reading tools.go: %v", err)
+	}
+	text := string(src)
+
+	idx := strings.Index(text, "followerNote := ")
+	if idx < 0 {
+		t.Fatal("the reconnect report's follower note is gone")
+	}
+	// The push-mode branch must be the FIRST thing that sets it, so no
+	// other wording can be the default that mode falls through to.
+	window := text[idx:min(len(text), idx+600)]
+	if !strings.Contains(window, "harness.PushMode()") {
+		t.Error("the follower note is not gated on the delivery mode")
+	}
+	pushCase := strings.Index(window, "no wait channel in this")
+	channelCase := strings.Index(window, "wait channel survived")
+	if pushCase < 0 {
+		t.Error("push mode is not told that there is no channel to protect")
+	}
+	if channelCase >= 0 && pushCase > channelCase {
+		t.Error("push mode falls through to the surviving-channel wording")
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
