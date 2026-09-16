@@ -57,6 +57,14 @@ func (f *fakeSource) push(text string) {
 	f.mu.Unlock()
 }
 
+// setConnected flips the source's connected state, standing in for a
+// connection ending under a reader that is attached to several.
+func (f *fakeSource) setConnected(v bool) {
+	f.mu.Lock()
+	f.connected = v
+	f.mu.Unlock()
+}
+
 // dialAndRead connects in "once" mode (like the default `wait` invocation):
 // sends the once-mode byte, reads until the server closes the connection.
 func dialAndRead(t *testing.T, path string) string {
@@ -116,14 +124,16 @@ func readChunk(t *testing.T, conn net.Conn) string {
 func TestWaitDeliversAlreadyBufferedEvent(t *testing.T) {
 	src := &fakeSource{connected: true}
 	src.push("hello")
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	got := dialAndRead(t, w.socketPath)
-	if got != "Run this command again to keep receiving:\n"+w.WaitCommand()+"\n\nhello\n" {
+	if got != "Run this command again to keep receiving:\n"+w.WaitCommand()+
+		"\n\n[connection: t]\nhello\n" {
 		t.Fatalf("unexpected output: %q", got)
 	}
 	// The re-run reminder must lead, not trail: a reader whose own read
@@ -137,10 +147,11 @@ func TestWaitDeliversAlreadyBufferedEvent(t *testing.T) {
 
 func TestPokeDeliversToRegisteredWaiter(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	done := make(chan string, 1)
@@ -170,10 +181,11 @@ func TestPokeDeliversToRegisteredWaiter(t *testing.T) {
 // still-registered waiter gets everything, including what was held back.
 func TestPokeDoesNotDeliverWhileSourceReportsNotWakeWorthy(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	done := make(chan string, 1)
@@ -213,10 +225,11 @@ func TestPokeDoesNotDeliverWhileSourceReportsNotWakeWorthy(t *testing.T) {
 
 func TestNewWaiterSupersedesOld(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	oldDone := make(chan string, 1)
@@ -253,10 +266,11 @@ func TestSocketPathStaysWithinUnixSocketPathLimit(t *testing.T) {
 	// generous headroom for the OS temp directory (which on Windows can
 	// itself be 40-50+ chars).
 	src := &fakeSource{connected: true}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	filename := filepath.Base(w.socketPath)
@@ -274,15 +288,13 @@ func TestSocketPathStaysWithinUnixSocketPathLimit(t *testing.T) {
 // Listen's own doc comment for why a deterministic path became a real
 // cross-process collision hazard once that became the common case.
 func TestSocketPathDiffersAcrossCalls(t *testing.T) {
-	src := &fakeSource{connected: true}
-
-	w1, err := Listen(src)
+	w1, err := Listen()
 	if err != nil {
 		t.Fatalf("listen 1: %v", err)
 	}
 	defer w1.Close()
 
-	w2, err := Listen(src)
+	w2, err := Listen()
 	if err != nil {
 		t.Fatalf("listen 2: %v", err)
 	}
@@ -296,17 +308,18 @@ func TestSocketPathDiffersAcrossCalls(t *testing.T) {
 func TestFollowDeliversMultipleEventsOverSameConnection(t *testing.T) {
 	src := &fakeSource{connected: true}
 	src.push("first")
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	conn := dialFollow(t, w.socketPath)
 	defer conn.Close()
 
 	got := readChunk(t, conn)
-	if got != "first\n\n" {
+	if got != "[connection: t]\nfirst\n\n" {
 		t.Fatalf("first chunk: got %q", got)
 	}
 
@@ -314,7 +327,7 @@ func TestFollowDeliversMultipleEventsOverSameConnection(t *testing.T) {
 	w.Poke()
 
 	got = readChunk(t, conn)
-	if got != "second\n\n" {
+	if got != "[connection: t]\nsecond\n\n" {
 		t.Fatalf("second chunk: got %q", got)
 	}
 }
@@ -343,10 +356,11 @@ func TestFollowSpacesWritesWithinABurst(t *testing.T) {
 	src := &fakeSource{connected: true}
 	src.push("first")
 	src.push("second")
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	conn := dialFollow(t, w.socketPath)
@@ -354,11 +368,11 @@ func TestFollowSpacesWritesWithinABurst(t *testing.T) {
 	w.Poke()
 
 	start := time.Now()
-	if got := readChunk(t, conn); got != "first\n\n" {
+	if got := readChunk(t, conn); got != "[connection: t]\nfirst\n\n" {
 		t.Fatalf("first chunk: got %q", got)
 	}
 	firstAt := time.Since(start)
-	if got := readChunk(t, conn); got != "second\n\n" {
+	if got := readChunk(t, conn); got != "[connection: t]\nsecond\n\n" {
 		t.Fatalf("second chunk: got %q", got)
 	}
 	secondAt := time.Since(start)
@@ -380,17 +394,18 @@ func TestFollowDeliversABurstAsSeparateChunksNotOneJoinedWrite(t *testing.T) {
 	src.push("first")
 	src.push("second")
 	src.push("third")
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	conn := dialFollow(t, w.socketPath)
 	defer conn.Close()
 	w.Poke()
 
-	for _, want := range []string{"first\n\n", "second\n\n", "third\n\n"} {
+	for _, want := range []string{"[connection: t]\nfirst\n\n", "[connection: t]\nsecond\n\n", "[connection: t]\nthird\n\n"} {
 		if got := readChunk(t, conn); got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -400,27 +415,29 @@ func TestFollowDeliversABurstAsSeparateChunksNotOneJoinedWrite(t *testing.T) {
 func TestFollowChunksHaveNoRerunTrailer(t *testing.T) {
 	src := &fakeSource{connected: true}
 	src.push("hello")
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	conn := dialFollow(t, w.socketPath)
 	defer conn.Close()
 
 	got := readChunk(t, conn)
-	if got != "hello\n\n" {
+	if got != "[connection: t]\nhello\n\n" {
 		t.Fatalf("follow-mode delivery should have no rerun trailer, got %q", got)
 	}
 }
 
 func TestNewWaiterSupersedesFollowConnection(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	oldConn := dialFollow(t, w.socketPath)
@@ -453,10 +470,11 @@ func TestNewWaiterSupersedesFollowConnection(t *testing.T) {
 
 func TestWaitFollowCommandAppendsFollowFlag(t *testing.T) {
 	src := &fakeSource{connected: true}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	if got, want := w.WaitFollowCommand(), w.WaitCommand()+" --follow"; got != want {
@@ -484,10 +502,11 @@ func TestFollowNeverLosesAnEventToRegistrationRace(t *testing.T) {
 	t.Cleanup(func() { liveEmissionSpacing = orig })
 
 	src := &fakeSource{connected: true}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	conn := dialFollow(t, w.socketPath)
@@ -548,14 +567,18 @@ func TestFollowNeverLosesAnEventToRegistrationRace(t *testing.T) {
 
 func TestDisconnectedSourceReportedImmediately(t *testing.T) {
 	src := &fakeSource{connected: false}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
+	// One connection ending is reported BY NAME rather than as the
+	// channel disconnecting: the channel carries others, and a reader told
+	// "hub disconnected" could not tell which of the two happened.
 	got := dialAndRead(t, w.socketPath)
-	if got != "hub disconnected\n" {
+	if !strings.Contains(got, `"t" disconnected`) {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -573,14 +596,15 @@ func (f *fakeSourceWithNote) DisconnectNote() string { return f.note }
 
 func TestDisconnectedSourceNoteIsAppendedWhenSourceProvidesOne(t *testing.T) {
 	src := &fakeSourceWithNote{fakeSource: fakeSource{connected: false}, note: " (revoked — do not reconnect)"}
-	w, err := Listen(src)
+	w, err := Listen()
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	w.SetSource("t", src)
 	defer w.Close()
 
 	got := dialAndRead(t, w.socketPath)
-	if got != "hub disconnected (revoked — do not reconnect)\n" {
+	if !strings.Contains(got, `"t" disconnected (revoked — do not reconnect)`) {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -608,10 +632,11 @@ func TestListenSweepsStaleSocketsButNeverTouchesALiveOne(t *testing.T) {
 
 	// a real, still-active listener that must survive the sweep untouched.
 	liveSrc := &fakeSource{connected: true}
-	liveWaiter, err := Listen(liveSrc)
+	liveWaiter, err := Listen()
 	if err != nil {
 		t.Fatalf("listen (live): %v", err)
 	}
+	liveWaiter.SetSource("t", liveSrc)
 	defer liveWaiter.Close()
 
 	// register a real waiter on the live one, so we can also prove its
@@ -621,8 +646,7 @@ func TestListenSweepsStaleSocketsButNeverTouchesALiveOne(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // let it register as current
 
 	// a fresh Listen() call — the thing that actually triggers a sweep.
-	triggerSrc := &fakeSource{connected: true}
-	triggerWaiter, err := Listen(triggerSrc)
+	triggerWaiter, err := Listen()
 	if err != nil {
 		t.Fatalf("listen (sweep trigger): %v", err)
 	}
@@ -642,7 +666,7 @@ func TestListenSweepsStaleSocketsButNeverTouchesALiveOne(t *testing.T) {
 	liveSrc.push("still alive after the sweep")
 	liveWaiter.Poke()
 	got := readChunk(t, liveConn)
-	if got != "still alive after the sweep\n\n" {
+	if got != "[connection: t]\nstill alive after the sweep\n\n" {
 		t.Fatalf("expected the live waiter to still deliver normally after the sweep, got %q", got)
 	}
 }
@@ -661,9 +685,9 @@ func TestEveryMethodToleratesANilWaiter(t *testing.T) {
 	var w *Waiter
 	// Each of these ran on a live path in push mode.
 	w.Poke()
-	w.ExpectReconnect()
+	w.ExpectReconnect("t")
 	w.Announce("anything")
-	w.SetSource(nil)
+	w.SetSource("t", nil)
 	if w.Following() {
 		t.Error("a nil waiter reported a follower")
 	}
@@ -675,5 +699,76 @@ func TestEveryMethodToleratesANilWaiter(t *testing.T) {
 	}
 	if err := w.Close(); err != nil {
 		t.Errorf("Close on nil = %v, want nil", err)
+	}
+}
+
+// One channel, several conversations: a reader gets every connection's
+// traffic on the one socket, and every line says which connection it
+// belongs to. A pull harness runs one `wait` process and cannot run one
+// per connection, so this is the only shape that reaches it at all.
+func TestOneChannelCarriesSeveralConnectionsLabelled(t *testing.T) {
+	alpha := &fakeSource{connected: true}
+	beta := &fakeSource{connected: true}
+	w, err := Listen()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	w.SetSource("alpha", alpha)
+	w.SetSource("beta", beta)
+	defer w.Close()
+
+	conn := dialFollow(t, w.socketPath)
+	defer conn.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	alpha.push("from alpha")
+	w.Poke()
+	if got := readChunk(t, conn); got != "[connection: alpha]\nfrom alpha\n\n" {
+		t.Fatalf("expected alpha's line labelled, got %q", got)
+	}
+	beta.push("from beta")
+	w.Poke()
+	if got := readChunk(t, conn); got != "[connection: beta]\nfrom beta\n\n" {
+		t.Fatalf("expected beta's line labelled, got %q", got)
+	}
+}
+
+// One connection ending is a fact about that conversation, not about the
+// channel. The reader is told which one, by name, and stays attached —
+// releasing it would leave the remaining conversations with nothing
+// listening, and nothing could reattach it.
+func TestOneConnectionEndingDoesNotEndTheChannel(t *testing.T) {
+	alpha := &fakeSource{connected: true}
+	beta := &fakeSource{connected: true}
+	w, err := Listen()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	w.SetSource("alpha", alpha)
+	w.SetSource("beta", beta)
+	defer w.Close()
+
+	conn := dialFollow(t, w.socketPath)
+	defer conn.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	alpha.setConnected(false)
+	w.Poke()
+	got := readChunk(t, conn)
+	if !strings.Contains(got, `"alpha" disconnected`) {
+		t.Fatalf("expected alpha's ending to be named, got %q", got)
+	}
+	if strings.HasPrefix(got, "hub disconnected") {
+		t.Fatalf("expected the channel NOT to report itself disconnected, got %q", got)
+	}
+
+	// Still live for beta, on the same connection the reader already has.
+	beta.push("still here")
+	w.Poke()
+	if got := readChunk(t, conn); got != "[connection: beta]\nstill here\n\n" {
+		t.Fatalf("expected beta to keep delivering on the same channel, got %q", got)
+	}
+	if attached := w.Attached(); len(attached) != 1 || attached[0] != "beta" {
+		t.Fatalf("expected only beta attached, got %v", attached)
 	}
 }

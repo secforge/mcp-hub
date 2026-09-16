@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -51,59 +52,144 @@ type registeredWaiter struct {
 	follow bool
 }
 
+// attached is one connection this waiter carries, and the per-connection
+// facts that used to be the whole waiter's.
+//
+// ONE SOCKET FOR THE PROCESS is not an optimisation. A pull harness runs
+// one `wait` process; it cannot run one per connection, so a second
+// socket is a connection nothing is listening to — which is exactly the
+// silence this component exists to prevent.
+//
+// The cost is that "the connection ended" and "the connection is coming
+// back" stop being facts about the channel and become facts about one
+// conversation ON the channel. They are therefore delivered as labelled
+// MESSAGES rather than as the socket closing: the follower survives any
+// one connection ending, and closing is reserved for the process itself
+// going away.
+type attached struct {
+	name string
+	src  Source
+	// expecting is set while a planned reconnect is in flight for THIS
+	// connection. It changes what a dead source means: normally the
+	// connection ending is the end of that conversation and the follower
+	// is told so, but during an announced restart the connection is
+	// coming back and the reader should still be attached when it does.
+	expecting bool
+	// held records that the reader has already been told this connection
+	// is holding, so a burst of pokes during the outage does not repeat
+	// it.
+	held bool
+}
+
 type Waiter struct {
-	source     Source
 	ln         net.Listener
 	socketPath string
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// sources is every connection this socket carries, and order keeps
+	// delivery stable so two runs of the same traffic read the same.
+	sources map[string]*attached
+	order   []string
 	current *registeredWaiter
 	// closed is set by Close under w.mu. A delivery in flight has
 	// unregistered its reader, so Close cannot see it to say goodbye —
 	// this is what lets the delivery discover, when it comes back to
 	// re-register, that there is no longer a Waiter to register with.
 	closed bool
-	// expecting is set while a planned reconnect is in flight. It changes
-	// what a dead source MEANS to this waiter: normally the connection
-	// ending is the end of the story and a follower is told so and
-	// released, but during an announced restart the connection is coming
-	// back and the follower should still be here when it does.
-	//
-	// Without this a planned restart silently costs the session its live
-	// channel: the client reconnects, and the only process that would
-	// have reported anything died with the old connection. The session
-	// ends up connected and blind, which is worse than staying down —
-	// nothing arrives to prompt anyone to look.
-	expecting bool
-	// held records that the waiting side has already been told we are
-	// holding, so a burst of pokes during the outage does not repeat it.
-	held bool
 }
 
-// ExpectReconnect tells this waiter that the source is about to die on
-// purpose and will be replaced. Followers are kept open across the gap
-// rather than released.
-func (w *Waiter) ExpectReconnect() {
+// ExpectReconnect tells this waiter that one connection is about to die
+// on purpose and will be replaced. The reader is kept attached across the
+// gap rather than told that conversation ended.
+func (w *Waiter) ExpectReconnect(name string) {
 	if w == nil {
 		return
 	}
 	w.mu.Lock()
-	w.expecting, w.held = true, false
+	if a := w.sources[name]; a != nil {
+		a.expecting, a.held = true, false
+	}
 	w.mu.Unlock()
 }
 
-// SetSource swaps in the connection that replaced the one this waiter was
-// built on, ending the hold. The socket path never changes, so a follower
-// that survived the gap keeps receiving without knowing anything happened.
-func (w *Waiter) SetSource(s Source) {
+// SetSource attaches a connection under name, or swaps in the one that
+// replaced it, ending any hold. The socket path never changes, so a
+// reader that survived a gap keeps receiving without knowing anything
+// happened.
+func (w *Waiter) SetSource(name string, s Source) {
 	if w == nil {
 		return
 	}
 	w.mu.Lock()
-	w.source = s
-	w.expecting, w.held = false, false
+	if w.sources == nil {
+		w.sources = map[string]*attached{}
+	}
+	if a := w.sources[name]; a != nil {
+		a.src, a.expecting, a.held = s, false, false
+	} else {
+		w.sources[name] = &attached{name: name, src: s}
+		w.order = append(w.order, name)
+	}
 	w.mu.Unlock()
 	w.Poke()
+}
+
+// Detach removes one connection from this waiter and tells whoever is
+// reading, by name. The socket stays open: another conversation may still
+// be running on it, and even if none is, a reader released here could not
+// be reattached when the next connect happens.
+func (w *Waiter) Detach(name, why string) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	a := w.sources[name]
+	delete(w.sources, name)
+	for i, n := range w.order {
+		if n == name {
+			w.order = append(w.order[:i], w.order[i+1:]...)
+			break
+		}
+	}
+	remaining := len(w.order)
+	w.mu.Unlock()
+	if a == nil {
+		return
+	}
+	msg := fmt.Sprintf("[hub: %q is no longer on this channel — %s. Nothing further will arrive "+
+		"for it here.", name, why)
+	if remaining == 0 {
+		msg += " No connection is left on this channel; it stays open, and a new hub_connect " +
+			"attaches to it without you restarting anything."
+	} else {
+		msg += fmt.Sprintf(" %d other connection(s) are still delivering here.", remaining)
+	}
+	w.Announce(msg + "]")
+}
+
+// Attached lists the connections this waiter carries.
+func (w *Waiter) Attached() []string {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.order...)
+}
+
+// sourcesSnapshot copies the attachment list for iteration outside the
+// lock — deliver writes to a socket, which must never happen while
+// holding a lock a Poke needs.
+func (w *Waiter) sourcesSnapshot() []*attached {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make([]*attached, 0, len(w.order))
+	for _, n := range w.order {
+		if a := w.sources[n]; a != nil {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // Following reports whether a follow-mode reader is registered right
@@ -150,18 +236,20 @@ func (w *Waiter) Announce(msg string) {
 }
 
 // holdingFor reports whether a dead source should be waited out rather
-// than reported as the end, and whether the waiting side still needs to
-// be told that is what is happening.
-func (w *Waiter) holdingFor() (holding, announce bool) {
+// than reported as the end, and whether the reader still needs to be told
+// that is what is happening — asked per connection, since one holding
+// says nothing about the others.
+func (w *Waiter) holdingFor(name string) (holding, announce bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !w.expecting {
+	a := w.sources[name]
+	if a == nil || !a.expecting {
 		return false, false
 	}
-	if w.held {
+	if a.held {
 		return true, false
 	}
-	w.held = true
+	a.held = true
 	return true, true
 }
 
@@ -214,13 +302,13 @@ func SocketDirForTesting(dir string) (restore func()) {
 // with nothing to arbitrate between them. Only one connection to this
 // socket may be registered at a time; a new connection always supersedes
 // any previously registered one, whether it was in "once" or "follow" mode.
-func Listen(source Source) (*Waiter, error) {
+func Listen() (*Waiter, error) {
 	path := socketPath()
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
 	}
-	w := &Waiter{source: source, ln: ln, socketPath: path}
+	w := &Waiter{ln: ln, socketPath: path, sources: map[string]*attached{}}
 	go w.acceptLoop()
 	sweepStaleSockets(path)
 	return w, nil
@@ -357,7 +445,7 @@ func (w *Waiter) handleAccept(conn net.Conn) {
 	// for why the two must never be split, on pain of a permanently
 	// undelivered event.
 	w.mu.Lock()
-	if hasEvents, connected := w.source.Peek(); hasEvents || !connected {
+	if w.pendingLocked() {
 		w.mu.Unlock()
 		w.deliver(rw)
 		return
@@ -389,7 +477,7 @@ func (w *Waiter) Poke() {
 		return
 	}
 	w.mu.Lock()
-	if hasEvents, connected := w.source.Peek(); !hasEvents && connected {
+	if !w.pendingLocked() {
 		w.mu.Unlock()
 		return
 	}
@@ -404,8 +492,24 @@ func (w *Waiter) Poke() {
 
 func (w *Waiter) deliver(rw *registeredWaiter) {
 	if !rw.follow {
-		formatted, connected := w.source.Drain()
-		if !connected {
+		// One-shot: whatever any connection has, labelled, then close.
+		// "Disconnected" is reported only when there is nothing attached
+		// at all — with connections still live, one of them ending is a
+		// labelled line in the payload, not the end of the channel.
+		var parts []string
+		for _, a := range w.sourcesSnapshot() {
+			formatted, connected := a.src.Drain()
+			if formatted != "" {
+				parts = append(parts, label(a.name)+formatted)
+			}
+			if !connected {
+				if holding, _ := w.holdingFor(a.name); !holding {
+					parts = append(parts, endedMessage(a))
+					w.Detach(a.name, "its connection ended")
+				}
+			}
+		}
+		if len(parts) == 0 {
 			writeAndClose(rw.conn, w.disconnectedMessage())
 			return
 		}
@@ -415,7 +519,8 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 		// through (e.g. a caller with its own read timeout), a trailing
 		// reminder is exactly the part most likely to be lost. Leading
 		// with it means the instruction survives even a truncated read.
-		writeAndClose(rw.conn, "Run this command again to keep receiving:\n"+w.WaitCommand()+"\n\n"+formatted+"\n")
+		writeAndClose(rw.conn, "Run this command again to keep receiving:\n"+w.WaitCommand()+
+			"\n\n"+strings.Join(parts, "\n\n")+"\n")
 		return
 	}
 
@@ -425,81 +530,66 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 	// write, ripe for a downstream layer to truncate as one unit, now
 	// leaves as N separate writes, each individually complete and
 	// self-identifying (FormatEventsBatch's "i/N" marker).
-	chunks, connected := w.source.DrainBatch()
-	if !connected {
-		if holding, announce := w.holdingFor(); holding {
-			// Deliver whatever the old connection had buffered before it
-			// went, then stay. Closing here would take the live channel
-			// down with a connection that is coming back.
-			for _, c := range chunks {
-				if _, err := rw.conn.Write([]byte(c + "\n\n")); err != nil {
-					rw.conn.Close()
-					return
-				}
-			}
-			if announce {
-				if _, err := rw.conn.Write([]byte(w.holdingMessage() + "\n\n")); err != nil {
-					rw.conn.Close()
-					return
-				}
-			}
-			w.mu.Lock()
-			if w.current == nil {
-				w.current = rw
-				w.mu.Unlock()
-				return
-			}
-			w.mu.Unlock()
-			writeAndClose(rw.conn, w.supersededMessage())
-			return
-		}
-		// Deliver what was drained BEFORE announcing the end, exactly as
-		// the holding branch above does. DrainBatch already emptied the
-		// buffer, so dropping these loses the live delivery of events that
-		// had arrived — not the events themselves, since DrainEvents does
-		// not MarkConsumed and the confirmed position therefore never
-		// moved, but the reader is told the channel ended and told nothing
-		// about content that had already left the buffer.
+	//
+	// Every write is labelled with the connection it came from. With one
+	// channel carrying several conversations, an unlabelled line is a
+	// message the reader cannot place, answer, or confirm — and confirming
+	// it against the wrong connection is the one mistake that silently
+	// skips messages.
+	wrote := 0
+	for _, a := range w.sourcesSnapshot() {
+		chunks, connected := a.src.DrainBatch()
 		for _, c := range chunks {
-			if _, err := rw.conn.Write([]byte(c + "\n\n")); err != nil {
+			// liveEmissionSpacing between successive writes in the same
+			// delivery — not before the first, which stays immediate (the
+			// common single-event case pays no latency at all). See its
+			// own doc comment for why this closes, rather than merely
+			// reduces, the downstream-coalescing merge class.
+			if wrote > 0 {
+				time.Sleep(liveEmissionSpacing)
+			}
+			if _, err := rw.conn.Write([]byte(label(a.name) + c + "\n\n")); err != nil {
 				rw.conn.Close()
 				return
 			}
+			wrote++
 		}
-		writeAndClose(rw.conn, w.disconnectedMessage())
-		return
-	}
-	for i, c := range chunks {
-		// liveEmissionSpacing between successive writes in the same
-		// delivery — not before the first, which stays immediate (the
-		// common single-event case pays no latency at all). See its own
-		// doc comment for why this closes, rather than merely reduces,
-		// the downstream-coalescing merge class — provided the harness's
-		// documented batching window is accurate.
-		if i > 0 {
-			time.Sleep(liveEmissionSpacing)
+		if connected {
+			continue
 		}
-		if _, err := rw.conn.Write([]byte(c + "\n\n")); err != nil {
-			rw.conn.Close()
-			return
+		// A dead source: either it is coming back, in which case the
+		// reader is told once and stays, or that conversation has ended,
+		// in which case the reader is told which one and stays anyway.
+		// Neither closes the channel — the other conversations on it are
+		// still live, and a reader released here could not be reattached
+		// when the next connect happens.
+		holding, announce := w.holdingFor(a.name)
+		switch {
+		case holding && announce:
+			if _, err := rw.conn.Write([]byte(label(a.name) + w.holdingMessage() + "\n\n")); err != nil {
+				rw.conn.Close()
+				return
+			}
+			wrote++
+		case !holding:
+			if _, err := rw.conn.Write([]byte(endedMessage(a) + "\n\n")); err != nil {
+				rw.conn.Close()
+				return
+			}
+			wrote++
+			w.Detach(a.name, "its connection ended")
 		}
 	}
 
-	// Re-register for the next event — checking w.source.Peek() and setting
-	// w.current in the same uninterrupted lock hold that Poke() uses to
-	// read/clear w.current, not as two separate steps. Splitting them (an
-	// unlocked Peek() first, then a separate lock to register) leaves a gap
-	// in which a concurrent Poke() — triggered by an event landing in
-	// exactly that window — finds w.current still nil from the *previous*
-	// delivery, silently no-ops (Poke does nothing when nothing is
-	// registered), and then this call goes on to register anyway, based on
-	// a Peek() taken *before* that event existed. The result: an event that
-	// genuinely arrived sits in the buffer with nothing left to ever poke
-	// it again — the connection stays registered, technically alive,
-	// forever waiting for a notification that already happened and was
-	// missed. Checking Peek() fresh inside the same lock Poke() uses
-	// closes the gap: whichever of the two acquires w.mu first, the other
-	// is guaranteed to observe accurate state once it's their turn.
+	// Re-register for the next event — checking for pending work and
+	// setting w.current in the same uninterrupted lock hold that Poke()
+	// uses to read/clear w.current, not as two separate steps. Splitting
+	// them leaves a gap in which a concurrent Poke() — triggered by an
+	// event landing in exactly that window — finds w.current still nil
+	// from the previous delivery, silently no-ops, and then this call
+	// registers anyway based on a check taken before that event existed.
+	// The result: an event that genuinely arrived sits in the buffer with
+	// nothing left to ever poke it again.
 	w.mu.Lock()
 	if w.closed {
 		// The Waiter was closed while this delivery was writing. Tell the
@@ -517,13 +607,54 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 		writeAndClose(rw.conn, w.supersededMessage())
 		return
 	}
-	if hasEvents, connected := w.source.Peek(); hasEvents || !connected {
+	if w.pendingLocked() {
 		w.mu.Unlock()
 		w.deliver(rw)
 		return
 	}
 	w.current = rw
 	w.mu.Unlock()
+}
+
+// label prefixes a delivered chunk with the connection it belongs to.
+// Every line on a shared channel carries one: a message a reader cannot
+// place is a message it cannot answer or confirm.
+func label(name string) string {
+	return "[connection: " + name + "]\n"
+}
+
+// pendingLocked reports whether ANY attached connection has something a
+// reader should be woken for: buffered events, or an ending that has not
+// been reported yet. Caller holds w.mu.
+//
+// "Any", not "all": a reader waiting on eight conversations is waiting
+// for whichever speaks first, and a quiet connection must not be able to
+// hold back a busy one.
+func (w *Waiter) pendingLocked() bool {
+	for _, n := range w.order {
+		a := w.sources[n]
+		if a == nil {
+			continue
+		}
+		hasEvents, connected := a.src.Peek()
+		if hasEvents {
+			return true
+		}
+		if connected {
+			continue
+		}
+		// A dead source is news exactly ONCE. While it is held for an
+		// announced restart and the reader has already been told, it
+		// stays attached and stays disconnected — so counting it as
+		// pending would wake a delivery that has nothing to write, which
+		// would find it pending again, forever. (It did: one stack
+		// overflow, caught by the suite.) A source whose ending has been
+		// reported is detached instead, so it cannot reach here at all.
+		if !(a.expecting && a.held) {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Waiter) Close() error {
@@ -562,11 +693,21 @@ type disconnectNoter interface {
 // disconnectedMessage is the "hub disconnected" text sent to a waiter,
 // with whatever extra note the source can offer appended.
 func (w *Waiter) disconnectedMessage() string {
+	return "hub disconnected\n"
+}
+
+// endedMessage reports that ONE connection ended, by name, with whatever
+// the source can say about why. A labelled line rather than the socket
+// closing: the other conversations on this channel have not ended, and a
+// reader told "disconnected" would have no way to tell which of those two
+// things happened.
+func endedMessage(a *attached) string {
 	note := ""
-	if n, ok := w.source.(disconnectNoter); ok {
+	if n, ok := a.src.(disconnectNoter); ok {
 		note = n.DisconnectNote()
 	}
-	return "hub disconnected" + note + "\n"
+	return fmt.Sprintf("[hub: %q disconnected%s. Nothing further arrives for it here until it is "+
+		"reconnected; other connections on this channel are unaffected.]", a.name, note)
 }
 
 // holdingMessage tells the waiting side that the connection ended on

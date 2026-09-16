@@ -3475,7 +3475,7 @@ func TestAnnouncedRestartKeepsTheFollowerAlive(t *testing.T) {
 
 	sess := sole(t, hub)
 	sess.mu.Lock()
-	before := sess.waiter
+	before := hub.currentWaiter()
 	sess.mu.Unlock()
 	if before == nil {
 		t.Fatal("expected a waiter after connect")
@@ -3495,7 +3495,7 @@ func TestAnnouncedRestartKeepsTheFollowerAlive(t *testing.T) {
 
 	sess = sole(t, hub)
 	sess.mu.Lock()
-	after := sess.waiter
+	after := hub.currentWaiter()
 	sess.mu.Unlock()
 	if after != before {
 		t.Fatal("expected the SAME waiter to survive the restart, not a replacement")
@@ -3504,18 +3504,21 @@ func TestAnnouncedRestartKeepsTheFollowerAlive(t *testing.T) {
 		t.Fatalf("expected the socket path to be unchanged so a live follower keeps working:\n%s\n%s",
 			beforePath, after.WaitFollowCommand())
 	}
+	// Nothing is actually following in this test, so the truthful report
+	// is that the CHANNEL survived — which is the fact that matters: it
+	// carries every connection, so nobody should be starting a second.
 	note := hub.takeAutoReconnectNote()
-	if !strings.Contains(note, "held open across the restart") {
-		t.Fatalf("expected the report to say the follower survived, got: %s", note)
-	}
-	if strings.Contains(note, "start one with") {
-		t.Fatalf("expected NOT to be told to start a follower that is already running, got: %s", note)
+	if !strings.Contains(note, "channel survived the restart") {
+		t.Fatalf("expected the report to say the channel survived, got: %s", note)
 	}
 }
 
-// An ambiguous drop is not a planned restart: the socket closes as it
-// always did, because nothing says the connection is coming back.
-func TestUnannouncedDropStillClosesTheWaitSocket(t *testing.T) {
+// An ambiguous drop is not a planned restart: nothing says the
+// connection is coming back, so it LEAVES the channel and the reader is
+// told by name. The channel itself stays — it carries the other
+// connections, and a reader released here could not be reattached by the
+// next connect.
+func TestUnannouncedDropDetachesTheConnectionButKeepsTheChannel(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	link, _ := restartOnceServer(t, false, 0)
 	ctx := context.Background()
@@ -3541,11 +3544,12 @@ func TestUnannouncedDropStillClosesTheWaitSocket(t *testing.T) {
 	}) {
 		t.Fatal("expected the dead connection to be torn down")
 	}
-	sess.mu.Lock()
-	w := sess.waiter
-	sess.mu.Unlock()
-	if w != nil {
-		t.Fatal("expected the wait socket to be released on an ambiguous drop")
+	w := hub.currentWaiter()
+	if w == nil {
+		t.Fatal("expected the wait channel to survive one connection dropping")
+	}
+	if attached := w.Attached(); len(attached) != 0 {
+		t.Fatalf("expected the dropped connection to leave the channel, still attached: %v", attached)
 	}
 }
 
@@ -3605,9 +3609,7 @@ func TestNotConnectedSaysANotificationIsComingWhenSomethingIsFollowing(t *testin
 	defer hub.handleDisconnect(ctx, connReqFor(testConn))
 
 	sess := sole(t, hub)
-	sess.mu.Lock()
-	w := sess.waiter
-	sess.mu.Unlock()
+	w := hub.currentWaiter()
 	c, err := net.Dial("unix", strings.Fields(w.WaitFollowCommand())[3])
 	if err != nil {
 		t.Skipf("could not dial the wait socket: %v", err)
@@ -3652,10 +3654,7 @@ func TestReconnectTellsTheSurvivingFollowerToCatchUp(t *testing.T) {
 	}
 	defer hub.handleDisconnect(ctx, connReqFor(testConn))
 
-	sess := sole(t, hub)
-	sess.mu.Lock()
-	w := sess.waiter
-	sess.mu.Unlock()
+	w := hub.currentWaiter()
 
 	// Follow the socket the way the CLI does.
 	c, err := net.Dial("unix", strings.TrimSuffix(strings.Fields(w.WaitFollowCommand())[3], ""))
@@ -3735,9 +3734,7 @@ func TestConnectDuringAReconnectIsRefused(t *testing.T) {
 		t.Fatalf("expected it to say how to stop waiting, got: %s", got)
 	}
 	// The held waiter must still be held — refusing must not disturb it.
-	sess.mu.Lock()
-	w := sess.waiter
-	sess.mu.Unlock()
+	w := hub.currentWaiter()
 	if w == nil {
 		t.Fatal("expected the refusal to leave the held follower alone")
 	}
@@ -3759,7 +3756,7 @@ func TestDisconnectDuringAHeldReconnectReleasesTheFollower(t *testing.T) {
 	if !waitFor(t, "hold", func() bool {
 		sess.mu.Lock()
 		defer sess.mu.Unlock()
-		return sess.conn == nil && sess.waiter != nil
+		return sess.conn == nil && hub.currentWaiter() != nil
 	}) {
 		t.Fatal("expected a held waiter with no connection")
 	}
@@ -3768,14 +3765,19 @@ func TestDisconnectDuringAHeldReconnectReleasesTheFollower(t *testing.T) {
 	if err != nil {
 		t.Fatalf("disconnect errored: %v", err)
 	}
-	if !strings.Contains(textOf(res), "released") {
-		t.Fatalf("expected it to say the held follower was released, got: %s", textOf(res))
+	// The pending reconnect is cancelled and the connection leaves the
+	// channel by name. The channel itself stays open: it carries the
+	// other connections, and a reader released here could not be
+	// reattached by the next connect.
+	if !strings.Contains(textOf(res), "cancelled") {
+		t.Fatalf("expected it to say the pending reconnect was cancelled, got: %s", textOf(res))
 	}
-	sess.mu.Lock()
-	w := sess.waiter
-	sess.mu.Unlock()
-	if w != nil {
-		t.Fatal("expected no waiter left after disconnecting")
+	w := hub.currentWaiter()
+	if w == nil {
+		t.Fatal("expected the channel to outlive one connection being given up")
+	}
+	if attached := w.Attached(); len(attached) != 0 {
+		t.Fatalf("expected the connection to have left the channel, still attached: %v", attached)
 	}
 }
 
@@ -3853,7 +3855,7 @@ func TestFailedReconnectRetriesAndSaysHowToStop(t *testing.T) {
 	// And the follower is still held, since it is still coming back.
 	sess := sole(t, hub)
 	sess.mu.Lock()
-	w, pending := sess.waiter, sess.reconnecting
+	w, pending := hub.currentWaiter(), sess.reconnecting
 	sess.mu.Unlock()
 	if w == nil || !pending {
 		t.Fatalf("expected the hold and the pending flag to persist across failures (waiter=%v pending=%v)", w != nil, pending)

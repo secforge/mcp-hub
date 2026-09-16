@@ -166,22 +166,30 @@ risk in the plan.
 
 ## 6. Wait socket (pull-mode harnesses only)
 
-Still ONE SOCKET PER CONNECTION, deliberately, and this is a change from
-what this section first proposed.
+ONE SOCKET FOR THE PROCESS, carrying every connection, each line labelled
+with the connection it came from.
 
-Multiplexing would save follower processes and cost correctness in the
-worst place to spend it. The waiter's state machine is built on one
-source: "the connection is coming back" (`expecting`), "the connection
-ended" and "we are holding" are each a fact about one conversation, and
-one socket serving eight would have to answer a follower asking about all
-of them at once — telling it alpha has gone while beta is fine, without
-releasing it, and without a silence that means either. That is the same
-class of ambiguity this whole client exists to remove, introduced into
-the one component whose entire job is to make silence mean something.
+Not an optimisation: a pull harness (Codex) runs one `wait` process and
+cannot run one per connection in parallel. A second socket is therefore a
+conversation nothing is listening to — which is the silence this whole
+component exists to prevent, so per-connection sockets are not an option
+at all.
 
-The cost of not doing it is one `wait --follow` per connection, which a
-pull harness can run. Claude binds no socket at all here, so nothing in
-this project pays it today.
+What that costs is the thing to get right. "The connection ended" and
+"the connection is coming back" stop being facts about the channel and
+become facts about one conversation ON it, so they are delivered as
+labelled messages rather than as the socket closing:
+
+- a reader survives any one connection ending, and is told which one;
+- a held reconnect is announced once, by name, and the reader stays;
+- the socket closes exactly once, when the process itself goes away —
+  the one event that does end every conversation at the same time.
+
+The recursion this introduced is worth recording: a held connection is
+disconnected and stays attached, so "is there anything to deliver?"
+answered yes forever and delivery re-entered itself until the stack blew.
+A dead source is news exactly once. Caught by the suite, not in
+production.
 
 ## 7. Limits
 
@@ -197,8 +205,10 @@ registry row — but the second MCP registration can go.
 
 ## Status
 
-Phases 1–4 are built and released in this repository; §6 is the pull-mode
-socket, which is still one per connection — see the note there.
+Phases 1–5 are built. §8's retirement of the `mcp-hub2` registration is
+the remaining step, and waits until the new client is released and
+reconnected everywhere — that registration is read by every session on
+the machine, not just this project's.
 
 ## Phases
 

@@ -52,6 +52,11 @@ type Hub struct {
 	// receive it.
 	spillMu   sync.Mutex
 	spillPath string
+	// waiter is the process's one wait socket, bound on the first
+	// connection that needs it and carrying every connection after that
+	// — see ensureWaiter. Nil in push mode, where no socket is bound at
+	// all.
+	waiter *waiter.Waiter
 	// autoReconnect holds what this client has to tell the model but has
 	// no tool result to put it in — a reconnect it performed on its own,
 	// a relay that failed. Process-wide rather than per-session, because
@@ -521,30 +526,29 @@ func (s *session) teardownIfCurrent(conn *hubconn.Conn) {
 	s.teardown(conn, false)
 }
 
-// teardown ends the active connection. keepWaiter holds the wait socket
-// open instead of closing it, for the one case where the connection is
-// coming back on its own: closing it would kill the follower process,
-// and the reconnect would then restore the connection while leaving the
-// session with no live channel and nothing to tell it so.
+// teardown ends the active connection. keepWaiter says this connection is
+// coming back on its own, so the reader is told to hold rather than told
+// the conversation ended.
+//
+// The wait socket itself is never closed here: it carries the other
+// connections too, and a reader released on one connection ending could
+// not be reattached when the next connect happens. Only the process
+// shutting down closes it.
 func (s *session) teardown(conn *hubconn.Conn, keepWaiter bool) {
 	s.mu.Lock()
 	if s.conn != conn {
 		s.mu.Unlock()
 		return
 	}
-	w := s.waiter
 	target := s.connTarget
 	s.conn, s.connTarget = nil, connstore.Target{}
-	if !keepWaiter {
-		s.waiter = nil
-	}
 	s.mu.Unlock()
 	s.clearAttachDir()
-	if w != nil {
+	if w := s.hub.currentWaiter(); w != nil {
 		if keepWaiter {
-			w.ExpectReconnect()
+			w.ExpectReconnect(s.name)
 		} else {
-			w.Close()
+			w.Detach(s.name, "it disconnected and is not coming back on its own")
 		}
 	}
 	if target != (connstore.Target{}) {
@@ -750,20 +754,14 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		s.reportFailedAttempt(attempt, waited, err)
 		return reconnectRetry
 	}
-	// Reuse the wait socket that was deliberately kept open across the
-	// restart, so the follower that survived the gap simply resumes. Only
-	// fall back to a new one if there was nothing to keep.
-	s.mu.Lock()
-	w := s.waiter
-	s.mu.Unlock()
-	keptFollower := w != nil
-	if keptFollower {
-		w.SetSource(conn)
-	} else if harness.PushMode() {
-		// Nothing to keep and nothing to start: see handleConnect.
-	} else {
+	// The wait socket outlives any one connection, so a reconnect
+	// reattaches to the one already there and whatever was following it
+	// simply resumes. Only a harness with no socket at all binds nothing.
+	w := s.hub.currentWaiter()
+	keptFollower := w != nil && w.Following()
+	if w == nil && !harness.PushMode() {
 		var err error
-		w, err = waiter.Listen(conn)
+		w, err = s.hub.ensureWaiter()
 		if err != nil {
 			conn.Close()
 			s.note(fmt.Sprintf("Automatic reconnect dialled successfully but could "+
@@ -785,7 +783,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		// afterwards arms nothing: the follower is already gone by the
 		// time the teardown runs.
 		if !conn.Connected() && s.willAutoReconnect(conn) {
-			w.ExpectReconnect()
+			w.ExpectReconnect(s.name)
 		}
 		w.Poke()
 		s.pushToHarness(conn, w)
@@ -804,9 +802,14 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
 		ReconnectSecret: secret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
-	followerNote := "Your follower was held open across the restart and is already delivering " +
-		"again — do NOT start another, it would supersede the one that is working."
+	// Three different facts, and a reader acts differently on each: a
+	// follower that survived and is live again, a channel that survived
+	// with nothing attached to it, and no channel at all.
+	followerNote := "The wait channel survived the restart and this connection is back on it — " +
+		"do NOT start a second follower, one channel carries every connection."
 	if keptFollower {
+		followerNote = "Your follower was held open across the restart and is already delivering " +
+			"again — do NOT start another, it would supersede the one that is working."
 		// The held follower is why this needs saying twice. It survived,
 		// so the channel looks exactly as it did before — and a quiet
 		// channel now means either that nothing happened or that
@@ -814,14 +817,15 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		// unretrieved on the server. The follower cannot tell those
 		// apart, and will never deliver the second: what arrived while
 		// this client was away was never written to this connection.
-		w.Announce("[hub: reconnected after the server's restart — this follower is live again. " +
+		w.Announce("[connection: " + s.name + "]\n[hub: reconnected after the server's restart — " +
+			"this connection is live again on this channel. " +
 			"Anything sent DURING the outage was not delivered here and will not appear on this " +
 			"channel: call hub_catch_up() to retrieve it. Silence here from now on means nothing " +
 			"new, but it does not mean nothing was missed.]")
 	}
-	if !keptFollower && !harness.PushMode() {
-		followerNote = "There was no follower to keep, so nothing is delivering live events — " +
-			"start one with:\n    " + w.WaitFollowCommand()
+	if !keptFollower && !harness.PushMode() && w != nil {
+		followerNote = "The wait channel survived the restart, but nothing is following it, so " +
+			"nothing is delivering live events — start one with:\n    " + w.WaitFollowCommand()
 	}
 	s.note(fmt.Sprintf("RECONNECTED AUTOMATICALLY after the server's announced "+
 		"restart, having waited %s. You are connected again as peer %s. Messages may have arrived "+
@@ -844,11 +848,8 @@ func (s *session) reportFailedAttempt(attempt int, interval time.Duration, err e
 		"also releases the follower being held open for it.",
 		attempt, err, interval.Round(time.Second))
 	s.note(msg)
-	s.mu.Lock()
-	w := s.waiter
-	s.mu.Unlock()
-	if w != nil {
-		w.Announce("[hub: " + msg + "]")
+	if w := s.hub.currentWaiter(); w != nil {
+		w.Announce("[connection: " + s.name + "]\n[hub: " + msg + "]")
 	}
 }
 
@@ -941,9 +942,7 @@ func (s *session) notConnected() *mcp.CallToolResult {
 	// Without one, nobody will say anything and checking back is the only
 	// option. Telling someone to wait for a notification that nothing
 	// will send is worse than telling them to poll.
-	s.mu.Lock()
-	w := s.waiter
-	s.mu.Unlock()
+	w := s.hub.currentWaiter()
 	whatHappensNext := "Nothing is following, so you will NOT be told when it returns — try again " +
 		"after that, then call hub_catch_up()."
 	if w != nil && w.Following() {
@@ -970,14 +969,14 @@ func (s *session) notConnected() *mcp.CallToolResult {
 // conversation. Giving up has to be as visible as succeeding.
 func (s *session) abandonReconnect(note string) {
 	s.mu.Lock()
-	w := s.waiter
-	s.waiter = nil
 	s.reconnectAt = time.Time{}
 	s.mu.Unlock()
-	if w != nil {
-		w.Announce("[hub: the automatic reconnect did not succeed, so this follower is being " +
-			"closed. Nothing further will arrive on it. Reconnect with hub_connect when ready]")
-		w.Close()
+	// The channel itself is NOT closed: it carries the other connections,
+	// and a reader released here could not be reattached when the next
+	// connect happens. What ends is this connection's place on it, said
+	// by name so the reader knows which conversation stopped.
+	if w := s.hub.currentWaiter(); w != nil {
+		w.Detach(s.name, "its automatic reconnect did not succeed; hub_connect when ready")
 	}
 	s.note(note)
 }
@@ -1762,7 +1761,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	var w *waiter.Waiter
 	if !harness.PushMode() {
 		var err error
-		w, err = waiter.Listen(conn)
+		w, err = s.hub.ensureWaiter()
 		if err != nil {
 			conn.Close()
 			return mcp.NewToolResultError(fmt.Sprintf("could not start wait socket: %v", err)), nil
@@ -1781,7 +1780,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// afterwards arms nothing: the follower is already gone by the
 		// time the teardown runs.
 		if !conn.Connected() && s.willAutoReconnect(conn) {
-			w.ExpectReconnect()
+			w.ExpectReconnect(s.name)
 		}
 		w.Poke()
 		s.pushToHarness(conn, w)
@@ -1818,7 +1817,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// Tell the waiter to hold BEFORE scheduling, since scheduling
 		// sets the in-flight flag that willAutoReconnect reads.
 		if s.willAutoReconnect(conn) {
-			w.ExpectReconnect()
+			w.ExpectReconnect(s.name)
 		}
 		s.scheduleReconnectIfGraceful(conn)
 	}
@@ -2630,19 +2629,21 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	}()
 
 	conn, w, target := s.clearActiveConn()
+	// This connection leaves the channel by name. The channel itself
+	// stays: it carries the others, and a reader released here could not
+	// be reattached by the next connect.
+	if w != nil {
+		w.Detach(name, "you disconnected it")
+	}
 	if conn == nil {
-		// There may still be a waiter held open for a reconnect that is
-		// no longer wanted. Releasing it is the whole point of asking to
-		// disconnect, and nothing else will ever close it.
+		// A reconnect may have been pending for a connection that is no
+		// longer wanted. Cancelling it is the whole point of asking to
+		// disconnect.
 		if w != nil {
-			w.Close()
 			return mcp.NewToolResultText("not connected — a reconnect was pending and has been " +
-				"cancelled, and the follower held open for it has been released"), nil
+				"cancelled, and the channel has been told this connection is gone"), nil
 		}
 		return s.notConnected(), nil
-	}
-	if w != nil {
-		w.Close()
 	}
 	conn.Close()
 	if target != (connstore.Target{}) {
@@ -2661,17 +2662,26 @@ func (h *Hub) Shutdown() {
 	for _, s := range h.allSessions() {
 		s.closeReturnPath()
 		h.close(s.name)
-		conn, w, target := s.clearActiveConn()
+		conn, _, target := s.clearActiveConn()
 		if conn == nil {
 			continue
-		}
-		if w != nil {
-			w.Close()
 		}
 		conn.Close()
 		if target != (connstore.Target{}) {
 			_ = connstore.MarkDisconnected(target)
 		}
+	}
+	// The channel closes once, here, and only here: the process going
+	// away is the one event that ends every conversation on it at the
+	// same time. Closing it makes a backgrounded `wait --follow` see its
+	// connection end and exit on its own, rather than lingering as a
+	// process the harness has to warn about.
+	h.mu.Lock()
+	w := h.waiter
+	h.waiter = nil
+	h.mu.Unlock()
+	if w != nil {
+		_ = w.Close()
 	}
 }
 

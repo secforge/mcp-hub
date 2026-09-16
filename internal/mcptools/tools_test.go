@@ -1631,8 +1631,11 @@ func TestPeersToolReportsDisconnectInsteadOfStaleRoster(t *testing.T) {
 	if !strings.Contains(textOf(res), "not connected") {
 		t.Fatalf("expected a clear not-connected result, got: %s", textOf(res))
 	}
-	if c, w := sole(t, hub).activeConn(); c != nil || w != nil {
-		t.Fatalf("expected the dead connection to be torn down, got conn=%v waiter=%v", c, w)
+	// The connection is gone; the CHANNEL is not, and must not be — it
+	// carries every other connection, and a reader released here could
+	// not be reattached by the next connect.
+	if c, _ := sole(t, hub).activeConn(); c != nil {
+		t.Fatalf("expected the dead connection to be torn down, got conn=%v", c)
 	}
 }
 
@@ -1709,12 +1712,15 @@ func TestDisconnectDetectedAutomaticallyWithoutAnyToolCall(t *testing.T) {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 
-	conn, _ := sole(t, hub).activeConn()
+	// Held before closing: a teardown releases the name, so afterwards
+	// there is nothing to look up — which is the point.
+	sess := sole(t, hub)
+	conn, _ := sess.activeConn()
 	conn.Close()
 
 	deadlinePoll(t, func() bool {
-		c, w := sole(t, hub).activeConn()
-		return c == nil && w == nil
+		c, _ := sess.activeConn()
+		return c == nil
 	})
 }
 

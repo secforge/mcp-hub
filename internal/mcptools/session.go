@@ -51,7 +51,6 @@ type session struct {
 	// it — so the difference is recorded rather than guessed at.
 	everConnected bool
 	conn          *hubconn.Conn
-	waiter        *waiter.Waiter
 	// connTarget is the connstore.Target this connection was reached
 	// through, so teardown can mark it disconnected in the store —
 	// zero-valued for a connection not tracked there at all
@@ -302,10 +301,18 @@ func (h *Hub) allSessions() []*session {
 
 // activeConn returns this session's connection and wait socket, or (nil,
 // nil) when it is not connected.
+// activeConn returns this session's connection and the wait socket
+// serving it, or (nil, …) when it is not connected.
+//
+// The waiter is the PROCESS's, not this session's: a pull harness runs
+// one `wait` process and cannot run one per connection, so every
+// connection is carried on the one socket and identified by name in what
+// it writes. See waiter.attached.
 func (s *session) activeConn() (*hubconn.Conn, *waiter.Waiter) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.conn, s.waiter
+	conn := s.conn
+	s.mu.Unlock()
+	return conn, s.hub.currentWaiter()
 }
 
 // setActiveConn records a newly established connection. target identifies
@@ -314,8 +321,11 @@ func (s *session) activeConn() (*hubconn.Conn, *waiter.Waiter) {
 func (s *session) setActiveConn(conn *hubconn.Conn, w *waiter.Waiter, target connstore.Target) {
 	s.mu.Lock()
 	s.everConnected = true
-	s.conn, s.waiter, s.connTarget = conn, w, target
+	s.conn, s.connTarget = conn, target
 	s.mu.Unlock()
+	// Attached under this connection's name, so every line the reader
+	// receives says which conversation it belongs to.
+	w.SetSource(s.name, conn)
 }
 
 // setCatchUpKey records id as this connection's stable identity for
@@ -359,11 +369,11 @@ func (s *session) setCatchUpKey(id connstore.Target) {
 // right now, regardless of which Conn instance a caller happens to hold.
 func (s *session) clearActiveConn() (*hubconn.Conn, *waiter.Waiter, connstore.Target) {
 	s.mu.Lock()
-	conn, w, target := s.conn, s.waiter, s.connTarget
-	s.conn, s.waiter, s.connTarget = nil, nil, connstore.Target{}
+	conn, target := s.conn, s.connTarget
+	s.conn, s.connTarget = nil, connstore.Target{}
 	s.mu.Unlock()
 	s.clearAttachDir()
-	return conn, w, target
+	return conn, s.hub.currentWaiter(), target
 }
 
 // note queues something for the model that has no tool result to go in,
@@ -482,4 +492,47 @@ func (h *Hub) cursorBelongsElsewhere(mine *session, cursor string) string {
 		}
 	}
 	return ""
+}
+
+// currentWaiter is the process's wait socket, or nil where none is bound
+// (push mode, or a harness that never needed one).
+func (h *Hub) currentWaiter() *waiter.Waiter {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.waiter
+}
+
+// ensureWaiter binds the process's one wait socket, on the first
+// connection that needs it.
+//
+// One socket, because a pull harness runs one `wait` process and cannot
+// run one per connection: a second socket would be a conversation nothing
+// is listening to, which is the silence this whole component exists to
+// prevent. Connections are told apart by the label on every line rather
+// than by which socket carried it.
+func (h *Hub) ensureWaiter() (*waiter.Waiter, error) {
+	h.mu.Lock()
+	if h.waiter != nil {
+		w := h.waiter
+		h.mu.Unlock()
+		return w, nil
+	}
+	h.mu.Unlock()
+	w, err := waiter.Listen()
+	if err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.waiter != nil {
+		// Another connect bound one while this was listening. Keep the
+		// first: a second socket is one nothing was told to read.
+		go w.Close()
+		return h.waiter, nil
+	}
+	h.waiter = w
+	return w, nil
 }
