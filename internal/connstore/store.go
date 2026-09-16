@@ -143,15 +143,25 @@ type Entry struct {
 	// the wire — purely so a later session can offer the name this
 	// project used last, rather than the caller having to remember it or
 	// invent a second one for the same conversation.
-	LocalName string       `json:"localName,omitempty"`
+	LocalName string `json:"localName,omitempty"`
+	// HolderPID is the process that last held this connection open, and
+	// it is what lets a later run tell "a previous process had this and
+	// is gone" from "someone deliberately left". Cleared by an explicit
+	// disconnect, kept by a drop or a process simply ending — see
+	// MarkLeftOnPurpose.
+	//
+	// A pid is reused eventually, which is why it is only ever read
+	// alongside "is that process alive": a live pid means somebody may
+	// still hold this, and nothing is claimed about it.
+	HolderPID int          `json:"holderPid,omitempty"`
 	CatchUp   CatchUpState `json:"catchUp,omitempty"`
 }
 
 // empty reports whether e carries nothing worth keeping on disk.
 func (e Entry) empty() bool {
 	return e.PeerID == "" && e.Name == "" && e.ReconnectSecret == "" &&
-		e.Topic == "" && e.LocalName == "" && !e.Connected && e.LastConnectedAt.IsZero() &&
-		e.CatchUp.empty()
+		e.Topic == "" && e.LocalName == "" && e.HolderPID == 0 && !e.Connected &&
+		e.LastConnectedAt.IsZero() && e.CatchUp.empty()
 }
 
 // ListedEntry pairs a stored entry with the identity it is stored under,
@@ -375,6 +385,31 @@ func Upsert(target Target, identity Entry) error {
 
 // MarkDisconnected clears target's Connected flag, leaving everything
 // else — including the identity needed to reconnect — in place.
+// MarkLeftOnPurpose records that this connection was given up
+// deliberately — an explicit hub_disconnect — rather than ending because
+// the connection dropped or the process went away.
+//
+// The difference is the whole point of recording a holder at all: a later
+// run reports what a previous process was holding when it died, and
+// reporting something the caller chose to leave would be nagging about a
+// decision it already made.
+func MarkLeftOnPurpose(target Target) error {
+	return withLock(true, func() error {
+		s, err := load()
+		if err != nil {
+			return err
+		}
+		e, ok := getEntry(s, target.Project, target.Link)
+		if !ok {
+			return nil
+		}
+		e.Connected = false
+		e.HolderPID = 0
+		setEntry(&s, target.Project, target.Link, e)
+		return save(s)
+	})
+}
+
 func MarkDisconnected(target Target) error {
 	return withLock(true, func() error {
 		s, err := load()

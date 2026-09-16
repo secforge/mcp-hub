@@ -816,6 +816,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	}
 	_ = connstore.Upsert(target, connstore.Entry{
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
+		HolderPID:       os.Getpid(),
 		ReconnectSecret: secret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
 	// FOUR different facts, and a reader acts differently on each: push
@@ -1109,6 +1110,9 @@ func receiveTools() string {
 func (h *Hub) Register(s *server.MCPServer) {
 	activeHub = h
 	sweepStaleAttachmentDirs()
+	// Said on the first tool call, whichever it is: the connections a
+	// previous run held are gone, and nothing else would ever mention it.
+	h.reportAbandonedConnections()
 	// Every tool goes through withReconnectNote so that a reconnection
 	// this client performed on its own is reported on the very next call,
 	// whichever call that happens to be. Wrapping here rather than in
@@ -1854,6 +1858,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 	_ = connstore.Upsert(target, connstore.Entry{
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
+		HolderPID:       os.Getpid(),
 		ReconnectSecret: reconnectSecret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
 
@@ -2673,7 +2678,11 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	conn.Close()
 	if target != (connstore.Target{}) {
-		_ = connstore.MarkDisconnected(target)
+		// Left ON PURPOSE, which is not the same as ended — a later run
+		// reports what a previous process was still holding when it
+		// died, and must not nag about a connection its caller chose to
+		// give up.
+		_ = connstore.MarkLeftOnPurpose(target)
 	}
 	return mcp.NewToolResultText("disconnected"), nil
 }
