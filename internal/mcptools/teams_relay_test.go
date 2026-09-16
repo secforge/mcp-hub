@@ -1893,6 +1893,11 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
+	// Cleared first: this package shares one connection store, and a
+	// closed httptest server's port is reused, so an earlier test's
+	// target can be this one's — and a gap widens rather than replaces,
+	// which would carry that test's start into this one's.
+	clearCatchUpGap(id)
 	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()
@@ -4233,6 +4238,7 @@ func TestAGapThatStartsAtACursorIsRetrievedByCursor(t *testing.T) {
 	id := targetForLink(ctx, link)
 	// Recorded the way the seek branch records it: the start is this
 	// client's own stored cursor, the end is the seek's landing time.
+	clearCatchUpGap(id)
 	setCatchUpGapFromCursor(id, "639251841733942000.45797", "2026-09-16T19:40:00Z")
 
 	hub := NewHub()

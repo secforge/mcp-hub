@@ -1634,7 +1634,7 @@ func TestPeersToolReportsDisconnectInsteadOfStaleRoster(t *testing.T) {
 
 	conn, _ := sole(t, hub).activeConn()
 	conn.Close() // simulate a silent drop, not a clean hub_disconnect()
-	deadlinePoll(t, func() bool { c, _ := sole(t, hub).activeConn(); return c == nil })
+	deadlinePoll(t, func() bool { return droppedConn(hub) })
 
 	res, err := hub.handlePeers(ctx, connReqFor(testConn))
 	if err != nil {
@@ -1649,8 +1649,8 @@ func TestPeersToolReportsDisconnectInsteadOfStaleRoster(t *testing.T) {
 	// The connection is gone; the CHANNEL is not, and must not be — it
 	// carries every other connection, and a reader released here could
 	// not be reattached by the next connect.
-	if c, _ := sole(t, hub).activeConn(); c != nil {
-		t.Fatalf("expected the dead connection to be torn down, got conn=%v", c)
+	if !droppedConn(hub) {
+		t.Fatal("expected the dead connection to be torn down")
 	}
 }
 
@@ -1705,7 +1705,7 @@ func TestConnectAfterSilentDisconnectDoesNotRequireExplicitDisconnect(t *testing
 
 	conn, _ := sole(t, hub).activeConn()
 	conn.Close()
-	deadlinePoll(t, func() bool { c, _ := sole(t, hub).activeConn(); return c == nil })
+	deadlinePoll(t, func() bool { return droppedConn(hub) })
 
 	res, err := hub.handleConnect(ctx, connReq)
 	if err != nil || res.IsError {

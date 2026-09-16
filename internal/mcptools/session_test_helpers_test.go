@@ -54,3 +54,19 @@ func connReqFor(name string) mcp.CallToolRequest {
 // on addresses has to say which case it is in rather than reading an
 // absent inbox as a failure.
 func harnessAvailableForTest() bool { return harness.PushMode() }
+
+// droppedConn reports that this hub is no longer holding a live
+// connection, whichever way the drop landed: a connection that is not
+// coming back gives up its NAME, so the session may be gone entirely, or
+// it may still be there with nothing attached. Both mean the same thing
+// to a caller, and which one a test observes depends on timing it should
+// not have to care about — polling through sole() asserted the second and
+// failed on the first.
+func droppedConn(h *Hub) bool {
+	for _, s := range h.allSessions() {
+		if c, _ := s.activeConn(); c != nil {
+			return false
+		}
+	}
+	return true
+}

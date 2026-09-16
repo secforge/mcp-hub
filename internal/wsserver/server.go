@@ -158,23 +158,27 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 	}
 
 	session := h.manager.GetOrCreate(sessionID)
-	var writeErr error
 	_, reused := session.Join(reconnectSecret,
 		func(id string) hubsession.Peer {
 			peerID = id
 			p = &peer{id: id, conn: conn, done: done, name: name, agePublicKey: agePublicKey,
 				pingPeriod: snapPingPeriod, writeWait: snapWriteWait,
-				out: make(chan any, outboundQueue)}
+				out:      make(chan any, outboundQueue),
+				closing:  make(chan closeRequest, 1),
+				finished: make(chan struct{}),
+			}
 			go p.writeLoop()
 			return p
 		},
 		func() {
-			writeErr = conn.WriteJSON(wire.NewJoined(peerID, name, agePublicKey))
+			// QUEUED like everything else. Written here, this was a second
+			// writer on a socket that already had one, which is both a
+			// race and — two frames interleaved — a protocol violation.
+			// Ordering still holds: the roster Join delivers next goes
+			// into the same queue, behind this.
+			p.Deliver(wire.NewJoined(peerID, name, agePublicKey))
 		},
 	)
-	if writeErr != nil {
-		return
-	}
 	if logger != nil {
 		logger.AppendJoined(peerID, name, agePublicKey, reused, reconnectSecret != "", time.Now().UTC().Format(time.RFC3339))
 	}
@@ -216,7 +220,7 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 		}
 
 		if err := session.DeliverTo(p, m.To, wire.NewDirectedMsg(peerID, m.Text, ts, m.Attachments, m.Format, m.ReplyTo, m.Mentions)); err != nil {
-			conn.WriteJSON(wire.NewError(err.Error()))
+			p.Deliver(wire.NewError(err.Error()))
 			continue
 		}
 		if logger != nil {
@@ -240,18 +244,44 @@ func (h *Handler) serve(conn *websocket.Conn, sessionID, name, agePublicKey, rec
 // recoverable: the server holds the messages, and catch-up walks them.
 const outboundQueue = 64
 
+// closeRequest is the END OF THE QUEUE, not an action taken beside it.
+//
+// Closing the socket directly let a close overtake frames already queued
+// for that peer — so a peer could learn the connection had ended and
+// never learn why, because the error frame explaining it was still
+// waiting. Queued, it is written after them, by the same goroutine, in
+// order. It is also what removes the send-on-closed-channel panic: with
+// the close being an item, nothing ever closes the channel items are sent
+// on.
+type closeRequest struct {
+	code   int
+	reason string
+}
+
 type peer struct {
 	id           string
-	mu           sync.Mutex
 	conn         *websocket.Conn
 	done         chan struct{}
 	name         string
 	agePublicKey string
 	pingPeriod   time.Duration
 	writeWait    time.Duration
-	// out carries events to the single goroutine that writes them, so a
-	// Deliver never blocks on the network. Closed once, by closeOut.
-	out       chan any
+	// out carries everything this peer is sent to the single goroutine
+	// that writes it — events, the joined frame, errors. NEVER CLOSED: a
+	// closed channel is what turned a delivery racing a teardown into a
+	// panic, and the close travels through the queue instead (see
+	// closeRequest).
+	out chan any
+	// closing carries the one close request, and is separate from out so
+	// that a peer whose queue is full can still be told to go away — a
+	// full queue is exactly when that has to work.
+	closing chan closeRequest
+	// finished is closed by writeLoop when it has written everything it
+	// is going to and shut the socket. Teardown waits on THIS, not on a
+	// flush: a barrier enqueued after a close is refused and returns at
+	// once, which reads as "nothing left to wait for" while the close is
+	// still unwritten.
+	finished  chan struct{}
 	closeOnce sync.Once
 }
 
@@ -272,41 +302,83 @@ func (p *peer) Deliver(event any) {
 	select {
 	case p.out <- event:
 	default:
-		p.closeOut()
+		// A full queue means this peer has stopped reading. Blocking is
+		// the bug this queue exists to remove and dropping is silent, so
+		// it is closed: a close is the one signal a peer that has stopped
+		// reading cannot miss.
+		p.requestClose(websocket.CloseTryAgainLater, "outbound queue full")
 	}
 }
 
-// closeOut ends this peer's outbound side once, which stops the writer
-// goroutine and closes the socket, so the blocked ReadMessage in serve
-// returns and the ordinary teardown runs.
-func (p *peer) closeOut() {
+// requestClose queues this peer's close, once. Everything else — a full
+// queue, a failed write, the session superseding this identity, serve
+// returning — goes through here, so there is exactly one path that ends a
+// connection and it is ordered against everything already queued.
+func (p *peer) requestClose(code int, reason string) {
 	p.closeOnce.Do(func() {
-		close(p.out)
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		_ = p.conn.Close()
+		p.closing <- closeRequest{code: code, reason: reason}
 	})
+}
+
+// closeOut ends this peer's outbound side and waits for the writer to
+// have finished — not for a flush, and not merely for the request to be
+// queued. The socket is shut by the writer itself, which is what makes
+// the blocked ReadMessage in serve return and run the ordinary teardown.
+func (p *peer) closeOut() {
+	p.requestClose(websocket.CloseNormalClosure, "")
+	<-p.finished
 }
 
 // writeLoop is the ONLY place this peer's socket is written for events.
 // One goroutine, so writes cannot interleave, and a deadline on each so a
 // wedged connection ends instead of holding this goroutine forever.
 func (p *peer) writeLoop() {
-	for event := range p.out {
-		p.mu.Lock()
-		_ = p.conn.SetWriteDeadline(time.Now().Add(p.writeWait))
-		err := p.conn.WriteJSON(event)
-		p.mu.Unlock()
-		if err != nil {
-			// The connection is gone or wedged. Closing makes the reader
-			// return and run the normal teardown; draining the rest keeps
-			// this loop from blocking a Deliver that is already in flight.
-			p.closeOut()
-			for range p.out {
+	defer close(p.finished)
+	for {
+		select {
+		case event := <-p.out:
+			if !p.write(event) {
+				p.shutdown(websocket.CloseAbnormalClosure, "write failed")
+				return
 			}
+		case cr := <-p.closing:
+			// Everything already queued goes out FIRST: the close is the
+			// end of this peer's stream, not a jump to the front of it.
+			for {
+				select {
+				case event := <-p.out:
+					if !p.write(event) {
+						p.shutdown(websocket.CloseAbnormalClosure, "write failed")
+						return
+					}
+					continue
+				default:
+				}
+				break
+			}
+			p.shutdown(cr.code, cr.reason)
 			return
 		}
 	}
+}
+
+// write is the ONLY place an application frame reaches this socket, which
+// is what makes ordering a property of the code rather than of timing. A
+// write mutex would have made concurrent writes safe and still let them
+// interleave in the wrong order — two interleaved frames are a protocol
+// violation, not just a race — so there is no mutex here and no second
+// writer for one to guard.
+func (p *peer) write(event any) bool {
+	_ = p.conn.SetWriteDeadline(time.Now().Add(p.writeWait))
+	return p.conn.WriteJSON(event) == nil
+}
+
+// shutdown sends the close frame and shuts the socket. Called only from
+// writeLoop, on its way out.
+func (p *peer) shutdown(code int, reason string) {
+	_ = p.conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(code, reason), time.Now().Add(p.writeWait))
+	_ = p.conn.Close()
 }
 
 // Close implements hubsession.Peer — see its doc comment on why this must
@@ -316,11 +388,11 @@ func (p *peer) writeLoop() {
 // blocked ReadMessage call in serve's loop return an error and run its
 // own normal teardown (session.Leave, log append) on its own goroutine.
 func (p *peer) Close(code int, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_ = p.conn.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(code, reason), time.Now().Add(p.writeWait))
-	_ = p.conn.Close()
+	// Queued, not written here, and deliberately NOT waited for: this is
+	// called from Join with the session lock held, and waiting for a
+	// socket under that lock is the stall this whole queue exists to
+	// prevent. serve's own teardown waits.
+	p.requestClose(code, reason)
 }
 
 // pingLoop periodically pings the connection until either a write fails
