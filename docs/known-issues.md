@@ -26,10 +26,12 @@ has been instrumented to confirm it.
 
 **Why it matters anyway.** A test that fails only under load and passes on
 every retry trains a reader to re-run rather than to look, which is exactly
-the habit that makes a real intermittent failure invisible. Two other tests
+the habit that makes a real intermittent failure invisible. Three other tests
 (`TestSendWithAttachmentsDeliversThem`,
-`TestHubSendWithoutConfirmCursorDoesNotConfirm`) each failed once the same
-way and likewise never reproduced.
+`TestHubSendWithoutConfirmCursorDoesNotConfirm`,
+`TestCatchUpGapDedupBranchPrunesHandedOverAhead`) each failed once the same
+way and likewise never reproduced — the last on 2026-09-16, clean on three
+isolated runs and three full-package runs immediately after.
 
 **Not investigated further** because it was found while building something
 unrelated. The next step would be to raise or parameterise the deadline

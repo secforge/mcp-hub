@@ -1530,6 +1530,19 @@ func (h *Hub) Register(s *server.MCPServer) {
 					"as ordinary hub_catch_up: call repeatedly until it reports the gap fully "+
 					"retrieved. If there's no recorded gap for this session, reports that and does "+
 					"nothing. Ignored if false or omitted (the default, ordinary behavior)")),
+			mcp.WithNumber("limit", mcp.Description(
+				"Optional, and only where this client DELIVERS the backlog rather than returning "+
+					"it one message per call (see the connect result). How many messages this run "+
+					"may hand you. It can only LOWER the limit: ask for more than the built-in cap "+
+					"and you get the cap, with the figure that actually applied stated in the "+
+					"closing message. Use it when you know your own remaining room better than a "+
+					"constant does — a few if you want a look, omitted for as much as the budget "+
+					"allows")),
+			mcp.WithNumber("maxKB", mcp.Description(
+				"Optional companion to limit, in kilobytes, with the same rule: it can only lower "+
+					"the cap, never raise it. Two limits rather than one because message count and "+
+					"total size are different costs and the evidence cannot say which exhausts a "+
+					"reader first")),
 		),
 		h.handleCatchUp,
 	)
@@ -3481,7 +3494,10 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		h.mu.Lock()
 		id := h.catchUpID
 		h.mu.Unlock()
-		go h.runCatchUpPush(conn, id, anchor)
+		go h.runCatchUpPush(conn, id, anchor, catchUpWant{
+			Messages: req.GetInt("limit", 0),
+			KB:       req.GetInt("maxKB", 0),
+		})
 		return mcp.NewToolResultText(decisionNote(cursor, project, conn, measuredBehind, branch) +
 			seekNote +
 			"catching up — the messages are being DELIVERED to you one at a time, as live traffic " +

@@ -43,6 +43,34 @@ const (
 	catchUpPushFetchTimeout = 30 * time.Second
 )
 
+// catchUpWant is how much of the backlog the model asked for. It can
+// only ever ask for LESS.
+//
+// The model knows something this code does not — how much room it has
+// left, and whether it wants the whole backlog or a look at the next
+// few. So it may lower either limit. It may not raise them: the ceiling
+// is what stops a backlog spending a reader's whole remaining attention
+// in one run, and a limit the reader can raise is not a ceiling. Asking
+// for more than the cap gets the cap, silently on the model's side but
+// stated in the closing message, so the number it reads is the one that
+// applied.
+type catchUpWant struct {
+	Messages int
+	KB       int
+}
+
+// limits resolves a request against the hard caps.
+func (w catchUpWant) limits() (messages, bytes int) {
+	messages, bytes = catchUpPushMaxMessages, catchUpPushBudget
+	if w.Messages > 0 && w.Messages < messages {
+		messages = w.Messages
+	}
+	if w.KB > 0 && w.KB*1024 < bytes {
+		bytes = w.KB * 1024
+	}
+	return messages, bytes
+}
+
 // catchUpResult is what one push run did, for the closing message.
 type catchUpResult struct {
 	Delivered int
@@ -58,10 +86,12 @@ type catchUpResult struct {
 // Runs on its own goroutine: the tool call returns immediately, because
 // the delivery is the point rather than the answer. Everything it learns
 // goes to the model the same way a live message does.
-func (h *Hub) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wire.Anchor) {
+func (h *Hub) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wire.Anchor,
+	want catchUpWant) {
 	var res catchUpResult
+	maxMessages, maxBytes := want.limits()
 
-	for res.Delivered < catchUpPushMaxMessages && res.Bytes < catchUpPushBudget {
+	for res.Delivered < maxMessages && res.Bytes < maxBytes {
 		ev, ok, err := conn.RequestMessageAfterAwaiting(anchor)
 		if err != nil {
 			res.Err = err
@@ -105,7 +135,8 @@ func (h *Hub) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wir
 	}
 
 	if res.StoppedBy == "" && !res.CaughtUp && res.Err == nil {
-		res.StoppedBy = "this run reached its delivery budget"
+		res.StoppedBy = fmt.Sprintf("this run reached its limit of %d messages or %d KB",
+			maxMessages, maxBytes/1024)
 	}
 	h.pushCatchUpSummary(res)
 }
