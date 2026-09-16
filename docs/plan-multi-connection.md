@@ -200,8 +200,11 @@ the honest way to say so.
 ## 8. What this retires
 
 `mcp-hub2` exists only to hold a second connection, and becomes
-redundant. `MCP_HUB_SERVER_NAME` stays — it names the inbox and the
-registry row — but the second MCP registration can go.
+redundant. `MCP_HUB_SERVER_NAME` stays, as the FALLBACK attribution for
+anything not said on behalf of a named connection — but the second MCP
+registration can go. It is no longer this project's to remove unilaterally:
+every session on the machine reads that config, so it waits until the new
+client is released and reconnected everywhere.
 
 ## Status
 
@@ -221,7 +224,7 @@ the machine, not just this project's.
 3. **Labelling.** Push shape, cursor trailer, `#hub conn=`, cross-connection
    confirm refusal.
 4. **Shared budget + serialized catch-up.**
-5. **Multiplexed wait socket.**
+5. **One wait channel for the process**, carrying every connection.
 6. **Retire the `mcp-hub2` registration; docs.**
 
 Phases 1–3 are what make it usable; 4 is what makes it safe under load.
