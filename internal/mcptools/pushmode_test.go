@@ -172,3 +172,37 @@ func TestTheConnectNoteDoesNotSayTheSameThingTwice(t *testing.T) {
 		t.Errorf("the truncation rule is stated more than once:\n%s", got)
 	}
 }
+
+// "Nothing to catch up" describes the SERVER's unread position. The
+// client's own buffer is a different store, and a pull-only reader can
+// hold undelivered events while the server truthfully reports nothing
+// behind. Saying "live traffic will arrive normally" there is the
+// opposite of true, since nothing is delivering it.
+//
+// Found live 2026-09-16: a session followed the connect instructions
+// exactly, was told it was caught up, and was holding nine buffered
+// events including the message it was being asked about.
+func TestCaughtUpDoesNotClaimDeliveryWhileEventsSitInTheBuffer(t *testing.T) {
+	restore := harness.ClearEnvForTesting()
+	defer restore()
+
+	for _, tc := range []struct {
+		name       string
+		buffered   bool
+		wantPhrase string
+		notPhrase  string
+	}{
+		{"nothing buffered", false, "live traffic will arrive normally", "hub_receive"},
+		{"events waiting", true, "hub_receive", "live traffic will arrive normally"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := caughtUpText(tc.buffered)
+			if !strings.Contains(text, tc.wantPhrase) {
+				t.Errorf("result does not say %q:\n%s", tc.wantPhrase, text)
+			}
+			if strings.Contains(text, tc.notPhrase) {
+				t.Errorf("result wrongly says %q:\n%s", tc.notPhrase, text)
+			}
+		})
+	}
+}

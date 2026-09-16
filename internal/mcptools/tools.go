@@ -391,6 +391,19 @@ func decisionNote(cursor, project string, conn *hubconn.Conn, measured int, bran
 		from, where, stated, measuredNote, branch)
 }
 
+// caughtUpText renders the nothing-to-do answer, saying which store it is
+// answering about. See its call site for the live failure that made the
+// distinction necessary.
+func caughtUpText(buffered bool) string {
+	base := "nothing to catch up — no prior position recorded and the server reports nothing behind"
+	if buffered {
+		return base + " — BUT this client is already holding buffered events and nothing is " +
+			"delivering them: call hub_receive to take them. That is a different store from the " +
+			"catch-up position, which is why this call reports nothing"
+	}
+	return base + "; live traffic will arrive normally"
+}
+
 // noteCatchUpWriteFailure surfaces a failed write of the persisted
 // catch-up state on the next tool call.
 //
@@ -876,6 +889,8 @@ func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int
 	keptFollower := w != nil
 	if keptFollower {
 		w.SetSource(conn)
+	} else if harness.PushMode() {
+		// Nothing to keep and nothing to start: see handleConnect.
 	} else {
 		var err error
 		w, err = waiter.Listen(conn)
@@ -1781,10 +1796,21 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// fix differs entirely depending on which case it is.
 		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %v%s", err, selfupdate.Check().Note())), nil
 	}
-	w, err := waiter.Listen(conn)
-	if err != nil {
-		conn.Close()
-		return mcp.NewToolResultError(fmt.Sprintf("could not start wait socket: %v", err)), nil
+	// NO WAIT SOCKET IN PUSH MODE. The socket exists so a `wait` process
+	// can carry events to a model that has no other route; where the
+	// harness takes deliveries there is no such process and never will
+	// be, so binding one creates a file nothing will ever connect to and
+	// a command the guidance no longer mentions. hub_wait and hub_receive
+	// are not registered in this mode either — the whole pull apparatus
+	// is absent rather than idle.
+	var w *waiter.Waiter
+	if !harness.PushMode() {
+		var err error
+		w, err = waiter.Listen(conn)
+		if err != nil {
+			conn.Close()
+			return mcp.NewToolResultError(fmt.Sprintf("could not start wait socket: %v", err)), nil
+		}
 	}
 	// Live push is the one delivery path the reader did not ask for, so it
 	// is the one that needs a ceiling: hub_read and hub_catch_up spend the
@@ -3349,10 +3375,27 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		h.mu.Lock()
 		h.knownContiguous = true
 		h.mu.Unlock()
+		// "Nothing to catch up" is a statement about the SERVER's unread
+		// position. This client's own buffer is a different store, and a
+		// pull-only reader can be holding undelivered events while the
+		// server truthfully reports nothing behind — at which point
+		// "live traffic will arrive normally" is the opposite of true,
+		// because nothing is delivering it.
+		//
+		// Found live, 2026-09-16: a session followed the connect
+		// instructions exactly, called hub_catch_up, was told it was
+		// caught up, and was holding nine buffered events — including the
+		// message it was being asked whether it had received.
+		tail := "; live traffic will arrive normally"
+		if has, _ := conn.Peek(); has {
+			tail = " — BUT this client is already holding buffered events and nothing is " +
+				"delivering them: call hub_receive to take them. That is a different store from " +
+				"the catch-up position, which is why this call reports nothing"
+		}
 		return mcp.NewToolResultText(
 			decisionNote(cursor, project, conn, measuredBehind, branch) +
-				"nothing to catch up — no prior position recorded and the server reports nothing behind; " +
-				"live traffic will arrive normally" + gapNote,
+				"nothing to catch up — no prior position recorded and the server reports nothing " +
+				"behind" + tail + gapNote,
 		), nil
 	}
 
