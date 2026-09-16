@@ -28,104 +28,20 @@ import (
 // Hub bundles the single active hub connection + wait socket for one
 // mcp-hub-client process.
 type Hub struct {
-	// mu guards conn/waiter/connTarget. Needed because, unlike every other
-	// mutation of these fields (which happens synchronously inside a tool
-	// call), conn.OnActivity's disconnect callback (see handleConnect) can
-	// clear them from the Conn's own background read goroutine at any
-	// moment — automatic detection of a dead connection, not just the
-	// reactive per-call check a tool handler does.
-	mu     sync.Mutex
-	conn   *hubconn.Conn
-	waiter *waiter.Waiter
-	// connTarget is the connstore.Target the active conn was reached
-	// through, so teardownIfCurrent/clearActiveConn can mark it
-	// disconnected in the store — zero-valued for a connection not tracked
-	// there at all (teams_relay_connect; see handleTeamsRelayConnect).
-	connTarget connstore.Target
-	// lastHandedOverCursor is the contiguous high-water mark of message
-	// positions actually returned to the model via hub_catch_up — "the
-	// last position before which everything has been handed over", never
-	// just "the newest position seen". See handleCatchUp for the full
-	// rationale (advance-only-on-hand-over, not on-fetch).
-	//
-	// Persisted via connstore.Target.Get/Set, keyed by catchUpID
-	// (below) — durable across a process restart, which a plain
-	// in-memory field wouldn't be. catchUpID, not connTarget, is what a
-	// plain hub_connect session AND a teams_relay_connect session (which
-	// has no connstore.Target at all — see connTarget's own comment) can
-	// both derive a stable identity from; see setCatchUpKey and
-	// catchUpKeyForRelay.
-	lastHandedOverCursor string
-	// knownContiguous records that this session has been told, by the
-	// server, that nothing precedes live traffic: a catch-up walk that
-	// answered "caught up", or a connect reporting nothing behind and no
-	// recorded gap.
-	//
-	// It is what makes auto-confirming a live message safe. A returning
-	// tool call IS delivery to the model — unlike wait --follow, which
-	// writes to a socket nobody may read — so a synchronous hand-over is
-	// exactly the confirmation hub_confirm would give. What it cannot do
-	// on its own is prove the message FOLLOWS the last confirmed one:
-	// cursors are opaque, so a client holding two of them cannot tell
-	// whether anything sits between. Advancing anyway would silently skip
-	// that middle, which is the one failure this whole mechanism exists to
-	// prevent. Knowing the gap is empty is the missing premise, and only
-	// the server can supply it.
-	knownContiguous bool
-	// seekedSinceConnect records that this connection has already seeked
-	// past a large backlog, so it does so at most once. Conn.Behind() is a
-	// connect-time snapshot that never moves, so without this every
-	// subsequent hub_catch_up would see the same large number, seek again,
-	// and overwrite the recorded gap — losing the retrieval progress of
-	// the range the first seek skipped.
-	seekedSinceConnect bool
-	// catchUpID is the current connection's stable identity for
-	// lastHandedOverCursor's persistence — set once per successful
-	// connect via setCatchUpKey, which also loads whatever was
-	// previously persisted for it. The zero value (Valid() false) means
-	// "nothing to key persistence on" (not connected, or a connection
-	// kind that hasn't called setCatchUpKey).
-	catchUpID connstore.Target
-	// handedOverAhead is the set of Msg.Cursor values confirmed handed
-	// to the model — via a synchronous tool result (hub_receive/
-	// hub_wait/hub_catch_up, anything routed through
-	// resultWithReceivedAttachments — see recordHandedOver) — at a
-	// position AHEAD of lastHandedOverCursor's own contiguous mark.
-	// handleCatchUp checks this before showing a message: one already in
-	// this set was already shown live, so catch-up advances past it
-	// (a confirmed hand-over, so the mark legitimately moves) instead of
-	// showing a duplicate. Entries are pruned as handleCatchUp's walk
-	// reaches and consumes them; an entry the walk never reaches (a
-	// message only ever seen via hub_receive/hub_wait, never followed by
-	// a catch-up call that walks past it) is not otherwise pruned by
-	// that path — but it IS persisted (connstore.CatchUpState.Ahead,
-	// alongside Cursor/Gap) and fully cleared on every hub_confirm, so
-	// it stays bounded by traffic since the last confirm rather than by
-	// the whole conversation's history.
-	handedOverAhead map[string]bool
-
-	// redial is what a graceful restart needs in order to come back
-	// without the model having to act: the link and name this session last
-	// connected with. Held only after a successful connect, and cleared by
-	// an explicit hub_disconnect — a caller that chose to leave must not
-	// be dragged back in.
-	redialLink string
-	redialName string
-	// autoReconnect holds the outcome of a reconnect this client performed
-	// on its own, waiting to be told to the model. A reconnection the
-	// model never hears about is exactly the delivery-vs-comprehension gap
-	// this codebase keeps closing elsewhere: the socket would be healthy
-	// and the model would still believe it was offline.
+	// mu guards the session map and nothing else. Each session guards its
+	// own state — see session.mu for the lock order.
+	mu sync.Mutex
+	// sessions is every open connection, keyed by the name its caller
+	// gave it at connect. That name is the address: every tool that acts
+	// on a connection names one, and an unknown name is an error rather
+	// than a fallback to whichever is open.
+	sessions map[string]*session
+	// autoReconnect holds what this client has to tell the model but has
+	// no tool result to put it in — a reconnect it performed on its own,
+	// a relay that failed. Process-wide rather than per-session, because
+	// there is one reader: a drop that takes several connections with it
+	// produces one notice naming them, not one notice each.
 	autoReconnect string
-	// reconnecting guards against two automatic attempts overlapping, and
-	// against one racing a hub_connect the model issued itself.
-	reconnecting bool
-	// reconnectAt is when the pending automatic attempt is due. Without
-	// it every tool answers a planned outage with a bare "not connected",
-	// which is true and useless: it reads identically to a hub that is
-	// simply gone, so a caller cannot tell whether waiting is worthwhile
-	// or whether it should give up and do something else.
-	reconnectAt time.Time
 
 	// waitMu, waitCancel, and waitGen let a new handleWait call supersede
 	// one already in flight, mirroring waiter.Waiter's single-registered-
@@ -133,15 +49,6 @@ type Hub struct {
 	waitMu     sync.Mutex
 	waitCancel context.CancelFunc
 	waitGen    uint64
-
-	// attachMu guards attachDir/attachSeq — the local temp directory
-	// received image attachments are saved into (see attachmentDir) and a
-	// counter for unique filenames within it. Separate from mu since it's
-	// touched by handleReceive/handleWait, which don't otherwise need the
-	// conn-state lock.
-	attachMu  sync.Mutex
-	attachDir string
-	attachSeq int
 
 	// pusher delivers events into the harness that launched this process,
 	// so a hub message reaches the model without the model having armed a
@@ -572,82 +479,6 @@ func loadHandedOverAhead(id connstore.Target) map[string]bool {
 	return ahead
 }
 
-// activeConn returns the current connection and its wait socket, or (nil,
-// nil) if not connected.
-func (h *Hub) activeConn() (*hubconn.Conn, *waiter.Waiter) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.conn, h.waiter
-}
-
-// setActiveConn records a newly established connection as the active one.
-// target identifies it in connstore for later teardown bookkeeping — the
-// zero Target for a connection kind connstore doesn't track at all.
-func (h *Hub) setActiveConn(conn *hubconn.Conn, w *waiter.Waiter, target connstore.Target) {
-	h.mu.Lock()
-	h.conn, h.waiter, h.connTarget = conn, w, target
-	h.mu.Unlock()
-}
-
-// setCatchUpKey records id as the current connection's stable identity
-// for hub_catch_up's persisted position, and loads whatever was
-// previously stored under it (nothing, for a first-ever connection to
-// this identity) — called once per successful connect, after
-// setActiveConn, with an identity derived from the connection's own
-// stable identity: connstore.HubCatchUpID(target) for a plain
-// hub_connect session, or catchUpIDForRelay's derivation for a
-// teams_relay_connect session (which has no connstore.Target at all —
-// see connTarget's own comment).
-//
-// Every call resets lastHandedOverCursor to match id, even when id is
-// unchanged from before — reconnecting re-reads the persisted value
-// rather than trusting whatever's already in memory, so a second
-// process/session sharing the same identity (or this same process after
-// an external edit to the store) can't silently diverge from what's on
-// disk. The zero CatchUpID (a connection kind that doesn't call this at
-// all) leaves catchUpID/lastHandedOverCursor at their zero values, and
-// handleCatchUp treats that the same as "nothing recorded yet."
-func (h *Hub) setCatchUpKey(id connstore.Target) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.catchUpID = id
-	h.lastHandedOverCursor = ""
-	h.seekedSinceConnect = false
-	// Nothing is known about what precedes live traffic until a server
-	// says so. Assuming otherwise on a fresh connection is how a backlog
-	// gets skipped.
-	h.knownContiguous = false
-	// handedOverAhead's entries are cursors witnessed live for THIS
-	// connection's message stream — carrying them into a DIFFERENT
-	// identity (a different conversation entirely) would be the same
-	// stale-cursor-bleed hazard the old target-based reset guarded
-	// against, just one map over. So start from nil, then load whatever
-	// this exact identity persisted (see saveHandedOverAhead) — a
-	// reconnect to the SAME conversation restores the set, a switch to a
-	// different one starts clean.
-	h.handedOverAhead = nil
-	if id.Link != "" {
-		if cs, ok := connstore.GetCatchUp(id); ok {
-			h.lastHandedOverCursor = cs.Cursor
-		}
-		h.handedOverAhead = loadHandedOverAhead(id)
-	}
-}
-
-// clearActiveConn unconditionally forgets whatever connection is currently
-// active and returns it plus the connstore.Target it was reached through,
-// for an explicit hub_disconnect — which should tear down whatever is
-// active right now, regardless of which Conn instance a caller happens to
-// be holding a reference to.
-func (h *Hub) clearActiveConn() (*hubconn.Conn, *waiter.Waiter, connstore.Target) {
-	h.mu.Lock()
-	conn, w, target := h.conn, h.waiter, h.connTarget
-	h.conn, h.waiter, h.connTarget = nil, nil, connstore.Target{}
-	h.mu.Unlock()
-	h.clearAttachDir()
-	return conn, w, target
-}
-
 // teardownIfCurrent tears down the active connection, but only if it's
 // still exactly the Conn passed in. A caller that noticed conn had died —
 // including conn's own background read goroutine, via conn.OnActivity — is
@@ -658,8 +489,8 @@ func (h *Hub) clearActiveConn() (*hubconn.Conn, *waiter.Waiter, connstore.Target
 // connstore entry (if any) disconnected — this is the automatic-drop path,
 // not just explicit hub_disconnect, so a session that ends this way isn't
 // wrongly reported as "still open" by a later process's startup note.
-func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
-	h.teardown(conn, false)
+func (s *session) teardownIfCurrent(conn *hubconn.Conn) {
+	s.teardown(conn, false)
 }
 
 // teardown ends the active connection. keepWaiter holds the wait socket
@@ -667,20 +498,20 @@ func (h *Hub) teardownIfCurrent(conn *hubconn.Conn) {
 // coming back on its own: closing it would kill the follower process,
 // and the reconnect would then restore the connection while leaving the
 // session with no live channel and nothing to tell it so.
-func (h *Hub) teardown(conn *hubconn.Conn, keepWaiter bool) {
-	h.mu.Lock()
-	if h.conn != conn {
-		h.mu.Unlock()
+func (s *session) teardown(conn *hubconn.Conn, keepWaiter bool) {
+	s.mu.Lock()
+	if s.conn != conn {
+		s.mu.Unlock()
 		return
 	}
-	w := h.waiter
-	target := h.connTarget
-	h.conn, h.connTarget = nil, connstore.Target{}
+	w := s.waiter
+	target := s.connTarget
+	s.conn, s.connTarget = nil, connstore.Target{}
 	if !keepWaiter {
-		h.waiter = nil
+		s.waiter = nil
 	}
-	h.mu.Unlock()
-	h.clearAttachDir()
+	s.mu.Unlock()
+	s.clearAttachDir()
 	if w != nil {
 		if keepWaiter {
 			w.ExpectReconnect()
@@ -690,6 +521,14 @@ func (h *Hub) teardown(conn *hubconn.Conn, keepWaiter bool) {
 	}
 	if target != (connstore.Target{}) {
 		_ = connstore.MarkDisconnected(target)
+	}
+	// A connection that is not coming back gives up its name, so the
+	// obvious next move — reconnect under the same name — works. A name
+	// held by something that ended is a name nobody can use and nothing
+	// can explain. Where a reconnect IS pending the session keeps its
+	// name, which is what refuses a manual dial racing the automatic one.
+	if !keepWaiter {
+		s.hub.close(s.name)
 	}
 }
 
@@ -771,16 +610,16 @@ func gracefulRestartNote(conn *hubconn.Conn) string {
 // because the decision has to be made BEFORE the teardown that would
 // otherwise close the socket, and a socket closed on a wrong guess
 // cannot be un-closed.
-func (h *Hub) willAutoReconnect(conn *hubconn.Conn) bool {
+func (s *session) willAutoReconnect(conn *hubconn.Conn) bool {
 	if !conn.GracefulShutdown() || conn.SuggestedReconnectDelay() == 0 {
 		return false
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.redialLink != "" && !h.reconnecting
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.redialLink != "" && !s.reconnecting
 }
 
-func (h *Hub) scheduleReconnectIfGraceful(conn *hubconn.Conn) {
+func (s *session) scheduleReconnectIfGraceful(conn *hubconn.Conn) {
 	if !conn.GracefulShutdown() {
 		return
 	}
@@ -791,17 +630,17 @@ func (h *Hub) scheduleReconnectIfGraceful(conn *hubconn.Conn) {
 		// model is told it was deliberate and can reconnect when it likes.
 		return
 	}
-	h.mu.Lock()
-	link, name := h.redialLink, h.redialName
-	if link == "" || h.reconnecting {
-		h.mu.Unlock()
+	s.mu.Lock()
+	link, name := s.redialLink, s.redialName
+	if link == "" || s.reconnecting {
+		s.mu.Unlock()
 		return
 	}
-	h.reconnecting = true
-	h.reconnectAt = time.Now().Add(delay)
-	h.mu.Unlock()
+	s.reconnecting = true
+	s.reconnectAt = time.Now().Add(delay)
+	s.mu.Unlock()
 
-	go h.reconnectLoop(link, name, delay)
+	go s.reconnectLoop(link, name, delay)
 }
 
 // reconnectLoop keeps trying at the interval the server itself named,
@@ -819,30 +658,30 @@ func (h *Hub) scheduleReconnectIfGraceful(conn *hubconn.Conn) {
 // Each failure is reported rather than swallowed, so waiting is a choice
 // the caller keeps making with current information instead of one it made
 // once and forgot.
-func (h *Hub) reconnectLoop(link, name string, interval time.Duration) {
+func (s *session) reconnectLoop(link, name string, interval time.Duration) {
 	defer func() {
-		h.mu.Lock()
-		h.reconnecting, h.reconnectAt = false, time.Time{}
-		h.mu.Unlock()
+		s.mu.Lock()
+		s.reconnecting, s.reconnectAt = false, time.Time{}
+		s.mu.Unlock()
 	}()
 	for attempt := 1; ; attempt++ {
 		time.Sleep(interval)
 		// hub_disconnect clears the link, and that is the cancel signal:
 		// a caller that chose to leave must not be dragged back in by an
 		// attempt scheduled before it decided.
-		h.mu.Lock()
-		cancelled := h.redialLink == ""
-		h.mu.Unlock()
+		s.mu.Lock()
+		cancelled := s.redialLink == ""
+		s.mu.Unlock()
 		if cancelled {
 			return
 		}
-		outcome := h.reconnectOnce(link, name, interval, attempt)
+		outcome := s.reconnectOnce(link, name, interval, attempt)
 		if outcome != reconnectRetry {
 			return
 		}
-		h.mu.Lock()
-		h.reconnectAt = time.Now().Add(interval)
-		h.mu.Unlock()
+		s.mu.Lock()
+		s.reconnectAt = time.Now().Add(interval)
+		s.mu.Unlock()
 	}
 }
 
@@ -856,9 +695,9 @@ const (
 
 // reconnectOnce performs a single redial and says whether trying again
 // could help.
-func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int) reconnectOutcome {
+func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt int) reconnectOutcome {
 	// The model may have reconnected itself while this was waiting.
-	if prev, _ := h.activeConn(); prev != nil && prev.Connected() {
+	if prev, _ := s.activeConn(); prev != nil && prev.Connected() {
 		return reconnectDone
 	}
 
@@ -866,7 +705,7 @@ func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int
 	stored, _ := connstore.Get(target)
 	secret := stored.ReconnectSecret
 	if secret == "" {
-		h.abandonReconnect("Automatic reconnect was not attempted after the server's restart: " +
+		s.abandonReconnect("Automatic reconnect was not attempted after the server's restart: " +
 			"this session's stored identity for that link is gone, so reconnecting would take a " +
 			"new one. Retrying cannot fix that. Call hub_connect yourself when ready.")
 		return reconnectFatal
@@ -877,15 +716,15 @@ func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int
 		Name:            name,
 	})
 	if err != nil {
-		h.reportFailedAttempt(attempt, waited, err)
+		s.reportFailedAttempt(attempt, waited, err)
 		return reconnectRetry
 	}
 	// Reuse the wait socket that was deliberately kept open across the
 	// restart, so the follower that survived the gap simply resumes. Only
 	// fall back to a new one if there was nothing to keep.
-	h.mu.Lock()
-	w := h.waiter
-	h.mu.Unlock()
+	s.mu.Lock()
+	w := s.waiter
+	s.mu.Unlock()
 	keptFollower := w != nil
 	if keptFollower {
 		w.SetSource(conn)
@@ -896,7 +735,7 @@ func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int
 		w, err = waiter.Listen(conn)
 		if err != nil {
 			conn.Close()
-			h.noteAutoReconnect(fmt.Sprintf("Automatic reconnect dialled successfully but could "+
+			s.note(fmt.Sprintf("Automatic reconnect dialled successfully but could "+
 				"not start its wait socket (%v), so it was abandoned and you are still "+
 				"disconnected — call hub_connect to retry.", err))
 			return reconnectFatal
@@ -907,24 +746,24 @@ func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int
 	// reader's own budget by the reader's own decision. The spill
 	// directory is the same one received attachments use, and dies with
 	// the connection for the same reason.
-	conn.SetDeliveryBudget(h.attachmentDir, 0, 0, 0)
+	conn.SetDeliveryBudget(s.attachmentDir, 0, 0, 0)
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
 		// the disconnect to a follower and releases it, so arming
 		// afterwards arms nothing: the follower is already gone by the
 		// time the teardown runs.
-		if !conn.Connected() && h.willAutoReconnect(conn) {
+		if !conn.Connected() && s.willAutoReconnect(conn) {
 			w.ExpectReconnect()
 		}
 		w.Poke()
-		h.pushToHarness(conn, w)
+		s.pushToHarness(conn, w)
 		if !conn.Connected() {
-			h.teardown(conn, h.willAutoReconnect(conn))
-			h.scheduleReconnectIfGraceful(conn)
+			s.teardown(conn, s.willAutoReconnect(conn))
+			s.scheduleReconnectIfGraceful(conn)
 		}
 	})
-	h.setActiveConn(conn, w, target)
-	h.setCatchUpKey(target)
+	s.setActiveConn(conn, w, target)
+	s.setCatchUpKey(target)
 	topic := ""
 	if t := conn.Topic(); t != nil {
 		topic = *t
@@ -952,7 +791,7 @@ func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int
 		followerNote = "There was no follower to keep, so nothing is delivering live events — " +
 			"start one with:\n    " + w.WaitFollowCommand()
 	}
-	h.noteAutoReconnect(fmt.Sprintf("RECONNECTED AUTOMATICALLY after the server's announced "+
+	s.note(fmt.Sprintf("RECONNECTED AUTOMATICALLY after the server's announced "+
 		"restart, having waited %s. You are connected again as peer %s. Messages may have arrived "+
 		"while you were away and while this client was waiting — call hub_catch_up() now, the same "+
 		"as after any reconnect. %s",
@@ -966,16 +805,16 @@ func (h *Hub) reconnectOnce(link, name string, waited time.Duration, attempt int
 // information is not really being made. It always names the way out,
 // because an automatic retry with no visible exit is indistinguishable
 // from being stuck.
-func (h *Hub) reportFailedAttempt(attempt int, interval time.Duration, err error) {
+func (s *session) reportFailedAttempt(attempt int, interval time.Duration, err error) {
 	msg := fmt.Sprintf("Automatic reconnect attempt %d FAILED: %v. You are still disconnected. "+
 		"Another attempt follows in about %s, and it will keep retrying at that interval. Either "+
 		"WAIT — you will be told when it succeeds — or call hub_disconnect to stop trying, which "+
 		"also releases the follower being held open for it.",
 		attempt, err, interval.Round(time.Second))
-	h.noteAutoReconnect(msg)
-	h.mu.Lock()
-	w := h.waiter
-	h.mu.Unlock()
+	s.note(msg)
+	s.mu.Lock()
+	w := s.waiter
+	s.mu.Unlock()
 	if w != nil {
 		w.Announce("[hub: " + msg + "]")
 	}
@@ -1046,10 +885,10 @@ func prependText(res *mcp.CallToolResult, text string) *mcp.CallToolResult {
 // opposite decisions. Nothing is queued either way: a send during the gap
 // fails, and it should, since holding a message to deliver later means
 // sending it into a conversation that has moved on.
-func (h *Hub) notConnected() *mcp.CallToolResult {
-	h.mu.Lock()
-	pending, at := h.reconnecting, h.reconnectAt
-	h.mu.Unlock()
+func (s *session) notConnected() *mcp.CallToolResult {
+	s.mu.Lock()
+	pending, at := s.reconnecting, s.reconnectAt
+	s.mu.Unlock()
 	if !pending {
 		return mcp.NewToolResultError("not connected")
 	}
@@ -1059,9 +898,9 @@ func (h *Hub) notConnected() *mcp.CallToolResult {
 	// Without one, nobody will say anything and checking back is the only
 	// option. Telling someone to wait for a notification that nothing
 	// will send is worse than telling them to poll.
-	h.mu.Lock()
-	w := h.waiter
-	h.mu.Unlock()
+	s.mu.Lock()
+	w := s.waiter
+	s.mu.Unlock()
 	whatHappensNext := "Nothing is following, so you will NOT be told when it returns — try again " +
 		"after that, then call hub_catch_up()."
 	if w != nil && w.Following() {
@@ -1086,18 +925,18 @@ func (h *Hub) notConnected() *mcp.CallToolResult {
 // to nothing: no connection, no pending reconnect, and no event will ever
 // reach it again — silent in a way indistinguishable from a quiet
 // conversation. Giving up has to be as visible as succeeding.
-func (h *Hub) abandonReconnect(note string) {
-	h.mu.Lock()
-	w := h.waiter
-	h.waiter = nil
-	h.reconnectAt = time.Time{}
-	h.mu.Unlock()
+func (s *session) abandonReconnect(note string) {
+	s.mu.Lock()
+	w := s.waiter
+	s.waiter = nil
+	s.reconnectAt = time.Time{}
+	s.mu.Unlock()
 	if w != nil {
 		w.Announce("[hub: the automatic reconnect did not succeed, so this follower is being " +
 			"closed. Nothing further will arrive on it. Reconnect with hub_connect when ready]")
 		w.Close()
 	}
-	h.noteAutoReconnect(note)
+	s.note(note)
 }
 
 // noteAutoReconnect stores something the model has not been told yet. It
@@ -1222,6 +1061,16 @@ func (h *Hub) Register(s *server.MCPServer) {
 				"hub_peers/hub_catch_up work the same way either way. The connect result states "+
 				"what this particular server declared about itself"+
 				startupConnectionsNote()),
+			mcp.WithString("as", mcp.Required(), mcp.Description(
+				"REQUIRED: a short name for THIS connection, which every later call uses to "+
+					"refer to it — hub_send(connection: \"<name>\"), hub_catch_up(connection: "+
+					"\"<name>\"), and so on. Lowercase letters, digits, - and _, up to 32 "+
+					"characters. Pick something that says which conversation it is (\"chat-relay\", "+
+					"\"ops\"), not which agent you are — that is what the separate \"name\" "+
+					"argument is for. A name already in use is REFUSED rather than reattached to "+
+					"the existing connection, so it is never ambiguous which one you are holding; "+
+					"a connection that dropped releases its name, so reconnecting under the same "+
+					"one is fine")),
 			mcp.WithString("link", mcp.Description(
 				"REQUIRED: the exact link string the user gave you, unmodified — do not parse, "+
 					"reformat, split, or strip anything from it, and do not infer anything about "+
@@ -1267,6 +1116,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_send",
+			connectionParam(),
 			mcp.WithDescription("Send a text message to the current hub session. On a teams "+
 				"session (e.g. via hub_connect's link form), this call itself waits briefly for the "+
 				"real outcome — the send actually being accepted, or refused — and reports it "+
@@ -1330,6 +1180,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_disconnect",
+			connectionParam(),
 			mcp.WithDescription("Disconnect from the current hub session")),
 		h.handleDisconnect,
 	)
@@ -1366,6 +1217,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_read",
+			connectionParam(),
 			mcp.WithDescription("Read one message from this conversation's history, by where it "+
 				"sits rather than by what you have already seen. A QUERY, not a hand-over: it "+
 				"advances no position, marks nothing as read, and clears no recorded gap, so "+
@@ -1412,6 +1264,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_pin",
+			connectionParam(),
 			mcp.WithDescription("Pin a message in this conversation — only where the server "+
 				"declares it can do this; against one that doesn't (every ordinary hub session, "+
 				"which has no conversation behind it to pin in), the call is refused here with "+
@@ -1426,6 +1279,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_unpin",
+			connectionParam(),
 			mcp.WithDescription("Remove a message from this conversation's pinned set — same "+
 				"contract as hub_pin, including being refused where the server declares no "+
 				"pinning. Unpinning something a person pinned is visible to them, so it is worth "+
@@ -1437,6 +1291,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_pins",
+			connectionParam(),
 			mcp.WithDescription("List what is pinned in this conversation RIGHT NOW, asking the "+
 				"server rather than reporting what this client last heard. Read-only.\n"+
 				"Worth reaching for whenever it matters that the answer is current: the set "+
@@ -1455,6 +1310,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	if !harness.PushMode() {
 		addTool(
 			mcp.NewTool("hub_receive",
+				connectionParam(),
 				mcp.WithDescription("Drain and return currently buffered hub events without blocking. "+
 					"An image attached to a received message is saved to a local temp file, not "+
 					"inlined as base64 — the result names the path; read that file yourself (e.g. "+
@@ -1473,6 +1329,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	if !harness.PushMode() {
 		addTool(
 			mcp.NewTool("hub_wait",
+				connectionParam(),
 				mcp.WithDescription("Block until the next hub event arrives (or the hub disconnects), "+
 					"then return it — the direct MCP-tool alternative to running the wait CLI binary "+
 					"as a background/foreground process. Best for a harness that cannot background a "+
@@ -1487,6 +1344,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	}
 	addTool(
 		mcp.NewTool("hub_peers",
+			connectionParam(),
 			mcp.WithDescription("List everyone else currently in the hub session, including each "+
 				"peer's peerId and — if they supplied one on connect — their display name and age "+
 				"public key (e.g. for encrypting a message to them before sending)")),
@@ -1494,6 +1352,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_catch_up",
+			connectionParam(),
 			mcp.WithDescription("Read the single next message you missed. A server that doesn't "+
 				"implement messageAfter (including every mcp-hub-server, and any teams relay "+
 				"that hasn't added it yet) silently ignores the request; this call then times out "+
@@ -1548,6 +1407,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_confirm",
+			connectionParam(),
 			mcp.WithDescription("Explicitly confirm you received a message INTACT, by its cursor — "+
 				confirmWhyNote()+
 				" Advances this session's persisted catch-up position to cursor and "+
@@ -1571,6 +1431,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_react",
+			connectionParam(),
 			mcp.WithDescription("Add or remove a reaction on an earlier message — only where the "+
 				"server declares it can do this; against one that doesn't, the call is refused "+
 				"here with that reason rather than sent into silence. Errors if not "+
@@ -1591,6 +1452,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_edit",
+			connectionParam(),
 			mcp.WithDescription("Change an earlier message's content — only where the server declares "+
 				"it can do this; against one that doesn't, the call is refused here with that "+
 				"reason rather than sent into silence. Typically only possible on a message this "+
@@ -1645,6 +1507,7 @@ func (h *Hub) Register(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_delete",
+			connectionParam(),
 			mcp.WithDescription("Remove an earlier message — only where the server declares it can do "+
 				"this; against one that doesn't, the call is refused here with that reason rather "+
 				"than sent into silence. Typically only possible on a message this "+
@@ -1722,11 +1585,13 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 			"speaks a framed protocol with an auth handshake, a raw write is dropped without an " +
 			"error, and the address is only an address because a tool knows what to do with it.\n" +
 			"SendMessage carries text only, so anything structural goes in a FIRST LINE of the " +
-			"form: #hub to=<peerId> replyTo=<externalId> confirm=<cursor> format=html — any " +
-			"subset, recognised only as the first line, with your message from the next line on. " +
-			"An unknown or mistyped directive is REFUSED and nothing is sent, rather than being " +
-			"relayed as prose. A message that merely mentions to= in its body is prose and stays " +
-			"prose.\n" +
+			"form: #hub conn=<name> to=<peerId> replyTo=<externalId> confirm=<cursor> " +
+			"format=html — recognised only as the first line, with your message from the next " +
+			"line on. conn is REQUIRED and names which connection the reply is for: one inbox " +
+			"serves every connection this client holds, and a reply that does not say where it " +
+			"goes is refused rather than sent to a guess. An unknown or mistyped directive is " +
+			"likewise REFUSED and nothing is sent, rather than being relayed as prose. A message " +
+			"that merely mentions to= in its body is prose and stays prose.\n" +
 			"Two things that line cannot do: @-mentions and attachments. Both need hub_send, " +
 			"which takes them as real arguments — a filename inside a message would turn a typo " +
 			"into a file read.\n" +
@@ -1779,39 +1644,32 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 }
 
 func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Three states, three answers. Connecting while a reconnect is in
-	// flight is refused rather than raced: the automatic attempt already
-	// holds this session's identity, its stored secret and a follower
-	// kept open across the gap, and a second dial would either lose that
-	// race or win it and strand what the first one was holding.
-	h.mu.Lock()
-	pendingReconnect, pendingAt := h.reconnecting, h.reconnectAt
-	h.mu.Unlock()
-	if pendingReconnect {
-		in := time.Until(pendingAt).Round(time.Second)
-		when := "right now"
-		if in > 0 {
-			when = fmt.Sprintf("in about %s", in)
-		}
-		return mcp.NewToolResultError(fmt.Sprintf("reconnection in progress — this client is "+
-			"already coming back on its own after the server announced a restart, %s. Do not dial "+
-			"a second time; wait for it. If you want to stop waiting instead, call hub_disconnect, "+
-			"which gives up and releases the follower being held for it.", when)), nil
+	// The name is taken first, and taking it is what refuses a second
+	// connection under a name already in use — including one this client
+	// is in the middle of reconnecting by itself, which still holds its
+	// identity, its stored secret and a follower kept open across the
+	// gap. A second dial would either lose that race or win it and strand
+	// what the first one was holding.
+	//
+	// A connection that dropped for good releases its name in teardown,
+	// so reconnecting after a drop under the same name is the ordinary
+	// case and works; what is refused is a name still owned by something.
+	as, err := req.RequireString("as")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-
-	if prev, _ := h.activeConn(); prev != nil {
-		if !prev.Connected() {
-			// The previous connection died on its own (server restart,
-			// network drop, kill -9) without a clean hub_disconnect() ever
-			// running to clear it — normally torn down automatically (see
-			// the OnActivity wiring below) well before a caller gets here,
-			// but don't make the caller issue hub_disconnect itself in the
-			// rare case it hasn't yet.
-			h.teardownIfCurrent(prev)
-		} else {
-			return mcp.NewToolResultError("already connected; call hub_disconnect first"), nil
-		}
+	s, err := h.open(as)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// Every failure from here on releases the name again. A name held by
+	// a connection that was never established is a name nobody can use
+	// and nothing can explain.
+	defer func() {
+		if conn, _ := s.activeConn(); conn == nil {
+			h.close(as)
+		}
+	}()
 	link, err := req.RequireString("link")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -1873,17 +1731,17 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// reader's own budget by the reader's own decision. The spill
 	// directory is the same one received attachments use, and dies with
 	// the connection for the same reason.
-	conn.SetDeliveryBudget(h.attachmentDir, 0, 0, 0)
+	conn.SetDeliveryBudget(s.attachmentDir, 0, 0, 0)
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
 		// the disconnect to a follower and releases it, so arming
 		// afterwards arms nothing: the follower is already gone by the
 		// time the teardown runs.
-		if !conn.Connected() && h.willAutoReconnect(conn) {
+		if !conn.Connected() && s.willAutoReconnect(conn) {
 			w.ExpectReconnect()
 		}
 		w.Poke()
-		h.pushToHarness(conn, w)
+		s.pushToHarness(conn, w)
 		if !conn.Connected() {
 			// The read loop that just invoked us is the one that detected
 			// this — a silent drop, a server-side close, anything short of
@@ -1892,15 +1750,15 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			// still listening) around until the next tool call.
 			// A restart the server announced is coming back, so the
 			// follower is kept rather than killed — see teardown.
-			h.teardown(conn, h.willAutoReconnect(conn))
-			h.scheduleReconnectIfGraceful(conn)
+			s.teardown(conn, s.willAutoReconnect(conn))
+			s.scheduleReconnectIfGraceful(conn)
 		}
 	})
-	h.setActiveConn(conn, w, target)
-	h.setCatchUpKey(target)
-	h.mu.Lock()
-	h.redialLink, h.redialName = link, name
-	h.mu.Unlock()
+	s.setActiveConn(conn, w, target)
+	s.setCatchUpKey(target)
+	s.mu.Lock()
+	s.redialLink, s.redialName = link, name
+	s.mu.Unlock()
 	// A server can close between Dial returning and the callback above
 	// being registered — a restart announced moments after a join does
 	// exactly that, and the read loop has then already exited without
@@ -1915,10 +1773,10 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if !conn.Connected() {
 		// Tell the waiter to hold BEFORE scheduling, since scheduling
 		// sets the in-flight flag that willAutoReconnect reads.
-		if h.willAutoReconnect(conn) {
+		if s.willAutoReconnect(conn) {
 			w.ExpectReconnect()
 		}
-		h.scheduleReconnectIfGraceful(conn)
+		s.scheduleReconnectIfGraceful(conn)
 	}
 
 	topic := ""
@@ -2089,7 +1947,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// diagnosis, and this is the only moment anyone is looking.
 	return mcp.NewToolResultText(fmt.Sprintf(
 		"Connected as peer %s.\n%s\n%s%s%s%s%s%s",
-		conn.PeerID(), rosterNote, waitBlock, versionNote, identityNote, notes, h.behindNote(conn),
+		conn.PeerID(), rosterNote, waitBlock, versionNote, identityNote, notes, s.behindNote(conn),
 		selfupdate.Check().RestartRecommendation(),
 	)), nil
 }
@@ -2099,7 +1957,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 // model has to notice is missing — a server-reported fact should be
 // stated, not left to be inferred or discovered later. Empty when a
 // server didn't set Behind (including every mcp-hub-server).
-func (h *Hub) behindNote(conn *hubconn.Conn) string {
+func (s *session) behindNote(conn *hubconn.Conn) string {
 	note := ""
 	if conn.Behind() > 0 {
 		if conn.Behind() > catchUpSeekThreshold && conn.BehindSince() != "" {
@@ -2115,9 +1973,9 @@ func (h *Hub) behindNote(conn *hubconn.Conn) string {
 				conn.Behind(), conn.BehindSince())
 		}
 	}
-	h.mu.Lock()
-	id := h.catchUpID
-	h.mu.Unlock()
+	s.mu.Lock()
+	id := s.catchUpID
+	s.mu.Unlock()
 	if from, to, ok := getCatchUpGap(id); ok {
 		note += fmt.Sprintf("\nAlso still on record: an earlier catch-up seek skipped the range %s "+
 			"to %s rather than walk it. Not lost — still on the server — call "+
@@ -2157,17 +2015,17 @@ func attachmentExtension(contentType string) string {
 // removed entirely by clearAttachDir when the connection tears down. Not
 // created eagerly at connect time, so a session that never receives an
 // attachment never touches disk for this.
-func (h *Hub) attachmentDir() (string, error) {
-	h.attachMu.Lock()
-	defer h.attachMu.Unlock()
-	if h.attachDir != "" {
-		return h.attachDir, nil
+func (s *session) attachmentDir() (string, error) {
+	s.attachMu.Lock()
+	defer s.attachMu.Unlock()
+	if s.attachDir != "" {
+		return s.attachDir, nil
 	}
 	dir, err := os.MkdirTemp("", "mcp-hub-attachments-")
 	if err != nil {
 		return "", err
 	}
-	h.attachDir = dir
+	s.attachDir = dir
 	return dir, nil
 }
 
@@ -2254,12 +2112,6 @@ func harnessServerName() string {
 // hub. Only a message from this process's own parent reaches here; see
 // harness.Inbox for why the kernel decides that rather than the token.
 func (h *Hub) sendFromInbox(text string) {
-	conn, _ := h.activeConn()
-	if conn == nil || !conn.Connected() {
-		h.noteAutoReconnect("a reply was sent to this session's hub inbox while it was not " +
-			"connected, so it was NOT relayed. Reconnect and send it again with hub_send.")
-		return
-	}
 	// SendMessage's result says the reply reached this inbox and nothing
 	// about the hub — the same delivery-versus-consumption gap as
 	// everywhere else, one layer out. This path closes it by reading the
@@ -2276,9 +2128,26 @@ func (h *Hub) sendFromInbox(text string) {
 			"sent. Fix the line and send again, or use hub_send.", err))
 		return
 	}
+	// One inbox, several connections, so the reply has to say which one it
+	// answers. Refused rather than sent to whichever is open: a reply that
+	// lands in the wrong conversation cannot be recalled, and "the only
+	// one connected" is a rule that silently changes meaning the moment a
+	// second connection exists.
+	s, err := h.session(header.Conn)
+	if err != nil {
+		s.note(fmt.Sprintf("a reply could not be relayed (%v), so NOTHING was sent. "+
+			"Name the connection in the first line: #hub conn=<name>", err))
+		return
+	}
+	conn, _ := s.activeConn()
+	if conn == nil || !conn.Connected() {
+		s.note("a reply was sent to this session's hub inbox while it was not " +
+			"connected, so it was NOT relayed. Reconnect and send it again with hub_send.")
+		return
+	}
 	if header.Confirm != "" {
-		if _, err := h.confirmCursor(conn, header.Confirm); err != nil {
-			h.noteAutoReconnect(fmt.Sprintf("a reply asked to confirm %s and that failed (%v); "+
+		if _, err := s.confirmCursor(conn, header.Confirm); err != nil {
+			s.note(fmt.Sprintf("a reply asked to confirm %s and that failed (%v); "+
 				"the message itself is still being sent.", header.Confirm, err))
 		}
 	}
@@ -2286,7 +2155,7 @@ func (h *Hub) sendFromInbox(text string) {
 		// Directives with no text: a confirm-only reply is legitimate,
 		// but sending an empty message to the hub is not.
 		if header.Confirm == "" {
-			h.noteAutoReconnect("a reply carried directives but no message text, so nothing was " +
+			s.note("a reply carried directives but no message text, so nothing was " +
 				"sent.")
 		}
 		return
@@ -2299,7 +2168,7 @@ func (h *Hub) sendFromInbox(text string) {
 	// the pushed copy of it is redundant everywhere.
 	ack, gotAck, err := conn.SendAwaitingAck(body, header.To, nil, header.Format, header.ReplyTo, nil)
 	if err != nil {
-		h.noteAutoReconnect(fmt.Sprintf("a reply sent to this session's hub inbox could not be "+
+		s.note(fmt.Sprintf("a reply sent to this session's hub inbox could not be "+
 			"relayed (%v) — it did not reach the hub. Send it again with hub_send.", err))
 		return
 	}
@@ -2313,17 +2182,17 @@ func (h *Hub) sendFromInbox(text string) {
 	// where the message turned out to go.
 	switch {
 	case !gotAck:
-		h.noteAutoReconnect("your reply was sent, but the hub did not acknowledge it in time — " +
+		s.note("your reply was sent, but the hub did not acknowledge it in time — " +
 			"it may still have arrived; hub_read or hub_catch_up can tell you.")
 	case ack.ActionOKStated && !ack.ActionOK:
-		h.noteAutoReconnect("your reply was REFUSED by the hub — it did not arrive. Send it again " +
+		s.note("your reply was REFUSED by the hub — it did not arrive. Send it again " +
 			"with hub_send.")
 	case !ack.ActionOKStated:
-		h.noteAutoReconnect("your reply was sent, and the hub answered without saying whether it " +
+		s.note("your reply was sent, and the hub answered without saying whether it " +
 			"succeeded — neither a confirmation nor a refusal.")
 	default:
 		if d := header.Summary(); d != "" {
-			h.noteAutoReconnect("relayed your reply with: " + d)
+			s.note("relayed your reply with: " + d)
 		}
 	}
 }
@@ -2344,7 +2213,7 @@ func (h *Hub) sendFromInbox(text string) {
 // contract. A push that never lands costs nothing a hub_catch_up cannot
 // recover, whereas an error surfaced from a background event loop has no
 // caller to receive it.
-func (h *Hub) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
+func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 	if !harness.PushMode() {
 		return
 	}
@@ -2356,7 +2225,7 @@ func (h *Hub) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 	if w != nil && w.Following() {
 		return
 	}
-	if ok, _ := h.pusher.Available(); !ok {
+	if ok, _ := s.hub.pusher.Available(); !ok {
 		return
 	}
 	items, _ := conn.DrainForPush()
@@ -2367,7 +2236,7 @@ func (h *Hub) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		// hub_receive, so if this did not run there would be no second
 		// chance: the attachment would be named by an event nothing ever
 		// resolved, and unreachable rather than merely inconvenient.
-		it.Text += h.saveReceivedAttachments(conn, []hubconn.Event{it.Event})
+		it.Text += s.saveReceivedAttachments(conn, []hubconn.Event{it.Event})
 		// Charged here rather than at render time: the attachment notes
 		// above are part of what the reader receives, and a budget that
 		// does not count them is not counting what it delivers.
@@ -2375,7 +2244,7 @@ func (h *Hub) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		// More says another delivery is already on its way, so a reader
 		// that wants to act on a burst knows to wait for the rest of it
 		// rather than treating each arrival as the whole of the news.
-		if _, err := h.pusher.Push(it.Cursor, it.Text, i < len(items)-1); err != nil {
+		if _, err := s.hub.pusher.Push(it.Cursor, it.Text, i < len(items)-1); err != nil {
 			// The event is already out of the buffer, so a failed push
 			// leaves it delivered nowhere. Nothing is durably lost — the
 			// catch-up position only advances on an explicit confirm, so
@@ -2387,7 +2256,7 @@ func (h *Hub) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		}
 	}
 	if failed > 0 {
-		h.noteAutoReconnect(fmt.Sprintf("%d message(s) could not be delivered to you live — the "+
+		s.note(fmt.Sprintf("%d message(s) could not be delivered to you live — the "+
 			"push into this session failed. Nothing is lost: your catch-up position only moves "+
 			"on an explicit confirm, so the server still holds them. Call hub_catch_up() to read "+
 			"them.", failed))
@@ -2400,11 +2269,11 @@ func (h *Hub) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 // hub_disconnect, automatic dead-connection detection, process Shutdown)
 // already goes through, so saved attachments never outlive the session
 // that received them.
-func (h *Hub) clearAttachDir() {
-	h.attachMu.Lock()
-	dir := h.attachDir
-	h.attachDir = ""
-	h.attachMu.Unlock()
+func (s *session) clearAttachDir() {
+	s.attachMu.Lock()
+	dir := s.attachDir
+	s.attachDir = ""
+	s.attachMu.Unlock()
 	if dir != "" {
 		_ = os.RemoveAll(dir)
 	}
@@ -2445,26 +2314,26 @@ func (h *Hub) resolveAttachment(conn *hubconn.Conn, a wire.Attachment) (raw []by
 // can read with its own file tool costs far fewer tokens than embedding
 // base64 in every tool result, especially across a long-running hub_wait
 // loop.
-func (h *Hub) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.Event) string {
+func (s *session) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.Event) string {
 	var b strings.Builder
 	for _, ev := range events {
 		for _, a := range ev.Attachments {
-			raw, contentType, err := h.resolveAttachment(conn, a)
+			raw, contentType, err := s.hub.resolveAttachment(conn, a)
 			if err != nil {
 				fmt.Fprintf(&b, "\n\n[attachment on the message from %s at %s could not be fetched: %v]",
 					ev.PeerID, ev.TS, err)
 				continue
 			}
-			dir, err := h.attachmentDir()
+			dir, err := s.attachmentDir()
 			if err != nil {
 				fmt.Fprintf(&b, "\n\n[attachment on the message from %s at %s could not be saved locally: %v]",
 					ev.PeerID, ev.TS, err)
 				continue
 			}
-			h.attachMu.Lock()
-			h.attachSeq++
-			seq := h.attachSeq
-			h.attachMu.Unlock()
+			s.attachMu.Lock()
+			s.attachSeq++
+			seq := s.attachSeq
+			s.attachMu.Unlock()
 			// Prefer the attachment's own filename when it has one (a
 			// generic file benefits far more from this than an image
 			// does) — sanitized to base name only, so a maliciously
@@ -2509,13 +2378,13 @@ func (h *Hub) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.Event
 // can't be forgotten at a new call site later. See MarkConsumed's doc
 // comment for why the wire-level read-receipt boundary needs the same
 // synchronous-hand-over guarantee recordHandedOver already relies on.
-func (h *Hub) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string, events []hubconn.Event) *mcp.CallToolResult {
+func (s *session) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string, events []hubconn.Event) *mcp.CallToolResult {
 	// Order matters: recordHandedOver stacks every cursor in the ahead
 	// set, and confirmLiveDelivery is what then takes back out the ones it
 	// could confirm outright. Running it first would just have them added
 	// straight back.
-	h.recordHandedOver(events)
-	h.confirmLiveDelivery(events)
+	s.recordHandedOver(events)
+	s.confirmLiveDelivery(events)
 	conn.MarkConsumed(events)
 	// A pulled cursor needs a POSITION in the delivery ledger even though
 	// it spends no push budget: a confirm locates a prefix by position, so
@@ -2523,12 +2392,12 @@ func (h *Hub) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string
 	// nothing and a closed delivery window never reopened — while
 	// hub_confirm reported success.
 	conn.NoteHandedOver(events)
-	return mcp.NewToolResultText(formatted + h.saveReceivedAttachments(conn, events))
+	return mcp.NewToolResultText(formatted + s.saveReceivedAttachments(conn, events))
 }
 
 // confirmLiveDelivery advances the persisted catch-up position for LIVE
 // messages handed to the model synchronously, while this session knows
-// nothing precedes them (see Hub.knownContiguous).
+// nothing precedes them (see session.knownContiguous).
 //
 // Without this, a client reading only through blocking calls never
 // advanced its position at all: every delivery recorded the cursor as
@@ -2542,10 +2411,10 @@ func (h *Hub) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string
 // Historical messages are excluded: hub_catch_up's own walk advances the
 // position itself, one message at a time, and a gap retrieval delivers
 // messages from BEFORE the current position, which must never move it.
-func (h *Hub) confirmLiveDelivery(events []hubconn.Event) {
-	h.mu.Lock()
-	if !h.knownContiguous {
-		h.mu.Unlock()
+func (s *session) confirmLiveDelivery(events []hubconn.Event) {
+	s.mu.Lock()
+	if !s.knownContiguous {
+		s.mu.Unlock()
 		return
 	}
 	advanced := ""
@@ -2554,19 +2423,19 @@ func (h *Hub) confirmLiveDelivery(events []hubconn.Event) {
 			continue
 		}
 		advanced = e.Cursor
-		delete(h.handedOverAhead, e.Cursor)
+		delete(s.handedOverAhead, e.Cursor)
 	}
 	if advanced == "" {
-		h.mu.Unlock()
+		s.mu.Unlock()
 		return
 	}
-	h.lastHandedOverCursor = advanced
-	id := h.catchUpID
-	snapshot := make(map[string]bool, len(h.handedOverAhead))
-	for c := range h.handedOverAhead {
+	s.lastHandedOverCursor = advanced
+	id := s.catchUpID
+	snapshot := make(map[string]bool, len(s.handedOverAhead))
+	for c := range s.handedOverAhead {
 		snapshot[c] = true
 	}
-	h.mu.Unlock()
+	s.mu.Unlock()
 
 	setCatchUpCursor(id, advanced)
 	saveHandedOverAhead(id, snapshot)
@@ -2579,29 +2448,29 @@ func (h *Hub) confirmLiveDelivery(events []hubconn.Event) {
 // only ever reached via resultWithReceivedAttachments, i.e. a
 // SYNCHRONOUS tool result, which — unlike wait --follow's async
 // notification path — IS the delivery, not a best-effort guess at one.
-func (h *Hub) recordHandedOver(events []hubconn.Event) {
-	h.mu.Lock()
+func (s *session) recordHandedOver(events []hubconn.Event) {
+	s.mu.Lock()
 	changed := false
 	for _, e := range events {
 		if e.Cursor == "" {
 			continue
 		}
-		if h.handedOverAhead == nil {
-			h.handedOverAhead = make(map[string]bool)
+		if s.handedOverAhead == nil {
+			s.handedOverAhead = make(map[string]bool)
 		}
-		h.handedOverAhead[e.Cursor] = true
+		s.handedOverAhead[e.Cursor] = true
 		changed = true
 	}
 	var id connstore.Target
 	var snapshot map[string]bool
 	if changed {
-		id = h.catchUpID
-		snapshot = make(map[string]bool, len(h.handedOverAhead))
-		for c := range h.handedOverAhead {
+		id = s.catchUpID
+		snapshot = make(map[string]bool, len(s.handedOverAhead))
+		for c := range s.handedOverAhead {
 			snapshot[c] = true
 		}
 	}
-	h.mu.Unlock()
+	s.mu.Unlock()
 	if changed {
 		saveHandedOverAhead(id, snapshot)
 	}
@@ -2627,12 +2496,12 @@ func readAttachmentParam(req mcp.CallToolRequest) ([]wire.Attachment, error) {
 }
 
 func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	if !conn.Connected() {
-		h.teardownIfCurrent(conn)
+		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	text, err := req.RequireString("text")
@@ -2653,7 +2522,7 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	}
 	behindNote := ""
 	if confirmCursor := req.GetString("confirmCursor", ""); confirmCursor != "" {
-		behind, err := h.confirmCursor(conn, confirmCursor)
+		behind, err := s.confirmCursor(conn, confirmCursor)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("confirmCursor failed: %v", err)), nil
 		}
@@ -2683,17 +2552,28 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name, err := req.RequireString("connection")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	s, err := h.session(name)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	// Leaving on purpose ends the standing permission to come back. A
 	// server restart arriving moments later must not drag a caller into a
 	// session it chose to leave, and "I disconnected but it reconnected"
 	// is the kind of surprise that makes an automatic mechanism
 	// untrustworthy in general, not just here.
-	h.mu.Lock()
-	h.redialLink, h.redialName, h.autoReconnect = "", "", ""
-	h.reconnecting, h.reconnectAt = false, time.Time{}
-	h.mu.Unlock()
+	s.mu.Lock()
+	s.redialLink, s.redialName = "", ""
+	s.reconnecting, s.reconnectAt = false, time.Time{}
+	s.mu.Unlock()
+	// The name is free again the moment its connection is given up, so
+	// reconnecting under it is an ordinary thing to do next.
+	defer h.close(name)
 
-	conn, w, target := h.clearActiveConn()
+	conn, w, target := s.clearActiveConn()
 	if conn == nil {
 		// There may still be a waiter held open for a reconnect that is
 		// no longer wanted. Releasing it is the whole point of asking to
@@ -2703,7 +2583,7 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 			return mcp.NewToolResultText("not connected — a reconnect was pending and has been " +
 				"cancelled, and the follower held open for it has been released"), nil
 		}
-		return h.notConnected(), nil
+		return s.notConnected(), nil
 	}
 	if w != nil {
 		w.Close()
@@ -2725,16 +2605,19 @@ func (h *Hub) Shutdown() {
 	if h.inbox != nil {
 		_ = h.inbox.Close()
 	}
-	conn, w, target := h.clearActiveConn()
-	if conn == nil {
-		return
-	}
-	if w != nil {
-		w.Close()
-	}
-	conn.Close()
-	if target != (connstore.Target{}) {
-		_ = connstore.MarkDisconnected(target)
+	for _, s := range h.allSessions() {
+		h.close(s.name)
+		conn, w, target := s.clearActiveConn()
+		if conn == nil {
+			continue
+		}
+		if w != nil {
+			w.Close()
+		}
+		conn.Close()
+		if target != (connstore.Target{}) {
+			_ = connstore.MarkDisconnected(target)
+		}
 	}
 }
 
@@ -2774,9 +2657,9 @@ func (h *Hub) handleUnpin(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 }
 
 func (h *Hub) pinAction(req mcp.CallToolRequest, pin bool) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	_, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	externalID, err := req.RequireString("externalId")
 	if err != nil {
@@ -2806,9 +2689,9 @@ func (h *Hub) pinAction(req mcp.CallToolRequest, pin bool) (*mcp.CallToolResult,
 // needs a way to be asked about rather than a rule saying it should not
 // drift.
 func (h *Hub) handlePins(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	_, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	ev, ok, err := conn.Pins()
 	if err != nil {
@@ -2822,9 +2705,9 @@ func (h *Hub) handlePins(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	at, after := req.GetString("at", ""), req.GetString("after", "")
 	switch {
@@ -2886,7 +2769,7 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// The delivery is recorded, but this is not resultWithReceivedAttachments:
 	// that also marks the wire-level receipt, which must not point at an
 	// old message. See this function's doc comment.
-	h.recordHandedOver([]hubconn.Event{ev})
+	s.recordHandedOver([]hubconn.Event{ev})
 	// NoteHandedOver is a LOCAL position in the delivery ledger — no
 	// cursor on the wire, no acknowledgement — so it does not weaken the
 	// split above, and leaving it out reopened the defect it exists to
@@ -3053,12 +2936,41 @@ func (h *Hub) handleSelfUpdate(ctx context.Context, req mcp.CallToolRequest) (*m
 }
 
 func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// What is OPEN comes first and separately from what is merely stored.
+	// A stored entry is a link this project has used; an open one is a
+	// name that tools will answer to right now, and only the second is
+	// something to act on.
+	var openLines []string
+	for _, s := range h.allSessions() {
+		conn, _ := s.activeConn()
+		state := "connecting"
+		switch {
+		case conn != nil && conn.Connected():
+			state = "connected as peer " + conn.PeerID()
+		case conn != nil:
+			state = "disconnected, not yet torn down"
+		}
+		s.mu.Lock()
+		if s.reconnecting {
+			state = "reconnecting automatically"
+		}
+		link := s.redialLink
+		s.mu.Unlock()
+		openLines = append(openLines, fmt.Sprintf("%s — %s (link=%s)", s.name, state, link))
+	}
+	openBlock := "No connection is open. hub_connect opens one and gives it a name.\n\n"
+	if len(openLines) > 0 {
+		openBlock = "OPEN CONNECTIONS — these are the names every other tool takes:\n  " +
+			strings.Join(openLines, "\n  ") + "\n\n"
+	}
+
 	entries, err := connstore.ListForProject(projectForConnect(ctx))
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("could not list stored connections: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("%scould not list stored connections: %v",
+			openBlock, err)), nil
 	}
 	if len(entries) == 0 {
-		return mcp.NewToolResultText("no stored connections for this project"), nil
+		return mcp.NewToolResultText(openBlock + "no stored connections for this project"), nil
 	}
 	lines := make([]string, 0, len(entries))
 	for _, le := range entries {
@@ -3091,32 +3003,33 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		}
 		lines = append(lines, line)
 	}
-	return mcp.NewToolResultText(strings.Join(lines, "\n")), nil
+	return mcp.NewToolResultText(openBlock + "PREVIOUSLY USED LINKS in this project:\n" +
+		strings.Join(lines, "\n")), nil
 }
 
 func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	events, connected := conn.DrainEvents()
 	formatted := hubconn.FormatEvents(events)
 	if !connected {
-		h.teardownIfCurrent(conn)
+		s.teardownIfCurrent(conn)
 		// Still surface anything that arrived right before the disconnect
 		// (e.g. a final message buffered just ahead of the read loop
 		// erroring out) instead of silently discarding it in favor of a
 		// bare "hub disconnected" — the caller can always tell the two
 		// apart since disconnected-with-content still ends with the note.
 		if formatted != "" {
-			return h.resultWithReceivedAttachments(conn, formatted+"\n\n"+disconnectedText(conn), events), nil
+			return s.resultWithReceivedAttachments(conn, formatted+"\n\n"+disconnectedText(conn), events), nil
 		}
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	if formatted == "" {
 		return mcp.NewToolResultText("no messages"), nil
 	}
-	return h.resultWithReceivedAttachments(conn, formatted, events), nil
+	return s.resultWithReceivedAttachments(conn, formatted, events), nil
 }
 
 // waitPollInterval is how often handleWait re-checks the buffer while
@@ -3163,9 +3076,9 @@ const waitAgainReminder = "REMINDER: after processing the message(s) below, call
 // abandons a call on its own timeout (no cancellation sent) and then
 // retries, leaving the old call still running server-side.
 func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 
 	innerCtx, cancel := context.WithCancel(ctx)
@@ -3193,13 +3106,13 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 			events, connected := conn.DrainEvents()
 			formatted := hubconn.FormatEvents(events)
 			if !connected {
-				h.teardownIfCurrent(conn)
+				s.teardownIfCurrent(conn)
 				if formatted == "" {
 					return mcp.NewToolResultText(disconnectedText(conn)), nil
 				}
-				return h.resultWithReceivedAttachments(conn, formatted+"\n\n"+disconnectedText(conn), events), nil
+				return s.resultWithReceivedAttachments(conn, formatted+"\n\n"+disconnectedText(conn), events), nil
 			}
-			return h.resultWithReceivedAttachments(conn, waitAgainReminder+formatted, events), nil
+			return s.resultWithReceivedAttachments(conn, waitAgainReminder+formatted, events), nil
 		}
 		select {
 		case <-innerCtx.Done():
@@ -3215,12 +3128,12 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func (h *Hub) handlePeers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	if !conn.Connected() {
-		h.teardownIfCurrent(conn)
+		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	catchingUp := ""
@@ -3297,18 +3210,18 @@ const catchUpSeekWindow = 10 * time.Minute
 const catchUpDedupSkipLimit = 20
 
 func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	if !conn.Connected() {
-		h.teardownIfCurrent(conn)
+		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 
 	if req.GetBool("discardGap", false) {
 		h.mu.Lock()
-		catchUpIDNow := h.catchUpID
+		catchUpIDNow := s.catchUpID
 		h.mu.Unlock()
 		discarded, ok := discardCatchUpGap(catchUpIDNow)
 		if !ok {
@@ -3326,15 +3239,15 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 
 	if req.GetBool("gap", false) {
 		h.mu.Lock()
-		catchUpIDNow := h.catchUpID
+		catchUpIDNow := s.catchUpID
 		h.mu.Unlock()
-		return h.handleCatchUpGap(conn, catchUpIDNow)
+		return s.handleCatchUpGap(conn, catchUpIDNow)
 	}
 
 	h.mu.Lock()
-	cursor := h.lastHandedOverCursor
-	catchUpIDNow := h.catchUpID
-	alreadySeeked := h.seekedSinceConnect
+	cursor := s.lastHandedOverCursor
+	catchUpIDNow := s.catchUpID
+	alreadySeeked := s.seekedSinceConnect
 	h.mu.Unlock()
 
 	// Included in every terminal "you're done" message below, not just
@@ -3375,7 +3288,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// unknown rather than becoming zero — the whole defect here was a
 	// silence read as a number.
 	h.mu.Lock()
-	project := h.catchUpID.Project
+	project := s.catchUpID.Project
 	h.mu.Unlock()
 
 	measuredBehind := 0
@@ -3426,9 +3339,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
 		h.mu.Lock()
-		id := h.catchUpID
-		h.seekedSinceConnect = true
-		h.knownContiguous = false
+		id := s.catchUpID
+		s.seekedSinceConnect = true
+		s.knownContiguous = false
 		h.mu.Unlock()
 		setCatchUpGap(id, cursor, seekAt)
 		// The prose must describe what happened, not what usually
@@ -3455,13 +3368,13 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
 		h.mu.Lock()
-		id := h.catchUpID
-		h.seekedSinceConnect = true
+		id := s.catchUpID
+		s.seekedSinceConnect = true
 		h.mu.Unlock()
 		// A seek leaves a range nobody has walked, so live traffic is no
 		// longer known to follow the confirmed position.
 		h.mu.Lock()
-		h.knownContiguous = false
+		s.knownContiguous = false
 		h.mu.Unlock()
 		setCatchUpGap(id, conn.BehindSince(), seekAt)
 		seekNote = fmt.Sprintf(
@@ -3483,7 +3396,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	default:
 		branch = "nothing to do"
 		h.mu.Lock()
-		h.knownContiguous = true
+		s.knownContiguous = true
 		h.mu.Unlock()
 		// "Nothing to catch up" is a statement about the SERVER's unread
 		// position. This client's own buffer is a different store, and a
@@ -3510,9 +3423,9 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// else — see catchuppush.go for why the two differ.
 	if harness.PushMode() {
 		h.mu.Lock()
-		id := h.catchUpID
+		id := s.catchUpID
 		h.mu.Unlock()
-		go h.runCatchUpPush(conn, id, anchor, catchUpWant{
+		go s.runCatchUpPush(conn, id, anchor, catchUpWant{
 			Messages: req.GetInt("limit", 0),
 			KB:       req.GetInt("maxKB", 0),
 		})
@@ -3542,7 +3455,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			// the gap is a separate, explicitly-tracked range, not an
 			// unknown one.
 			h.mu.Lock()
-			h.knownContiguous = true
+			s.knownContiguous = true
 			h.mu.Unlock()
 			return mcp.NewToolResultText(seekNote +
 				"[hub: caught up — no more messages after your last known position]" + gapNote), nil
@@ -3552,7 +3465,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			), nil
 		case "msg":
 			h.mu.Lock()
-			alreadyHandedOver := ev.Cursor != "" && h.handedOverAhead[ev.Cursor]
+			alreadyHandedOver := ev.Cursor != "" && s.handedOverAhead[ev.Cursor]
 			h.mu.Unlock()
 			if alreadyHandedOver {
 				// Already shown to the model via a synchronous
@@ -3562,11 +3475,11 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				// legitimately moves) and try the next position instead
 				// of showing a duplicate the model has already read.
 				h.mu.Lock()
-				h.lastHandedOverCursor = ev.Cursor
-				delete(h.handedOverAhead, ev.Cursor)
-				id := h.catchUpID
-				snapshot := make(map[string]bool, len(h.handedOverAhead))
-				for c := range h.handedOverAhead {
+				s.lastHandedOverCursor = ev.Cursor
+				delete(s.handedOverAhead, ev.Cursor)
+				id := s.catchUpID
+				snapshot := make(map[string]bool, len(s.handedOverAhead))
+				for c := range s.handedOverAhead {
 					snapshot[c] = true
 				}
 				h.mu.Unlock()
@@ -3583,8 +3496,8 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			// falling back to a seek.
 			if ev.Cursor != "" {
 				h.mu.Lock()
-				h.lastHandedOverCursor = ev.Cursor
-				id := h.catchUpID
+				s.lastHandedOverCursor = ev.Cursor
+				id := s.catchUpID
 				h.mu.Unlock()
 				setCatchUpCursor(id, ev.Cursor)
 			}
@@ -3592,7 +3505,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				seekNote + hubconn.FormatEvent(ev) +
 				"\n\n[hub: more may remain — call hub_catch_up again; you'll be told \"caught up\" once " +
 				"there's nothing further]"
-			return h.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
+			return s.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
 		default:
 			return mcp.NewToolResultError(fmt.Sprintf("unexpected catch-up response kind %q", ev.Kind)), nil
 		}
@@ -3625,7 +3538,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 // (both are RFC3339 UTC on this client's own side; a server's own
 // message TS format may vary) — if it's ever wrong, the failure mode is
 // walking a little further than strictly needed, not losing anything.
-func (h *Hub) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mcp.CallToolResult, error) {
+func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mcp.CallToolResult, error) {
 	gap, ok := loadCatchUpGap(id)
 	if !ok {
 		return mcp.NewToolResultText(
@@ -3662,9 +3575,9 @@ func (h *Hub) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mcp.Ca
 				fmt.Sprintf("gap retrieval refused (code=%s, retryable=%t): %s", ev.Code, ev.Retryable, ev.Text),
 			), nil
 		case "msg":
-			h.mu.Lock()
-			alreadyHandedOver := ev.Cursor != "" && h.handedOverAhead[ev.Cursor]
-			h.mu.Unlock()
+			s.mu.Lock()
+			alreadyHandedOver := ev.Cursor != "" && s.handedOverAhead[ev.Cursor]
+			s.mu.Unlock()
 			reachedEnd := gap.To != "" && ev.TS != "" && ev.TS >= gap.To
 			if alreadyHandedOver {
 				// Same reasoning as the ordinary walk's dedup branch —
@@ -3679,14 +3592,14 @@ func (h *Hub) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mcp.Ca
 				// retrieval through repeated hub_catch_up(gap: true) calls
 				// (as happened live while chasing the decodeEvent bug)
 				// accumulated dead entries without bound.
-				h.mu.Lock()
-				delete(h.handedOverAhead, ev.Cursor)
-				aheadID := h.catchUpID
-				snapshot := make(map[string]bool, len(h.handedOverAhead))
-				for c := range h.handedOverAhead {
+				s.mu.Lock()
+				delete(s.handedOverAhead, ev.Cursor)
+				aheadID := s.catchUpID
+				snapshot := make(map[string]bool, len(s.handedOverAhead))
+				for c := range s.handedOverAhead {
 					snapshot[c] = true
 				}
-				h.mu.Unlock()
+				s.mu.Unlock()
 				saveHandedOverAhead(aheadID, snapshot)
 				if reachedEnd {
 					clearCatchUpGap(id)
@@ -3718,7 +3631,7 @@ func (h *Hub) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mcp.Ca
 						"again to continue retrieving it]", gap.From, gap.To,
 				)
 			}
-			return h.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
+			return s.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
 		default:
 			return mcp.NewToolResultError(fmt.Sprintf("unexpected gap retrieval response kind %q", ev.Kind)), nil
 		}
@@ -3740,19 +3653,19 @@ func (h *Hub) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mcp.Ca
 // itself closes that gap by construction: the call can only originate
 // once the model has actually seen cursor.
 func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	if !conn.Connected() {
-		h.teardownIfCurrent(conn)
+		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	cursor, err := req.RequireString("cursor")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	behind, err := h.confirmCursor(conn, cursor)
+	behind, err := s.confirmCursor(conn, cursor)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("confirm failed: %v", err)), nil
 	}
@@ -3790,10 +3703,10 @@ func formatBehindNote(behind *int) string {
 // conn.ConfirmReceived), not a piggybacked one — chat-relay's own note:
 // a piggybacked receipt is fire-and-forget by design and never answers
 // with a pending count, where a standalone one does.
-func (h *Hub) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
+func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
 	behind, err := conn.ConfirmReceived(cursor)
 	if conn.TakeSkippedHeldNotice() {
-		h.noteAutoReconnect("that confirm moved your read position PAST message(s) live delivery " +
+		s.note("that confirm moved your read position PAST message(s) live delivery " +
 			"had held back, so they will not be delivered and will not be walked to. They are " +
 			"still on the server: hub_read(after: <a cursor from before the hold>) retrieves " +
 			"them. Said once — nothing will mention this gap again.")
@@ -3801,8 +3714,8 @@ func (h *Hub) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
 	if err != nil {
 		return nil, err
 	}
-	h.mu.Lock()
-	h.lastHandedOverCursor = cursor
+	s.mu.Lock()
+	s.lastHandedOverCursor = cursor
 	// handedOverAhead's entries exist to dedup a walk that hasn't reached
 	// them yet — but a confirm jump moves the walk's own starting point
 	// straight past all of them without ever waking on any individual
@@ -3816,21 +3729,21 @@ func (h *Hub) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
 	// cursor would never have reached those entries anyway; worst case a
 	// genuinely-newer entry gets dropped too, costing one avoidable
 	// duplicate later, not a loss.
-	h.handedOverAhead = nil
-	id := h.catchUpID
-	h.mu.Unlock()
+	s.handedOverAhead = nil
+	id := s.catchUpID
+	s.mu.Unlock()
 	setCatchUpCursor(id, cursor)
 	saveHandedOverAhead(id, nil)
 	return behind, nil
 }
 
 func (h *Hub) handleReact(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	if !conn.Connected() {
-		h.teardownIfCurrent(conn)
+		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	externalID, err := req.RequireString("externalId")
@@ -3868,12 +3781,12 @@ func (h *Hub) handleReact(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 }
 
 func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	if !conn.Connected() {
-		h.teardownIfCurrent(conn)
+		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	externalID, err := req.RequireString("externalId")
@@ -3894,7 +3807,7 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	}
 	behindNote := ""
 	if confirmCursor := req.GetString("confirmCursor", ""); confirmCursor != "" {
-		behind, err := h.confirmCursor(conn, confirmCursor)
+		behind, err := s.confirmCursor(conn, confirmCursor)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("confirmCursor failed: %v", err)), nil
 		}
@@ -3920,12 +3833,12 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 }
 
 func (h *Hub) handleDelete(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	conn, _ := h.activeConn()
-	if conn == nil {
-		return h.notConnected(), nil
+	s, conn, bad := h.forRequest(req)
+	if bad != nil {
+		return bad, nil
 	}
 	if !conn.Connected() {
-		h.teardownIfCurrent(conn)
+		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	externalID, err := req.RequireString("externalId")

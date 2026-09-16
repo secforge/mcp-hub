@@ -151,7 +151,7 @@ func TestEveryToolThatHandsOverACursorRecordsALedgerPosition(t *testing.T) {
 		t.Fatalf("reading tools.go: %v", err)
 	}
 	text := string(src)
-	recorded := strings.Count(text, "h.recordHandedOver(")
+	recorded := strings.Count(text, "sole(t, h).recordHandedOver(")
 	noted := strings.Count(text, "NoteHandedOver(")
 	// recordHandedOver marks a cursor as delivered; NoteHandedOver gives
 	// it a ledger position. Every site doing the first must do the second,
@@ -255,7 +255,7 @@ func TestCatchUpDeliversByPushOnlyInPushMode(t *testing.T) {
 	}
 	text := string(src)
 
-	idx := strings.Index(text, "go h.runCatchUpPush(")
+	idx := strings.Index(text, "go s.runCatchUpPush(")
 	if idx < 0 {
 		t.Fatal("the push-mode catch-up branch is gone")
 	}

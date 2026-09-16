@@ -23,6 +23,10 @@ import (
 // turn a sentence into a file read. Both keep hub_send, which takes them
 // as real arguments rather than as text that looks like arguments.
 type inboxHeader struct {
+	// Conn is which connection the reply is for. Required, because this
+	// inbox serves every open connection and a reply that does not say
+	// where it goes cannot be placed — see sendFromInbox.
+	Conn       string
 	To         string
 	ReplyTo    string
 	Confirm    string
@@ -52,6 +56,8 @@ func parseInboxHeader(text string) (inboxHeader, string, error) {
 			return h, "", fmt.Errorf("%q is not key=value", field)
 		}
 		switch key {
+		case "conn":
+			h.Conn = value
 		case "to":
 			h.To = value
 		case "replyTo":
@@ -64,7 +70,7 @@ func parseInboxHeader(text string) (inboxHeader, string, error) {
 			}
 			h.Format = value
 		default:
-			return h, "", fmt.Errorf("unknown directive %q (known: to, replyTo, confirm, format; "+
+			return h, "", fmt.Errorf("unknown directive %q (known: conn, to, replyTo, confirm, format; "+
 				"mentions and attachments need hub_send)", key)
 		}
 		h.Directives = append(h.Directives, key+"="+value)

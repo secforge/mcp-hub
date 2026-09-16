@@ -86,7 +86,7 @@ type catchUpResult struct {
 // Runs on its own goroutine: the tool call returns immediately, because
 // the delivery is the point rather than the answer. Everything it learns
 // goes to the model the same way a live message does.
-func (h *Hub) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wire.Anchor,
+func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wire.Anchor,
 	want catchUpWant) {
 	var res catchUpResult
 	maxMessages, maxBytes := want.limits()
@@ -113,8 +113,8 @@ func (h *Hub) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wir
 		}
 
 		text := conn.ShapeForPush(ev)
-		text += h.saveReceivedAttachments(conn, []hubconn.Event{ev})
-		if _, err := h.pusher.Push(ev.Cursor, text, true); err != nil {
+		text += s.saveReceivedAttachments(conn, []hubconn.Event{ev})
+		if _, err := s.hub.pusher.Push(ev.Cursor, text, true); err != nil {
 			// The message is still on the server and the position has not
 			// moved, so this is recoverable — but only if it is said.
 			res.Err = err
@@ -123,9 +123,9 @@ func (h *Hub) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wir
 
 		// The push IS the hand-over, so the position advances here, the
 		// same way a synchronous delivery advances it.
-		h.mu.Lock()
-		h.lastHandedOverCursor = ev.Cursor
-		h.mu.Unlock()
+		s.mu.Lock()
+		s.lastHandedOverCursor = ev.Cursor
+		s.mu.Unlock()
 		setCatchUpCursor(id, ev.Cursor)
 		conn.NoteHandedOver([]hubconn.Event{ev})
 
@@ -138,7 +138,7 @@ func (h *Hub) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wir
 		res.StoppedBy = fmt.Sprintf("this run reached its limit of %d messages or %d KB",
 			maxMessages, maxBytes/1024)
 	}
-	h.pushCatchUpSummary(res)
+	s.pushCatchUpSummary(res)
 }
 
 // pushCatchUpSummary is the last thing a run delivers: what happened and
@@ -147,7 +147,7 @@ func (h *Hub) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wir
 // without saying so would leave a reader unable to tell "caught up" from
 // "stopped", which is the one distinction this whole codebase exists to
 // keep.
-func (h *Hub) pushCatchUpSummary(res catchUpResult) {
+func (s *session) pushCatchUpSummary(res catchUpResult) {
 	var text string
 	switch {
 	case res.Err != nil:
@@ -166,8 +166,8 @@ func (h *Hub) pushCatchUpSummary(res catchUpResult) {
 	}
 	// No cursor: this is this client's own words about a run, not a
 	// message anyone can re-fetch.
-	if _, err := h.pusher.Push("", text, false); err != nil {
-		h.noteAutoReconnect(fmt.Sprintf("a catch-up run finished but its summary could not be "+
+	if _, err := s.hub.pusher.Push("", text, false); err != nil {
+		s.note(fmt.Sprintf("a catch-up run finished but its summary could not be "+
 			"delivered (%v): %d message(s) were pushed.", err, res.Delivered))
 	}
 }
