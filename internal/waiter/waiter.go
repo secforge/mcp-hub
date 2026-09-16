@@ -91,6 +91,11 @@ type Waiter struct {
 	sources map[string]*attached
 	order   []string
 	current *registeredWaiter
+	// wake carries "there may be something to deliver" to the delivery
+	// goroutine. Buffered to one and sent non-blockingly, so a burst of
+	// pokes costs one wake-up rather than a queue of them, and so Poke
+	// never blocks whatever called it.
+	wake chan struct{}
 	// closed is set by Close under w.mu. A delivery in flight has
 	// unregistered its reader, so Close cannot see it to say goodbye —
 	// this is what lets the delivery discover, when it comes back to
@@ -308,8 +313,10 @@ func Listen() (*Waiter, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &Waiter{ln: ln, socketPath: path, sources: map[string]*attached{}}
+	w := &Waiter{ln: ln, socketPath: path, sources: map[string]*attached{},
+		wake: make(chan struct{}, 1)}
 	go w.acceptLoop()
+	go w.deliverLoop()
 	sweepStaleSockets(path)
 	return w, nil
 }
@@ -444,18 +451,18 @@ func (w *Waiter) handleAccept(conn net.Conn) {
 	// under one uninterrupted lock hold — see the comment on deliver's tail
 	// for why the two must never be split, on pain of a permanently
 	// undelivered event.
+	// Registered, then poked — rather than delivering on this goroutine.
+	// The poke is unconditional, so anything already buffered is picked
+	// up by the delivery loop; registering first means no event can land
+	// in the gap and find nobody to wake.
 	w.mu.Lock()
-	if w.pendingLocked() {
-		w.mu.Unlock()
-		w.deliver(rw)
-		return
-	}
 	old := w.current
 	w.current = rw
 	w.mu.Unlock()
 	if old != nil {
 		writeAndClose(old.conn, w.supersededMessage())
 	}
+	w.Poke()
 }
 
 // Poke delivers to the currently registered waiter, if any, using whatever
@@ -476,18 +483,48 @@ func (w *Waiter) Poke() {
 	if w == nil {
 		return
 	}
-	w.mu.Lock()
-	if !w.pendingLocked() {
+	// Signals and returns. It used to deliver inline, and the caller is
+	// the CONNECTION'S READ LOOP (via Conn.OnActivity), so every pause
+	// delivery took — liveEmissionSpacing between chunks, a write to a
+	// slow reader — was paid by not reading that socket. A twenty-event
+	// burst spaced at 500ms meant about 9.5 seconds during which no
+	// frame was read, no pong processed, and a disconnect could not be
+	// noticed. Worst exactly when messages arrive fastest, which is when
+	// reading matters most.
+	//
+	// The spacing itself is doing real work and stays; what moves is
+	// where it is waited for.
+	select {
+	case w.wake <- struct{}{}:
+	default:
+		// A wake-up is already pending. One is enough: the loop
+		// re-checks everything when it runs.
+	}
+}
+
+// deliverLoop is the one goroutine that writes to a reader. Everything
+// slow — the spacing between chunks, a write to a socket that is not
+// being drained — happens here, where the only cost is latency on the
+// delivery itself.
+func (w *Waiter) deliverLoop() {
+	for range w.wake {
+		w.mu.Lock()
+		if w.closed {
+			w.mu.Unlock()
+			return
+		}
+		if !w.pendingLocked() {
+			w.mu.Unlock()
+			continue
+		}
+		rw := w.current
+		w.current = nil
 		w.mu.Unlock()
-		return
+		if rw == nil {
+			continue
+		}
+		w.deliver(rw)
 	}
-	rw := w.current
-	w.current = nil
-	w.mu.Unlock()
-	if rw == nil {
-		return
-	}
-	w.deliver(rw)
 }
 
 func (w *Waiter) deliver(rw *registeredWaiter) {
@@ -676,6 +713,9 @@ func (w *Waiter) Close() error {
 		w.current = nil
 	}
 	w.mu.Unlock()
+	// Wakes the delivery loop so it sees closed and returns, rather than
+	// sitting on a channel nothing will send to again.
+	w.Poke()
 	err := w.ln.Close()
 	_ = os.Remove(w.socketPath)
 	return err

@@ -772,3 +772,48 @@ func TestOneConnectionEndingDoesNotEndTheChannel(t *testing.T) {
 		t.Fatalf("expected only beta attached, got %v", attached)
 	}
 }
+
+// Poke is called from the CONNECTION'S READ LOOP, so it must return at
+// once. It used to deliver inline, which meant every pause delivery took
+// — the spacing between chunks, a write to a slow reader — was time that
+// socket was not being read: a twenty-event burst spaced at 500ms stopped
+// reading for about 9.5 seconds, worst exactly when messages arrive
+// fastest.
+func TestPokeDoesNotWaitForTheDelivery(t *testing.T) {
+	orig := liveEmissionSpacing
+	liveEmissionSpacing = 300 * time.Millisecond
+	defer func() { liveEmissionSpacing = orig }()
+
+	src := &fakeSource{connected: true}
+	w, err := Listen()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	w.SetSource("t", src)
+	defer w.Close()
+
+	conn := dialFollow(t, w.socketPath)
+	defer conn.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Three chunks: delivery pays two spacings, 600ms.
+	src.push("one")
+	src.push("two")
+	src.push("three")
+
+	start := time.Now()
+	w.Poke()
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("Poke blocked for %v — the read loop would be stalled that long", elapsed)
+	}
+
+	// And the delivery still happens, spaced, on its own goroutine.
+	for _, want := range []string{"one", "two", "three"} {
+		if got := readChunk(t, conn); got != "[connection: t]\n"+want+"\n\n" {
+			t.Fatalf("expected %q, got %q", want, got)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < 2*liveEmissionSpacing {
+		t.Fatalf("expected the spacing to still be paid on the delivery side, took only %v", elapsed)
+	}
+}
