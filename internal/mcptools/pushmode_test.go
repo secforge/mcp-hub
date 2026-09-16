@@ -255,15 +255,21 @@ func TestCatchUpDeliversByPushOnlyInPushMode(t *testing.T) {
 	}
 	text := string(src)
 
-	idx := strings.Index(text, "go s.runCatchUpPush(")
+	idx := strings.Index(text, "s.runCatchUpPush(")
 	if idx < 0 {
 		t.Fatal("the push-mode catch-up branch is gone")
 	}
 	// The guard must be the push-mode check, not something else that
 	// happens to be nearby.
-	before := text[max(0, idx-400):idx]
+	before := text[max(0, idx-1200):idx]
 	if !strings.Contains(before, "harness.PushMode()") {
 		t.Error("the push drain is not gated on push mode")
+	}
+	// And it must go through the one-at-a-time slot: two backlogs
+	// interleaving produce a stream neither conversation reads as its
+	// own.
+	if !strings.Contains(before, "catchUpSlot") {
+		t.Error("the backlog walk is not serialized across connections")
 	}
 	// The per-call walk still has to exist for pull clients.
 	if !strings.Contains(text, "catchUpDedupSkipLimit") {

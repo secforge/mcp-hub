@@ -152,18 +152,18 @@ func (s *session) pushCatchUpSummary(res catchUpResult) {
 	var text string
 	switch {
 	case res.Err != nil:
-		text = fmt.Sprintf("[hub: catch-up STOPPED after %d message(s) — %v. Nothing is lost: the "+
+		text = fmt.Sprintf("[hub: catch-up on %s STOPPED after %d message(s) — %v. Nothing is lost: the "+
 			"position only advanced for what was delivered, so calling hub_catch_up again resumes "+
-			"exactly where this stopped]", res.Delivered, res.Err)
+			"exactly where this stopped]", s.name, res.Delivered, res.Err)
 	case res.CaughtUp:
-		text = fmt.Sprintf("[hub: caught up — %d message(s) delivered, nothing further on the "+
+		text = fmt.Sprintf("[hub: caught up on %s — %d message(s) delivered, nothing further on the "+
 			"server. Confirm the last one you have COMPLETE with hub_confirm, or piggyback it on "+
-			"your next send; until you do, a reconnect re-walks them]", res.Delivered)
+			"your next send; until you do, a reconnect re-walks them]", s.name, res.Delivered)
 	default:
-		text = fmt.Sprintf("[hub: catch-up PAUSED after %d message(s), %d KB — %s. More remains. "+
+		text = fmt.Sprintf("[hub: catch-up on %s PAUSED after %d message(s), %d KB — %s. More remains. "+
 			"Call hub_catch_up again for the next batch; confirm what you have read first so the "+
 			"next run starts from there rather than re-walking]",
-			res.Delivered, res.Bytes/1024, res.StoppedBy)
+			s.name, res.Delivered, res.Bytes/1024, res.StoppedBy)
 	}
 	// No cursor: this is this client's own words about a run, not a
 	// message anyone can re-fetch.

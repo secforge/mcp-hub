@@ -272,3 +272,48 @@ func TestTheDeliveredCursorMemoryIsBounded(t *testing.T) {
 		t.Fatalf("expected the set to stay bounded, got %d/%d", n, order)
 	}
 }
+
+// One window for the process, not one per connection. The window bounds
+// what a reader can absorb, and a reader is a process: eight connections
+// with a window each is eight times the ceiling that was set by watching
+// one receiver die.
+func TestConnectionsShareOneDeliveryWindow(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub := NewHub()
+	defer hub.Shutdown()
+	connectTwo(t, hub)
+
+	alpha, _ := hub.session("alpha")
+	beta, _ := hub.session("beta")
+	connA, _ := alpha.activeConn()
+	connB, _ := beta.activeConn()
+
+	// Spending on one is visible to the other, which is the whole point
+	// and also the accepted cost.
+	connA.ChargeDelivered("cursor-a", 1000)
+	if !connB.SameDeliveryBudget(connA) {
+		t.Fatal("expected both connections to spend against one window")
+	}
+	if hub.budget == nil {
+		t.Fatal("expected the process to own the window")
+	}
+}
+
+// Backlog walks are serialized: two at once produce a stream in which
+// neither conversation reads as a conversation.
+func TestOnlyOneBacklogWalkRunsAtATime(t *testing.T) {
+	h := NewHub()
+	// Taking the slot stands in for a run in progress.
+	h.catchUpSlot <- struct{}{}
+	select {
+	case h.catchUpSlot <- struct{}{}:
+		t.Fatal("expected the second walk to find the slot taken")
+	default:
+	}
+	<-h.catchUpSlot
+	select {
+	case h.catchUpSlot <- struct{}{}:
+	default:
+		t.Fatal("expected the slot to be free once the first run finished")
+	}
+}

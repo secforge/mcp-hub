@@ -30,6 +30,13 @@ import (
 // Both are needed and neither substitutes for the other: the first bounds
 // one delivery, the second bounds their sum, and it was the sum that
 // killed the receiver.
+// Budget is exported so one process can hold a SINGLE window across
+// several connections. The window bounds what a reader can absorb, and a
+// reader is a process, not a socket: eight connections with a window each
+// is eight times the ceiling that was set by measuring one receiver
+// dying. The spill threshold stays per-message and needs no sharing.
+type Budget = budget
+
 type budget struct {
 	mu sync.Mutex
 
@@ -84,12 +91,30 @@ type charge struct {
 // newBudget returns the default policy. Values are deliberately far apart:
 // the spill threshold guards one message, the window guards a session, and
 // a session is many messages.
+// NewDeliveryBudget builds a window for a caller that intends to share
+// one across several connections — see Conn.ShareDeliveryBudget.
+func NewDeliveryBudget() *Budget { return newBudget() }
+
 func newBudget() *budget {
 	return &budget{
 		spillBytes:  128 * 1024,
 		windowBytes: 500 * 1024,
 		windowCount: 200,
 	}
+}
+
+// ShareDeliveryBudget replaces this connection's own window with a shared
+// one, so several connections spend against the same ceiling. Call it
+// before SetDeliveryBudget, which configures whatever window is in place.
+//
+// Deliberately a replacement rather than a second layer: two windows
+// would each be satisfied while their sum was not, which is the exact
+// arithmetic that made a per-connection window wrong.
+func (c *Conn) ShareDeliveryBudget(b *Budget) {
+	if b == nil {
+		return
+	}
+	c.budget = b
 }
 
 // SetDeliveryBudget configures the push policy. spillDir is called only
@@ -327,3 +352,10 @@ func (b *budget) shape(e Event) Event {
 // to judge whether the rest is worth opening, small enough that a burst of
 // them cannot itself become the problem.
 const spillHeadBytes = 400
+
+// SameDeliveryBudget reports whether two connections spend against the
+// same window — for a caller that shares one and wants to prove it did,
+// rather than assume it from having called the setter.
+func (c *Conn) SameDeliveryBudget(other *Conn) bool {
+	return c != nil && other != nil && c.budget == other.budget
+}

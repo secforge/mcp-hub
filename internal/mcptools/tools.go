@@ -36,12 +36,33 @@ type Hub struct {
 	// on a connection names one, and an unknown name is an error rather
 	// than a fallback to whichever is open.
 	sessions map[string]*session
+	// budget is ONE delivery window for the whole process, shared by
+	// every connection. The window bounds what a reader can absorb and a
+	// reader is a process, not a socket: a window each would mean eight
+	// times the ceiling that was set by measuring one receiver dying.
+	//
+	// The cost is accepted rather than hidden: a noisy conversation can
+	// crowd out a quiet one. The cap on simultaneous connections is what
+	// bounds that, and it is the honest trade — the alternative starves
+	// nobody and protects nobody.
+	budget *hubconn.Budget
+	// spillMu/spillDir is where oversized bodies are written. Process-
+	// level, because the budget is: a spill belongs to the window that
+	// refused to inline it, not to whichever connection happened to
+	// receive it.
+	spillMu   sync.Mutex
+	spillPath string
 	// autoReconnect holds what this client has to tell the model but has
 	// no tool result to put it in — a reconnect it performed on its own,
 	// a relay that failed. Process-wide rather than per-session, because
 	// there is one reader: a drop that takes several connections with it
 	// produces one notice naming them, not one notice each.
 	autoReconnect string
+
+	// catchUpSlot serializes backlog walks across connections — see
+	// NewHub. Buffered to one: acquiring it is the right to deliver a
+	// backlog, and a second run waits rather than interleaving.
+	catchUpSlot chan struct{}
 
 	// waitMu, waitCancel, and waitGen let a new handleWait call supersede
 	// one already in flight, mirroring waiter.Waiter's single-registered-
@@ -63,7 +84,14 @@ type Hub struct {
 }
 
 func NewHub() *Hub {
-	return &Hub{pusher: harness.Open()}
+	return &Hub{
+		budget: hubconn.NewDeliveryBudget(),
+		// One slot, so at most one backlog walk is delivering at a time.
+		// Two interleaved backlogs produce a stream in which neither
+		// conversation reads as a conversation, and the reader cannot
+		// tell whether a gap belongs to one or the other.
+		catchUpSlot: make(chan struct{}, 1),
+	}
 }
 
 // messageStyleNote is appended to the description of every tool that
@@ -749,7 +777,8 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	// reader's own budget by the reader's own decision. The spill
 	// directory is the same one received attachments use, and dies with
 	// the connection for the same reason.
-	conn.SetDeliveryBudget(s.attachmentDir, 0, 0, 0)
+	conn.ShareDeliveryBudget(s.hub.budget)
+	conn.SetDeliveryBudget(s.hub.spillDir, 0, 0, 0)
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
 		// the disconnect to a follower and releases it, so arming
@@ -1744,7 +1773,8 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// reader's own budget by the reader's own decision. The spill
 	// directory is the same one received attachments use, and dies with
 	// the connection for the same reason.
-	conn.SetDeliveryBudget(s.attachmentDir, 0, 0, 0)
+	conn.ShareDeliveryBudget(s.hub.budget)
+	conn.SetDeliveryBudget(s.hub.spillDir, 0, 0, 0)
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
 		// the disconnect to a follower and releases it, so arming
@@ -3453,19 +3483,43 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// made to ask for each. The per-call contract is unchanged everywhere
 	// else — see catchuppush.go for why the two differ.
 	if harness.PushMode() {
-		h.mu.Lock()
+		s.mu.Lock()
 		id := s.catchUpID
-		h.mu.Unlock()
-		go s.runCatchUpPush(conn, id, anchor, catchUpWant{
-			Messages: req.GetInt("limit", 0),
-			KB:       req.GetInt("maxKB", 0),
-		})
+		s.mu.Unlock()
+		// One walk at a time across every connection. Two backlogs
+		// interleaving produce a stream in which neither conversation
+		// reads as a conversation, and a reader cannot tell which one a
+		// gap belongs to. A second request waits its turn rather than
+		// being refused: it asked for its backlog, and it will get it.
+		queuedBehind := ""
+		select {
+		case h.catchUpSlot <- struct{}{}:
+			go func() {
+				defer func() { <-h.catchUpSlot }()
+				s.runCatchUpPush(conn, id, anchor, catchUpWant{
+					Messages: req.GetInt("limit", 0),
+					KB:       req.GetInt("maxKB", 0),
+				})
+			}()
+		default:
+			queuedBehind = "\nAnother connection is delivering its backlog right now, so this one " +
+				"is QUEUED and starts when that finishes. Nothing is lost by waiting, and the " +
+				"closing message for this run says so when it arrives."
+			go func() {
+				h.catchUpSlot <- struct{}{}
+				defer func() { <-h.catchUpSlot }()
+				s.runCatchUpPush(conn, id, anchor, catchUpWant{
+					Messages: req.GetInt("limit", 0),
+					KB:       req.GetInt("maxKB", 0),
+				})
+			}()
+		}
 		return mcp.NewToolResultText(decisionNote(cursor, project, conn, measuredBehind, branch) +
 			seekNote +
 			"catching up — the messages are being DELIVERED to you one at a time, as live traffic " +
 			"is, rather than returned here. A closing message says when it is done and whether " +
 			"anything remains. Do not call hub_catch_up again until you see it: a second run " +
-			"would walk the same position twice."), nil
+			"would walk the same position twice." + queuedBehind), nil
 	}
 
 	for skipped := 0; skipped < catchUpDedupSkipLimit; skipped++ {
@@ -3902,4 +3956,26 @@ func (h *Hub) handleDelete(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 		"delete request sent — no acknowledgement within %v; check "+deliveryChannels()+" for "+
 			"the actual outcome rather than assuming this succeeded", hubconn.AckWaitTimeout,
 	)), nil
+}
+
+// spillDir lazily creates the one directory oversized bodies are written
+// to, for the whole process. Shared with the delivery window it belongs
+// to: the window is what decided not to inline the body, and the window
+// is process-wide.
+//
+// Named like an attachment directory on purpose, so the same startup
+// sweep reclaims it after a crash — a process that is killed runs no
+// cleanup, and a spilled body outliving every reader is just disk.
+func (h *Hub) spillDir() (string, error) {
+	h.spillMu.Lock()
+	defer h.spillMu.Unlock()
+	if h.spillPath != "" {
+		return h.spillPath, nil
+	}
+	dir, err := os.MkdirTemp("", "mcp-hub-attachments-spill-")
+	if err != nil {
+		return "", err
+	}
+	h.spillPath = dir
+	return dir, nil
 }
