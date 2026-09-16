@@ -610,3 +610,206 @@ func TestWriteActionsAreSentWhenTheServerDeclaresThem(t *testing.T) {
 		}
 	}
 }
+
+// A history answer belongs to the request whose anchor it names, and to
+// no other. Routing on "has an Answers field" alone means a late reply to
+// a request that already timed out satisfies the NEXT one — and a
+// catch-up caller then persists a cursor from a walk it never made,
+// moving its reading position over messages nobody saw.
+func TestAHistoryAnswerForAnotherAnchorDoesNotSatisfyThisRequest(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
+		var m wire.MessageAfter
+		if err := conn.ReadJSON(&m); err != nil {
+			return
+		}
+		// The stale answer to a request this client already gave up on...
+		conn.WriteJSON(wire.Msg{
+			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text: "answer to the OLD request", TS: "ts-old", Historical: true,
+			Cursor: "cursor-old", Answers: &wire.Anchor{Cursor: "an-abandoned-anchor"},
+		})
+		time.Sleep(150 * time.Millisecond)
+		// ...then the answer actually asked for.
+		conn.WriteJSON(wire.Msg{
+			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text: "answer to THIS request", TS: "ts-new", Historical: true,
+			Cursor: "cursor-new", Answers: &wire.Anchor{Cursor: "the-anchor-asked-for"},
+		})
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "the-anchor-asked-for"})
+	if err != nil {
+		t.Fatalf("RequestMessageAfterAwaiting: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected the answer naming this request's own anchor to arrive")
+	}
+	if ev.Cursor != "cursor-new" {
+		t.Fatalf("got another request's answer handed back: %+v", ev)
+	}
+}
+
+// And a second history request, while one is still outstanding, is
+// refused rather than silently displacing it: the displaced caller was
+// never told and simply waited out its timeout, while the survivor took
+// whatever answer arrived first.
+func TestASecondHistoryRequestIsRefusedNotSilentlySwapped(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
+		time.Sleep(3 * time.Second) // never answers
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "first"})
+	}()
+	<-started
+	time.Sleep(100 * time.Millisecond)
+
+	_, _, err = c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "second"})
+	if err == nil {
+		t.Fatal("expected the second history request to be refused while the first is outstanding")
+	}
+	if !strings.Contains(err.Error(), "already") {
+		t.Fatalf("expected the refusal to say one is already outstanding, got: %v", err)
+	}
+}
+
+// An upgrade is not an answer. A server that accepts the socket and then
+// says nothing left the handshake read blocked with no deadline yet set,
+// so hub_connect hung indefinitely — the one failure a caller can neither
+// report nor retry.
+func TestAServerThatUpgradesAndSaysNothingDoesNotHangTheConnect(t *testing.T) {
+	old := pongWait
+	pongWait = 300 * time.Millisecond
+	defer func() { pongWait = old }()
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		time.Sleep(3 * time.Second) // never sends joined
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	done := make(chan error, 1)
+	go func() {
+		c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+		if c != nil {
+			c.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected the connect to fail rather than succeed against a silent server")
+		}
+		if !strings.Contains(err.Error(), "joined") {
+			t.Fatalf("expected the failure to name what was missing, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connect hung against a server that upgraded and then said nothing")
+	}
+}
+
+// The activity callback used to run ON the read loop's own goroutine, so
+// anything it did that needed a REPLY could never get one: the reply
+// could only be read by the loop that was waiting for the callback to
+// return. Fetching a reference attachment during delivery is exactly
+// that, and it did not merely fail — it held the socket unread for the
+// whole deadline, ping handling included.
+func TestAnActivityCallbackCanAwaitAReplyFromItsOwnConnection(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
+		conn.WriteJSON(wire.Msg{
+			Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text: "look", TS: "ts1", Cursor: "cursor-1",
+		})
+		for {
+			var req wire.AttachmentRequest
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			if req.Type != wire.TypeAttachment {
+				continue
+			}
+			conn.WriteJSON(wire.AttachmentData{
+				Type: wire.TypeAttachmentData, Token: req.Token, Name: "note.md",
+				ContentType: "text/markdown", ContentBytes: "dGhlIGJ5dGVz",
+			})
+		}
+	}))
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c, err := dialTest(url, "550e8400-e29b-41d4-a716-446655440000", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	fetched := make(chan string, 4)
+	c.OnActivity(func() {
+		if hasEvents, _ := c.Peek(); !hasEvents {
+			return
+		}
+		c.Drain()
+		ev, ok, err := c.RequestAttachment("att-1")
+		if err != nil || !ok {
+			fetched <- ""
+			return
+		}
+		fetched <- ev.AttachmentContentBytes
+	})
+
+	select {
+	case got := <-fetched:
+		if got != "dGhlIGJ5dGVz" {
+			t.Fatalf("the callback could not fetch from its own connection, got %q", got)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("the callback never completed — it is waiting for a reply its own read loop must deliver")
+	}
+}

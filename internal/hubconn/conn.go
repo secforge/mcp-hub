@@ -297,6 +297,18 @@ type Conn struct {
 	// goroutine-creation happens-before edge instead.
 	pongWait time.Duration
 
+	// activity carries "something happened" to activityLoop, which is the
+	// ONLY place onActivity is called from. Capacity 1 and a non-blocking
+	// send: every callback drains whatever is there, so a second signal
+	// arriving while one is pending would tell it nothing new.
+	activity     chan struct{}
+	activityOnce sync.Once
+
+	// writeWait bounds an application write the same way it already
+	// bounds the keepalive's — snapshotted here for the same reason as
+	// pongWait above.
+	writeWait time.Duration
+
 	// ackIdleInterval is snapshotted the same way and for the same reason
 	// as pongWait above — read only by ackLoop, captured before it's
 	// spawned.
@@ -447,6 +459,12 @@ type ackClaim struct {
 	// claim already deleted and wait out its whole deadline for an
 	// answer that had gone to the buffer.
 	token string
+	// anchor is the history request this claim is waiting on. An answer
+	// names the anchor it answers, and one naming a different anchor
+	// belongs to an earlier request — handing it back here would answer
+	// "what follows X" with what follows Y, and a catch-up caller then
+	// persists a position from a walk it never made.
+	anchor wire.Anchor
 }
 
 // relayCloseNotes maps close codes a teams relay may use to signal a
@@ -728,10 +746,18 @@ func dialWS(target string, header http.Header) (*websocket.Conn, error) {
 // the two: everything behavioural comes from the server's declared
 // features, never from which of them dialled.
 func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval time.Duration) (*Conn, error) {
+	// BOUNDED, because an upgrade is not an answer. A server that
+	// completes the HTTP upgrade and then says nothing left this read
+	// blocked with no deadline set yet — the deadline the read loop
+	// relies on is only installed further down — so hub_connect hung
+	// indefinitely against a server that had already accepted the socket.
+	// A hang is the one failure a caller cannot report or retry.
+	_ = ws.SetReadDeadline(time.Now().Add(snapPongWait))
 	_, raw, err := ws.ReadMessage()
 	if err != nil {
 		ws.Close()
-		return nil, err
+		return nil, fmt.Errorf("no joined message from the server after the connection was "+
+			"accepted (waited %s): %w", snapPongWait, err)
 	}
 	var joined wire.Joined
 	if err := json.Unmarshal(raw, &joined); err != nil {
@@ -753,6 +779,8 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		serverVersion:           joined.ServerVersion,
 		peers:                   make(map[string]PeerInfo),
 		pongWait:                snapPongWait,
+		writeWait:               snapWriteWait,
+		activity:                make(chan struct{}, 1),
 		canSend:                 joined.CanSend,
 		conversationKind:        joined.ConversationKind,
 		topic:                   joined.Topic,
@@ -776,6 +804,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 	})
 	go c.readLoop()
 	go c.ackLoop()
+	go c.activityLoop()
 	go c.confirmReminderLoop()
 	return c, nil
 }
@@ -916,7 +945,38 @@ func (c *Conn) OnActivity(f func()) {
 	waiting := len(c.buffer) > 0 || c.closed
 	c.mu.Unlock()
 	if f != nil && waiting {
-		f()
+		c.signalActivity()
+	}
+}
+
+// signalActivity wakes the one goroutine that runs onActivity.
+//
+// The callback used to be invoked by the read loop itself, which meant it
+// could not do anything that needed an ANSWER from this connection: the
+// answer could only be read by the loop that was waiting for the callback
+// to return. Fetching a reference attachment during delivery is exactly
+// that, and it did not just fail — it held the socket unread for the
+// whole deadline, ping handling included, so a longer deadline made it
+// worse rather than better.
+//
+// One goroutine, not one per signal, because deliveries must stay
+// ordered: two callbacks running at once would interleave two drains of
+// the same buffer.
+func (c *Conn) signalActivity() {
+	select {
+	case c.activity <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Conn) activityLoop() {
+	for range c.activity {
+		c.mu.Lock()
+		f := c.onActivity
+		c.mu.Unlock()
+		if f != nil {
+			f()
+		}
 	}
 }
 
@@ -990,6 +1050,21 @@ func (c *Conn) claimNextAckForToken(ackKind, token string) (result <-chan Event,
 	return ch, cancel, nil
 }
 
+// answersAnchor reports whether an answer's own "answers" field names the
+// anchor this claim asked about.
+//
+// A server that states nothing (a nil answers) is taken as answering the
+// outstanding request: it is the only request there is, and refusing it
+// would strand a caller against every server that does not echo the
+// anchor back. Where the server DOES state one, it is believed — that is
+// the whole point of it saying so.
+func answersAnchor(answers *wire.Anchor, want wire.Anchor) bool {
+	if answers == nil {
+		return true
+	}
+	return answers.Cursor == want.Cursor && answers.At == want.At
+}
+
 // tryDivertToClaimLocked checks ev against any pending ack claims and, if
 // it matches one, delivers it directly and reports true — the caller
 // (readLoop) must skip buffering it and firing OnActivity for it entirely
@@ -1005,7 +1080,8 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 	// together with it, not here.
 	if c.pendingMessageAfter != nil {
 		switch {
-		case ev.Kind == "msg" && ev.Answers != nil, ev.Kind == "noMoreMessages":
+		case (ev.Kind == "msg" && ev.Answers != nil || ev.Kind == "noMoreMessages") &&
+			answersAnchor(ev.Answers, c.pendingMessageAfter.anchor):
 			claim := c.pendingMessageAfter
 			c.pendingMessageAfter = nil
 			debugf("tryDivertToClaimLocked: matched claim=%p kind=%q cursor=%q answers=%+v",
@@ -1277,11 +1353,8 @@ func (c *Conn) confirmReminderLoop() {
 			UnconfirmedCount: c.unconfirmedCount,
 			UnconfirmedSince: c.unconfirmedSince,
 		})
-		f := c.onActivity
 		c.mu.Unlock()
-		if f != nil {
-			f()
-		}
+		c.signalActivity()
 	}
 }
 
@@ -1300,11 +1373,8 @@ func (c *Conn) readLoop() {
 				c.timedOut = true
 				c.timedOutAt = time.Now()
 			}
-			f := c.onActivity
 			c.mu.Unlock()
-			if f != nil {
-				f()
-			}
+			c.signalActivity()
 			return
 		}
 		ev, ok := decodeEvent(raw)
@@ -1376,15 +1446,12 @@ func (c *Conn) readLoop() {
 			}
 			c.rosterAnnounced = true
 		}
-		f := c.onActivity
 		c.mu.Unlock()
 		if abandoned {
 			c.abandon()
 			return
 		}
-		if f != nil {
-			f()
-		}
+		c.signalActivity()
 	}
 }
 
@@ -1416,14 +1483,11 @@ const maxBufferedEvents = 5000
 func (c *Conn) abandon() {
 	c.mu.Lock()
 	c.abandoned = true
-	f := c.onActivity
 	c.mu.Unlock()
 	_ = c.Close()
 	// The callback runs AFTER the close, so whoever wakes on it sees a
 	// connection that is already ended rather than one about to be.
-	if f != nil {
-		f()
-	}
+	c.signalActivity()
 }
 
 // AbandonedForBacklog reports whether this connection ended because its
@@ -1739,11 +1803,20 @@ func (c *Conn) SupportsMessageAfterFilter(name string) bool {
 func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filter) (Event, bool, error) {
 	ch := make(chan Event, 1)
 	c.mu.Lock()
-	claim := &ackClaim{result: ch}
-	prev := c.pendingMessageAfter
+	// REFUSED, not replaced — the same reasoning as claimNextAck. A
+	// displaced caller was never delivered to and never told: it waited
+	// out its own timeout while the survivor took the first answer to
+	// arrive, which may well have been the displaced request's.
+	if c.pendingMessageAfter != nil {
+		c.mu.Unlock()
+		return Event{}, false, fmt.Errorf(
+			"another history request is already awaiting its answer on this connection; " +
+				"retry once it has returned")
+	}
+	claim := &ackClaim{result: ch, anchor: anchor}
 	c.pendingMessageAfter = claim
 	c.mu.Unlock()
-	debugf("RequestMessageAfterAwaiting: anchor=%+v claim=%p replacing-prev=%v", anchor, claim, prev != nil)
+	debugf("RequestMessageAfterAwaiting: anchor=%+v claim=%p", anchor, claim)
 	cancel := func() {
 		c.mu.Lock()
 		if c.pendingMessageAfter == claim {
@@ -2276,6 +2349,12 @@ func (c *Conn) TakeSkippedHeldNotice() bool {
 func (c *Conn) writeJSON(v any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	// A write with no deadline can block for as long as the peer declines
+	// to read, and it blocks holding writeMu — so one stalled send stops
+	// every other write on this connection, including the pong that keeps
+	// it alive, and it does so before any ack timeout has even started
+	// counting. The deadline is the same one the keepalive writes use.
+	_ = c.ws.SetWriteDeadline(time.Now().Add(c.writeWait))
 	return c.ws.WriteJSON(v)
 }
 

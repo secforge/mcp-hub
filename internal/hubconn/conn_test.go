@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -2519,5 +2520,35 @@ func TestRegisteringForActivityReportsWhatAlreadyArrived(t *testing.T) {
 	formatted, _ := c.Drain()
 	if !strings.Contains(formatted, "1 already here") {
 		t.Fatalf("expected the roster to be waiting in the buffer, got: %q", formatted)
+	}
+}
+
+// Every connection in a process shares one spill directory, and a cursor
+// is opaque and scoped to the server that issued it — so two connections
+// can spill under the same name. Overwriting meant a path already handed
+// to a reader resolved to a different message, possibly from another
+// conversation.
+func TestTwoSpillsWithTheSameCursorDoNotOverwriteEachOther(t *testing.T) {
+	dir := t.TempDir()
+	b := NewDeliveryBudget()
+	b.spillDir = func() (string, error) { return dir, nil }
+
+	first, err := b.spill("shared-cursor", "the first connection's message")
+	if err != nil {
+		t.Fatalf("first spill: %v", err)
+	}
+	second, err := b.spill("shared-cursor", "the second connection's message")
+	if err != nil {
+		t.Fatalf("second spill: %v", err)
+	}
+	if first == second {
+		t.Fatalf("both spills landed on the same file: %s", first)
+	}
+	got, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatalf("reading the first spill: %v", err)
+	}
+	if string(got) != "the first connection's message" {
+		t.Fatalf("the first spill was overwritten: %q", got)
 	}
 }

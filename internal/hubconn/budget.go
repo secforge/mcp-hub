@@ -319,12 +319,28 @@ func (b *budget) spill(cursor, body string) (string, error) {
 	if name == "" {
 		name = "message"
 	}
-	name = filepath.Base(name) + ".txt"
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	// UNIQUE, not derived from the cursor alone. Every connection in this
+	// process shares one spill directory, and a cursor is opaque and
+	// scoped to the server that issued it — so two connections can hold
+	// the same cursor value, two different cursors can share a basename,
+	// and every cursorless message wanted the same name. Each of those
+	// overwrote a file whose path had already been handed to a reader,
+	// which then resolved to somebody else's message, possibly from
+	// another conversation. The cursor stays in the name because it is
+	// what makes the file identifiable; the suffix is what makes it one
+	// file.
+	f, err := os.CreateTemp(dir, filepath.Base(name)+"-*.txt")
+	if err != nil {
 		return "", err
 	}
-	return path, nil
+	defer f.Close()
+	if err := f.Chmod(0o600); err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(body); err != nil {
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // shape returns the event as it should be delivered. A body within the
