@@ -50,6 +50,12 @@ type Pusher struct {
 	// learned is a server name taken from request metadata, if the harness
 	// supplies one. Empty when it does not.
 	learned string
+	// replyAddress, when set, is advertised on every delivery so the model
+	// can answer with the harness's own SendMessage instead of a separate
+	// tool. Set before the deliverer is opened, since the option is fixed
+	// at that point — an address learned afterwards would not be the one
+	// messages were actually sent under.
+	replyAddress string
 	// adopted records that a thread id has been latched from an MCP
 	// request, so the Codex path is not asked to re-latch on every call.
 	adopted bool
@@ -87,7 +93,11 @@ func Open() *Pusher {
 // the best name known by then. Caller must hold p.mu.
 func (p *Pusher) deliverer() deliver.Deliverer {
 	if p.d == nil {
-		p.d = deliver.Open(deliver.WithSenderName(senderName(p.learned)))
+		opts := []deliver.Option{deliver.WithSenderName(senderName(p.learned))}
+		if p.replyAddress != "" {
+			opts = append(opts, deliver.WithReplyAddress(p.replyAddress))
+		}
+		p.d = deliver.Open(opts...)
 	}
 	return p.d
 }
@@ -171,6 +181,19 @@ func safeServerName(raw string) string {
 		}
 	}
 	return b.String()
+}
+
+// SetReplyAddress names an inbox of ours to advertise on every delivery.
+// Ignored once the deliverer is open, for the reason in the field comment.
+func (p *Pusher) SetReplyAddress(addr string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.d == nil {
+		p.replyAddress = addr
+	}
 }
 
 // PushMode reports whether this process should deliver hub events by

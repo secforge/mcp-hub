@@ -148,6 +148,11 @@ type Hub struct {
 	// follower first. Never nil (see harness.Open); an absent harness
 	// reports itself through Available rather than by being missing.
 	pusher *harness.Pusher
+	// inbox is the return path: an address the model can SendMessage to,
+	// whose messages are relayed to the hub. Nil where the harness offers
+	// no messaging socket, or where binding it failed — in both cases
+	// hub_send remains the way to speak, which is what it was before.
+	inbox *harness.Inbox
 }
 
 func NewHub() *Hub {
@@ -1144,6 +1149,7 @@ func receiveTools() string {
 
 func (h *Hub) Register(s *server.MCPServer) {
 	activeHub = h
+	h.openReturnPath()
 	sweepStaleAttachmentDirs()
 	// Every tool goes through withReconnectNote so that a reconnection
 	// this client performed on its own is reported on the very next call,
@@ -2104,6 +2110,46 @@ func sweepStaleAttachmentDirs() {
 	}
 }
 
+// openReturnPath binds the inbox the model can reply to and tells the
+// pusher to advertise it, so a hub message arrives with a from= the
+// harness already instructs the model to answer.
+//
+// Best-effort by design: a failure here costs the symmetry and nothing
+// else, since hub_send is unchanged and still registered. It is reported
+// rather than swallowed — a return path that silently is not there would
+// leave the model replying into nothing, which is worse than knowing it
+// must use the tool.
+func (h *Hub) openReturnPath() {
+	if !harness.PushMode() {
+		return
+	}
+	inbox, err := harness.OpenInbox()
+	if err != nil {
+		h.noteAutoReconnect(fmt.Sprintf("replies by SendMessage are not available in this session "+
+			"(%v) — use hub_send to speak to the hub. Receiving is unaffected.", err))
+		return
+	}
+	h.inbox = inbox
+	h.pusher.SetReplyAddress(inbox.Address())
+	inbox.Start(context.Background(), h.sendFromInbox)
+}
+
+// sendFromInbox relays a reply the model addressed to our inbox onto the
+// hub. Only a message from this process's own parent reaches here; see
+// harness.Inbox for why the kernel decides that rather than the token.
+func (h *Hub) sendFromInbox(text string) {
+	conn, _ := h.activeConn()
+	if conn == nil || !conn.Connected() {
+		h.noteAutoReconnect("a reply was sent to this session's hub inbox while it was not " +
+			"connected, so it was NOT relayed. Reconnect and send it again with hub_send.")
+		return
+	}
+	if err := conn.Send(text, nil, "", "", nil); err != nil {
+		h.noteAutoReconnect(fmt.Sprintf("a reply sent to this session's hub inbox could not be "+
+			"relayed (%v) — it did not reach the hub. Send it again with hub_send.", err))
+	}
+}
+
 // pushToHarness delivers whatever just arrived into the model harness that
 // launched this process, so a hub message reaches the model without the
 // model having armed a follower.
@@ -2498,6 +2544,9 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 // about) — but is meant to be called once, at process shutdown, not from
 // a tool call. A no-op if nothing is connected.
 func (h *Hub) Shutdown() {
+	if h.inbox != nil {
+		_ = h.inbox.Close()
+	}
 	conn, w, target := h.clearActiveConn()
 	if conn == nil {
 		return
