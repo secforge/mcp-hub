@@ -1536,6 +1536,11 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"walk forward, pass the LAST cursor that came back as `after`. A server that does "+
 				"not implement messageAfter (including every mcp-hub-server) will not answer at "+
 				"all, which this reports rather than leaving you waiting"),
+			mcp.WithNumber("maxKB", mcp.Description(
+				"Optional companion to limit, in kilobytes, with the same rule: it can only "+
+					"lower the cap, never raise it. Two limits rather than one because message "+
+					"count and total size are different costs, and which of them exhausts a "+
+					"reader first is not something this side can tell")),
 			mcp.WithNumber("limit", mcp.Description(
 				"How many messages to return, oldest first (default 1, maximum 20). Reading a "+
 					"span of history one call at a time is the case this exists for. Safe here "+
@@ -3062,11 +3067,21 @@ func (h *Hub) Shutdown() {
 // people up here: replacing the binary does nothing to this process. Every
 // success path says so, because an update that is installed but unloaded
 // looks exactly like an update that did not happen.
-// maxReadBatch bounds what one hub_read may return. A query that moves no
-// position is safe to batch, but a reader's context is still spent by
-// what comes back, and a walk that returns hundreds of messages spends it
-// on a question nobody asked.
-const maxReadBatch = 20
+// maxReadBatch and readBatchBudget bound what one hub_read may return.
+//
+// TWO limits, for the reason hub_catch_up already has two: count and size
+// are different costs, and the evidence cannot say which exhausts a
+// reader first — 1.29 MB over four messages killed one receiver, 1.00 MB
+// in a single message did not kill another. Twenty messages of ordinary
+// chat is a cheap answer; twenty messages carrying spilled bodies is not.
+//
+// Smaller than the catch-up budget on purpose. A backlog is what a reader
+// asked to be caught up on; this is a question about history, and an
+// answer to a question should not cost half the window.
+const (
+	maxReadBatch    = 20
+	readBatchBudget = 128 * 1024
+)
 
 // handleRead answers a question about history rather than making progress
 // through a backlog. It advances no position and clears no gap, so it
@@ -3184,6 +3199,11 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if limit > maxReadBatch {
 		limit = maxReadBatch
 	}
+	budget := readBatchBudget
+	if kb := req.GetInt("maxKB", 0); kb > 0 && kb*1024 < budget {
+		budget = kb * 1024
+	}
+	spent := 0
 
 	var events []hubconn.Event
 	var ev hubconn.Event
@@ -3208,9 +3228,10 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 			break
 		}
 		events = append(events, ev)
+		spent += len(ev.Text)
 		// A message with no cursor cannot anchor the next step, so the
 		// walk stops rather than asking the same question again.
-		if ev.Cursor == "" {
+		if ev.Cursor == "" || spent >= budget {
 			break
 		}
 		anchor = wire.Anchor{Cursor: ev.Cursor}
@@ -3270,7 +3291,11 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	attachments := s.saveReceivedAttachments(conn, events)
 	last := events[len(events)-1]
 	reached := ""
-	if len(events) < limit {
+	switch {
+	case spent >= budget:
+		reached = fmt.Sprintf(" Stopped at %d KB rather than at the message count, so there may "+
+			"well be more: read on from the last cursor.", spent/1024)
+	case len(events) < limit:
 		reached = " The walk stopped before the limit, so this is everything there was."
 	}
 	return mcp.NewToolResultText(hubconn.FormatEventsOn(s.name, events) + attachments +

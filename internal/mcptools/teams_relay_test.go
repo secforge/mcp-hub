@@ -4539,3 +4539,64 @@ func TestReadReturnsUpToTheLimitInOneCall(t *testing.T) {
 		t.Errorf("an unasked-for limit returned more than one message: %s", textOf(res))
 	}
 }
+
+// Count alone does not bound a read: twenty ordinary lines are cheap and
+// twenty large ones are not, and which limit matters is not knowable from
+// this side. The walk stops on bytes too, and says which limit stopped it
+// so a reader knows whether more is waiting.
+func TestReadStopsOnSizeAndSaysSo(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	big := strings.Repeat("x", 40*1024)
+	upgrader := websocket.Upgrader{}
+	var asked int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			n := atomic.AddInt32(&asked, 1)
+			conn.WriteJSON(wire.Msg{
+				Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+				Text: big, TS: "ts", Historical: true,
+				Cursor: fmt.Sprintf("cursor-%d", n), ExternalID: fmt.Sprintf("ext-%d", n),
+				Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor},
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	readReq := mcp.CallToolRequest{}
+	readReq.Params.Arguments = map[string]any{
+		"connection": testConn, "at": "2026-09-17T21:00:00Z", "limit": 20, "maxKB": 100}
+	res, err := hub.handleRead(ctx, readReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_read failed: err=%v result=%+v", err, res)
+	}
+	if got := atomic.LoadInt32(&asked); got > 4 {
+		t.Errorf("expected the size cap to stop the walk early, but it asked %d times", got)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "KB rather than at the message count") {
+		t.Errorf("expected the answer to say which limit stopped it: %s", text[max(0, len(text)-400):])
+	}
+}
