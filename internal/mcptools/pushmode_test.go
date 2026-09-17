@@ -122,7 +122,7 @@ func TestPushModeMentionsNoWaitingMachineryAnywhereTheModelCanSee(t *testing.T) 
 // it is where a stale instruction does the most damage.
 func TestConnectGuidanceInPushModeSaysNothingToStart(t *testing.T) {
 	inPushMode(t)
-	got := buildWaitBlock(context.Background(), nil, "reconnect somehow")
+	got := buildWaitBlock(context.Background(), nil, "reconnect somehow", true)
 	for _, banned := range []string{"hub_wait", "--follow", "Monitor", "background"} {
 		if strings.Contains(got, banned) {
 			t.Errorf("push-mode connect guidance mentions %q:\n%s", banned, got)
@@ -168,7 +168,7 @@ func TestEveryToolThatHandsOverACursorRecordsALedgerPosition(t *testing.T) {
 // stated twice — as it did, live, the first time the new wording shipped.
 func TestTheConnectNoteDoesNotSayTheSameThingTwice(t *testing.T) {
 	inPushMode(t)
-	got := buildWaitBlock(context.Background(), nil, "reconnect somehow")
+	got := buildWaitBlock(context.Background(), nil, "reconnect somehow", true)
 	if strings.Count(got, "cut off in transit") > 1 {
 		t.Errorf("the truncation rule is stated more than once:\n%s", got)
 	}
@@ -378,7 +378,7 @@ func TestCodexGetsThePushGuidanceOnceItIsPushOnly(t *testing.T) {
 	codexPushOnly.Store(true)
 	defer codexPushOnly.Store(false)
 
-	got := buildWaitBlock(ctxWithClientName("codex"), nil, "reconnect somehow")
+	got := buildWaitBlock(ctxWithClientName("codex"), nil, "reconnect somehow", false)
 	if strings.Contains(got, "Persistent monitoring") {
 		t.Errorf("expected no monitoring loop for a push-only Codex client:\n%s", got)
 	}
@@ -397,7 +397,7 @@ func TestCodexKeepsTheLoopWhenThereIsNothingToPushInto(t *testing.T) {
 	defer restore()
 	codexPushOnly.Store(false)
 
-	got := buildWaitBlock(ctxWithClientName("codex"), nil, "reconnect somehow")
+	got := buildWaitBlock(ctxWithClientName("codex"), nil, "reconnect somehow", false)
 	if !strings.Contains(got, "Persistent monitoring") {
 		t.Errorf("expected the blocking loop where nothing can be pushed:\n%s", got)
 	}
@@ -546,4 +546,32 @@ func registeredToolNamesOn(t *testing.T, s *server.MCPServer) []string {
 		names = append(names, part[:strings.Index(part, `"`)])
 	}
 	return names
+}
+
+// Where there is no return-path inbox — every Codex caller — the reply
+// guidance must not describe one. Telling a reader to answer at an
+// address that does not exist on its harness sends it looking for a tool
+// it does not have, which is how a message goes unanswered by a reader
+// that was willing to answer.
+func TestWithoutAnInboxTheGuidanceSaysToUseHubSend(t *testing.T) {
+	restore := harness.ClearEnvForTesting()
+	defer restore()
+	codexPushOnly.Store(true)
+	defer codexPushOnly.Store(false)
+
+	got := buildWaitBlock(ctxWithClientName("codex"), nil, "reconnect somehow", false)
+	if !strings.Contains(got, "hub_send(connection:") {
+		t.Errorf("expected the guidance to name hub_send and its connection argument:\n%s", got)
+	}
+	for _, banned := range []string{"SendMessage", "from= address", "uds:"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("the guidance describes %q, which does not exist on this harness:\n%s", banned, got)
+		}
+	}
+
+	// And with an inbox, the address path is still described.
+	got = buildWaitBlock(context.Background(), nil, "reconnect somehow", true)
+	if !strings.Contains(got, "SendMessage") {
+		t.Errorf("expected the address path where an inbox exists:\n%s", got)
+	}
 }

@@ -579,10 +579,32 @@ func FormatEventsBatch(events []Event) []string {
 // including this exact text, and a body edited in transit would be a
 // worse defect than the one being fixed.
 func NameNotice(connection, text string) string {
-	if connection == "" || !strings.HasPrefix(text, "[hub: ") {
+	if connection == "" {
 		return text
 	}
-	return "[hub on " + connection + ": " + strings.TrimPrefix(text, "[hub: ")
+	if strings.HasPrefix(text, "[hub: ") {
+		return "[hub on " + connection + ": " + strings.TrimPrefix(text, "[hub: ")
+	}
+	// A MESSAGE needs it as much as a notice does, and for a sharper
+	// reason: the reply goes back through a tool that takes the
+	// connection by name, so a reader that cannot tell which conversation
+	// a message came from cannot answer it at all. On one harness the
+	// delivery's sender label supplies that; on another nothing does.
+	for _, prefix := range messagePrefixes {
+		if strings.HasPrefix(text, prefix) {
+			return prefix + "on " + connection + " — " + strings.TrimPrefix(text, prefix)
+		}
+	}
+	return text
+}
+
+// messagePrefixes are the openings of every delivered message form, pull
+// path and push path. Matched as prefixes only: a peer's own text may
+// contain any of them, and a body rewritten in transit would be a worse
+// defect than the one this fixes.
+var messagePrefixes = []string{
+	"[HUB MESSAGE — ", "[HUB HISTORY — ", "[HUB PRIVATE MESSAGE — ",
+	"[untrusted, ",
 }
 
 // FormatEventOn is FormatEvent with this client's own notices naming the

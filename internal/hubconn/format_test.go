@@ -678,3 +678,19 @@ func TestEveryNoticeInABatchNamesTheConnection(t *testing.T) {
 		t.Fatalf("expected each notice in the batch to name the connection, got %d: %s", n, got)
 	}
 }
+
+// A delivered MESSAGE needs its connection named as much as a notice
+// does, and for a sharper reason: the reply goes back through a tool that
+// takes the connection by name, so a reader who cannot tell which
+// conversation a message came from cannot answer it at all.
+func TestADeliveredMessageNamesItsConnection(t *testing.T) {
+	for _, tc := range []struct{ name, got string }{
+		{"pull", FormatEventOn("relay", Event{Kind: "msg", PeerID: "peer-1", TS: "ts", Text: "hi"})},
+		{"history", FormatEventOn("relay", Event{Kind: "msg", PeerID: "peer-1", TS: "ts", Text: "hi", Historical: true})},
+		{"push", NameNotice("relay", FormatEventForPush(Event{Kind: "msg", PeerID: "peer-1", TS: "ts", Text: "hi"}))},
+	} {
+		if !strings.Contains(tc.got, "relay") {
+			t.Errorf("%s delivery does not name the connection: %s", tc.name, tc.got)
+		}
+	}
+}
