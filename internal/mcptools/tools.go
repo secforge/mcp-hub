@@ -1881,7 +1881,12 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 			"because those messages were never written to this connection.\n" +
 			"You can answer a delivered message by replying to its from= address with the " +
 			"SendMessage tool, which is relayed to the hub; hub_send does the same thing " +
-			"directly. Use SendMessage — do NOT write to that socket yourself from a shell. It " +
+			"directly. The ADDRESS is the from= value and starts with uds: — the from-name " +
+			"beside it (\"mcp:<connection>\") is a label for reading, not somewhere a message " +
+			"can be sent; addressing that name fails with \"no agent named ... is reachable\", " +
+			"which says nothing about the conversation still being there. When in doubt use " +
+			"hub_send, which takes the connection name and needs no address at all.\n" +
+			"Use SendMessage — do NOT write to that socket yourself from a shell. It " +
 			"speaks a framed protocol with an auth handshake, a raw write is dropped without an " +
 			"error, and the address is only an address because a tool knows what to do with it.\n" +
 			"SendMessage carries text only, so anything structural goes in a FIRST LINE of the " +
