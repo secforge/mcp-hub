@@ -1643,8 +1643,14 @@ func TestPeersToolReportsDisconnectInsteadOfStaleRoster(t *testing.T) {
 	if strings.Contains(textOf(res), "Current peers") {
 		t.Fatalf("expected no stale roster after disconnect, got: %s", textOf(res))
 	}
-	if !strings.Contains(textOf(res), "not connected") {
-		t.Fatalf("expected a clear not-connected result, got: %s", textOf(res))
+	// A drop is retried now, so the honest answer names that rather than
+	// "not connected" full stop — and it must not claim the server
+	// announced anything, because nothing did.
+	if !strings.Contains(textOf(res), "RECONNECTING") {
+		t.Fatalf("expected the answer to say a reconnect is coming, got: %s", textOf(res))
+	}
+	if strings.Contains(textOf(res), "announced") {
+		t.Fatalf("an unexplained drop must not be reported as an announced restart: %s", textOf(res))
 	}
 	// The connection is gone; the CHANNEL is not, and must not be — it
 	// carries every other connection, and a reader released here could
@@ -1682,8 +1688,8 @@ func TestSendToolReportsDisconnectInsteadOfAttemptingASend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleSend returned an error: %v", err)
 	}
-	if !strings.Contains(textOf(res), "not connected") {
-		t.Fatalf("expected a clear not-connected result, got: %s", textOf(res))
+	if !strings.Contains(textOf(res), "RECONNECTING") {
+		t.Fatalf("expected the send to say a reconnect is coming rather than attempt one, got: %s", textOf(res))
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3411,9 +3412,11 @@ func TestAnnouncedRestartReconnectsAutomaticallyAndSaysSo(t *testing.T) {
 	}
 }
 
-// A bare drop says nothing about intent, so it must not be retried
-// automatically — that stays the model's judgement, as it always was.
-func TestUnannouncedDropDoesNotReconnectAutomatically(t *testing.T) {
+// A bare drop says nothing about intent — and every one of the things it
+// could be comes back. So it IS retried, and the reader is told at once
+// rather than discovering it later from a tool call that says the
+// connection's name no longer exists.
+func TestUnannouncedDropReconnectsAndSaysSo(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	link, joins := restartOnceServer(t, false, 0)
 	ctx := context.Background()
@@ -3425,15 +3428,17 @@ func TestUnannouncedDropDoesNotReconnectAutomatically(t *testing.T) {
 	}
 	defer hub.handleDisconnect(ctx, connReqFor(testConn))
 
-	time.Sleep(1500 * time.Millisecond)
-	if joins() != 1 {
-		t.Fatalf("expected no automatic reconnect after an ambiguous drop, got %d joins", joins())
+	// Told about the drop itself, before any attempt has run.
+	if !waitFor(t, "the drop to be reported", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return strings.Contains(hub.autoReconnect, "is DOWN")
+	}) {
+		t.Fatal("expected the drop to be reported to the reader")
 	}
-	hub.mu.Lock()
-	note := hub.autoReconnect
-	hub.mu.Unlock()
-	if note != "" {
-		t.Fatalf("expected no reconnect report for a bare drop, got: %s", note)
+
+	if !waitFor(t, "a reconnect attempt", func() bool { return joins() > 1 }) {
+		t.Fatalf("expected the ambiguous drop to be retried, got %d joins", joins())
 	}
 }
 
@@ -4401,4 +4406,55 @@ func TestAPushedAttachmentIsFetchedWhileTheReaderIsInItsCallback(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("the attachment was never fetched — the request and its reply cannot both use the read loop")
+}
+
+// The one case that must NOT be retried: the server saying reconnecting
+// cannot work. A deleted conversation answers the same way for ever, so
+// trying again is noise — and the reader needs to be told once, plainly,
+// rather than watching attempts fail.
+func TestAPermanentRefusalEndsTheConnectionInsteadOfRetrying(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	var joins int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		atomic.AddInt32(&joins, 1)
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		// What chat-relay sends for a conversation that has been deleted:
+		// an error it marks NOT retryable, then the socket goes.
+		conn.WriteJSON(wire.Error{Type: wire.TypeError, Code: "conversation_unavailable",
+			Message: "this conversation has been deleted", Retryable: false})
+		time.Sleep(50 * time.Millisecond)
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"as": testConn, "link": link, "name": "t"}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	if !waitFor(t, "the refusal to be reported", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return strings.Contains(hub.autoReconnect, "will NOT be reconnected")
+	}) {
+		t.Fatal("expected the permanent refusal to be reported to the reader")
+	}
+	before := atomic.LoadInt32(&joins)
+	time.Sleep(1500 * time.Millisecond)
+	if got := atomic.LoadInt32(&joins); got != before {
+		t.Fatalf("expected no retry after a permanent refusal, got %d more join(s)", got-before)
+	}
 }

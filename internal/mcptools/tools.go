@@ -592,6 +592,19 @@ func (s *session) teardown(conn *hubconn.Conn, keepWaiter bool) {
 	target := s.connTarget
 	s.conn, s.connTarget = nil, connstore.Target{}
 	s.mu.Unlock()
+	if keepWaiter {
+		// Marked HERE, not when the loop starts. The decision to come
+		// back was taken a moment ago, by the caller that passed
+		// keepWaiter, and between this and the loop actually starting a
+		// tool call would otherwise be told a bare "not connected" — the
+		// one answer that reads as "this is over" about a connection
+		// that is already coming back.
+		s.mu.Lock()
+		if s.reconnectAt.IsZero() {
+			s.reconnectAt = time.Now()
+		}
+		s.mu.Unlock()
+	}
 	s.clearAttachDir()
 	if w := s.hub.currentWaiter(); w != nil {
 		if keepWaiter {
@@ -667,35 +680,48 @@ func gracefulRestartNote(conn *hubconn.Conn) string {
 		conn.ServerReconnectEstimate().Round(time.Second), delay.Round(time.Second))
 }
 
-// scheduleReconnectIfGraceful reconnects by itself, but ONLY after a
-// close the server declared deliberate (1001). That restriction is the
-// whole design:
+// A dropped connection has exactly two outcomes, and the server decides
+// which:
 //
-//   - A 1001 says the server meant to go, so coming back is what the
-//     caller would have wanted and there is nothing to decide.
-//   - A bare drop says nothing about intent. It could be a dead laptop,
-//     a revoked credential, or a network partition, and retrying on that
-//     ambiguity is how a client ends up hammering a server that will
-//     never answer. Those stay the model's call, exactly as before.
+//   - It said reconnecting cannot work — a deleted conversation, a
+//     revoked or expired credential. That is the internal disconnect:
+//     the connection ends, the name is released, and the reader is told
+//     why once rather than watched failing for ever.
+//   - Anything else. The client keeps trying until it succeeds or a
+//     caller stops it, because a drop says nothing about intent: a
+//     killed process, a partition and a suspended host all look
+//     identical, and all three come back.
 //
-// Credential refusals (4001/4002/4003) are not 1001 and so never reach
-// here — the server means "do not come back", and honouring that matters
-// more than availability.
+// Nothing else is remembered. The redial link IS the "was this
+// deliberate" bit — hub_disconnect clears it — and the attempt count and
+// the next delay live in the loop that uses them.
 //
-// The result is REPORTED rather than silent. A connection restored
-// without the model hearing about it is the same failure this codebase
-// keeps closing elsewhere: the socket would be healthy and the model
-// would still believe it was offline, which is worse than staying down,
+// The result is REPORTED at every stage. A connection restored without
+// the model hearing about it is the same failure this codebase keeps
+// closing elsewhere: the socket would be healthy and the model would
+// still believe it was offline, which is worse than staying down,
 // because nothing would prompt it to check.
+
 // willAutoReconnect answers, before anything is torn down, whether this
 // client intends to come back on its own — which is what decides whether
-// the wait socket is kept alive across the gap. Deliberately the same
-// conditions scheduleReconnectIfGraceful applies, asked separately
-// because the decision has to be made BEFORE the teardown that would
-// otherwise close the socket, and a socket closed on a wrong guess
-// cannot be un-closed.
+// the wait socket is kept alive across the gap. Asked separately from
+// scheduleReconnect because the decision has to be made BEFORE the
+// teardown that would otherwise close the socket, and a socket closed on
+// a wrong guess cannot be un-closed.
+
+// willAutoReconnect reports whether this connection is coming back on its
+// own.
+//
+// EVERY drop is, unless the server has said reconnecting cannot work. It
+// used to be only an announced restart, which read as caution and behaved
+// as the opposite: an ambiguous drop — a killed server, a partition, a
+// laptop that was suspended for hours — got no retry at all, and since
+// nothing else announced it either, a reader could sit disconnected
+// indefinitely believing it was still in the conversation. A hub that is
+// merely slow to come back is the ordinary case; a deleted conversation
+// is the rare one, and it is the only one that says so.
 func (s *session) willAutoReconnect(conn *hubconn.Conn) bool {
-	if !conn.GracefulShutdown() || conn.SuggestedReconnectDelay() == 0 {
+	if _, permanent := conn.PermanentFailure(); permanent {
 		return false
 	}
 	s.mu.Lock()
@@ -703,28 +729,69 @@ func (s *session) willAutoReconnect(conn *hubconn.Conn) bool {
 	return s.redialLink != "" && !s.reconnecting
 }
 
-func (s *session) scheduleReconnectIfGraceful(conn *hubconn.Conn) {
-	if !conn.GracefulShutdown() {
-		return
+// reconnectBackoff is how long to wait before the attempt numbered
+// attempt, for a drop the server did not schedule. It rises so a hub that
+// is gone for hours is not dialled every second, and it stops rising so a
+// hub that comes back after those hours is found within a minute rather
+// than at the end of an ever-doubling wait.
+func reconnectBackoff(attempt int) time.Duration {
+	steps := []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second}
+	if attempt < 1 {
+		attempt = 1
 	}
-	delay := conn.SuggestedReconnectDelay()
-	if delay == 0 {
-		// The server said it was going but gave no estimate. Guessing one
-		// risks returning before it is up and burning the attempt; the
-		// model is told it was deliberate and can reconnect when it likes.
+	if attempt > len(steps) {
+		return time.Minute
+	}
+	return steps[attempt-1]
+}
+
+// scheduleReconnect brings a dropped connection back, and tells the
+// reader either way.
+//
+// The notice is not decoration. Until this existed, an ambiguous drop
+// pushed NOTHING: the connection ended, its name was released, and the
+// next tool call said "no connection named X" — so the first thing a
+// reader learned was that the name it had been using no longer existed.
+// Between the drop and that call it had no reason to suspect anything,
+// which is the silence this whole project exists to remove. Observed
+// after a host was hibernated for several hours.
+func (s *session) scheduleReconnect(conn *hubconn.Conn) {
+	if reason, permanent := conn.PermanentFailure(); permanent {
+		s.note(fmt.Sprintf("Connection %q ENDED and will NOT be reconnected: %s. Retrying "+
+			"cannot fix that. The name is free again if you want to open something else "+
+			"under it.", s.name, reason))
 		return
 	}
 	s.mu.Lock()
 	link, name := s.redialLink, s.redialName
 	if link == "" || s.reconnecting {
+		// No link means an explicit hub_disconnect: a caller that chose
+		// to leave is not dragged back in.
 		s.mu.Unlock()
 		return
+	}
+	// A server that announced its restart named its own delay; anything
+	// else gets the backoff.
+	delay := conn.SuggestedReconnectDelay()
+	scheduled := delay > 0
+	if !scheduled {
+		delay = reconnectBackoff(1)
 	}
 	s.reconnecting = true
 	s.reconnectAt = time.Now().Add(delay)
 	s.mu.Unlock()
 
-	go s.reconnectLoop(link, name, delay)
+	why := "The connection dropped without warning" + conn.DisconnectNote()
+	if scheduled {
+		why = "The server announced a restart"
+	}
+	s.note(fmt.Sprintf("Connection %q is DOWN. %s. Reconnecting automatically, first attempt in "+
+		"about %s, and retrying until it succeeds — you will be told when it does. Nothing is "+
+		"lost: your reading position only moves on a confirm, so the server still holds "+
+		"anything sent meanwhile. hub_disconnect stops the retrying.",
+		s.name, why, delay.Round(time.Second)))
+
+	go s.reconnectLoop(link, name, delay, scheduled)
 }
 
 // reconnectLoop keeps trying at the interval the server itself named,
@@ -742,7 +809,7 @@ func (s *session) scheduleReconnectIfGraceful(conn *hubconn.Conn) {
 // Each failure is reported rather than swallowed, so waiting is a choice
 // the caller keeps making with current information instead of one it made
 // once and forgot.
-func (s *session) reconnectLoop(link, name string, interval time.Duration) {
+func (s *session) reconnectLoop(link, name string, interval time.Duration, scheduled bool) {
 	defer func() {
 		s.mu.Lock()
 		s.reconnecting, s.reconnectAt = false, time.Time{}
@@ -762,6 +829,12 @@ func (s *session) reconnectLoop(link, name string, interval time.Duration) {
 		outcome := s.reconnectOnce(link, name, interval, attempt)
 		if outcome != reconnectRetry {
 			return
+		}
+		// A server that named its own interval keeps it; everything else
+		// backs off, so an hours-long outage is not dialled every second
+		// and a host that wakes up is still found within a minute.
+		if !scheduled {
+			interval = reconnectBackoff(attempt + 1)
 		}
 		s.mu.Lock()
 		s.reconnectAt = time.Now().Add(interval)
@@ -855,7 +928,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		s.pushToHarness(conn, w)
 		if !conn.Connected() {
 			s.teardown(conn, s.willAutoReconnect(conn))
-			s.scheduleReconnectIfGraceful(conn)
+			s.scheduleReconnect(conn)
 		}
 	})
 	s.setActiveConn(conn, w, target)
@@ -1007,7 +1080,11 @@ func prependText(res *mcp.CallToolResult, text string) *mcp.CallToolResult {
 // sending it into a conversation that has moved on.
 func (s *session) notConnected() *mcp.CallToolResult {
 	s.mu.Lock()
-	pending, at := s.reconnecting, s.reconnectAt
+	// EITHER is pending: the loop already running, or a teardown that has
+	// decided to come back and not yet started it. Asking only about the
+	// loop answered "not connected" during the gap between the two, which
+	// is the one moment a reader is most likely to ask.
+	pending, at := s.reconnecting || !s.reconnectAt.IsZero(), s.reconnectAt
 	s.mu.Unlock()
 	if !pending {
 		return mcp.NewToolResultError("not connected")
@@ -1027,14 +1104,20 @@ func (s *session) notConnected() *mcp.CallToolResult {
 	}
 	in := time.Until(at).Round(time.Second)
 	if in < 0 {
-		return mcp.NewToolResultError("WAIT: RECONNECTING — an automatic reconnect after the " +
-			"server's announced restart is in progress right now. Nothing was queued, so whatever " +
-			"you were doing has NOT happened and must be done again. " + whatHappensNext)
+		return mcp.NewToolResultError("WAIT: RECONNECTING — an automatic reconnect is in " +
+			"progress right now. Nothing was queued, so whatever you were doing has NOT " +
+			"happened and must be done again. " + whatHappensNext)
 	}
-	return mcp.NewToolResultError(fmt.Sprintf("WAIT: RECONNECTING — the server announced a restart "+
-		"and this client will reconnect by itself in about %s. Nothing is queued, so whatever you "+
-		"were doing has NOT happened and must be done again afterwards. Do not reconnect by hand; "+
-		"a manual hub_connect now races the automatic one. %s", in, whatHappensNext))
+	// What is said is that a reconnect is coming, not WHY the connection
+	// went: an announced restart and an unexplained drop are both retried
+	// now, and naming the wrong one of the two is worse than naming
+	// neither — a reader told "the server announced a restart" about a
+	// dead laptop learns something false about the other end.
+	return mcp.NewToolResultError(fmt.Sprintf("WAIT: RECONNECTING — this connection is down and "+
+		"this client will reconnect by itself in about %s, retrying until it succeeds. Nothing "+
+		"is queued, so whatever you were doing has NOT happened and must be done again "+
+		"afterwards. Do not reconnect by hand; a manual hub_connect now races the automatic "+
+		"one. %s", in, whatHappensNext))
 }
 
 // abandonReconnect gives up on coming back by itself, and releases the
@@ -1898,7 +1981,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			// A restart the server announced is coming back, so the
 			// follower is kept rather than killed — see teardown.
 			s.teardown(conn, s.willAutoReconnect(conn))
-			s.scheduleReconnectIfGraceful(conn)
+			s.scheduleReconnect(conn)
 		}
 	})
 	s.setActiveConn(conn, w, target)
@@ -1925,7 +2008,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		if s.willAutoReconnect(conn) {
 			w.ExpectReconnect(s.name)
 		}
-		s.scheduleReconnectIfGraceful(conn)
+		s.scheduleReconnect(conn)
 	}
 
 	topic := ""

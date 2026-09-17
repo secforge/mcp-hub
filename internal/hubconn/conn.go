@@ -432,6 +432,10 @@ type Conn struct {
 	skippedHeld     bool
 	peers           map[string]PeerInfo
 	rosterAnnounced bool
+	// fatalText is set by an "error" event the server marked NOT
+	// retryable, and is what stops this client reconnecting for ever to
+	// something that has been deleted — see PermanentFailure.
+	fatalText string
 	// pendingAcks holds at most one outstanding claim per expected ack
 	// kind ("sendAck"/"reactionAck"/"editAck") — see claimNextAck.
 	pendingAcks map[string]*ackClaim
@@ -523,6 +527,30 @@ func (c *Conn) DisconnectNote() string {
 		return fmt.Sprintf(" (connection closed, code %d)", c.closeCode)
 	}
 	return ""
+}
+
+// PermanentFailure reports that reconnecting this link cannot succeed,
+// and why. Two sources say so, and both are the server's own statement
+// rather than an inference from a failure: a close code in the
+// do-not-reconnect range (see relayCloseNotes), or an "error" event the
+// server marked NOT retryable — a deleted conversation, a revoked or
+// expired credential.
+//
+// The distinction matters because everything else is worth retrying. A
+// drop with no explanation is ambiguous by nature — a killed process, a
+// partition, a laptop that was asleep — and treating ambiguity as
+// permanent is how a client stops reconnecting to a hub that is merely
+// slow to come back.
+func (c *Conn) PermanentFailure() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if note, ok := relayCloseNotes[c.closeCode]; ok {
+		return strings.TrimSpace(strings.Trim(note, " ()")), true
+	}
+	if c.fatalText != "" {
+		return c.fatalText, true
+	}
+	return "", false
 }
 
 // GracefulShutdown reports whether the server closed this connection on
@@ -1429,6 +1457,13 @@ func (c *Conn) readLoop() {
 			c.unconfirmedCount++
 		}
 		switch ev.Kind {
+		case "error":
+			// Recorded, not merely delivered: the close that follows
+			// carries no reason, so by the time anything asks whether a
+			// reconnect could work, this is the only thing that knows.
+			if ev.Code != "" && !ev.Retryable {
+				c.fatalText = fmt.Sprintf("%s (%s)", ev.Text, ev.Code)
+			}
 		case "serverStopping":
 			// Kept so the disconnect that follows can report an estimate.
 			// Not what decides "was this graceful" — the close code is,
