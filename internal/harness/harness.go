@@ -280,25 +280,22 @@ func ClearEnvForTesting() func() {
 // harnessEnv is every variable deliver.Open reads to decide which harness
 // launched this process and how to reach it.
 //
-// deliver.EnvCodexThread stays on this list even though a Codex harness
-// does not in fact set it. The library reads it, so a value in the
-// environment — left by anything at all — would latch a target this
-// process was never given, and a guard that clears "the harness
-// environment" has to mean all of it. What a real Codex harness supplies
-// is _meta.threadId on each MCP request, which no environment guard can
-// reach and nothing here persists.
+// The list is the Claude pair alone, because those are the only
+// variables the library consults. There is deliberately no environment
+// channel for a Codex target: an MCP server is handed no thread by its
+// harness, so a thread id found in this process's environment was put
+// there by something that never chose this process as a target. What a
+// real Codex harness supplies is _meta.threadId on each request, which no
+// environment guard can reach and nothing here persists.
 //
-// The deeper defect is that this list lives in a different package from
-// the code that decides which variables matter, so it gets to be wrong
-// quietly every time the library learns a new one. Reported by
-// harness-transport, who offered a ClearAllHarnessEnv upstream; until
-// that exists, the constants below are at least taken from the library
+// The list still lives in a different package from the code that decides
+// which variables matter, so it gets to be wrong quietly every time the
+// library learns a new one. The constants are taken from the library
 // rather than spelled out here, so a rename breaks the build instead of
-// the guard.
+// the guard — as the removal of the Codex variable just did.
 var harnessEnv = []string{
 	deliver.EnvClaudeSocket,
 	deliver.EnvClaudeToken,
-	deliver.EnvCodexThread,
 }
 
 // Available reports whether the harness can be reached, with a sentence

@@ -110,17 +110,6 @@ func OpenInbox() (*Inbox, error) {
 		// who may send — see the type comment.
 		RequireAuth: true,
 		PublishKey:  true,
-		// OFF. AutoStatus answers every accepted frame with a
-		// "delivered" peer_message_status, and Claude Code renders that
-		// as "approved and released after approval" — because a real
-		// session emits a delivered only after a hold, so a bare one
-		// reads as an approval for a hold that never happened.
-		//
-		// A real session is silent on the accept path, so silence is the
-		// faithful behaviour. Delivery is learned from the hub's own
-		// acknowledgement arriving back, which says the message reached
-		// the hub rather than merely reaching this process.
-		AutoStatus: false,
 		// Never: a peer whose credentials the kernel will not report
 		// cannot be compared to our parent, so it cannot be accepted.
 		AllowUnidentifiedPeers: false,

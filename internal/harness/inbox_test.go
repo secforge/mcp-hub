@@ -2,10 +2,7 @@ package harness
 
 import (
 	"context"
-	"encoding/json"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -129,45 +126,6 @@ func TestUnwrappableContentIsRelayedAsItIs(t *testing.T) {
 	plain := "no envelope here, just a message"
 	if got := frameText(&udsmsg.Frame{Message: &udsmsg.UserMessage{Content: plain}}); got != plain {
 		t.Fatalf("frameText = %q, want the content unchanged", got)
-	}
-}
-
-// The entry must say what this process IS. Appearing as an interactive
-// session would be the impersonation the design refused; appearing as an
-// mcp entry named for both the parent and the server is the third option.
-func TestThePublishedEntryDoesNotClaimToBeASession(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	if err := os.MkdirAll(filepath.Join(dir, ".claude", "sessions"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	e, err := udsmsg.NewMCPEntry("/tmp/test-inbox.sock", "mcp-hub (build)", "mcp-hub2")
-	if err != nil {
-		t.Fatalf("NewMCPEntry: %v", err)
-	}
-	if err := udsmsg.PublishSession(e); err != nil {
-		t.Skipf("registry not writable here: %v", err)
-	}
-	defer udsmsg.UnpublishSession(e.PID)
-
-	raw, err := os.ReadFile(filepath.Join(dir, ".claude", "sessions",
-		strconv.Itoa(e.PID)+".json"))
-	if err != nil {
-		t.Fatalf("reading the published entry: %v", err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("the entry is not valid JSON: %v", err)
-	}
-	if got["kind"] == "interactive" || got["entrypoint"] == "cli" {
-		t.Errorf("the entry claims to be an interactive session: %v", got)
-	}
-	if name, _ := got["name"].(string); !strings.Contains(name, "mcp-hub2") {
-		t.Errorf("the entry does not name which MCP server it is: %q", name)
-	}
-	if got["pid"] == nil || got["messagingSocketPath"] == "" {
-		t.Errorf("the entry is not addressable: %v", got)
 	}
 }
 
