@@ -1542,7 +1542,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"count and total size are different costs, and which of them exhausts a "+
 					"reader first is not something this side can tell")),
 			mcp.WithNumber("limit", mcp.Description(
-				"How many messages to return, oldest first (default 1, maximum 20). Reading a "+
+				"How many messages to return, oldest first (default 1, maximum 200). Reading a "+
 					"span of history one call at a time is the case this exists for. Safe here "+
 					"in a way it is not for hub_catch_up: this call moves no position and asking "+
 					"twice gives the same answer, so nothing can be skipped by two messages "+
@@ -3069,18 +3069,20 @@ func (h *Hub) Shutdown() {
 // looks exactly like an update that did not happen.
 // maxReadBatch and readBatchBudget bound what one hub_read may return.
 //
-// TWO limits, for the reason hub_catch_up already has two: count and size
-// are different costs, and the evidence cannot say which exhausts a
-// reader first — 1.29 MB over four messages killed one receiver, 1.00 MB
-// in a single message did not kill another. Twenty messages of ordinary
-// chat is a cheap answer; twenty messages carrying spilled bodies is not.
+// TWO limits, for the reason hub_catch_up has two: count and size are
+// different costs, and the evidence cannot say which exhausts a reader
+// first — 1.29 MB over four messages killed one receiver, 1.00 MB in a
+// single message did not kill another. Twenty messages of ordinary chat
+// is a cheap answer; twenty messages carrying spilled bodies is not.
 //
-// Smaller than the catch-up budget on purpose. A backlog is what a reader
-// asked to be caught up on; this is a question about history, and an
-// answer to a question should not cost half the window.
+// The SAME numbers as the catch-up run, deliberately. What bounds a
+// reader is the reader, not which call the messages arrived through, and
+// two different ceilings for the same cost would be two numbers to keep
+// in agreement with one piece of evidence — with the quieter of them
+// stopping a walk early for no reason anybody could state.
 const (
-	maxReadBatch    = 20
-	readBatchBudget = 128 * 1024
+	maxReadBatch    = catchUpPushMaxMessages
+	readBatchBudget = catchUpPushBudget
 )
 
 // handleRead answers a question about history rather than making progress

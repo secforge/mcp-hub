@@ -3518,6 +3518,18 @@ func TestAnnouncedRestartKeepsTheFollowerAlive(t *testing.T) {
 	// Nothing is actually following in this test, so the truthful report
 	// is that the CHANNEL survived — which is the fact that matters: it
 	// carries every connection, so nobody should be starting a second.
+	//
+	// Waited for rather than taken: the drop is reported when it happens
+	// and the return when it happens, so the first note to appear is the
+	// "is DOWN" one, which is a different statement true at a different
+	// time.
+	if !waitFor(t, "the reconnect report", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return strings.Contains(hub.autoReconnect, "channel survived the restart")
+	}) {
+		t.Fatal("expected a report saying the channel survived")
+	}
 	note := hub.takeAutoReconnectNote()
 	if !strings.Contains(note, "channel survived the restart") {
 		t.Fatalf("expected the report to say the channel survived, got: %s", note)

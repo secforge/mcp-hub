@@ -32,10 +32,15 @@ the habit that makes a real intermittent failure invisible. Three other tests
 `TestCatchUpGapDedupBranchPrunesHandedOverAhead`) each failed once the same
 way and likewise never reproduced — the last on 2026-09-16, clean on three
 isolated runs and three full-package runs immediately after.
-`TestCatchUpWithNoPriorPositionAndNoBehindReportsNothingToCatchUp` and
-`TestAnnouncedRestartKeepsTheFollowerAlive` joined them with the same
-shape: one failure inside a full-package run, then clean on an isolated
-run and on repeated full-package runs.
+`TestCatchUpWithNoPriorPositionAndNoBehindReportsNothingToCatchUp` joined
+them with the same shape: one failure inside a full-package run, then
+clean on an isolated run and on repeated full-package runs.
+
+`TestAnnouncedRestartKeepsTheFollowerAlive` was filed here too and did not
+belong: it was failing for a stated reason (it took the first pending
+note, which had become the new drop notice rather than the reconnect
+report) and is fixed. Worth recording because filing it here delayed
+reading the message it had been printing all along.
 
 **Not investigated further** because it was found while building something
 unrelated. The next step would be to raise or parameterise the deadline
