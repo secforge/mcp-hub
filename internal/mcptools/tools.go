@@ -1046,11 +1046,17 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 				}
 			}
 			if err := adoptErr; err != nil {
-				// A refused adopt means the harness will not accept this
-				// process talking to that target — most importantly when a
-				// SECOND thread reaches one MCP server, which the library
-				// fails closed on. Silence here would turn a deliberate
-				// refusal into delivery that simply stops.
+				// An error here means a MALFORMED thread id or a SECOND
+				// thread reaching one MCP server, which the library fails
+				// closed on. An ordinary request carrying no thread id is
+				// not an error and must never be reported as one: most
+				// requests carry none, and saying "the harness refused
+				// delivery" about them describes a refusal that did not
+				// happen, on every call.
+				//
+				// Silence in the real case would be worse still — a
+				// deliberate refusal would read as delivery that simply
+				// stopped.
 				h.noteAutoReconnect(fmt.Sprintf("live delivery into this session was refused by "+
 					"the harness (%v) — messages will not be pushed to you until that is "+
 					"resolved; use hub_catch_up() to read.", err))
