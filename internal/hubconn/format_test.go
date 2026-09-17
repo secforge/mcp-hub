@@ -639,3 +639,42 @@ func TestServerStoppingDecodesTheEstimate(t *testing.T) {
 		t.Fatalf("expected the intent and the estimate rendered, got: %s", got)
 	}
 }
+
+// A notice says something about one conversation, and with several open
+// the first thing a reader needs is which. Carried only by the delivery's
+// sender name, that fact is present on one harness and absent on another.
+func TestANoticeNamesTheConnectionItCameFrom(t *testing.T) {
+	got := FormatEventOn("relay", Event{Kind: "roster", RosterPeers: []PeerInfo{
+		{ID: "550e8400-e29b-41d4-a716-446655440001", Name: "Alice"},
+	}})
+	if !strings.Contains(got, "[hub on relay:") {
+		t.Fatalf("the roster notice does not say which connection it is about: %s", got)
+	}
+}
+
+// A peer's message can contain anything, including the exact text a
+// notice starts with. Rewriting inside a body would be a worse defect
+// than the one this fixes, so only a prefix is touched.
+func TestAMessageBodyIsNeverRewritten(t *testing.T) {
+	body := "look at this: [hub: 2 already here — someone]"
+	got := FormatEventOn("relay", Event{Kind: "msg", PeerID: "peer-1", TS: "ts", Text: body})
+	if !strings.Contains(got, body) {
+		t.Fatalf("the message body was edited in transit: %s", got)
+	}
+	if strings.Contains(got, "[hub on relay:") {
+		t.Fatalf("a peer's text was treated as this client's own notice: %s", got)
+	}
+}
+
+// Every line of a batch names it, not just the first: a reader scanning a
+// burst should not have to track which connection the run belongs to.
+func TestEveryNoticeInABatchNamesTheConnection(t *testing.T) {
+	got := FormatEventsOn("relay", []Event{
+		{Kind: "roster", RosterPeers: []PeerInfo{{ID: "550e8400-e29b-41d4-a716-446655440001"}}},
+		{Kind: "msg", PeerID: "peer-1", TS: "ts", Text: "hello"},
+		{Kind: "roster"},
+	})
+	if n := strings.Count(got, "[hub on relay:"); n < 2 {
+		t.Fatalf("expected each notice in the batch to name the connection, got %d: %s", n, got)
+	}
+}

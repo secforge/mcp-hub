@@ -2404,9 +2404,9 @@ func (c *Conn) writeJSON(v any) error {
 // twice would close the live window on the strength of a pull.
 func (c *Conn) ShapeForPush(e Event) string {
 	if c.budget == nil {
-		return FormatEventForPush(e)
+		return NameNotice(c.budgetOwner, FormatEventForPush(e))
 	}
-	return FormatEventForPush(c.budget.shape(e))
+	return NameNotice(c.budgetOwner, FormatEventForPush(c.budget.shape(e)))
 }
 
 // NoteHandedOver records cursors delivered to the model by a path that
@@ -2465,7 +2465,7 @@ type PushItem struct {
 func (c *Conn) DrainForPush() (items []PushItem, connected bool) {
 	events, connected := c.DrainEvents()
 	for _, e := range c.applyBudget(events, pushDeliveredCost) {
-		text := FormatEventForPush(e)
+		text := NameNotice(c.budgetOwner, FormatEventForPush(e))
 		if text == "" {
 			continue
 		}

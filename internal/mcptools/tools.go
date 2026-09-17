@@ -1407,7 +1407,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"the existing connection, so it is never ambiguous which one you are holding; "+
 					"a connection that dropped releases its name, so reconnecting under the same "+
 					"one is fine")),
-			mcp.WithString("link", mcp.Description(
+			mcp.WithString("link", mcp.Required(), mcp.Description(
 				"REQUIRED: the exact link string the user gave you, unmodified — do not parse, "+
 					"reformat, split, or strip anything from it, and do not infer anything about "+
 					"the server from how it looks. Keep the exact string: reconnecting after a "+
@@ -1997,7 +1997,25 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// case and works; what is refused is a name still owned by something.
 	as, err := req.RequireString("as")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		// Answered here rather than left to the schema. A caller reaching
+		// this has a tool list that predates the parameter — which is
+		// exactly when it cannot look the answer up — and a bare
+		// "required argument not found" tells it nothing about what to
+		// pass or what passing it would mean. Seen live: a model refused
+		// to guess, on the reasonable grounds that an undocumented
+		// argument to a connect call might affect identity or
+		// permissions.
+		return mcp.NewToolResultError("this call needs `as`: a short LOCAL name for the " +
+			"connection, which every later call uses to refer to it — hub_send(connection: " +
+			"\"<name>\"), hub_catch_up(connection: \"<name>\"). Lowercase letters, digits, - " +
+			"and _, up to 32 characters; name the conversation (\"relay\", \"ops\"), not " +
+			"yourself.\n\nIt is safe to choose: the name never leaves this client, and it is " +
+			"NOT your identity on the hub (resumed from a secret this client stores and " +
+			"presents for you) and NOT your display name to other peers (the separate `name` " +
+			"argument). A name already in use is refused rather than reattached, and a " +
+			"connection that dropped releases its name, so reusing one after a drop is " +
+			"fine.\n\nIf your tool schema does not show `as`, it predates this client: the " +
+			"live tool is the authority."), nil
 	}
 	s, err := h.open(as)
 	if err != nil {
@@ -2034,7 +2052,11 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}()
 	link, err := req.RequireString("link")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError("this call needs `link`: the exact string the user gave " +
+			"you, passed through unmodified. Do not parse, reformat, split or strip anything " +
+			"from it, and do not infer anything about the server from how it looks — what " +
+			"authorizes resuming it is a secret this client stores per link, so there is " +
+			"nothing for you to keep alongside it."), nil
 	}
 	name := req.GetString("name", "")
 	agePublicKey := req.GetString("agePublicKey", "")
@@ -2938,7 +2960,7 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		// event on refusal) arrived in time — report it directly rather
 		// than a bare "sent" that doesn't actually confirm anything on a
 		// teams session. See hubconn.Conn.SendAwaitingAck.
-		return mcp.NewToolResultText(hubconn.FormatEvent(ev) + behindNote), nil
+		return mcp.NewToolResultText(hubconn.FormatEventOn(s.name, ev) + behindNote), nil
 	}
 	if !conn.WantsActionAcks() {
 		if to == "" {
@@ -3080,7 +3102,7 @@ func (h *Hub) handleUnpin(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 }
 
 func (h *Hub) pinAction(req mcp.CallToolRequest, pin bool) (*mcp.CallToolResult, error) {
-	_, conn, bad := h.forRequest(req)
+	s, conn, bad := h.forRequest(req)
 	if bad != nil {
 		return bad, nil
 	}
@@ -3098,7 +3120,7 @@ func (h *Hub) pinAction(req mcp.CallToolRequest, pin bool) (*mcp.CallToolResult,
 		return mcp.NewToolResultError(fmt.Sprintf("%s request failed: %v", verb, err)), nil
 	}
 	if ok {
-		return mcp.NewToolResultText(hubconn.FormatEvent(ev)), nil
+		return mcp.NewToolResultText(hubconn.FormatEventOn(s.name, ev)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf(
 		"%s request sent — confirmation (or a refusal) will arrive via "+deliveryChannels()+", "+
@@ -3112,7 +3134,7 @@ func (h *Hub) pinAction(req mcp.CallToolRequest, pin bool) (*mcp.CallToolResult,
 // needs a way to be asked about rather than a rule saying it should not
 // drift.
 func (h *Hub) handlePins(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	_, conn, bad := h.forRequest(req)
+	s, conn, bad := h.forRequest(req)
 	if bad != nil {
 		return bad, nil
 	}
@@ -3124,7 +3146,7 @@ func (h *Hub) handlePins(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		return mcp.NewToolResultText("the server did not answer in time — call hub_pins again; " +
 			"nothing about this session's state changed"), nil
 	}
-	return mcp.NewToolResultText(hubconn.FormatEvent(ev)), nil
+	return mcp.NewToolResultText(hubconn.FormatEventOn(s.name, ev)), nil
 }
 
 func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -3207,7 +3229,7 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// leaving the attachment out with it rendered the message as though
 	// it had none, which is a silence with nothing to retry against.
 	attachments := s.saveReceivedAttachments(conn, []hubconn.Event{ev})
-	return mcp.NewToolResultText(hubconn.FormatEvent(ev) + attachments + "\n\n[hub: this was a read, not a " +
+	return mcp.NewToolResultText(hubconn.FormatEventOn(s.name, ev) + attachments + "\n\n[hub: this was a read, not a " +
 		"catch-up — your unread position is unchanged, so nothing you still have to read was " +
 		"consumed. This message is recorded as delivered to you, so a later hub_catch_up will " +
 		"skip past it rather than show it again. To keep reading forward, pass this message's " +
@@ -3449,7 +3471,7 @@ func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return bad, nil
 	}
 	events, connected := conn.DrainEvents()
-	formatted := hubconn.FormatEvents(events)
+	formatted := hubconn.FormatEventsOn(s.name, events)
 	if !connected {
 		s.teardownIfCurrent(conn)
 		// Still surface anything that arrived right before the disconnect
@@ -3549,7 +3571,7 @@ func (h *Hub) handleWait(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	for {
 		if hasEvents, connected := conn.Peek(); hasEvents || !connected {
 			events, connected := conn.DrainEvents()
-			formatted := hubconn.FormatEvents(events)
+			formatted := hubconn.FormatEventsOn(s.name, events)
 			if !connected {
 				s.teardownIfCurrent(conn)
 				if formatted == "" {
@@ -3971,7 +3993,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				setCatchUpCursor(id, ev.Cursor)
 			}
 			formatted := decisionNote(cursor, project, conn, measuredBehind, branch) +
-				seekNote + hubconn.FormatEvent(ev) +
+				seekNote + hubconn.FormatEventOn(s.name, ev) +
 				"\n\n[hub: more may remain — call hub_catch_up again; you'll be told \"caught up\" once " +
 				"there's nothing further]"
 			return s.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
@@ -4094,7 +4116,7 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 			} else {
 				saveCatchUpGap(id, gap)
 			}
-			formatted := hubconn.FormatEvent(ev)
+			formatted := hubconn.FormatEventOn(s.name, ev)
 			if reachedEnd {
 				formatted += fmt.Sprintf(
 					"\n\n[hub: gap fully retrieved — this was the last message between %s and %s]",
@@ -4250,7 +4272,7 @@ func (h *Hub) handleReact(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 		return mcp.NewToolResultError(fmt.Sprintf("reaction request failed: %v", err)), nil
 	}
 	if ok {
-		return mcp.NewToolResultText(hubconn.FormatEvent(ev)), nil
+		return mcp.NewToolResultText(hubconn.FormatEventOn(s.name, ev)), nil
 	}
 	if !conn.WantsActionAcks() {
 		return mcp.NewToolResultText(
@@ -4302,7 +4324,7 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		return mcp.NewToolResultError(fmt.Sprintf("edit request failed: %v", err)), nil
 	}
 	if ok {
-		return mcp.NewToolResultText(hubconn.FormatEvent(ev) + behindNote), nil
+		return mcp.NewToolResultText(hubconn.FormatEventOn(s.name, ev) + behindNote), nil
 	}
 	if !conn.WantsActionAcks() {
 		return mcp.NewToolResultText(
@@ -4334,7 +4356,7 @@ func (h *Hub) handleDelete(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 		return mcp.NewToolResultError(fmt.Sprintf("delete request failed: %v", err)), nil
 	}
 	if ok {
-		return mcp.NewToolResultText(hubconn.FormatEvent(ev)), nil
+		return mcp.NewToolResultText(hubconn.FormatEventOn(s.name, ev)), nil
 	}
 	if !conn.WantsActionAcks() {
 		return mcp.NewToolResultText(

@@ -554,8 +554,52 @@ func FormatEventsBatch(events []Event) []string {
 // rather than only being able to infer it after the fact from the last
 // event's own "i/N". See FormatEventsBatch's doc comment for why both
 // exist rather than a burst-level marker alone.
+// NameNotice marks one of THIS CLIENT's own notices with the connection
+// it belongs to.
+//
+// A notice says something about a particular conversation — who is in it,
+// that it dropped, that a position wants confirming — and with several
+// connections open, which one is the first thing a reader needs. It used
+// to be carried only by the delivery's sender name, which the harness
+// renders or does not: on one it appears as "mcp:relay", on another the
+// notice arrives naming no conversation at all.
+//
+// Rewrites a PREFIX only. A peer's message can contain anything,
+// including this exact text, and a body edited in transit would be a
+// worse defect than the one being fixed.
+func NameNotice(connection, text string) string {
+	if connection == "" || !strings.HasPrefix(text, "[hub: ") {
+		return text
+	}
+	return "[hub on " + connection + ": " + strings.TrimPrefix(text, "[hub: ")
+}
+
+// FormatEventOn is FormatEvent with this client's own notices naming the
+// connection they came from — see NameNotice.
+func FormatEventOn(connection string, e Event) string {
+	return NameNotice(connection, FormatEvent(e))
+}
+
+// FormatEventsOn is FormatEvents with the same naming, applied per event
+// so a batch names its connection on every line rather than once.
+func FormatEventsOn(connection string, events []Event) string {
+	if connection == "" {
+		return FormatEvents(events)
+	}
+	named := make([]Event, len(events))
+	copy(named, events)
+	chunks := FormatEventsBatch(named)
+	for i := range chunks {
+		chunks[i] = NameNotice(connection, chunks[i])
+	}
+	return joinChunks(chunks)
+}
+
 func FormatEvents(events []Event) string {
-	chunks := FormatEventsBatch(events)
+	return joinChunks(FormatEventsBatch(events))
+}
+
+func joinChunks(chunks []string) string {
 	if len(chunks) == 0 {
 		return ""
 	}

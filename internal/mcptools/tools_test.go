@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -2195,5 +2196,70 @@ func TestSelfUpdateAlreadyCurrentNamesWhatAnUpdateCannotFix(t *testing.T) {
 	}
 	if !strings.Contains(text, "never released at all") {
 		t.Fatalf("expected it to name the cause an update cannot reach, got: %s", text)
+	}
+}
+
+// The schema documents `as`, but a caller whose tool list predates it
+// cannot read the schema — and that caller is exactly the one that omits
+// it. So the failure answers the question itself, including the part a
+// model is right to hesitate over: whether an unexplained argument to a
+// connect call affects identity or permissions.
+func TestOmittingAsExplainsWhatItIsAndThatItIsSafe(t *testing.T) {
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"link": "wss://example.test/hub/join#secret"}
+	res, err := hub.handleConnect(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleConnect: %v", err)
+	}
+	got := textOf(res)
+	for _, want := range []string{"LOCAL name", "never leaves this client", "NOT your identity"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the missing-`as` error does not say %q:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, "connection:") {
+		t.Errorf("the error does not show how the name is used later:\n%s", got)
+	}
+}
+
+// Every parameter this tool enforces is declared as required. A schema
+// saying "optional" about something the handler refuses without is a
+// model's only source of truth disagreeing with the behaviour — and the
+// model that believes it is the one that then cannot connect.
+func TestEveryEnforcedConnectArgumentIsDeclaredRequired(t *testing.T) {
+	var parsed struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				InputSchema struct {
+					Required []string `json:"required"`
+				} `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(toolsListJSON(t)), &parsed); err != nil {
+		t.Fatalf("parsing tools/list: %v", err)
+	}
+	var required []string
+	var found bool
+	for _, tool := range parsed.Result.Tools {
+		if tool.Name == "hub_connect" {
+			required, found = tool.InputSchema.Required, true
+		}
+	}
+	if !found {
+		t.Fatal("hub_connect is not registered")
+	}
+	for _, name := range []string{"as", "link"} {
+		var declared bool
+		for _, r := range required {
+			if r == name {
+				declared = true
+			}
+		}
+		if !declared {
+			t.Errorf("%q is enforced by the handler but not declared required; declared: %v", name, required)
+		}
 	}
 }
