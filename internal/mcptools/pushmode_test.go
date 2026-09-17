@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -387,5 +388,65 @@ func TestCodexGuidanceDropsTheLoopOncePushesAreDelivered(t *testing.T) {
 	got = buildWaitBlock(ctx, nil, "reconnect somehow", false)
 	if !strings.Contains(got, "Persistent monitoring") {
 		t.Errorf("expected the blocking loop while nothing can be pushed:\n%s", got)
+	}
+}
+
+// A connection opened by the very request that carried the thread id must
+// inherit it. hub_connect creates its session DURING that request, after
+// the adopt pass has already run over the sessions that existed — so
+// without this the new connection has no target until some later,
+// unrelated call happens to arrive, which on a quiet conversation is the
+// whole session.
+func TestAConnectionInheritsTheThreadIdFromTheRequestThatOpenedIt(t *testing.T) {
+	restore := harness.ClearEnvForTesting()
+	defer restore()
+
+	hub := NewHub()
+	hub.rememberMeta(map[string]any{"threadId": "thread-from-this-very-request"})
+
+	sess, err := hub.open(testConn)
+	if err != nil {
+		t.Fatalf("opening a session: %v", err)
+	}
+	sess.openReturnPath()
+	if sess.pusher == nil {
+		t.Fatal("a connection has no pusher, so there is nothing for a thread id to latch into")
+	}
+	// Available() still reports false here (no reachable harness in a
+	// test), so what is asserted is that the adopt was ATTEMPTED with the
+	// remembered value rather than skipped — the pusher exists and the
+	// hub had something to give it.
+	hub.mu.Lock()
+	remembered := hub.lastMeta["threadId"]
+	hub.mu.Unlock()
+	if remembered != "thread-from-this-very-request" {
+		t.Fatalf("the request's thread id was not kept for later connections, got %v", remembered)
+	}
+}
+
+// And it is never written down: a thread id from a previous run names a
+// thread that no longer exists.
+func TestTheThreadIdIsNotPersisted(t *testing.T) {
+	restore := harness.ClearEnvForTesting()
+	defer restore()
+	dir := t.TempDir()
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", dir)
+
+	hub := NewHub()
+	hub.rememberMeta(map[string]any{"threadId": "thread-that-must-not-be-stored"})
+
+	found := false
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr == nil && strings.Contains(string(raw), "thread-that-must-not-be-stored") {
+			found = true
+		}
+		return nil
+	})
+	if found {
+		t.Fatal("the thread id reached disk; it names a thread that will not exist next run")
 	}
 }

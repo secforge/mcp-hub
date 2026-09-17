@@ -280,13 +280,13 @@ func ClearEnvForTesting() func() {
 // harnessEnv is every variable deliver.Open reads to decide which harness
 // launched this process and how to reach it.
 //
-// CODEX_THREAD_ID is on this list for a reason worth keeping: the first
-// version cleared only the Claude pair, which is what deliver.Open checks
-// FIRST. With no Claude socket it falls through and constructs the Codex
-// backend, latching its target from this variable — so on a machine where
-// a Codex app-server is running, a guard that cleared "the harness
-// environment" had in fact cleared the half that happened to be in use
-// here and left the other half live.
+// deliver.EnvCodexThread stays on this list even though a Codex harness
+// does not in fact set it. The library reads it, so a value in the
+// environment — left by anything at all — would latch a target this
+// process was never given, and a guard that clears "the harness
+// environment" has to mean all of it. What a real Codex harness supplies
+// is _meta.threadId on each MCP request, which no environment guard can
+// reach and nothing here persists.
 //
 // The deeper defect is that this list lives in a different package from
 // the code that decides which variables matter, so it gets to be wrong
@@ -312,11 +312,17 @@ func (p *Pusher) Available() (bool, string) {
 	return p.deliverer().Available()
 }
 
-// Adopt latches the target from an inbound MCP request's _meta. A no-op
-// where the target comes from the environment (Claude), and the only way
-// to learn it where it does not (Codex), which is why it is called on
-// every request rather than at startup: a server that has not yet been
-// called has not yet been told which thread it belongs to.
+// Adopt latches the target from an inbound MCP request's _meta.threadId.
+//
+// That is the ONLY place a Codex target comes from: no environment
+// variable carries it, whatever the library's fallback suggests. Hence
+// calling this on every request rather than at startup — a server that
+// has not yet been called has not yet been told which thread it belongs
+// to — and hence a connection opened by one request inheriting what that
+// request carried, rather than waiting for the next one.
+//
+// A no-op where the target came from the environment at exec (Claude).
+// Latched in memory: it names the thread talking to this process now.
 func (p *Pusher) Adopt(meta map[string]any) error {
 	if p == nil || len(meta) == 0 {
 		return nil

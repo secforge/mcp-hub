@@ -261,6 +261,18 @@ func (h *Hub) open(name string) (*session, error) {
 		h.sessions = map[string]*session{}
 	}
 	s := &session{name: name, hub: h}
+	// Built HERE, before anything can run against this session. Assigning
+	// it later raced the connection's own goroutines, which read it to
+	// decide whether an arriving event can be delivered.
+	//
+	// Pointed at whatever thread the last request came from, since a
+	// connection opened by that request would otherwise have no target
+	// until an unrelated later call arrived. h.mu is already held, so
+	// lastMeta is read directly rather than through adoptInto.
+	s.pusher = harness.OpenAs(name)
+	if len(h.lastMeta) > 0 {
+		_ = s.pusher.Adopt(h.lastMeta)
+	}
 	h.sessions[name] = s
 	return s, nil
 }
@@ -285,6 +297,23 @@ func (h *Hub) session(name string) (*session, error) {
 			"opens a connection and gives it a name", name)
 	}
 	return nil, fmt.Errorf("no connection named %q — open: %s", name, strings.Join(open, ", "))
+}
+
+// rememberMeta keeps the most recent request's _meta so a connection
+// opened later can be pointed at the same harness thread.
+//
+// IN MEMORY ONLY, and deliberately. It names which harness thread is
+// talking to this process right now; it is not an identity, not a
+// credential, and a value from a previous run describes a thread that no
+// longer exists — persisting it would mean a restarted process
+// confidently delivering into somewhere nobody is listening.
+func (h *Hub) rememberMeta(meta map[string]any) {
+	if len(meta) == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastMeta = meta
 }
 
 // close forgets a session entirely, so its name is free again.

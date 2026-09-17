@@ -88,7 +88,9 @@ func TestAConfiguredNameSurvivesDisplayUnchanged(t *testing.T) {
 // The guard must clear every variable deliver.Open reads, not the subset
 // that happened to matter on the machine where it was written: Open
 // checks the Claude socket first and falls through to the Codex backend,
-// which latches its target from CODEX_THREAD_ID.
+// which also consults an environment variable for its target — one a real
+// Codex harness does not set, which is exactly why a stray value must not
+// be left where the library will read it.
 func TestClearEnvForTestingClearsEveryHarnessVariable(t *testing.T) {
 	for _, name := range harnessEnv {
 		t.Setenv(name, "set")

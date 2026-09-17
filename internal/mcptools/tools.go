@@ -36,6 +36,10 @@ type Hub struct {
 	// on a connection names one, and an unknown name is an error rather
 	// than a fallback to whichever is open.
 	sessions map[string]*session
+	// lastMeta is the most recent request's _meta, kept so a connection
+	// opened later can be pointed at the same harness thread — see
+	// rememberMeta for why it is never written down.
+	lastMeta map[string]any
 	// budget is ONE delivery window for the whole process, shared by
 	// every connection. The window bounds what a reader can absorb and a
 	// reader is a process, not a socket: a window each would mean eight
@@ -1023,6 +1027,15 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 		// For Claude it is a no-op — the target came from the environment
 		// at exec — and calling it anyway keeps one code path.
 		if m := req.Params.Meta; m != nil {
+			// Kept for the sessions that do not exist yet. hub_connect
+			// creates one DURING this request, after this runs, so a
+			// connection opened by the very call that carried the thread
+			// id would otherwise have no target until some later call
+			// happened to arrive — and on a quiet conversation that is
+			// the whole session. Held in memory only: it identifies the
+			// harness thread talking to this process right now, and it
+			// means nothing to the next process.
+			h.rememberMeta(m.AdditionalFields)
 			// Every connection's pusher, because each addresses the same
 			// parent under its own name and a thread id latched by one
 			// says nothing about the others.
@@ -2331,6 +2344,10 @@ func sweepStaleAttachmentDirs() {
 // leave the model replying into nothing, which is worse than knowing it
 // must use the tool.
 func (s *session) openReturnPath() {
+	// The pusher belongs to the session and exists from the moment it
+	// does (see Hub.open). Only the return-path inbox below is
+	// Claude-specific: SendMessage replies arrive over a Unix socket that
+	// a Codex harness does not have.
 	if !harness.PushOnly() {
 		return
 	}
@@ -2351,10 +2368,8 @@ func (s *session) openReturnPath() {
 		return
 	}
 	s.inbox = inbox
-	// Opened under the connection's name, so the attribution on a
-	// delivered message and the address a reply returns to describe the
-	// same thing.
-	s.pusher = harness.OpenAs(s.name)
+	// The address a reply returns to and the attribution on a delivered
+	// message describe the same thing.
 	s.pusher.SetReplyAddress(inbox.Address())
 	inbox.Start(context.Background(), s.sendFromInbox)
 	// Deliberately NOT listed in the harness registry. That registry is
