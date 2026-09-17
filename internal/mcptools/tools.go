@@ -1518,7 +1518,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool(
 		mcp.NewTool("hub_read",
 			connectionParam(),
-			mcp.WithDescription("Read one message from this conversation's history, by where it "+
+			mcp.WithDescription("Read from this conversation's history, by where it "+
 				"sits rather than by what you have already seen. A QUERY, not a hand-over: it "+
 				"advances no position, marks nothing as read, and clears no recorded gap, so "+
 				"calling it twice gives the same answer. What you read IS recorded as delivered "+
@@ -1528,13 +1528,21 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"Use this for a question about the past ('what was said around 18:00', 'what came "+
 				"after that message'). Use hub_catch_up to make progress through what you have "+
 				"not read. They are different jobs and the position only moves for the second.\n"+
-				"Returns ONE message, or states plainly that there is none after that point. On a "+
+				"Returns ONE message by default, or up to `limit` of them in order, or states "+
+				"plainly that there is none after that point. On a "+
 				"FILTERED read the end of the walk is a different statement — nothing further "+
 				"MATCHES, which does not mean there are no further messages — and the result "+
 				"says which of the two it is rather than leaving you to assume. To "+
-				"walk forward, pass the cursor of what came back as `after`. A server that does "+
+				"walk forward, pass the LAST cursor that came back as `after`. A server that does "+
 				"not implement messageAfter (including every mcp-hub-server) will not answer at "+
 				"all, which this reports rather than leaving you waiting"),
+			mcp.WithNumber("limit", mcp.Description(
+				"How many messages to return, oldest first (default 1, maximum 20). Reading a "+
+					"span of history one call at a time is the case this exists for. Safe here "+
+					"in a way it is not for hub_catch_up: this call moves no position and asking "+
+					"twice gives the same answer, so nothing can be skipped by two messages "+
+					"arriving together — where a hand-over batches, one message can hide beside "+
+					"another and be missed for good")),
 			mcp.WithString("at", mcp.Description(
 				"Timestamp to read from, RFC 3339 (e.g. 2026-09-10T18:00:00Z). Returns the first "+
 					"message after that instant. Mutually exclusive with after")),
@@ -3033,6 +3041,12 @@ func (h *Hub) Shutdown() {
 // people up here: replacing the binary does nothing to this process. Every
 // success path says so, because an update that is installed but unloaded
 // looks exactly like an update that did not happen.
+// maxReadBatch bounds what one hub_read may return. A query that moves no
+// position is safe to batch, but a reader's context is still spent by
+// what comes back, and a walk that returns hundreds of messages spends it
+// on a question nobody asked.
+const maxReadBatch = 20
+
 // handleRead answers a question about history rather than making progress
 // through a backlog. It advances no position and clears no gap, so it
 // cannot consume what this session still has to read.
@@ -3136,15 +3150,56 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		return mcp.NewToolResultError(msg), nil
 	}
 
-	ev, ok, err := conn.RequestMessageAfterFiltered(anchor, filter)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("read failed: %v", err)), nil
+	// A LIMIT is safe here in a way it is not for hub_catch_up. That call
+	// hands over unread messages and moves a position, so one message
+	// hiding beside another is how a message gets skipped for good. This
+	// one is a query: it moves nothing, and asking twice gives the same
+	// answer — so returning several costs nothing and saves a caller
+	// reading fifteen minutes of history one round trip at a time.
+	limit := req.GetInt("limit", 1)
+	if limit < 1 {
+		limit = 1
 	}
-	if !ok {
-		return mcp.NewToolResultText("the server did not answer in time — call hub_read again with " +
-			"the same arguments; nothing about this session's state changed"), nil
+	if limit > maxReadBatch {
+		limit = maxReadBatch
 	}
-	if ev.Kind == "error" {
+
+	var events []hubconn.Event
+	var ev hubconn.Event
+	var ok bool
+	var err error
+	for len(events) < limit {
+		ev, ok, err = conn.RequestMessageAfterFiltered(anchor, filter)
+		if err != nil {
+			if len(events) > 0 {
+				break
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("read failed: %v", err)), nil
+		}
+		if !ok {
+			if len(events) > 0 {
+				break
+			}
+			return mcp.NewToolResultText("the server did not answer in time — call hub_read " +
+				"again with the same arguments; nothing about this session's state changed"), nil
+		}
+		if ev.Kind == "error" || ev.Kind == "noMoreMessages" {
+			break
+		}
+		events = append(events, ev)
+		// A message with no cursor cannot anchor the next step, so the
+		// walk stops rather than asking the same question again.
+		if ev.Cursor == "" {
+			break
+		}
+		anchor = wire.Anchor{Cursor: ev.Cursor}
+	}
+	// Everything below answers about the LAST reply, which is what ended
+	// the walk — an error, a no-more-messages, or the last message read.
+	if len(events) > 0 && ev.Kind != "error" && ev.Kind != "noMoreMessages" {
+		ev = events[len(events)-1]
+	}
+	if ev.Kind == "error" && len(events) == 0 {
 		// bad_filter and bad_anchor name different halves of the request,
 		// and saying which is what stops a retry fixing the part that was
 		// already right.
@@ -3156,7 +3211,7 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// is described, because every sentence below depends on it.
 	unapplied := unappliedFilters(filter, ev.Matching)
 
-	if ev.Kind == "noMoreMessages" {
+	if ev.Kind == "noMoreMessages" && len(events) == 0 {
 		if ev.Matching == nil && filter.Set() {
 			return mcp.NewToolResultText("NOT A COMPLETE ANSWER: this server did not apply the " +
 				"filter — it sent back no record of having applied one — so \"no more messages\" " +
@@ -3177,7 +3232,7 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// The delivery is recorded, but this is not resultWithReceivedAttachments:
 	// that also marks the wire-level receipt, which must not point at an
 	// old message. See this function's doc comment.
-	s.recordHandedOver([]hubconn.Event{ev})
+	s.recordHandedOver(events)
 	// NoteHandedOver is a LOCAL position in the delivery ledger — no
 	// cursor on the wire, no acknowledgement — so it does not weaken the
 	// split above, and leaving it out reopened the defect it exists to
@@ -3185,18 +3240,24 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// reader recovering a held range does it with hub_read, confirms what
 	// it recovered, and without a position that confirm released nothing
 	// and the window stayed shut.
-	conn.NoteHandedOver([]hubconn.Event{ev})
+	conn.NoteHandedOver(events)
 	// An attachment on a message read out of history is fetched and saved
 	// exactly as one on a delivered message is. Only the RECEIPT half of
 	// resultWithReceivedAttachments must be kept away from this path;
 	// leaving the attachment out with it rendered the message as though
 	// it had none, which is a silence with nothing to retry against.
-	attachments := s.saveReceivedAttachments(conn, []hubconn.Event{ev})
-	return mcp.NewToolResultText(hubconn.FormatEventOn(s.name, ev) + attachments + "\n\n[hub: this was a read, not a " +
-		"catch-up — your unread position is unchanged, so nothing you still have to read was " +
-		"consumed. This message is recorded as delivered to you, so a later hub_catch_up will " +
-		"skip past it rather than show it again. To keep reading forward, pass this message's " +
-		"own cursor as after" + matchedSuffix(ev.Matching) + "]" + unappliedNote(unapplied)), nil
+	attachments := s.saveReceivedAttachments(conn, events)
+	last := events[len(events)-1]
+	reached := ""
+	if len(events) < limit {
+		reached = " The walk stopped before the limit, so this is everything there was."
+	}
+	return mcp.NewToolResultText(hubconn.FormatEventsOn(s.name, events) + attachments +
+		"\n\n[hub: this was a read, not a catch-up — your unread position is unchanged, so " +
+		"nothing you still have to read was consumed." + reached + " What is here is recorded as " +
+		"delivered to you, so a later hub_catch_up skips past it rather than showing it twice. " +
+		"To keep reading forward, pass the LAST cursor above as after" +
+		matchedSuffix(last.Matching) + "]" + unappliedNote(unapplied)), nil
 }
 
 // checkFilterSupport refuses, before anything is written to the socket, a

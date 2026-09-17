@@ -249,14 +249,16 @@ func FormatEvent(e Event) string {
 		return fmt.Sprintf("[hub: %d already here — %s. That is everyone; a join or leave from "+
 			"here on is a real change]", len(who), strings.Join(who, ", "))
 	case "confirmReminder":
-		// Names the TOOL first and says that prose does not count. The
-		// two questions make a reader look rather than rubber-stamp, and
-		// a question is also the thing a model most naturally answers by
-		// writing an answer — which moves nothing, so the reminder fires
-		// again, is answered again, and repeats for as long as the reader
-		// is being conscientious. Seen live: the same cursor stated
-		// correctly three times over seven minutes while the position
-		// never moved.
+		// NO QUESTION MARKS. The cross-check below still has to happen —
+		// it is what stops a reader rubber-stamping a cursor handed to
+		// it — but asking for it in question form is asking a model to
+		// produce an answer, and an answer is the one thing that moves
+		// nothing. Naming the tool first and saying prose does not count
+		// was not enough on its own: a model receiving exactly that still
+		// replied "(1) last complete cursor: … (2) nothing was cut",
+		// correctly, three times, while the position stayed where it was.
+		// So the check is now an instruction to perform silently, and the
+		// only thing phrased as an action is the call.
 		//
 		// Deliberately a cross-check, not a value to echo back — found
 		// live, 2026-09-07: handing the model an exact cursor to paste
@@ -275,11 +277,11 @@ func FormatEvent(e Event) string {
 		// was itself truncated out of the part that said what to do. Both
 		// actions now come before any explanation, and the whole thing is
 		// short enough to arrive intact.
-		return fmt.Sprintf("[hub: CALL hub_confirm with the last message you have COMPLETE — "+
-			"possibly earlier than %q, the last delivered here. Text does not move it; only "+
-			"the call does. If anything since was cut or never arrived, do NOT confirm past it; "+
-			"hub_catch_up recovers it. Settle: (1) your last complete cursor? (2) anything cut "+
-			"or missing since it?%s]",
+		return fmt.Sprintf("[hub: CALL hub_confirm — not a question; answering in text moves "+
+			"nothing. Confirm the last message you have COMPLETE, possibly earlier than %q, the "+
+			"last delivered here. Decide silently which cursor that is and whether anything "+
+			"since was cut or missing; if so do NOT confirm past it — hub_catch_up recovers "+
+			"it.%s]",
 			e.Text, confirmReminderCost(e))
 	case "sendAck":
 		if e.ActionOK {

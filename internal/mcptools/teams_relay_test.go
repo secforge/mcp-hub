@@ -4460,3 +4460,82 @@ func TestAPermanentRefusalEndsTheConnectionInsteadOfRetrying(t *testing.T) {
 		t.Fatalf("expected no retry after a permanent refusal, got %d more join(s)", got-before)
 	}
 }
+
+// Reading a span of history one message per call costs a round trip per
+// message — fifteen minutes of a busy conversation is a dozen calls for
+// an answer that fits in one. A limit is safe HERE because the call moves
+// no position: nothing can be skipped by two messages arriving together,
+// which is the reason hub_catch_up has no such option.
+func TestReadReturnsUpToTheLimitInOneCall(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	var asked int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			n := atomic.AddInt32(&asked, 1)
+			if n > 3 {
+				conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+				continue
+			}
+			conn.WriteJSON(wire.Msg{
+				Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+				Text: fmt.Sprintf("message %d", n), TS: "ts", Historical: true,
+				Cursor: fmt.Sprintf("cursor-%d", n), ExternalID: fmt.Sprintf("ext-%d", n),
+				Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor},
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	readReq := mcp.CallToolRequest{}
+	readReq.Params.Arguments = map[string]any{"connection": testConn, "at": "2026-09-17T21:00:00Z", "limit": 5}
+	res, err := hub.handleRead(ctx, readReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_read failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	for _, want := range []string{"message 1", "message 2", "message 3"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected %q in one batched read, got: %s", want, text)
+		}
+	}
+	// Ran out before the limit, and says so rather than leaving a reader
+	// to wonder whether more was withheld.
+	if !strings.Contains(text, "everything there was") {
+		t.Errorf("expected the short walk to say it reached the end: %s", text)
+	}
+	// The default is still one: a caller that asks for nothing gets the
+	// old behaviour.
+	atomic.StoreInt32(&asked, 0)
+	readReq.Params.Arguments = map[string]any{"connection": testConn, "at": "2026-09-17T21:00:00Z"}
+	res, err = hub.handleRead(ctx, readReq)
+	if err != nil || res.IsError {
+		t.Fatalf("second hub_read failed: err=%v result=%+v", err, res)
+	}
+	if strings.Contains(textOf(res), "message 2") {
+		t.Errorf("an unasked-for limit returned more than one message: %s", textOf(res))
+	}
+}
