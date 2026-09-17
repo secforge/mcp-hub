@@ -45,14 +45,12 @@ type Inbox struct {
 	// onMessage receives text a verified parent sent. Nil until Start.
 	onMessage func(text string)
 	// diagnostic holds the last thing worth telling a reader about the
-	// wire: a held-message status with its cause, or whether an arriving
-	// user frame asserted a permission mode. Read once and cleared.
+	// wire: whether an arriving user frame asserted a permission mode.
+	// Read once and cleared.
 	//
-	// It exists because three sessions spent an hour inferring the gate's
-	// cause from absences, while the answer was in a field on a frame
-	// this process already receives. A status carries `cause` naming the
-	// branch that held it; a user frame either carries from_mode or does
-	// not. Both are facts rather than deductions.
+	// It exists because that attribution is a fact carried on a frame
+	// this process already receives, and inferring it from absences
+	// instead costs hours.
 	diagnostic string
 }
 
@@ -106,33 +104,22 @@ func OpenInbox() (*Inbox, error) {
 	srv, err := udsmsg.Listen(udsmsg.Config{
 		Handler: udsmsg.Handler{
 			OnUser: in.handleUser,
-			// The receiver builds this and sends it back here: it is the
-			// only place the hold's own cause is stated.
-			OnPeerMessageStatus: in.handleStatus,
 		},
 		// Auth is required and the key is published so a reply from the
 		// model's own session can present a token at all. Neither decides
 		// who may send — see the type comment.
 		RequireAuth: true,
 		PublishKey:  true,
-		// OFF, and this is the whole of the "approval notice" mystery.
-		//
-		// AutoStatus answers every accepted frame with a "delivered"
-		// peer_message_status. Claude Code renders that as "approved and
-		// released after approval", because for a real session a
-		// delivered only ever follows a hold — so a bare delivered from
-		// an inbox reads as a hold that was approved. Nothing was ever
-		// held: the notice was this client answering itself.
-		//
-		// It also explains why nothing moved it. Registration, derived
-		// mode, from_mode and the address form were each tested against a
-		// gate that did not exist.
+		// OFF. AutoStatus answers every accepted frame with a
+		// "delivered" peer_message_status, and Claude Code renders that
+		// as "approved and released after approval" — because a real
+		// session emits a delivered only after a hold, so a bare one
+		// reads as an approval for a hold that never happened.
 		//
 		// A real session is silent on the accept path, so silence is the
-		// faithful behaviour. The sender learns delivery from the hub's
-		// own acknowledgement arriving back, which is a stronger signal
-		// than a status frame: it says the message reached the hub rather
-		// than merely reaching this process.
+		// faithful behaviour. Delivery is learned from the hub's own
+		// acknowledgement arriving back, which says the message reached
+		// the hub rather than merely reaching this process.
 		AutoStatus: false,
 		// Never: a peer whose credentials the kernel will not report
 		// cannot be compared to our parent, so it cannot be accepted.
@@ -244,22 +231,6 @@ func (i *Inbox) handleUser(_ context.Context, p *udsmsg.Peer, f *udsmsg.Frame) {
 	if text := frameText(f); text != "" {
 		fn(text)
 	}
-}
-
-// handleStatus records a delivery status verbatim. Held and refused ones
-// carry the reason; a plain "delivered" is not worth reporting.
-func (i *Inbox) handleStatus(_ context.Context, _ *udsmsg.Peer, f *udsmsg.Frame) {
-	if f == nil || len(f.Raw) == 0 {
-		return
-	}
-	raw := string(f.Raw)
-	if !strings.Contains(raw, "held") && !strings.Contains(raw, "refused") &&
-		!strings.Contains(raw, "cause") {
-		return
-	}
-	i.mu.Lock()
-	i.diagnostic = "delivery status from the harness: " + raw
-	i.mu.Unlock()
 }
 
 // TakeDiagnostic returns the last wire fact worth reporting and clears

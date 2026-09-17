@@ -53,7 +53,7 @@ func connReqFor(name string) mcp.CallToolRequest {
 // (see TestMain), so the answer is normally no — and a test that asserts
 // on addresses has to say which case it is in rather than reading an
 // absent inbox as a failure.
-func harnessAvailableForTest() bool { return harness.PushMode() }
+func harnessAvailableForTest() bool { return harness.PushOnly() }
 
 // droppedConn reports that this hub is no longer holding a live
 // connection, whichever way the drop landed: a connection that is not

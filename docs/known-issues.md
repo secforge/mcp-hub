@@ -80,29 +80,29 @@ v0.1.1: `[cursor: …]` and `[no cursor: this message cannot be re-fetched]`.
 A test matching `[cursor:` would pass today and fail on the first
 client-authored notice.
 
-## Codex push mode is not built, but the code reads as though it were
+## Codex push is built but has never run against a Codex session
 
-`PushMode` keys on `CLAUDE_CODE_MESSAGING_SOCKET` alone, and
-`pushToHarness` returns before draining unless it is true. Under a Codex
-harness the socket is absent, so nothing is ever pushed — while `Adopt`
-still runs on every request and still latches a thread id, since that is
-the only way the library learns a Codex target. The thread-id plumbing and
-the second-thread mismatch check are therefore reachable only on the
-harness that does not need them.
+**What is built.** Delivery is decided by whether a target can be reached
+right now (`Pusher.Available`), not by which mode was picked at startup.
+A Claude target arrives in the environment at exec; a Codex one is carried
+on MCP tool-call metadata and is unknown until a call arrives — so
+registration cannot depend on it and no longer does. Under Codex the pull
+tools stay registered, and `pushToHarness` stands aside while a CLI
+follower is attached or a `hub_wait` is blocked, so one event has exactly
+one consumer.
 
-Found by chat-relay, 2026-09-15, reviewing the push path.
+**What has not happened.** None of it has been exercised against a real
+Codex session. The thread-id latching, the receipt handling that now
+distinguishes `ObservedStored`/`ObservedAccepted` from `ObservedNothing`,
+and the arbitration above are all verified only by this repository's own
+tests and the library's contract.
 
-**Why it was not simply switched on.** Keying `PushMode` on the pusher
-being available would put Codex into push mode as a side effect, which
-also unregisters `hub_wait` and `hub_receive` — and Codex cannot background
-a process, so the blocking call is what it depends on. That is a feature
-with a verification cost, not a one-line change, and it has never been
-exercised against a Codex session.
-
-**Until then** the honest statement is the one in `PushMode`'s doc comment:
-Codex push is unbuilt. The failure this avoids is the one the codebase
-keeps meeting — code that looks built and behaves unbuilt produces an
-absence nobody can attribute.
+**What to check first when it is tried.** Whether the first push lands at
+all (the target is latched from the connect call's own metadata, so the
+connect result already says which guidance it chose); whether a blocked
+`hub_wait` and a push ever deliver the same event twice; and whether the
+persisted reading position advances on a Codex receipt, which it should
+and on Claude deliberately does not.
 
 ## The self-update version is not signed
 

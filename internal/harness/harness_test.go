@@ -99,7 +99,7 @@ func TestClearEnvForTestingClearsEveryHarnessVariable(t *testing.T) {
 			t.Errorf("%s survived the guard as %q — a test could still reach a live harness", name, v)
 		}
 	}
-	if PushMode() {
+	if PushOnly() {
 		t.Error("push mode still engaged after the guard")
 	}
 	restore()

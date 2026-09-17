@@ -17,7 +17,7 @@ import (
 func inPushMode(t *testing.T) {
 	t.Helper()
 	t.Setenv(deliver.EnvClaudeSocket, "/nonexistent/test.sock")
-	if !harness.PushMode() {
+	if !harness.PushOnly() {
 		t.Fatal("push mode did not engage with a messaging socket set")
 	}
 }
@@ -121,7 +121,7 @@ func TestPushModeMentionsNoWaitingMachineryAnywhereTheModelCanSee(t *testing.T) 
 // it is where a stale instruction does the most damage.
 func TestConnectGuidanceInPushModeSaysNothingToStart(t *testing.T) {
 	inPushMode(t)
-	got := buildWaitBlock(context.Background(), nil, "reconnect somehow")
+	got := buildWaitBlock(context.Background(), nil, "reconnect somehow", true)
 	for _, banned := range []string{"hub_wait", "--follow", "Monitor", "background"} {
 		if strings.Contains(got, banned) {
 			t.Errorf("push-mode connect guidance mentions %q:\n%s", banned, got)
@@ -167,7 +167,7 @@ func TestEveryToolThatHandsOverACursorRecordsALedgerPosition(t *testing.T) {
 // stated twice — as it did, live, the first time the new wording shipped.
 func TestTheConnectNoteDoesNotSayTheSameThingTwice(t *testing.T) {
 	inPushMode(t)
-	got := buildWaitBlock(context.Background(), nil, "reconnect somehow")
+	got := buildWaitBlock(context.Background(), nil, "reconnect somehow", true)
 	if strings.Count(got, "cut off in transit") > 1 {
 		t.Errorf("the truncation rule is stated more than once:\n%s", got)
 	}
@@ -262,7 +262,7 @@ func TestCatchUpDeliversByPushOnlyInPushMode(t *testing.T) {
 	// The guard must be the push-mode check, not something else that
 	// happens to be nearby.
 	before := text[max(0, idx-1200):idx]
-	if !strings.Contains(before, "harness.PushMode()") {
+	if !strings.Contains(before, "harness.PushOnly()") {
 		t.Error("the push drain is not gated on push mode")
 	}
 	// And it must go through the one-at-a-time slot: two backlogs
@@ -291,7 +291,7 @@ func max(a, b int) int {
 // this within a minute of each other, live.
 func TestBufferedEventsAdviceMatchesTheDeliveryMode(t *testing.T) {
 	t.Setenv(harness.EnvClaudeSocketName, "/tmp/does-not-need-to-exist.sock")
-	if !harness.PushMode() {
+	if !harness.PushOnly() {
 		t.Fatal("expected push mode with the harness socket set")
 	}
 	text := caughtUpText(true)
@@ -324,7 +324,7 @@ func TestTheReconnectReportDoesNotInventAWaitChannelInPushMode(t *testing.T) {
 	// The push-mode branch must be the FIRST thing that sets it, so no
 	// other wording can be the default that mode falls through to.
 	window := text[idx:min(len(text), idx+600)]
-	if !strings.Contains(window, "harness.PushMode()") {
+	if !strings.Contains(window, "harness.PushOnly()") {
 		t.Error("the follower note is not gated on the delivery mode")
 	}
 	pushCase := strings.Index(window, "no wait channel in this")
@@ -342,4 +342,50 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// Codex keeps its pull tools — its push target is carried on tool-call
+// metadata, so at registration time this process does not yet know
+// whether it can push at all, and a reader left with neither path
+// receives nothing.
+func TestCodexKeepsThePullToolsBecauseItsTargetIsNotKnownYet(t *testing.T) {
+	restore := harness.ClearEnvForTesting()
+	defer restore()
+	if harness.PushOnly() {
+		t.Fatal("no Claude socket should mean this is not the push-only mode")
+	}
+	var names []string
+	for _, n := range registeredToolNames(t) {
+		names = append(names, n)
+	}
+	joined := strings.Join(names, ",")
+	for _, want := range []string{"hub_wait", "hub_receive"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("expected %q to stay registered where the target is not known at startup", want)
+		}
+	}
+}
+
+// Once a target IS latched, the guidance stops telling Codex to run a
+// perpetual blocking loop for events that now arrive on their own — and
+// says hub_wait still works, so a reader that calls it does not conclude
+// the pushes stopped.
+func TestCodexGuidanceDropsTheLoopOncePushesAreDelivered(t *testing.T) {
+	ctx := ctxWithClientName("codex")
+	got := buildWaitBlock(ctx, nil, "reconnect somehow", true)
+	if strings.Contains(got, "Persistent monitoring") {
+		t.Errorf("expected no monitoring loop once pushes are delivered:\n%s", got)
+	}
+	if !strings.Contains(got, "hub_wait") {
+		t.Errorf("expected the guidance to say hub_wait still works:\n%s", got)
+	}
+	if !strings.Contains(got, "hub_catch_up") {
+		t.Errorf("expected the reconnect gap to still be named:\n%s", got)
+	}
+
+	// With nothing latched yet, the loop is still the only way to receive.
+	got = buildWaitBlock(ctx, nil, "reconnect somehow", false)
+	if !strings.Contains(got, "Persistent monitoring") {
+		t.Errorf("expected the blocking loop while nothing can be pushed:\n%s", got)
+	}
 }

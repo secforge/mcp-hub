@@ -3701,12 +3701,13 @@ func TestReconnectTellsTheSurvivingFollowerToCatchUp(t *testing.T) {
 	}
 }
 
-// Three states, three answers. Connecting while a reconnect is in flight
-// is refused rather than raced: the automatic attempt already holds this
-// session's identity and a follower kept open across the gap, and a
-// second dial would either lose that race or win it and strand what the
-// first was holding.
-func TestConnectDuringAReconnectIsRefused(t *testing.T) {
+// Connecting while a reconnect is in flight TAKES OVER rather than being
+// refused. Every drop is retried now, so a refusal would make the
+// ordinary case — a reader that noticed and dialled — wait out a backoff
+// for an attempt doing exactly what it just asked for. What the loop was
+// holding belongs to the session rather than to the loop, so ending it
+// strands nothing, and the follower kept across the gap stays held.
+func TestConnectDuringAReconnectTakesOver(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	link, _ := restartOnceServer(t, true, 30) // long estimate: still pending when we ask
 	ctx := context.Background()
@@ -3731,20 +3732,21 @@ func TestConnectDuringAReconnectIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !res.IsError {
-		t.Fatalf("expected the second connect to be refused, got: %s", textOf(res))
+	if res.IsError {
+		t.Fatalf("expected the manual connect to take over, got: %s", textOf(res))
 	}
-	got := textOf(res)
-	if !strings.Contains(got, "reconnection in progress") {
-		t.Fatalf("expected the refusal to name the reason, got: %s", got)
+	// The held waiter must still be held — taking over must not disturb it.
+	if w := hub.currentWaiter(); w == nil {
+		t.Fatal("expected the follower held across the gap to survive the takeover")
 	}
-	if !strings.Contains(got, "hub_disconnect") {
-		t.Fatalf("expected it to say how to stop waiting, got: %s", got)
-	}
-	// The held waiter must still be held — refusing must not disturb it.
-	w := hub.currentWaiter()
-	if w == nil {
-		t.Fatal("expected the refusal to leave the held follower alone")
+	// And the loop it replaced must not still be counting down, or the
+	// next tool call reports a reconnect that nothing is performing.
+	s2 := sole(t, hub)
+	s2.mu.Lock()
+	pending := s2.reconnecting
+	s2.mu.Unlock()
+	if pending {
+		t.Fatal("expected the superseded reconnect loop to stop claiming to be in flight")
 	}
 }
 

@@ -232,30 +232,28 @@ func (p *Pusher) SetReplyAddress(addr string) {
 	}
 }
 
-// PushMode reports whether this process should deliver hub events by
-// pushing them into its parent harness rather than by waiting to be
-// asked. It is keyed on the CLAUDE harness having handed us a messaging
-// socket, and deliberately not on the pusher merely being available.
+// PushOnly reports the mode where delivery is entirely by push and there
+// is no pull tool to offer: a Claude harness, which hands this process a
+// messaging socket at exec so the target is known before anything is
+// registered.
 //
-// CODEX PUSH IS NOT BUILT. Under Codex this is false, so pushToHarness
-// returns before draining and nothing is ever delivered — while Adopt
-// still runs on every request and still latches a thread id, because that
-// is how the library learns a target it was not given at exec. The
-// machinery therefore exists and is exercised on the one harness that
-// does not need it, which reads as built and behaves as unbuilt.
+// It answers ONE question: is there a pull tool? It deliberately does not
+// answer "can this process deliver", which is a different question with a
+// different answer at a different time — see Pusher.Available.
 //
-// Keying this on Available() instead would switch Codex into push mode
-// as a side effect: hub_wait and hub_receive would stop being registered
-// for a harness that cannot background a process and depends on the
-// blocking call. That is a real feature with a real verification cost,
-// not a one-line change, and it has never been exercised against a Codex
-// session. Stated here rather than left to be inferred from behaviour —
-// see docs/known-issues.md.
+// Under Codex both are true: pushes are delivered AND the blocking pull
+// stays registered. That is not redundancy. A Codex target is carried on
+// MCP tool-call metadata, so it is unknown until a call arrives, and
+// tools are registered before any call has — a process that unregistered
+// the pull tools on the strength of a target it did not have yet would
+// leave the reader with no way to receive anything at all in that window.
+// The two consumers are arbitrated at delivery time instead, where the
+// answer is known: see pushToHarness.
 //
 // Where this is true the pull machinery is not merely redundant, it is
 // harmful: a follower and a push are two consumers of one event buffer,
 // and whichever drains first hides the event from the other.
-func PushMode() bool {
+func PushOnly() bool {
 	return os.Getenv(deliver.EnvClaudeSocket) != ""
 }
 

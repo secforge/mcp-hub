@@ -120,9 +120,14 @@ type session struct {
 	// directory — a DIFFERENT project whenever the two differ, whose
 	// identity for the same link is somebody else's.
 	redialTarget connstore.Target
-	// reconnecting guards against two automatic attempts overlapping, and
-	// against one racing a hub_connect the model issued itself.
+	// reconnecting guards against two automatic attempts overlapping.
 	reconnecting bool
+	// reconnectGen ends the loop currently running. A manual hub_connect
+	// bumps it and takes over, which is why the loop compares it rather
+	// than only checking whether the link is still set: a caller dialling
+	// by hand is not a caller leaving, so the link stays exactly where it
+	// is and something else has to say "stop".
+	reconnectGen int
 	// reconnectAt is when the pending automatic attempt is due. Without it
 	// every tool answers a planned outage with a bare "not connected",
 	// which is true and useless: it reads identically to a hub that is
@@ -220,27 +225,33 @@ func (h *Hub) open(name string) (*session, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if prev, ok := h.sessions[name]; ok {
-		// A name held by a connection this client is bringing back by
-		// itself is a different refusal, and the caller needs to know
-		// which: that attempt already holds the identity, the stored
-		// secret and a follower kept open across the gap, so a second
-		// dial would either lose the race or win it and strand what the
-		// first was holding.
+		// A name held by an automatic reconnect YIELDS to the caller.
+		// Every drop is retried now, so refusing here would make the
+		// ordinary case — a reader that noticed the drop and dialled —
+		// wait out a backoff of up to a minute for an attempt that is
+		// doing exactly what it just asked for. The loop is cancelled and
+		// this connect proceeds; what the loop was holding (the stored
+		// identity, the follower kept across the gap) is held by the
+		// session, not by the loop, so nothing is stranded by ending it.
 		prev.mu.Lock()
-		pending, at := prev.reconnecting, prev.reconnectAt
-		prev.mu.Unlock()
-		if pending {
-			when := "right now"
-			if in := time.Until(at).Round(time.Second); in > 0 {
-				when = fmt.Sprintf("in about %s", in)
-			}
-			return nil, fmt.Errorf("reconnection in progress on %q — this client is already coming "+
-				"back on its own after the server announced a restart, %s. Do not dial a second "+
-				"time; wait for it. To stop waiting instead, call hub_disconnect on that name, "+
-				"which gives up and releases the follower being held for it", name, when)
+		pending := prev.reconnecting || !prev.reconnectAt.IsZero()
+		stillConnected := prev.conn != nil
+		if pending && !stillConnected {
+			// Ends the loop: it checks this before every attempt, and a
+			// caller dialling by hand is not a caller leaving, so the
+			// redial link stays exactly where it is.
+			prev.reconnectGen++
+			prev.reconnecting, prev.reconnectAt = false, time.Time{}
 		}
-		return nil, fmt.Errorf("a connection named %q is already open — disconnect it first, or "+
-			"pick another name; this is never silently reattached to the existing one", name)
+		prev.mu.Unlock()
+		if pending && !stillConnected {
+			// h.mu is held here, so the map is edited directly rather
+			// than through h.close, which takes it.
+			delete(h.sessions, name)
+		} else {
+			return nil, fmt.Errorf("a connection named %q is already open — disconnect it first, "+
+				"or pick another name; this is never silently reattached to the existing one", name)
+		}
 	}
 	if len(h.sessions) >= maxSessions {
 		return nil, fmt.Errorf("already holding %d connections (%s) — the limit is %d; "+
