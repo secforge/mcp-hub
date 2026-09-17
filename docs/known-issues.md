@@ -32,10 +32,10 @@ the habit that makes a real intermittent failure invisible. Three other tests
 `TestCatchUpGapDedupBranchPrunesHandedOverAhead`) each failed once the same
 way and likewise never reproduced — the last on 2026-09-16, clean on three
 isolated runs and three full-package runs immediately after.
-`TestCatchUpWithNoPriorPositionAndNoBehindReportsNothingToCatchUp` joined
-them the same day with the same shape: one failure inside a full-package
-run ("catch-up request timed out waiting for the server"), then clean on
-one isolated run and three full-package runs.
+`TestCatchUpWithNoPriorPositionAndNoBehindReportsNothingToCatchUp` and
+`TestAnnouncedRestartKeepsTheFollowerAlive` joined them with the same
+shape: one failure inside a full-package run, then clean on an isolated
+run and on repeated full-package runs.
 
 **Not investigated further** because it was found while building something
 unrelated. The next step would be to raise or parameterise the deadline
@@ -82,27 +82,32 @@ client-authored notice.
 
 ## Codex push is built but has never run against a Codex session
 
-**What is built.** Delivery is decided by whether a target can be reached
-right now (`Pusher.Available`), not by which mode was picked at startup.
-A Claude target arrives in the environment at exec; a Codex one is carried
-on MCP tool-call metadata and is unknown until a call arrives — so
-registration cannot depend on it and no longer does. Under Codex the pull
-tools stay registered, and `pushToHarness` stands aside while a CLI
-follower is attached or a `hub_wait` is blocked, so one event has exactly
-one consumer.
+**What is built.** A Codex caller is push-only, like a Claude one: events
+are delivered as they arrive, `hub_wait` and `hub_receive` are not
+offered, and no wait socket is created. The switch happens on that
+caller's FIRST tool call, because tools are registered before any client
+has identified itself — the tool set is re-registered at that point so no
+description still names a tool that has just been removed.
+
+It is gated on the harness being reachable, not on the client's name
+alone. A name is a claim; unregistering the pull tools for a caller this
+process cannot push to would leave it no way to receive anything, which
+is the failure this exists to prevent rather than cause. Where a Codex
+caller appears with no reachable harness, the blocking loop and its
+instructions stay exactly as they were.
 
 **What has not happened.** None of it has been exercised against a real
-Codex session. The thread-id latching, the receipt handling that now
-distinguishes `ObservedStored`/`ObservedAccepted` from `ObservedNothing`,
-and the arbitration above are all verified only by this repository's own
-tests and the library's contract.
+Codex session. The thread-id latching from `_meta.threadId`, the receipt
+handling that distinguishes `ObservedStored`/`ObservedAccepted` from
+`ObservedNothing`, and the mode switch are verified only by this
+repository's own tests and the library's contract.
 
 **What to check first when it is tried.** Whether the first push lands at
 all (the target is latched from the connect call's own metadata, so the
-connect result already says which guidance it chose); whether a blocked
-`hub_wait` and a push ever deliver the same event twice; and whether the
-persisted reading position advances on a Codex receipt, which it should
-and on Claude deliberately does not.
+connect result already says which guidance it chose); whether the tool
+list a Codex client sees actually loses `hub_wait` after its first call;
+and whether the persisted reading position advances on a Codex receipt,
+which it should and on Claude deliberately does not.
 
 ## The self-update version is not signed
 

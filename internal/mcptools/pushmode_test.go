@@ -122,7 +122,7 @@ func TestPushModeMentionsNoWaitingMachineryAnywhereTheModelCanSee(t *testing.T) 
 // it is where a stale instruction does the most damage.
 func TestConnectGuidanceInPushModeSaysNothingToStart(t *testing.T) {
 	inPushMode(t)
-	got := buildWaitBlock(context.Background(), nil, "reconnect somehow", true)
+	got := buildWaitBlock(context.Background(), nil, "reconnect somehow")
 	for _, banned := range []string{"hub_wait", "--follow", "Monitor", "background"} {
 		if strings.Contains(got, banned) {
 			t.Errorf("push-mode connect guidance mentions %q:\n%s", banned, got)
@@ -168,7 +168,7 @@ func TestEveryToolThatHandsOverACursorRecordsALedgerPosition(t *testing.T) {
 // stated twice — as it did, live, the first time the new wording shipped.
 func TestTheConnectNoteDoesNotSayTheSameThingTwice(t *testing.T) {
 	inPushMode(t)
-	got := buildWaitBlock(context.Background(), nil, "reconnect somehow", true)
+	got := buildWaitBlock(context.Background(), nil, "reconnect somehow")
 	if strings.Count(got, "cut off in transit") > 1 {
 		t.Errorf("the truncation rule is stated more than once:\n%s", got)
 	}
@@ -263,7 +263,9 @@ func TestCatchUpDeliversByPushOnlyInPushMode(t *testing.T) {
 	// The guard must be the push-mode check, not something else that
 	// happens to be nearby.
 	before := text[max(0, idx-1200):idx]
-	if !strings.Contains(before, "harness.PushOnly()") {
+	// pushOnly(), not harness.PushOnly(): the mode is answered at runtime
+	// because a Codex caller only identifies itself on its first call.
+	if !strings.Contains(before, "pushOnly()") {
 		t.Error("the push drain is not gated on push mode")
 	}
 	// And it must go through the one-at-a-time slot: two backlogs
@@ -325,7 +327,7 @@ func TestTheReconnectReportDoesNotInventAWaitChannelInPushMode(t *testing.T) {
 	// The push-mode branch must be the FIRST thing that sets it, so no
 	// other wording can be the default that mode falls through to.
 	window := text[idx:min(len(text), idx+600)]
-	if !strings.Contains(window, "harness.PushOnly()") {
+	if !strings.Contains(window, "pushOnly()") {
 		t.Error("the follower note is not gated on the delivery mode")
 	}
 	pushCase := strings.Index(window, "no wait channel in this")
@@ -367,27 +369,37 @@ func TestCodexKeepsThePullToolsBecauseItsTargetIsNotKnownYet(t *testing.T) {
 	}
 }
 
-// Once a target IS latched, the guidance stops telling Codex to run a
-// perpetual blocking loop for events that now arrive on their own — and
-// says hub_wait still works, so a reader that calls it does not conclude
-// the pushes stopped.
-func TestCodexGuidanceDropsTheLoopOncePushesAreDelivered(t *testing.T) {
-	ctx := ctxWithClientName("codex")
-	got := buildWaitBlock(ctx, nil, "reconnect somehow", true)
+// A Codex caller gets the push-mode guidance, because it IS push mode
+// once it has identified itself: no loop to run, and no hub_wait left to
+// run it with.
+func TestCodexGetsThePushGuidanceOnceItIsPushOnly(t *testing.T) {
+	restore := harness.ClearEnvForTesting()
+	defer restore()
+	codexPushOnly.Store(true)
+	defer codexPushOnly.Store(false)
+
+	got := buildWaitBlock(ctxWithClientName("codex"), nil, "reconnect somehow")
 	if strings.Contains(got, "Persistent monitoring") {
-		t.Errorf("expected no monitoring loop once pushes are delivered:\n%s", got)
+		t.Errorf("expected no monitoring loop for a push-only Codex client:\n%s", got)
 	}
-	if !strings.Contains(got, "hub_wait") {
-		t.Errorf("expected the guidance to say hub_wait still works:\n%s", got)
+	if strings.Contains(got, "hub_wait") {
+		t.Errorf("the guidance names a tool this client no longer registers:\n%s", got)
 	}
 	if !strings.Contains(got, "hub_catch_up") {
 		t.Errorf("expected the reconnect gap to still be named:\n%s", got)
 	}
+}
 
-	// With nothing latched yet, the loop is still the only way to receive.
-	got = buildWaitBlock(ctx, nil, "reconnect somehow", false)
+// And where this process CANNOT push — no reachable harness — the loop is
+// still the only way a Codex caller receives anything, so it stays.
+func TestCodexKeepsTheLoopWhenThereIsNothingToPushInto(t *testing.T) {
+	restore := harness.ClearEnvForTesting()
+	defer restore()
+	codexPushOnly.Store(false)
+
+	got := buildWaitBlock(ctxWithClientName("codex"), nil, "reconnect somehow")
 	if !strings.Contains(got, "Persistent monitoring") {
-		t.Errorf("expected the blocking loop while nothing can be pushed:\n%s", got)
+		t.Errorf("expected the blocking loop where nothing can be pushed:\n%s", got)
 	}
 }
 
@@ -449,4 +461,89 @@ func TestTheThreadIdIsNotPersisted(t *testing.T) {
 	if found {
 		t.Fatal("the thread id reached disk; it names a thread that will not exist next run")
 	}
+}
+
+// A Codex caller turns this process push-only on its first call — tools
+// are registered before any client has identified itself, so that is the
+// earliest the question can be answered.
+func TestACodexCallerMakesThisProcessPushOnly(t *testing.T) {
+	restoreEnv := harness.ClearEnvForTesting()
+	defer restoreEnv()
+	restoreReach := harness.SetCodexReachableForTesting(true)
+	defer restoreReach()
+	codexPushOnly.Store(false)
+	defer codexPushOnly.Store(false)
+
+	srv := server.NewMCPServer("test", "0")
+	hub := NewHub()
+	hub.Register(srv)
+
+	hub.adoptCodexMode(ctxWithClientName("codex"))
+	if !pushOnly() {
+		t.Fatal("expected a Codex caller to put this process in push-only mode")
+	}
+	// Compared against tool NAMES: "hub_wait" also appears inside other
+	// tools' descriptions, so a substring match over the whole listing
+	// proves nothing either way.
+	for _, n := range registeredToolNamesOn(t, srv) {
+		if n == "hub_wait" || n == "hub_receive" {
+			t.Errorf("%q is still offered to a push-only Codex client", n)
+		}
+	}
+	// The descriptions must not point at them either.
+	if strings.Contains(toolsListJSONOn(t, srv), "hub_wait") {
+		t.Error("a tool description still sends the reader to hub_wait")
+	}
+}
+
+// But NOT on the name alone. A name is a claim; a harness this process
+// cannot reach is one it cannot push into, and unregistering the pull
+// tools there would leave the caller no way to receive anything at all.
+func TestACodexNameWithNoReachableHarnessChangesNothing(t *testing.T) {
+	restoreEnv := harness.ClearEnvForTesting()
+	defer restoreEnv()
+	restoreReach := harness.SetCodexReachableForTesting(false)
+	defer restoreReach()
+	codexPushOnly.Store(false)
+	defer codexPushOnly.Store(false)
+
+	srv := server.NewMCPServer("test", "0")
+	hub := NewHub()
+	hub.Register(srv)
+
+	hub.adoptCodexMode(ctxWithClientName("codex"))
+	if pushOnly() {
+		t.Fatal("expected no mode change where the harness cannot be reached")
+	}
+	var found bool
+	for _, n := range registeredToolNamesOn(t, srv) {
+		if n == "hub_wait" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("hub_wait was removed for a caller that has no other way to receive")
+	}
+}
+
+// toolsListJSONOn and registeredToolNamesOn ask a specific server what it
+// offers, rather than building a fresh one — the point of these tests is
+// what changed on the server the caller is talking to.
+func toolsListJSONOn(t *testing.T, s *server.MCPServer) string {
+	t.Helper()
+	raw, err := json.Marshal(s.HandleMessage(context.Background(),
+		[]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)))
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	return string(raw)
+}
+
+func registeredToolNamesOn(t *testing.T, s *server.MCPServer) []string {
+	t.Helper()
+	var names []string
+	for _, part := range strings.Split(toolsListJSONOn(t, s), `"name":"`)[1:] {
+		names = append(names, part[:strings.Index(part, `"`)])
+	}
+	return names
 }

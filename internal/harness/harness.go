@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/secforge/harness-transport/codexmsg"
 	"github.com/secforge/harness-transport/deliver"
 )
 
@@ -255,6 +256,31 @@ func (p *Pusher) SetReplyAddress(addr string) {
 // and whichever drains first hides the event from the other.
 func PushOnly() bool {
 	return os.Getenv(deliver.EnvClaudeSocket) != ""
+}
+
+// CodexReachable reports whether a Codex harness can actually be reached
+// from this process.
+//
+// Asked because the client's own name is what identifies a Codex caller,
+// and a name is a claim rather than a route. Switching delivery on the
+// name alone would unregister the pull tools for a caller this process
+// cannot push to, leaving it no way to receive anything at all — the
+// failure being avoided, produced by the fix for it.
+func CodexReachable() bool { return codexReachable() }
+
+var codexReachable = func() bool {
+	_, err := codexmsg.DefaultSocket()
+	return err == nil
+}
+
+// SetCodexReachableForTesting forces the answer and returns a function
+// restoring it. A test cannot rely on whether the machine running it
+// happens to have a Codex app-server, and the behaviour being tested is
+// what this client does with each answer.
+func SetCodexReachableForTesting(reachable bool) func() {
+	prev := codexReachable
+	codexReachable = func() bool { return reachable }
+	return func() { codexReachable = prev }
 }
 
 // ClearEnvForTesting removes the inherited harness messaging environment
