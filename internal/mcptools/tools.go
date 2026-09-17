@@ -411,6 +411,10 @@ var activeHub *Hub
 // once, before any connection exists.
 var codexPushOnly atomic.Bool
 
+// haveConnections mirrors whether any connection is open, for the prose
+// that names the tools which exist only while one is — see syncTools.
+var haveConnections atomic.Bool
+
 // pushOnly reports whether this process delivers by pushing and offers no
 // pull tool. True for a Claude harness from the moment it starts, and for
 // a Codex one from the moment it says so.
@@ -1312,6 +1316,20 @@ func deliveryChannels() string {
 	return "wait/hub_receive/hub_wait"
 }
 
+// conversationToolsPhrase names the tools that act on a connection, for
+// prose in a tool that exists whether or not one is open.
+//
+// With nothing connected they are not registered, so naming them would
+// point a reader at tools that are not there — which reads as this client
+// being broken rather than as there being nothing to act on yet. They
+// appear together with the first connection, so that is what it says.
+func conversationToolsPhrase() string {
+	if !haveConnections.Load() {
+		return "the tools that appear once a connection is open"
+	}
+	return "hub_send/" + receiveTools() + "/hub_peers/hub_catch_up"
+}
+
 // receiveTools names the pull tools that actually exist in this mode.
 func receiveTools() string {
 	if pushOnly() {
@@ -1329,6 +1347,11 @@ func (h *Hub) Register(s *server.MCPServer) {
 	// Said on the first tool call, whichever it is: the connections a
 	// previous run held are gone, and nothing else would ever mention it.
 	h.reportAbandonedConnections()
+	// Set from THIS hub's own state before its tools are built: the flag
+	// is process-wide because the prose that reads it is handed no hub,
+	// and a value left by a different one would describe somebody else's
+	// connections.
+	haveConnections.Store(h.anySession())
 	h.registerTools(s)
 }
 
@@ -1351,14 +1374,27 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool := func(tool mcp.Tool, handler server.ToolHandlerFunc) {
 		s.AddTool(tool, h.withReconnectNote(handler))
 	}
+	// A tool that acts on a connection is offered only while there is
+	// one. Before any connect it can do nothing but refuse, and a tool
+	// that is visible and always refuses reads as broken rather than as
+	// inapplicable — while the tools that DO apply (hub_connect, and the
+	// two that need nothing) are easier to find in a list that holds only
+	// them.
+	connected := h.anySession()
+	addConnTool := func(tool mcp.Tool, handler server.ToolHandlerFunc) {
+		if !connected {
+			return
+		}
+		addTool(tool, handler)
+	}
 	addTool(
 		mcp.NewTool("hub_connect",
 			mcp.WithDescription("Connect to a hub session via a link the user was given — one "+
 				"opaque string that identifies both where to connect and what authorizes it. "+
 				"The link may address an ordinary hub session or a conversation mirrored from a "+
 				"real chat platform (e.g. Microsoft Teams); that is the server's business, not "+
-				"something to work out from the link, and hub_send/"+receiveTools()+"/"+
-				"hub_peers/hub_catch_up work the same way either way. The connect result states "+
+				"something to work out from the link, and "+conversationToolsPhrase()+" work the "+
+				"same way either way. The connect result states "+
 				"what this particular server declared about itself"+
 				startupConnectionsNote()),
 			mcp.WithString("as", mcp.Required(), mcp.Description(
@@ -1414,7 +1450,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleConnect,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_send",
 			connectionParam(),
 			mcp.WithDescription("Send a text message to the current hub session. On a teams "+
@@ -1478,7 +1514,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleSend,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_disconnect",
 			connectionParam(),
 			mcp.WithDescription("Disconnect from the current hub session")),
@@ -1515,7 +1551,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"stand")),
 		h.handleSelfUpdate,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_read",
 			connectionParam(),
 			mcp.WithDescription("Read one message from this conversation's history, by where it "+
@@ -1562,7 +1598,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleRead,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_pin",
 			connectionParam(),
 			mcp.WithDescription("Pin a message in this conversation — only where the server "+
@@ -1577,7 +1613,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handlePin,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_unpin",
 			connectionParam(),
 			mcp.WithDescription("Remove a message from this conversation's pinned set — same "+
@@ -1589,7 +1625,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleUnpin,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_pins",
 			connectionParam(),
 			mcp.WithDescription("List what is pinned in this conversation RIGHT NOW, asking the "+
@@ -1608,7 +1644,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	// through hub_catch_up and hub_read, which ask the server rather than
 	// this buffer.
 	if !pushOnly() {
-		addTool(
+		addConnTool(
 			mcp.NewTool("hub_receive",
 				connectionParam(),
 				mcp.WithDescription("Drain and return currently buffered hub events without blocking. "+
@@ -1627,7 +1663,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	// itself. Not registered rather than registered-and-discouraged,
 	// because a discouraged tool is still a tool.
 	if !pushOnly() {
-		addTool(
+		addConnTool(
 			mcp.NewTool("hub_wait",
 				connectionParam(),
 				mcp.WithDescription("Block until the next hub event arrives (or the hub disconnects), "+
@@ -1642,7 +1678,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 			h.handleWait,
 		)
 	}
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_peers",
 			connectionParam(),
 			mcp.WithDescription("List everyone else currently in the hub session, including each "+
@@ -1650,7 +1686,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"public key (e.g. for encrypting a message to them before sending)")),
 		h.handlePeers,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_catch_up",
 			connectionParam(),
 			mcp.WithDescription("Read the single next message you missed. A server that doesn't "+
@@ -1705,7 +1741,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleCatchUp,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_confirm",
 			connectionParam(),
 			mcp.WithDescription("Explicitly confirm you received a message INTACT, by its cursor — "+
@@ -1729,7 +1765,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleConfirmReceived,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_react",
 			connectionParam(),
 			mcp.WithDescription("Add or remove a reaction on an earlier message — only where the "+
@@ -1750,7 +1786,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleReact,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_edit",
 			connectionParam(),
 			mcp.WithDescription("Change an earlier message's content — only where the server declares "+
@@ -1805,7 +1841,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleEdit,
 	)
-	addTool(
+	addConnTool(
 		mcp.NewTool("hub_delete",
 			connectionParam(),
 			mcp.WithDescription("Remove an earlier message — only where the server declares it can do "+
@@ -1967,6 +2003,12 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// A connection now exists, so the tools that act on one are offered
+	// from here. Called here rather than inside open, which holds the
+	// session lock this needs — and a deferred call there would have run
+	// BEFORE that lock was released, which is a deadlock rather than a
+	// subtlety.
+	h.syncTools()
 	// Every failure from here on releases the name again. A name held by
 	// a connection that was never established is a name nobody can use
 	// and nothing can explain.

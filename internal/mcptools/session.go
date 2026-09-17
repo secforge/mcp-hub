@@ -316,11 +316,56 @@ func (h *Hub) rememberMeta(meta map[string]any) {
 	h.lastMeta = meta
 }
 
+// anySession reports whether any connection is open, which is what
+// decides whether the connection-bound tools are offered at all.
+func (h *Hub) anySession() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.sessions) > 0
+}
+
+// syncTools brings the offered tool set in line with whether anything is
+// connected. Called after a connect and after a session is forgotten, so
+// the list a reader sees describes what they can actually do right now.
+//
+// The connection-bound tools are DELETED when the last one goes rather
+// than left in place: their descriptions speak of a conversation, and a
+// reader holding them after everything closed is being told they can
+// send into something that no longer exists.
+func (h *Hub) syncTools() {
+	s := h.mcpServer()
+	if s == nil {
+		return
+	}
+	// Read by the prose that describes these tools, which is built by
+	// functions holding no Hub. Set before the tools are rebuilt, so the
+	// descriptions and the tool set agree.
+	haveConnections.Store(h.anySession())
+	if !h.anySession() {
+		s.DeleteTools(connectionBoundTools...)
+		// Re-run so the remaining descriptions are rebuilt for a client
+		// with nothing open — several of them name the tools that have
+		// just gone.
+		h.registerTools(s)
+		return
+	}
+	h.registerTools(s)
+}
+
+// connectionBoundTools is every tool that acts on an open connection —
+// the set registerTools installs only while one exists.
+var connectionBoundTools = []string{
+	"hub_send", "hub_disconnect", "hub_read", "hub_pin", "hub_unpin", "hub_pins",
+	"hub_receive", "hub_wait", "hub_peers", "hub_catch_up", "hub_confirm",
+	"hub_react", "hub_edit", "hub_delete",
+}
+
 // close forgets a session entirely, so its name is free again.
 func (h *Hub) close(name string) {
 	h.mu.Lock()
 	delete(h.sessions, name)
 	h.mu.Unlock()
+	h.syncTools()
 }
 
 // names lists the open connections, sorted so two calls read the same.

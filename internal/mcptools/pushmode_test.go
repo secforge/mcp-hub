@@ -26,10 +26,20 @@ func inPushMode(t *testing.T) {
 // toolsListJSON is the tools/list response exactly as the model receives
 // it — the only view that settles what the model can see, as opposed to
 // what the source appears to register.
+//
+// WITH A CONNECTION OPEN, because the tools that act on one are offered
+// only while one exists. A listing taken before any connect answers a
+// different question ("what can be done with nothing open"), and every
+// caller here is asking about the tools a connected reader has.
 func toolsListJSON(t *testing.T) string {
 	t.Helper()
 	s := server.NewMCPServer("test", "0")
-	NewHub().Register(s)
+	h := NewHub()
+	h.Register(s)
+	if _, err := h.open("listing"); err != nil {
+		t.Fatalf("opening a session for the listing: %v", err)
+	}
+	h.syncTools()
 	res := s.HandleMessage(context.Background(),
 		[]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
 	raw, err := json.Marshal(res)
@@ -477,6 +487,10 @@ func TestACodexCallerMakesThisProcessPushOnly(t *testing.T) {
 	srv := server.NewMCPServer("test", "0")
 	hub := NewHub()
 	hub.Register(srv)
+	if _, err := hub.open("listing"); err != nil {
+		t.Fatalf("opening a session: %v", err)
+	}
+	hub.syncTools()
 
 	hub.adoptCodexMode(ctxWithClientName("codex"))
 	if !pushOnly() {
@@ -510,6 +524,10 @@ func TestACodexNameWithNoReachableHarnessChangesNothing(t *testing.T) {
 	srv := server.NewMCPServer("test", "0")
 	hub := NewHub()
 	hub.Register(srv)
+	if _, err := hub.open("listing"); err != nil {
+		t.Fatalf("opening a session: %v", err)
+	}
+	hub.syncTools()
 
 	hub.adoptCodexMode(ctxWithClientName("codex"))
 	if pushOnly() {
@@ -546,4 +564,58 @@ func registeredToolNamesOn(t *testing.T, s *server.MCPServer) []string {
 		names = append(names, part[:strings.Index(part, `"`)])
 	}
 	return names
+}
+
+// A tool a reader cannot call must not be named by the tools they can.
+// The pointer is worse than the absence: a description that sends them to
+// hub_wait when hub_wait is not registered reads as the tool being
+// broken, and there is nothing to try instead.
+//
+// Both ways it goes missing are checked, because they are different
+// mechanisms: push-only never registers it, and nothing-connected
+// withdraws it along with every other connection-bound tool.
+func TestNothingNamesHubWaitWhereHubWaitIsNotOffered(t *testing.T) {
+	banned := []string{"hub_wait", "hub_receive"}
+
+	t.Run("push-only", func(t *testing.T) {
+		restoreEnv := harness.ClearEnvForTesting()
+		defer restoreEnv()
+		restoreReach := harness.SetCodexReachableForTesting(true)
+		defer restoreReach()
+		codexPushOnly.Store(false)
+		defer codexPushOnly.Store(false)
+
+		srv := server.NewMCPServer("test", "0")
+		hub := NewHub()
+		hub.Register(srv)
+		if _, err := hub.open("listing"); err != nil {
+			t.Fatalf("opening a session: %v", err)
+		}
+		hub.syncTools()
+		hub.adoptCodexMode(ctxWithClientName("codex"))
+
+		listing := toolsListJSONOn(t, srv)
+		for _, name := range banned {
+			if strings.Contains(listing, name) {
+				t.Errorf("%q is named somewhere in the tool list of a push-only client", name)
+			}
+		}
+	})
+
+	t.Run("nothing connected", func(t *testing.T) {
+		restoreEnv := harness.ClearEnvForTesting()
+		defer restoreEnv()
+		codexPushOnly.Store(false)
+
+		srv := server.NewMCPServer("test", "0")
+		hub := NewHub()
+		hub.Register(srv)
+
+		listing := toolsListJSONOn(t, srv)
+		for _, name := range banned {
+			if strings.Contains(listing, name) {
+				t.Errorf("%q is named in the tool list of a client with nothing connected", name)
+			}
+		}
+	})
 }

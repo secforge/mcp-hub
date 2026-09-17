@@ -3393,16 +3393,23 @@ func TestAnnouncedRestartReconnectsAutomaticallyAndSaysSo(t *testing.T) {
 	if !waitFor(t, "reconnect", func() bool { return joins() >= 2 }) {
 		t.Fatal("expected the client to reconnect on its own after an announced restart")
 	}
+	// The drop is reported when it happens and the return when it
+	// happens, so this waits for the SECOND: taking the first note would
+	// take the "is DOWN" one, which is a different statement and true at
+	// a different time.
 	if !waitFor(t, "note", func() bool {
 		hub.mu.Lock()
 		defer hub.mu.Unlock()
-		return hub.autoReconnect != ""
+		return strings.Contains(hub.autoReconnect, "RECONNECTED AUTOMATICALLY")
 	}) {
 		t.Fatal("expected a pending report about the automatic reconnect")
 	}
 	note := hub.takeAutoReconnectNote()
 	if !strings.Contains(note, "RECONNECTED AUTOMATICALLY") {
 		t.Fatalf("expected the report to say what happened, got: %s", note)
+	}
+	if !strings.Contains(note, "is DOWN") {
+		t.Fatalf("expected the drop itself to have been reported too, got: %s", note)
 	}
 	if !strings.Contains(note, "hub_catch_up") {
 		t.Fatalf("expected the report to say to catch up, got: %s", note)
