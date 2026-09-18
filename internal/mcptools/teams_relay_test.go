@@ -3526,12 +3526,12 @@ func TestAnnouncedRestartKeepsTheFollowerAlive(t *testing.T) {
 	if !waitFor(t, "the reconnect report", func() bool {
 		hub.mu.Lock()
 		defer hub.mu.Unlock()
-		return strings.Contains(hub.autoReconnect, "channel survived the restart")
+		return strings.Contains(hub.autoReconnect, "channel survived the outage")
 	}) {
 		t.Fatal("expected a report saying the channel survived")
 	}
 	note := hub.takeAutoReconnectNote()
-	if !strings.Contains(note, "channel survived the restart") {
+	if !strings.Contains(note, "channel survived the outage") {
 		t.Fatalf("expected the report to say the channel survived, got: %s", note)
 	}
 }

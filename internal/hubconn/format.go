@@ -249,6 +249,15 @@ func FormatEvent(e Event) string {
 		return fmt.Sprintf("[hub: %d already here — %s. That is everyone; a join or leave from "+
 			"here on is a real change]", len(who), strings.Join(who, ", "))
 	case "confirmReminder":
+		// SAYS WHOSE VOICE THIS IS. A notice arrives through the same
+		// channel as a peer's message and in a similar shape, so the
+		// natural place to answer it is the conversation — and a reply
+		// sent there reaches the SERVER and every other peer, none of
+		// which can confirm anything, because the position being moved
+		// lives in this client alone. Seen live more than once: a
+		// correct cursor broadcast to four peers while the position
+		// stayed put.
+		//
 		// NO QUESTION MARKS. The cross-check below still has to happen —
 		// it is what stops a reader rubber-stamping a cursor handed to
 		// it — but asking for it in question form is asking a model to
@@ -277,11 +286,11 @@ func FormatEvent(e Event) string {
 		// was itself truncated out of the part that said what to do. Both
 		// actions now come before any explanation, and the whole thing is
 		// short enough to arrive intact.
-		return fmt.Sprintf("[hub: CALL hub_confirm — not a question; answering in text moves "+
-			"nothing. Confirm the last message you have COMPLETE, possibly earlier than %q, the "+
-			"last delivered here. Decide silently which cursor that is and whether anything "+
-			"since was cut or missing; if so do NOT confirm past it — hub_catch_up recovers "+
-			"it.%s]",
+		return fmt.Sprintf("[hub: CALL hub_confirm. This is your own client, not the "+
+			"conversation — nobody sees a reply here, text moves nothing. Confirm the "+
+			"last message you have COMPLETE, possibly earlier than %q, the last delivered here. "+
+			"Decide silently which cursor that is and whether anything since was cut; if so do "+
+			"NOT confirm past it — hub_catch_up recovers it.%s]",
 			e.Text, confirmReminderCost(e))
 	case "sendAck":
 		if e.ActionOK {

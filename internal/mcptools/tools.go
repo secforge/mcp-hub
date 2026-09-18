@@ -852,7 +852,7 @@ func (s *session) reconnectLoop(link, name string, interval time.Duration, sched
 		if cancelled {
 			return
 		}
-		outcome := s.reconnectOnce(link, name, interval, attempt)
+		outcome := s.reconnectOnce(link, name, interval, attempt, scheduled)
 		if outcome != reconnectRetry {
 			return
 		}
@@ -878,7 +878,7 @@ const (
 
 // reconnectOnce performs a single redial and says whether trying again
 // could help.
-func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt int) reconnectOutcome {
+func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt int, scheduled bool) reconnectOutcome {
 	// The model may have reconnected itself while this was waiting.
 	if prev, _ := s.activeConn(); prev != nil && prev.Connected() {
 		return reconnectDone
@@ -983,7 +983,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 			"do NOT start a second follower, one channel carries every connection."
 	}
 	if keptFollower {
-		followerNote = "Your follower was held open across the restart and is already delivering " +
+		followerNote = "Your follower was held open across the outage and is already delivering " +
 			"again — do NOT start another, it would supersede the one that is working."
 		// The held follower is why this needs saying twice. It survived,
 		// so the channel looks exactly as it did before — and a quiet
@@ -992,21 +992,30 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		// unretrieved on the server. The follower cannot tell those
 		// apart, and will never deliver the second: what arrived while
 		// this client was away was never written to this connection.
-		w.Announce("[connection: " + s.name + "]\n[hub: reconnected after the server's restart — " +
+		w.Announce("[connection: " + s.name + "]\n[hub: reconnected — " +
 			"this connection is live again on this channel. " +
 			"Anything sent DURING the outage was not delivered here and will not appear on this " +
 			"channel: call hub_catch_up() to retrieve it. Silence here from now on means nothing " +
 			"new, but it does not mean nothing was missed.]")
 	}
 	if !keptFollower && !pushOnly() && w != nil {
-		followerNote = "The wait channel survived the restart, but nothing is following it, so " +
+		followerNote = "The wait channel survived the outage, but nothing is following it, so " +
 			"nothing is delivering live events — start one with:\n    " + w.WaitFollowCommand()
 	}
-	s.note(fmt.Sprintf("RECONNECTED AUTOMATICALLY after the server's announced "+
-		"restart, having waited %s. You are connected again as peer %s. Messages may have arrived "+
-		"while you were away and while this client was waiting — call hub_catch_up() now, the same "+
-		"as after any reconnect. %s",
-		waited.Round(time.Second), conn.PeerID(), followerNote))
+	// WHY it went, said the way it happened. This used to read "after the
+	// server's announced restart" whatever the cause, which was written
+	// when an announced restart was the only thing retried — and became
+	// false the moment every drop was. A keepalive timeout reported as an
+	// announced restart tells a reader something about the other end that
+	// nobody observed.
+	because := "after the connection dropped"
+	if scheduled {
+		because = "after the server's announced restart"
+	}
+	s.note(fmt.Sprintf("RECONNECTED AUTOMATICALLY %s, having waited %s. You are connected again "+
+		"as peer %s. Messages may have arrived while you were away and while this client was "+
+		"waiting — call hub_catch_up() now, the same as after any reconnect. %s",
+		because, waited.Round(time.Second), conn.PeerID(), followerNote))
 	return reconnectDone
 }
 
