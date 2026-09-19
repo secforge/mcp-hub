@@ -942,12 +942,31 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	// the connection for the same reason.
 	conn.ShareDeliveryBudget(s.hub.budget, s.name)
 	conn.SetDeliveryBudget(s.hub.spillDir, 0, 0, 0)
+	// What a reconnect needs is recorded BEFORE the callback that reads
+	// it is registered. willAutoReconnect answers from redialLink, so a
+	// drop observed in the window between the two answered "this one is
+	// not coming back" about a connection that was — and the follower was
+	// released with "its connection ended" instead of being held across
+	// an announced restart.
+	s.mu.Lock()
+	s.redialLink, s.redialName = link, name
+	s.redialTarget = target
+	s.mu.Unlock()
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
 		// the disconnect to a follower and releases it, so arming
 		// afterwards arms nothing: the follower is already gone by the
 		// time the teardown runs.
-		if !conn.Connected() && s.willAutoReconnect(conn) {
+		//
+		// And armed on the ANNOUNCEMENT, not on the drop it promises:
+		// the delivery loop samples "still connected" while draining and
+		// acts on it afterwards, so a socket that dies inside that window
+		// is read as an ordinary disconnect and the follower is released
+		// with "its connection ended" — the one outcome the hold exists
+		// to prevent, and reproducible under load before this. A server
+		// that has said it is coming back is reason enough to hold; if it
+		// never drops, nothing consults the hold anyway.
+		if (!conn.Connected() || conn.SuggestedReconnectDelay() > 0) && s.willAutoReconnect(conn) {
 			w.ExpectReconnect(s.name)
 		}
 		w.Poke()
@@ -1529,11 +1548,13 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 			connectionParam(),
 			mcp.WithDescription("Read from this conversation's history, by where it "+
 				"sits rather than by what you have already seen. A QUERY, not a hand-over: it "+
-				"advances no position, marks nothing as read, and clears no recorded gap, so "+
+				"advances no position and marks nothing as read, so "+
 				"calling it twice gives the same answer. What you read IS recorded as delivered "+
 				"to you, so a later hub_catch_up skips past it rather than showing it twice — but "+
 				"your unread position does not move, so nothing you still have to read is "+
-				"consumed by asking.\n"+
+				"consumed by asking. A read that walks forward from exactly where a recorded gap "+
+				"stopped settles that much of the gap, for the same reason: those messages have "+
+				"now been seen.\n"+
 				"Use this for a question about the past ('what was said around 18:00', 'what came "+
 				"after that message'). Use hub_catch_up to make progress through what you have "+
 				"not read. They are different jobs and the position only moves for the second.\n"+
@@ -1707,13 +1728,15 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"If true, retrieve the RECORDED SKIPPED RANGE from an earlier seek (see the connect/"+
 					"catch-up note about one) instead of continuing from your normal position — the "+
 					"two are independent, so gap retrieval never re-delivers or interferes with what "+
-					"you've already read normally, and vice versa. Same one-message-per-call contract "+
-					"as ordinary hub_catch_up: call repeatedly until it reports the gap fully "+
-					"retrieved. If there's no recorded gap for this session, reports that and does "+
+					"you've already read normally, and vice versa. One message per call by default, "+
+					"as ordinary hub_catch_up is; unlike ordinary hub_catch_up this one takes limit "+
+					"and maxKB, so a long gap need not cost one round trip per message. Call it "+
+					"repeatedly until it reports the gap fully retrieved. If there's no recorded gap for this session, reports that and does "+
 					"nothing. Ignored if false or omitted (the default, ordinary behavior)")),
 			mcp.WithNumber("limit", mcp.Description(
-				"Optional, and only where this client DELIVERS the backlog rather than returning "+
-					"it one message per call (see the connect result). How many messages this run "+
+				"Optional. Applies where this client DELIVERS the backlog rather than returning "+
+					"it one message per call (see the connect result), and to gap: true, which "+
+					"returns a batch when asked for one. How many messages this run "+
 					"may hand you. It can only LOWER the limit: ask for more than the built-in cap "+
 					"and you get the cap, with the figure that actually applied stated in the "+
 					"closing message. Use it when you know your own remaining room better than a "+
@@ -2134,12 +2157,31 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// the connection for the same reason.
 	conn.ShareDeliveryBudget(s.hub.budget, s.name)
 	conn.SetDeliveryBudget(s.hub.spillDir, 0, 0, 0)
+	// What a reconnect needs is recorded BEFORE the callback that reads
+	// it is registered. willAutoReconnect answers from redialLink, so a
+	// drop observed in the window between the two said "this one is not
+	// coming back" about a connection that was — and the follower was
+	// released with "its connection ended" instead of being held across
+	// the announced restart it was meant to sit through.
+	s.mu.Lock()
+	s.redialLink, s.redialName = link, name
+	s.redialTarget = target
+	s.mu.Unlock()
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
 		// the disconnect to a follower and releases it, so arming
 		// afterwards arms nothing: the follower is already gone by the
 		// time the teardown runs.
-		if !conn.Connected() && s.willAutoReconnect(conn) {
+		//
+		// And armed on the ANNOUNCEMENT, not on the drop it promises:
+		// the delivery loop samples "still connected" while draining and
+		// acts on it afterwards, so a socket that dies inside that window
+		// is read as an ordinary disconnect and the follower is released
+		// with "its connection ended" — the one outcome the hold exists
+		// to prevent, and reproducible under load before this. A server
+		// that has said it is coming back is reason enough to hold; if it
+		// never drops, nothing consults the hold anyway.
+		if (!conn.Connected() || conn.SuggestedReconnectDelay() > 0) && s.willAutoReconnect(conn) {
 			w.ExpectReconnect(s.name)
 		}
 		w.Poke()
@@ -2159,10 +2201,6 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	s.setActiveConn(conn, w, target)
 	s.setCatchUpKey(target)
 	s.openReturnPath()
-	s.mu.Lock()
-	s.redialLink, s.redialName = link, name
-	s.redialTarget = target
-	s.mu.Unlock()
 	// A server can close between Dial returning and the callback above
 	// being registered — a restart announced moments after a join does
 	// exactly that, and the read loop has then already exited without
@@ -3094,9 +3132,40 @@ const (
 	readBatchBudget = catchUpPushBudget
 )
 
+// gapLimit and gapBudget bound one hub_catch_up(gap: true) run the way
+// hub_read's limit and maxKB bound a read, with the same two ceilings for
+// the same reason: count and size are different costs.
+//
+// The DEFAULT is one message, unlike hub_read's, because the gap walk
+// moves a persisted position (catchUpGap.AnchorCursor) as it goes, and a
+// batch that is cut in transit takes the anchor past what the reader
+// actually saw. A caller that asks for more is choosing that trade with
+// the batch's own i/N and end markers to detect a cut by; a caller that
+// says nothing keeps the one-at-a-time contract the gap walk has always
+// had.
+func gapLimit(req mcp.CallToolRequest) int {
+	limit := req.GetInt("limit", 1)
+	if limit < 1 {
+		return 1
+	}
+	if limit > maxReadBatch {
+		return maxReadBatch
+	}
+	return limit
+}
+
+func gapBudget(req mcp.CallToolRequest) int {
+	if kb := req.GetInt("maxKB", 0); kb > 0 && kb*1024 < readBatchBudget {
+		return kb * 1024
+	}
+	return readBatchBudget
+}
+
 // handleRead answers a question about history rather than making progress
-// through a backlog. It advances no position and clears no gap, so it
-// cannot consume what this session still has to read.
+// through a backlog. It advances no reading position, so it cannot consume
+// what this session still has to read. It does settle a recorded gap it
+// demonstrably covered — see noteReadCoveredGap, which is a statement
+// about what has been seen, not about where reading resumes.
 //
 // What it DOES record is that the message reached the model, because it
 // did — delivery is delivery, whichever call performed it, and a record
@@ -3188,6 +3257,7 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 			"ways of naming the same starting point"), nil
 	}
 	anchor := wire.Anchor{At: at, Cursor: after}
+	start := anchor
 
 	filter := wire.Filter{
 		Sender: req.GetString("sender", ""),
@@ -3286,6 +3356,7 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// that also marks the wire-level receipt, which must not point at an
 	// old message. See this function's doc comment.
 	s.recordHandedOver(events)
+	s.noteReadCoveredGap(start, events)
 	// NoteHandedOver is a LOCAL position in the delivery ledger — no
 	// cursor on the wire, no acknowledgement — so it does not weaken the
 	// split above, and leaving it out reopened the defect it exists to
@@ -3315,6 +3386,54 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		"delivered to you, so a later hub_catch_up skips past it rather than showing it twice. " +
 		"To keep reading forward, pass the LAST cursor above as after" +
 		matchedSuffix(last.Matching) + "]" + unappliedNote(unapplied)), nil
+}
+
+// noteReadCoveredGap moves the recorded gap's own anchor when a hub_read
+// walked forward from exactly where that gap had stopped — and clears the
+// gap when the walk passed its end.
+//
+// A read still advances no READING position; this is a different claim.
+// The gap record answers "what did the seek skip that you have not seen",
+// and messages this call just handed over have been seen, whichever tool
+// handed them over. Without this the listing goes on offering an
+// unretrieved gap with nothing unretrieved left in it — an absence
+// reported as a confident positive, which is the failure this whole
+// mechanism exists to avoid, pointing the other way.
+//
+// Deliberately requires the read to have STARTED at the gap's own anchor,
+// compared for equality and never for order: cursors are opaque, and a
+// read that began somewhere else inside the range would leave unseen
+// messages behind an anchor claiming they were covered.
+func (s *session) noteReadCoveredGap(start wire.Anchor, events []hubconn.Event) {
+	if start.Cursor == "" || len(events) == 0 {
+		return
+	}
+	s.mu.Lock()
+	id := s.catchUpID
+	s.mu.Unlock()
+	gap, ok := loadCatchUpGap(id)
+	if !ok {
+		return
+	}
+	at := gap.AnchorCursor
+	if at == "" {
+		at = gap.FromCursor
+	}
+	if at == "" || at != start.Cursor {
+		return
+	}
+	last := events[len(events)-1]
+	if last.Cursor == "" {
+		return
+	}
+	for _, ev := range events {
+		if gap.To != "" && ev.TS != "" && ev.TS >= gap.To {
+			clearCatchUpGap(id)
+			return
+		}
+	}
+	gap.AnchorCursor = last.Cursor
+	saveCatchUpGap(id, gap)
 }
 
 // checkFilterSupport refuses, before anything is written to the socket, a
@@ -3789,7 +3908,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		s.mu.Lock()
 		catchUpIDNow := s.catchUpID
 		s.mu.Unlock()
-		return s.handleCatchUpGap(conn, catchUpIDNow)
+		return s.handleCatchUpGap(conn, catchUpIDNow, gapLimit(req), gapBudget(req))
 	}
 
 	s.mu.Lock()
@@ -4110,7 +4229,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 // (both are RFC3339 UTC on this client's own side; a server's own
 // message TS format may vary) — if it's ever wrong, the failure mode is
 // walking a little further than strictly needed, not losing anything.
-func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mcp.CallToolResult, error) {
+func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target, limit, budget int) (*mcp.CallToolResult, error) {
 	gap, ok := loadCatchUpGap(id)
 	if !ok {
 		return mcp.NewToolResultText(
@@ -4130,12 +4249,26 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 		anchor = wire.Anchor{Cursor: gap.FromCursor}
 	}
 
-	for skipped := 0; skipped < catchUpDedupSkipLimit; skipped++ {
+	var events []hubconn.Event
+	spent, skipped := 0, 0
+	// Which of the walk's several endings happened, kept as facts rather
+	// than as text, because the same ending reads differently depending on
+	// whether anything was collected before it.
+	var finished, finishedAllSeen, hitBudget bool
+
+walk:
+	for len(events) < limit && skipped < catchUpDedupSkipLimit {
 		ev, ok, err := conn.RequestMessageAfterAwaiting(anchor)
 		if err != nil {
+			if len(events) > 0 {
+				break
+			}
 			return mcp.NewToolResultError(fmt.Sprintf("gap retrieval failed: %v", err)), nil
 		}
 		if !ok {
+			if len(events) > 0 {
+				break
+			}
 			return mcp.NewToolResultText(
 				"gap retrieval request timed out waiting for the server — call " +
 					"hub_catch_up(gap: true) again to retry",
@@ -4144,11 +4277,12 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 		switch ev.Kind {
 		case "noMoreMessages":
 			clearCatchUpGap(id)
-			return mcp.NewToolResultText(fmt.Sprintf(
-				"[hub: gap fully retrieved — nothing more between %s and %s. Normal hub_catch_up "+
-					"already covers everything from here onward]", gap.From(), gap.To,
-			)), nil
+			finished = true
+			break walk
 		case "error":
+			if len(events) > 0 {
+				break walk
+			}
 			return mcp.NewToolResultError(
 				fmt.Sprintf("gap retrieval refused (code=%s, retryable=%t): %s", ev.Code, ev.Retryable, ev.Text),
 			), nil
@@ -4162,14 +4296,11 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 				// already shown to the model via a synchronous call, so
 				// advance past it silently rather than re-present it. Also
 				// prunes the entry the same way the ordinary walk's own
-				// dedup branch already does — found live, 2026-09-08,
-				// coordinating with chat-relay's author and customer-portal
-				// on the hub: this branch used to leave the entry in
-				// handedOverAhead forever (only the ordinary walk's mirror
-				// branch pruned), so a session doing most of its gap
-				// retrieval through repeated hub_catch_up(gap: true) calls
-				// (as happened live while chasing the decodeEvent bug)
-				// accumulated dead entries without bound.
+				// dedup branch already does: this branch used to leave the
+				// entry in handedOverAhead forever (only the ordinary
+				// walk's mirror branch pruned), so a session doing most of
+				// its gap retrieval through repeated hub_catch_up(gap:
+				// true) calls accumulated dead entries without bound.
 				s.mu.Lock()
 				delete(s.handedOverAhead, ev.Cursor)
 				aheadID := s.catchUpID
@@ -4179,44 +4310,84 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target) (*mc
 				}
 				s.mu.Unlock()
 				saveHandedOverAhead(aheadID, snapshot)
+				skipped++
 				if reachedEnd {
 					clearCatchUpGap(id)
-					return mcp.NewToolResultText(fmt.Sprintf(
-						"[hub: gap fully retrieved (the remainder was already shown to you earlier) — "+
-							"nothing more between %s and %s]", gap.From(), gap.To,
-					)), nil
+					finishedAllSeen = true
+					break walk
 				}
 				gap.AnchorCursor = ev.Cursor
 				saveCatchUpGap(id, gap)
 				anchor = wire.Anchor{Cursor: ev.Cursor}
 				continue
 			}
+			events = append(events, ev)
+			spent += len(ev.Text)
 			gap.AnchorCursor = ev.Cursor
 			if reachedEnd {
 				clearCatchUpGap(id)
-			} else {
-				saveCatchUpGap(id, gap)
+				finished = true
+				break walk
 			}
-			formatted := hubconn.FormatEventOn(s.name, ev)
-			if reachedEnd {
-				formatted += fmt.Sprintf(
-					"\n\n[hub: gap fully retrieved — this was the last message between %s and %s]",
-					gap.From(), gap.To,
-				)
-			} else {
-				formatted += fmt.Sprintf(
-					"\n\n[hub: more of the gap (%s to %s) may remain — call hub_catch_up(gap: true) "+
-						"again to continue retrieving it]", gap.From(), gap.To,
-				)
+			saveCatchUpGap(id, gap)
+			// A message with no cursor cannot anchor the next step, so the
+			// walk stops rather than asking the same question again.
+			if ev.Cursor == "" {
+				break walk
 			}
-			return s.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil
+			if spent >= budget {
+				hitBudget = true
+				break walk
+			}
+			anchor = wire.Anchor{Cursor: ev.Cursor}
 		default:
+			if len(events) > 0 {
+				break walk
+			}
 			return mcp.NewToolResultError(fmt.Sprintf("unexpected gap retrieval response kind %q", ev.Kind)), nil
 		}
 	}
-	return mcp.NewToolResultText(fmt.Sprintf(
-		"[hub: skipped %d already-seen message(s) in the gap without finding a new one — call "+
-			"hub_catch_up(gap: true) again to continue]", catchUpDedupSkipLimit)), nil
+
+	if len(events) == 0 {
+		switch {
+		case finished:
+			return mcp.NewToolResultText(fmt.Sprintf(
+				"[hub: gap fully retrieved — nothing more between %s and %s. Normal hub_catch_up "+
+					"already covers everything from here onward]", gap.From(), gap.To,
+			)), nil
+		case finishedAllSeen:
+			return mcp.NewToolResultText(fmt.Sprintf(
+				"[hub: gap fully retrieved (the remainder was already shown to you earlier) — "+
+					"nothing more between %s and %s]", gap.From(), gap.To,
+			)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"[hub: skipped %d already-seen message(s) in the gap without finding a new one — call "+
+				"hub_catch_up(gap: true) again to continue]", skipped)), nil
+	}
+
+	var trailer string
+	switch {
+	case finished:
+		trailer = fmt.Sprintf(
+			"[hub: gap fully retrieved — that was the last message between %s and %s]",
+			gap.From(), gap.To)
+	case finishedAllSeen:
+		trailer = fmt.Sprintf(
+			"[hub: gap fully retrieved (the remainder was already shown to you earlier) — nothing "+
+				"more between %s and %s]", gap.From(), gap.To)
+	case hitBudget:
+		trailer = fmt.Sprintf(
+			"[hub: stopped at %d KB rather than at the message count, so more of the gap (%s to "+
+				"%s) remains — call hub_catch_up(gap: true) again to continue retrieving it]",
+			spent/1024, gap.From(), gap.To)
+	default:
+		trailer = fmt.Sprintf(
+			"[hub: more of the gap (%s to %s) may remain — call hub_catch_up(gap: true) again to "+
+				"continue retrieving it]", gap.From(), gap.To)
+	}
+	return s.resultWithReceivedAttachments(
+		conn, hubconn.FormatEventsOn(s.name, events)+"\n\n"+trailer, events), nil
 }
 
 // handleConfirmReceived implements hub_confirm — a model-issued read

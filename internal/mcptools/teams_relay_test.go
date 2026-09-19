@@ -3393,10 +3393,15 @@ func TestAnnouncedRestartReconnectsAutomaticallyAndSaysSo(t *testing.T) {
 	if !waitFor(t, "reconnect", func() bool { return joins() >= 2 }) {
 		t.Fatal("expected the client to reconnect on its own after an announced restart")
 	}
+	// Waits for the reconnect note itself, not for any note: the "is
+	// DOWN" notice is queued first and legitimately so, and the two
+	// accumulate into one pending report. Sampling on "something is
+	// pending" reads the first half of a report that is still being
+	// written.
 	if !waitFor(t, "note", func() bool {
 		hub.mu.Lock()
 		defer hub.mu.Unlock()
-		return hub.autoReconnect != ""
+		return strings.Contains(hub.autoReconnect, "RECONNECTED AUTOMATICALLY")
 	}) {
 		t.Fatal("expected a pending report about the automatic reconnect")
 	}
@@ -4610,5 +4615,300 @@ func TestReadStopsOnSizeAndSaysSo(t *testing.T) {
 	text := textOf(res)
 	if !strings.Contains(text, "KB rather than at the message count") {
 		t.Errorf("expected the answer to say which limit stopped it: %s", text[max(0, len(text)-400):])
+	}
+}
+
+// TestAGapIsRetrievedInABatchWhenALimitIsGiven covers the complaint from
+// the owner's own session, 2026-09-19: draining a 33-message gap cost 33
+// round trips because hub_catch_up(gap: true) returned exactly one
+// message per call and ignored `limit` even when one was passed. One
+// call, one limit, the whole gap.
+func TestAGapIsRetrievedInABatchWhenALimitIsGiven(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	var reqLog []wire.MessageAfter
+	var reqMu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			reqMu.Lock()
+			reqLog = append(reqLog, m)
+			reqMu.Unlock()
+			switch {
+			case m.At == "2026-09-01T09:00:00Z":
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "gap one", TS: "2026-09-01T09:05:00Z",
+					Historical: true, Cursor: "batch-gap-1", ExternalID: "ext-batch-1",
+					Answers: &wire.Anchor{At: "2026-09-01T09:00:00Z"},
+				})
+			case m.Cursor == "batch-gap-1":
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "gap two", TS: "2026-09-01T09:06:00Z",
+					Historical: true, Cursor: "batch-gap-2", ExternalID: "ext-batch-2",
+					Answers: &wire.Anchor{Cursor: "batch-gap-1"},
+				})
+			case m.Cursor == "batch-gap-2":
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "gap three", TS: "2026-09-01T10:00:00Z",
+					Historical: true, Cursor: "batch-gap-3", ExternalID: "ext-batch-3",
+					Answers: &wire.Anchor{Cursor: "batch-gap-2"},
+				})
+			default:
+				conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	id := targetForLink(ctx, link)
+	clearCatchUpGap(id)
+	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	gapReq := mcp.CallToolRequest{}
+	gapReq.Params.Arguments = map[string]any{"connection": testConn, "gap": true, "limit": 10}
+	res, err := hub.handleCatchUp(ctx, gapReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_catch_up(gap: true, limit: 10) failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	for _, want := range []string{"gap one", "gap two", "gap three"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q in the one batched answer, got: %s", want, text)
+		}
+	}
+	if !strings.Contains(text, "gap fully retrieved") {
+		t.Fatalf("expected the batch to report the gap complete, got: %s", text)
+	}
+	if _, ok := loadCatchUpGap(id); ok {
+		t.Fatal("expected the gap to be cleared once the batch reached its recorded end")
+	}
+}
+
+// TestAGapWithoutALimitStillComesOneAtATime holds the default in place:
+// the gap walk moves a persisted anchor, so a caller who says nothing
+// keeps the one-message contract and only an explicit limit trades it.
+func TestAGapWithoutALimitStillComesOneAtATime(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			switch {
+			case m.At == "2026-09-02T09:00:00Z":
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "solo one", TS: "2026-09-02T09:05:00Z",
+					Historical: true, Cursor: "solo-gap-1", ExternalID: "ext-solo-1",
+					Answers: &wire.Anchor{At: "2026-09-02T09:00:00Z"},
+				})
+			case m.Cursor == "solo-gap-1":
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "solo two", TS: "2026-09-02T09:06:00Z",
+					Historical: true, Cursor: "solo-gap-2", ExternalID: "ext-solo-2",
+					Answers: &wire.Anchor{Cursor: "solo-gap-1"},
+				})
+			default:
+				conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	id := targetForLink(ctx, link)
+	clearCatchUpGap(id)
+	setCatchUpGapFromAt(id, "2026-09-02T09:00:00Z", "2026-09-02T10:00:00Z")
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	gapReq := mcp.CallToolRequest{}
+	gapReq.Params.Arguments = map[string]any{"connection": testConn, "gap": true}
+	res, err := hub.handleCatchUp(ctx, gapReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_catch_up(gap: true) failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "solo one") {
+		t.Fatalf("expected the first gap message, got: %s", text)
+	}
+	if strings.Contains(text, "solo two") {
+		t.Fatalf("expected ONLY the first gap message without a limit, got: %s", text)
+	}
+}
+
+// TestAReadThatCoversTheGapSettlesIt is the second half of the same
+// complaint: after the range had been read with hub_read, the connection
+// listing went on offering an "unretrieved gap" that had nothing
+// unretrieved left in it.
+func TestAReadThatCoversTheGapSettlesIt(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			switch m.Cursor {
+			case "read-gap-start":
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "read one", TS: "2026-09-03T09:30:00Z",
+					Historical: true, Cursor: "read-gap-1", ExternalID: "ext-read-1",
+					Answers: &wire.Anchor{Cursor: "read-gap-start"},
+				})
+			case "read-gap-1":
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "read two", TS: "2026-09-03T10:00:00Z",
+					Historical: true, Cursor: "read-gap-2", ExternalID: "ext-read-2",
+					Answers: &wire.Anchor{Cursor: "read-gap-1"},
+				})
+			default:
+				conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	id := targetForLink(ctx, link)
+	clearCatchUpGap(id)
+	setCatchUpGapFromAt(id, "2026-09-03T09:00:00Z", "2026-09-03T10:00:00Z")
+	gap, ok := loadCatchUpGap(id)
+	if !ok {
+		t.Fatal("expected the gap just recorded to load")
+	}
+	gap.AnchorCursor = "read-gap-start"
+	saveCatchUpGap(id, gap)
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	readReq := mcp.CallToolRequest{}
+	readReq.Params.Arguments = map[string]any{"connection": testConn, "after": "read-gap-start", "limit": 10}
+	res, err := hub.handleRead(ctx, readReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_read failed: err=%v result=%+v", err, res)
+	}
+	if text := textOf(res); !strings.Contains(text, "read two") {
+		t.Fatalf("expected the read to reach the end of the gap, got: %s", text)
+	}
+	if _, ok := loadCatchUpGap(id); ok {
+		t.Fatal("expected a read that walked the whole recorded range to settle the gap")
+	}
+}
+
+// TestAReadStartingElsewhereLeavesTheGapAlone is the guard on the rule
+// above. Only a read that starts at the gap's own anchor can settle it:
+// one starting anywhere else would leave unseen messages behind an anchor
+// claiming they had been covered.
+func TestAReadStartingElsewhereLeavesTheGapAlone(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			if m.Cursor == "somewhere-else" {
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "unrelated", TS: "2026-09-04T11:00:00Z",
+					Historical: true, Cursor: "unrelated-1", ExternalID: "ext-unrelated-1",
+					Answers: &wire.Anchor{Cursor: "somewhere-else"},
+				})
+				continue
+			}
+			conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	id := targetForLink(ctx, link)
+	clearCatchUpGap(id)
+	setCatchUpGapFromAt(id, "2026-09-04T09:00:00Z", "2026-09-04T10:00:00Z")
+	gap, ok := loadCatchUpGap(id)
+	if !ok {
+		t.Fatal("expected the gap just recorded to load")
+	}
+	gap.AnchorCursor = "the-gaps-own-anchor"
+	saveCatchUpGap(id, gap)
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	readReq := mcp.CallToolRequest{}
+	readReq.Params.Arguments = map[string]any{"connection": testConn, "after": "somewhere-else", "limit": 10}
+	if res, err := hub.handleRead(ctx, readReq); err != nil || res.IsError {
+		t.Fatalf("hub_read failed: err=%v result=%+v", err, res)
+	}
+	got, ok := loadCatchUpGap(id)
+	if !ok {
+		t.Fatal("expected a read from an unrelated anchor to leave the gap recorded")
+	}
+	if got.AnchorCursor != "the-gaps-own-anchor" {
+		t.Fatalf("expected the gap's anchor untouched, got %q", got.AnchorCursor)
 	}
 }
