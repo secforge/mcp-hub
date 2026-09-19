@@ -230,6 +230,7 @@ func (w *Waiter) Announce(msg string) {
 	if rw == nil || !rw.follow {
 		return
 	}
+	_ = rw.conn.SetWriteDeadline(time.Now().Add(followWriteWait))
 	if _, err := rw.conn.Write([]byte(msg + "\n\n")); err != nil {
 		rw.conn.Close()
 		w.mu.Lock()
@@ -266,6 +267,24 @@ func (w *Waiter) holdingFor(name string) (holding, announce bool) {
 // break the sweep in production, where MCP_HUB_LOG_DIR — a *different*,
 // unrelated directory used by hublog/identitystore — is commonly set.
 var socketDir = os.TempDir()
+
+// modeByteWait bounds the wait for a reader's first byte, and
+// followWriteWait bounds every write to one.
+//
+// Neither had a deadline. A local connection that connected and sent
+// nothing held the accept loop, and a follower that stopped reading held
+// the delivery loop — in both cases a process on this machine, possibly
+// just suspended in a terminal, stalled delivery for every other reader.
+// A local socket is not a reason to trust the far end to keep up; it is
+// only a reason to expect it to be fast when it does.
+//
+// Generous on purpose: these exist to end a stall, not to enforce a
+// latency. A reader that cannot take one buffered write in half a minute
+// is not reading.
+const (
+	modeByteWait    = 10 * time.Second
+	followWriteWait = 30 * time.Second
+)
 
 // liveEmissionSpacing is the minimum delay between successive writes
 // within one deliver() call to a follow-mode connection — see deliver's
@@ -435,16 +454,27 @@ func (w *Waiter) acceptLoop() {
 		if err != nil {
 			return // listener closed
 		}
-		w.handleAccept(conn)
+		// On its own goroutine: handleAccept waits for the first byte,
+		// and doing that here meant one local connection that connected
+		// and then said nothing blocked every later reader from being
+		// accepted at all.
+		go w.handleAccept(conn)
 	}
 }
 
 func (w *Waiter) handleAccept(conn net.Conn) {
+	// BOUNDED. The mode byte is the first thing a reader sends and it
+	// sends it immediately; a connection that has not sent it within this
+	// is not a reader this process should keep waiting on.
+	_ = conn.SetReadDeadline(time.Now().Add(modeByteWait))
 	mode := make([]byte, 1)
 	if n, err := conn.Read(mode); err != nil || n != 1 {
 		conn.Close()
 		return
 	}
+	// Cleared once it has arrived: a follower then sits idle by design,
+	// and a deadline that outlived the handshake would end it.
+	_ = conn.SetReadDeadline(time.Time{})
 	rw := &registeredWaiter{conn: conn, follow: mode[0] == ModeFollow}
 
 	// The source's Peek() and the w.current registration below are checked
@@ -585,6 +615,7 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 			if wrote > 0 {
 				time.Sleep(liveEmissionSpacing)
 			}
+			_ = rw.conn.SetWriteDeadline(time.Now().Add(followWriteWait))
 			if _, err := rw.conn.Write([]byte(label(a.name) + c + "\n\n")); err != nil {
 				rw.conn.Close()
 				return
@@ -603,12 +634,14 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 		holding, announce := w.holdingFor(a.name)
 		switch {
 		case holding && announce:
+			_ = rw.conn.SetWriteDeadline(time.Now().Add(followWriteWait))
 			if _, err := rw.conn.Write([]byte(label(a.name) + w.holdingMessage() + "\n\n")); err != nil {
 				rw.conn.Close()
 				return
 			}
 			wrote++
 		case !holding:
+			_ = rw.conn.SetWriteDeadline(time.Now().Add(followWriteWait))
 			if _, err := rw.conn.Write([]byte(endedMessage(a) + "\n\n")); err != nil {
 				rw.conn.Close()
 				return
@@ -775,6 +808,7 @@ func (w *Waiter) supersededMessage() string {
 }
 
 func writeAndClose(conn net.Conn, msg string) {
+	_ = conn.SetWriteDeadline(time.Now().Add(followWriteWait))
 	_, _ = conn.Write([]byte(msg))
 	_ = conn.Close()
 }

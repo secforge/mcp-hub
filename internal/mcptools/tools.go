@@ -7,9 +7,11 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -2491,8 +2493,46 @@ func (s *session) attachmentDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	markAttachmentDirOwner(dir)
 	s.attachDir = dir
 	return dir, nil
+}
+
+// attachmentOwnerFile names the process a directory belongs to, so the
+// sweep can ask whether that process is still running instead of
+// inferring it from how old the directory is.
+const attachmentOwnerFile = ".owner"
+
+// markAttachmentDirOwner records this process as the owner of dir.
+//
+// Best-effort: a directory with no owner file is swept on age exactly as
+// before, which is the behaviour every directory had until now.
+func markAttachmentDirOwner(dir string) {
+	_ = os.WriteFile(filepath.Join(dir, attachmentOwnerFile),
+		[]byte(strconv.Itoa(os.Getpid())), 0o600)
+}
+
+// attachmentDirIsOwned reports whether dir names a process that still
+// exists. Signal 0 delivers nothing and only tests for the process, which
+// is the cheapest honest way to ask.
+//
+// Wrong in the SAFE direction when it is wrong: a recycled pid makes a
+// dead session's directory look alive and it is kept, costing disk. The
+// opposite mistake deletes a file a running session is about to read.
+func attachmentDirIsOwned(dir string) bool {
+	raw, err := os.ReadFile(filepath.Join(dir, attachmentOwnerFile))
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // staleAttachmentAge is how long an abandoned attachment directory is left
@@ -2508,11 +2548,14 @@ const staleAttachmentAge = 24 * time.Hour
 // oversized message bodies are spilled into them (see hubconn's delivery
 // budget) what accumulates is message content, not just attachments.
 //
-// Age is the only available signal here. A directory has no listener to
-// probe the way a stale wait socket does, and there is no owner recorded
-// in it, so "old enough that no plausible session is still using it" is
-// the test — which is why staleAttachmentAge is far longer than any
-// session's own use of a spilled file.
+// OWNERSHIP FIRST, age second. Each directory records the pid that made
+// it, and a directory whose owner is still running is never swept however
+// old it is: age alone said a session older than staleAttachmentAge had
+// abandoned its files, and the sessions here routinely run for days —
+// spilled message bodies and attachments handed to a reader both outlive
+// a day easily. Age remains the fallback, and is the whole test for a
+// directory left by a process that died before writing an owner, or by a
+// version that never wrote one.
 func sweepStaleAttachmentDirs() {
 	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "mcp-hub-attachments-*"))
 	if err != nil {
@@ -2521,6 +2564,9 @@ func sweepStaleAttachmentDirs() {
 	for _, p := range matches {
 		fi, err := os.Stat(p)
 		if err != nil || !fi.IsDir() {
+			continue
+		}
+		if attachmentDirIsOwned(p) {
 			continue
 		}
 		if time.Since(fi.ModTime()) > staleAttachmentAge {
@@ -4727,6 +4773,7 @@ func (h *Hub) spillDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	markAttachmentDirOwner(dir)
 	h.spillPath = dir
 	return dir, nil
 }

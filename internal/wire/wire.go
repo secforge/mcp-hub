@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime"
 	"os"
 	"path/filepath"
@@ -539,6 +540,35 @@ func AttachmentContentTypeForExt(ext string) (string, bool) {
 	}
 }
 
+// readAttachmentBytes reads at most MaxAttachmentRawBytes+1 bytes from
+// path, so "too large" is decided from one byte of evidence rather than
+// from the whole file.
+//
+// os.ReadFile would size its buffer from the file's own stat and read all
+// of it before anything compared it to the cap — a mistyped path naming a
+// very large file exhausted memory to produce a refusal, and a path that
+// is not a regular file at all (a fifo, /dev/zero) never terminates,
+// because its stat says nothing about how much it will produce.
+//
+// The extra byte is what makes the check exact: a file of exactly
+// MaxAttachmentRawBytes reads fully and is accepted, one byte more stops
+// here and is refused.
+func readAttachmentBytes(path, what string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not read %s: %w", what, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, MaxAttachmentRawBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("could not read %s: %w", what, err)
+	}
+	if len(data) > MaxAttachmentRawBytes {
+		return nil, fmt.Errorf("%s too large: exceeds the %d byte limit", what, MaxAttachmentRawBytes)
+	}
+	return data, nil
+}
+
 // ReadAttachmentFile reads path from the local filesystem, validates its
 // extension and raw size against AttachmentContentTypeForExt/
 // MaxAttachmentRawBytes, and returns a single-element Attachment slice
@@ -554,12 +584,9 @@ func ReadAttachmentFile(path string) ([]Attachment, error) {
 	if !ok {
 		return nil, fmt.Errorf("unsupported image type — only .png, .jpg/.jpeg, .gif, .webp are accepted")
 	}
-	data, err := os.ReadFile(path)
+	data, err := readAttachmentBytes(path, "image")
 	if err != nil {
-		return nil, fmt.Errorf("could not read imagePath: %w", err)
-	}
-	if len(data) > MaxAttachmentRawBytes {
-		return nil, fmt.Errorf("image too large: %d bytes exceeds the %d byte limit", len(data), MaxAttachmentRawBytes)
+		return nil, err
 	}
 	return []Attachment{{
 		ContentType:  contentType,
@@ -614,12 +641,9 @@ func ReadFileAttachment(path string) ([]Attachment, error) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	data, err := os.ReadFile(path)
+	data, err := readAttachmentBytes(path, "file")
 	if err != nil {
-		return nil, fmt.Errorf("could not read filePath: %w", err)
-	}
-	if len(data) > MaxAttachmentRawBytes {
-		return nil, fmt.Errorf("file too large: %d bytes exceeds the %d byte limit", len(data), MaxAttachmentRawBytes)
+		return nil, err
 	}
 	return []Attachment{{
 		ContentType:  contentType,

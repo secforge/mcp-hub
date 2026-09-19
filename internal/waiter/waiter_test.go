@@ -817,3 +817,55 @@ func TestPokeDoesNotWaitForTheDelivery(t *testing.T) {
 		t.Fatalf("expected the spacing to still be paid on the delivery side, took only %v", elapsed)
 	}
 }
+
+// TestASilentConnectionDoesNotBlockTheNextReader is Codex's finding,
+// 2026-09-19: handleAccept waited for the mode byte on the accept loop
+// itself and with no deadline, so one local connection that connected and
+// then said nothing stopped every later reader from being accepted.
+func TestASilentConnectionDoesNotBlockTheNextReader(t *testing.T) {
+	src := &fakeSource{connected: true}
+	w, err := Listen()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	w.SetSource("t", src)
+	defer w.Close()
+
+	// Connects, says nothing, holds the socket open.
+	silent, err := net.Dial("unix", w.socketPath)
+	if err != nil {
+		t.Fatalf("dialling the wait socket: %v", err)
+	}
+	defer silent.Close()
+
+	// A real reader arriving behind it must still be accepted and served.
+	served := make(chan error, 1)
+	go func() {
+		c, err := net.Dial("unix", w.socketPath)
+		if err != nil {
+			served <- err
+			return
+		}
+		defer c.Close()
+		_, err = c.Write([]byte{ModeFollow})
+		served <- err
+	}()
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("the second reader could not be served: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a connection that sent nothing blocked the accept loop, so no later reader " +
+			"could be served at all")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !w.Following() {
+		if time.Now().After(deadline) {
+			t.Fatal("expected the follower behind the silent connection to register")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

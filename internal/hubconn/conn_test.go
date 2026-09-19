@@ -2552,3 +2552,52 @@ func TestTwoSpillsWithTheSameCursorDoNotOverwriteEachOther(t *testing.T) {
 		t.Fatalf("the first spill was overwritten: %q", got)
 	}
 }
+
+// TestAnOversizedFrameIsRefusedRatherThanRead is Codex's finding,
+// 2026-09-19: the bundled server has bounded what a client may send it
+// since it was written, and nothing bounded the other direction.
+// gorilla/websocket has no default limit, so a server could announce a
+// frame of any size and this client would read all of it into memory
+// before deciding anything about it.
+func TestAnOversizedFrameIsRefusedRatherThanRead(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		ws.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
+		// One frame larger than the cap. Written as a single text
+		// message, which is exactly what the limit exists to refuse.
+		huge := make([]byte, maxReadFrameBytes+1024)
+		for i := range huge {
+			huge[i] = 'a'
+		}
+		ws.WriteMessage(websocket.TextMessage, huge)
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c, err := Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"#limit",
+		DialOptions{ReconnectSecret: "limit-secret"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// The read limit ends the connection rather than buffering the frame.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !c.Connected() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the connection survived a frame larger than the read limit, so the frame was read " +
+		"into memory rather than refused")
+}

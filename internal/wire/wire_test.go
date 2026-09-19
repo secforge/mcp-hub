@@ -4,8 +4,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestJoinedRoundTrip(t *testing.T) {
@@ -989,5 +993,80 @@ func TestIsValidID(t *testing.T) {
 		if got := IsValidID(c.id); got != c.want {
 			t.Errorf("IsValidID(%q) = %v, want %v", c.id, got, c.want)
 		}
+	}
+}
+
+// TestAnOversizedAttachmentIsRefusedWithoutReadingItAll is Codex's
+// finding, 2026-09-19: the size check ran after os.ReadFile had already
+// read the whole file, so refusing a mistyped path naming a very large
+// file cost the memory to hold it first.
+func TestAnOversizedAttachmentIsRefusedWithoutReadingItAll(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.png")
+	// One byte over the cap is the exact boundary the check has to make.
+	if err := os.WriteFile(path, make([]byte, MaxAttachmentRawBytes+1), 0o600); err != nil {
+		t.Fatalf("writing the oversized file: %v", err)
+	}
+	if _, err := ReadAttachmentFile(path); err == nil {
+		t.Fatal("expected a file one byte over the cap to be refused")
+	}
+
+	// And exactly at the cap is still accepted: a bound that also refuses
+	// the largest legal file is a different bound.
+	atCap := filepath.Join(dir, "atcap.png")
+	if err := os.WriteFile(atCap, make([]byte, MaxAttachmentRawBytes), 0o600); err != nil {
+		t.Fatalf("writing the at-cap file: %v", err)
+	}
+	if _, err := ReadAttachmentFile(atCap); err != nil {
+		t.Fatalf("a file of exactly the cap must still be sendable: %v", err)
+	}
+}
+
+// A path that is not a regular file has no size to stat and never ends.
+// os.ReadFile on it does not return; a bounded read does.
+func TestAnEndlessAttachmentPathDoesNotHangTheSend(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no fifos here")
+	}
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "endless.bin")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("could not create a fifo: %v", err)
+	}
+	// A writer that never stops, closed when the test ends.
+	stop := make(chan struct{})
+	go func() {
+		f, err := os.OpenFile(fifo, os.O_WRONLY, 0o600)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		buf := make([]byte, 1<<20)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := f.Write(buf); err != nil {
+				return
+			}
+		}
+	}()
+	defer close(stop)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReadFileAttachment(fifo)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an endless path to be refused for size, not accepted")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("reading an endless path never returned: the size check cannot be reached by " +
+			"reading the whole file first")
 	}
 }

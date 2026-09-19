@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4978,5 +4980,52 @@ func TestAConfirmOfOurOwnCursorIsNotRefusedBecauseAnotherConnectionUsesIt(t *tes
 	theirs.noteDelivered("only-theirs")
 	if other := hub.cursorBelongsElsewhere(mine, "only-theirs"); other != "theirs" {
 		t.Fatalf("expected a cursor only the other connection delivered to be named, got %q", other)
+	}
+}
+
+// TestAnOwnedAttachmentDirectoryIsNotSweptForBeingOld is Codex's
+// finding, 2026-09-19: the sweep took age alone as proof of abandonment.
+// The sessions here run for days, and a spilled message body or an
+// attachment handed to a reader outlives a day easily — so a live
+// session's own files were deleted underneath it.
+func TestAnOwnedAttachmentDirectoryIsNotSweptForBeingOld(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	old := time.Now().Add(-staleAttachmentAge - time.Hour)
+
+	// One this process owns, and one whose owner is long gone.
+	mine, err := os.MkdirTemp("", "mcp-hub-attachments-")
+	if err != nil {
+		t.Fatalf("making the owned directory: %v", err)
+	}
+	markAttachmentDirOwner(mine)
+	if err := os.WriteFile(filepath.Join(mine, "spilled.txt"), []byte("still needed"), 0o600); err != nil {
+		t.Fatalf("writing the spilled file: %v", err)
+	}
+	if err := os.Chtimes(mine, old, old); err != nil {
+		t.Fatalf("ageing the owned directory: %v", err)
+	}
+
+	orphan, err := os.MkdirTemp("", "mcp-hub-attachments-")
+	if err != nil {
+		t.Fatalf("making the orphaned directory: %v", err)
+	}
+	// A pid that cannot be running: 0 is never a live process here, and
+	// the file is deliberately present so this is not just "no owner".
+	if err := os.WriteFile(filepath.Join(orphan, attachmentOwnerFile), []byte("0"), 0o600); err != nil {
+		t.Fatalf("writing the orphan's owner: %v", err)
+	}
+	if err := os.Chtimes(orphan, old, old); err != nil {
+		t.Fatalf("ageing the orphaned directory: %v", err)
+	}
+
+	sweepStaleAttachmentDirs()
+
+	if _, err := os.Stat(mine); err != nil {
+		t.Fatalf("a directory owned by this live process was swept for being old: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("an old directory whose owner is gone should still be swept, got %v", err)
 	}
 }

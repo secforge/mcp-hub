@@ -788,6 +788,22 @@ func dialWS(target string, header http.Header) (*websocket.Conn, error) {
 	return nil, fmt.Errorf("%w — server answered %s", err, resp.Status)
 }
 
+// maxReadFrameBytes bounds a single incoming websocket frame, matching
+// the bundled server's own cap (wsserver.maxReadMessageBytes) and, for
+// the same reason it does, chat-relay's coordinated 44MB whole-frame cap
+// with a little headroom: an attachment's base64 payload inflates
+// wire.MaxAttachmentRawBytes by about a third, and a JSON envelope sits
+// on top of that.
+//
+// The server has bounded what a client may send it since it was written.
+// This is the other direction, which had no bound at all:
+// gorilla/websocket defaults to none, so a server — hostile, wedged, or
+// simply wrong — could announce a frame of any size and this client would
+// read all of it into memory before deciding anything about it. Trusting
+// the far end because it is "the server" is the assumption the whole
+// untrusted-content design here refuses to make everywhere else.
+const maxReadFrameBytes = 48 * 1024 * 1024
+
 // finishHandshake reads the server's initial "joined" message off an
 // already-connected ws, validates it, and builds the running Conn —
 // the tail shared by Dial and DialRelay, which differ only in how they
@@ -804,6 +820,10 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 	// indefinitely against a server that had already accepted the socket.
 	// A hang is the one failure a caller cannot report or retry.
 	_ = ws.SetReadDeadline(time.Now().Add(snapPongWait))
+	// Set BEFORE the first read, not with the rest of the connection's
+	// settings further down: the joined frame is itself a frame from a
+	// server this client has not yet learned anything about.
+	ws.SetReadLimit(maxReadFrameBytes)
 	_, raw, err := ws.ReadMessage()
 	if err != nil {
 		ws.Close()
