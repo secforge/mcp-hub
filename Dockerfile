@@ -11,7 +11,10 @@ COPY internal/ ./internal/
 
 # Only mcp-hub-server is deployed as a service; mcp-hub-client runs locally
 # via Claude Code over stdio, not in a container.
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o mcp-hub-server ./cmd/mcp-hub-server
+# GOEXPERIMENT=jsonv2 makes the wire's `case:strict` tags effective; see
+# scripts/release.sh and internal/wire's guard test for why a build
+# without it is silently more tolerant than the tests say it is.
+RUN CGO_ENABLED=0 GOOS=linux GOEXPERIMENT=jsonv2 go build -ldflags="-w -s" -o mcp-hub-server ./cmd/mcp-hub-server
 
 # Runtime stage
 FROM alpine:3.19

@@ -1121,19 +1121,22 @@ func TestUnrelatedBadCursorErrorDoesNotDisableAcks(t *testing.T) {
 	}
 	defer c.Close()
 
+	// Accumulates until BOTH errors have arrived, rather than draining
+	// the moment the buffer is non-empty. Peek going true says one event
+	// landed; draining on that and then asserting two is a race the
+	// second error loses whenever it is a moment behind, and a drain is
+	// destructive, so what it took is gone from the next look. Found by
+	// an external reviewer, 2026-09-19, and reproduced under -race.
+	var formatted string
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if formatted, _ := c.Peek(); formatted {
-			break
+	for !strings.Contains(formatted, "bad_cursor") || !strings.Contains(formatted, "bad_request") {
+		if chunk, _ := c.Drain(); chunk != "" {
+			formatted += chunk
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("never saw the errors buffered")
+			t.Fatalf("never saw both errors buffered, got: %s", formatted)
 		}
 		time.Sleep(5 * time.Millisecond)
-	}
-	formatted, _ := c.Drain()
-	if !strings.Contains(formatted, "bad_cursor") || !strings.Contains(formatted, "bad_request") {
-		t.Fatalf("expected unrelated bad_cursor/bad_request errors to reach the model buffer normally, got: %s", formatted)
 	}
 	if c.AckDisabled() {
 		t.Fatal("expected AckDisabled to remain false for errors unrelated to the ack subsystem")
@@ -2206,7 +2209,7 @@ func TestRequestAttachmentReturnsFetchedBytes(t *testing.T) {
 	}
 	defer c.Close()
 
-	ev, ok, err := c.RequestAttachment("att-3142")
+	ev, ok, err := c.RequestAttachment("att-3142", nil)
 	if err != nil {
 		t.Fatalf("RequestAttachment: %v", err)
 	}
@@ -2246,7 +2249,7 @@ func TestRequestAttachmentSurfacesServerError(t *testing.T) {
 	}
 	defer c.Close()
 
-	ev, ok, err := c.RequestAttachment("does-not-exist")
+	ev, ok, err := c.RequestAttachment("does-not-exist", nil)
 	if err != nil {
 		t.Fatalf("RequestAttachment: %v", err)
 	}
@@ -2396,7 +2399,7 @@ func TestASlowAttachmentIsStillFetched(t *testing.T) {
 	}
 	defer c.Close()
 
-	ev, ok, err := c.RequestAttachment("att-16510")
+	ev, ok, err := c.RequestAttachment("att-16510", nil)
 	if err != nil {
 		t.Fatalf("RequestAttachment: %v", err)
 	}
@@ -2450,7 +2453,7 @@ func TestAnAttachmentReplyForAnotherTokenIsNotHandedBack(t *testing.T) {
 	}
 	defer c.Close()
 
-	ev, ok, err := c.RequestAttachment("att-16510")
+	ev, ok, err := c.RequestAttachment("att-16510", nil)
 	if err != nil {
 		t.Fatalf("RequestAttachment: %v", err)
 	}
@@ -2600,4 +2603,100 @@ func TestAnOversizedFrameIsRefusedRatherThanRead(t *testing.T) {
 	}
 	t.Fatal("the connection survived a frame larger than the read limit, so the frame was read " +
 		"into memory rather than refused")
+}
+
+// TestTheAttachmentDeadlineFollowsTheStatedSize covers chat-relay's
+// addition of 2026-09-19: every hub-path reference now carries the
+// SERVED byte length, and it asked this client to size its deadline
+// against that rather than against a flat 30s. The 20s writer ceiling on
+// their side bounds handing one frame to the kernel, not the upstream
+// fetch that has to happen before there is a frame at all.
+func TestTheAttachmentDeadlineFollowsTheStatedSize(t *testing.T) {
+	// Nil is "the server did not say", which is not zero: it is the old
+	// sizeless reference form, and the floor is the only honest bound.
+	if got := AttachmentWaitFor(nil); got != AttachmentWaitTimeout {
+		t.Fatalf("an unstated size must use the floor, got %v", got)
+	}
+	// A server that states zero has said something, but nothing that
+	// justifies waiting longer than the floor.
+	zero := int64(0)
+	if got := AttachmentWaitFor(&zero); got != AttachmentWaitTimeout {
+		t.Fatalf("a stated zero must use the floor, got %v", got)
+	}
+	// A small attachment is not a reason to wait less than the floor:
+	// the fetch, not the transfer, is what the floor covers.
+	small := int64(4096)
+	if got := AttachmentWaitFor(&small); got < AttachmentWaitTimeout {
+		t.Fatalf("a small attachment must not shorten the floor, got %v", got)
+	}
+	// A large one does extend it.
+	large := int64(32 << 20)
+	got := AttachmentWaitFor(&large)
+	if got <= AttachmentWaitTimeout {
+		t.Fatalf("a 32MB attachment must wait longer than the floor, got %v", got)
+	}
+	if got > AttachmentMaxWait {
+		t.Fatalf("the scaling must stay under the ceiling, got %v", got)
+	}
+	// And a server that misstates an enormous size cannot make this
+	// client wait indefinitely on one fetch.
+	absurd := int64(1) << 40
+	if got := AttachmentWaitFor(&absurd); got != AttachmentMaxWait {
+		t.Fatalf("an absurd size must clamp to the ceiling, got %v", got)
+	}
+}
+
+// TestOnlyTheConversationCodeEndsAConnection is chat-relay's
+// authoritative answer of 2026-09-19, read back as a test: on that
+// server an error frame NEVER means the connection is over. Every code
+// it emits refuses one request and leaves the connection usable. The
+// allowlist here had five names that server does not send, and a guess
+// in that map is a live connection killed over a word.
+func TestOnlyTheConversationCodeEndsAConnection(t *testing.T) {
+	// The complete set chat-relay emits, from its own source.
+	for _, code := range []string{
+		"unavailable", "send_refused", "not_found", "bad_request",
+		"bad_attachment", "bad_ack", "bad_ack_cursor", "bad_anchor",
+		"bad_filter", "too_large", "unsupported",
+	} {
+		if fatalErrorCodes[code] {
+			t.Errorf("%q refuses one request and must not end the connection", code)
+		}
+	}
+	// The one that stays: the frame carries the reason, the close (4003)
+	// carries the verdict, and a reader that missed the close still
+	// learns why from the frame.
+	if !fatalErrorCodes["conversation_unavailable"] {
+		t.Error("conversation_unavailable must still end the connection")
+	}
+	// Names that server never sends have no business deciding this.
+	for _, guess := range []string{"conversation_deleted", "unauthorized", "forbidden", "expired"} {
+		if fatalErrorCodes[guess] {
+			t.Errorf("%q was a guess at a code chat-relay does not send", guess)
+		}
+	}
+}
+
+// TestASupersededCloseIsNotRetriedAutomatically covers the one place
+// this client deliberately departs from chat-relay's recommendation.
+// 4004 does not mean the connection broke — another connection took this
+// identity. Reconnecting means presenting the same secret again, which
+// takes it straight back; if the other holder also reconnects
+// automatically the two take turns forever.
+func TestASupersededCloseIsNotRetriedAutomatically(t *testing.T) {
+	note, ok := relayCloseNotes[4004]
+	if !ok {
+		t.Fatal("4004 must be recognised, or a takeover reads as an ordinary drop and is retried")
+	}
+	if !strings.Contains(note, "superseded") {
+		t.Fatalf("the note must say what happened, got: %s", note)
+	}
+	// Every other close stays retryable — including 1006, which is what
+	// chat-relay's overflow and write-timeout paths produce, since a
+	// close frame cannot be sent by a peer whose writes do not complete.
+	for _, code := range []int{1000, 1001, 1006, 1011, 4005} {
+		if _, fatal := relayCloseNotes[code]; fatal {
+			t.Errorf("close code %d must stay retryable", code)
+		}
+	}
 }

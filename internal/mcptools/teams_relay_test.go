@@ -4454,7 +4454,7 @@ func TestAPushedAttachmentIsFetchedWhileTheReaderIsInItsCallback(t *testing.T) {
 	conn, _ := sess.activeConn()
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		ev, ok, err := conn.RequestAttachment("att-1")
+		ev, ok, err := conn.RequestAttachment("att-1", nil)
 		if err == nil && ok && ev.AttachmentContentBytes != "" {
 			return // fetched while the read loop was live
 		}
@@ -5027,5 +5027,76 @@ func TestAnOwnedAttachmentDirectoryIsNotSweptForBeingOld(t *testing.T) {
 	}
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
 		t.Fatalf("an old directory whose owner is gone should still be swept, got %v", err)
+	}
+}
+
+// TestTheConnectResultNamesAVerifiedNewerRelease covers the client half
+// of the design agreed on the hub, 2026-09-19: the server states a
+// release it has VERIFIED from the signed manifest, and this side
+// decides what that means for this binary — because only this side can
+// order a release tag against a development build's own numbering.
+func TestTheConnectResultNamesAVerifiedNewerRelease(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link := startRelayTestServerWithJoined(t, wire.Joined{
+		Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+		ServerVersion: wire.ProtocolVersion,
+		ClientRelease: &wire.ClientRelease{Version: "v99.9.9", ReadAt: "2026-09-19T21:00:00Z"},
+	})
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	res, err := hub.handleConnect(ctx, req)
+	if err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	text := textOf(res)
+	if !strings.Contains(text, "v99.9.9") {
+		t.Fatalf("expected the verified release to be named, got: %s", text)
+	}
+	if !strings.Contains(text, "2026-09-19T21:00:00Z") {
+		t.Fatalf("expected when the server verified it, got: %s", text)
+	}
+	if !strings.Contains(text, "hub_self_update") {
+		t.Fatalf("expected the reader to be told what installs it, got: %s", text)
+	}
+}
+
+// And silence in the three cases where there is nothing to say. A line
+// on every connect saying "you are up to date" is noise that trains a
+// reader to skip the line that one day says otherwise — and an ABSENT
+// clientRelease is "this server verified nothing", never "you are
+// current", which is the absence-is-not-zero rule that had this client
+// telling a peer it had missed nothing for a week.
+func TestTheConnectResultIsSilentWhenThereIsNothingToSay(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		release *wire.ClientRelease
+	}{
+		{"the server said nothing", nil},
+		{"the server has the concept but verified nothing", &wire.ClientRelease{}},
+		{"this build is already that release", &wire.ClientRelease{Version: "v0.0.1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+			link := startRelayTestServerWithJoined(t, wire.Joined{
+				Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+				ServerVersion: wire.ProtocolVersion, ClientRelease: tc.release,
+			})
+			ctx := context.Background()
+			hub := NewHub()
+			req := mcp.CallToolRequest{}
+			req.Params.Arguments = map[string]any{"as": testConn, "link": link}
+			res, err := hub.handleConnect(ctx, req)
+			if err != nil || res.IsError {
+				t.Fatalf("connect failed: err=%v result=%+v", err, res)
+			}
+			defer hub.handleDisconnect(ctx, connReqFor(testConn))
+			if text := textOf(res); strings.Contains(text, "current release") {
+				t.Fatalf("expected no release note, got: %s", text)
+			}
+		})
 	}
 }

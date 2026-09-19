@@ -1980,6 +1980,56 @@ func replyGuidance(hasInbox bool) string {
 // which differs between hub_connect (the same sessionId) and
 // teams_relay_connect (the same link used the first time). The secret
 // behind either is this client's own and never the model's to present.
+
+// releaseNote compares this binary against the release the SERVER has
+// verified, and says something only when there is something to say.
+//
+// The comparison lives here rather than on the server because only this
+// side can make it: a release tag and a development build's
+// 3.1.3.20260919212933 do not order by any rule a server has reason to
+// know, and a server inventing one would be a confident wrong answer
+// about which of two binaries is newer. The server's job is to state a
+// verified fact; deciding what it means for this binary is the client's.
+//
+// FOUR outcomes, and three of them say nothing:
+//
+//   - the server verified nothing (or has no such concept): silence. An
+//     absent clientRelease is "nothing verified here", never "you are
+//     current" — the same absence-is-not-zero rule that made this
+//     client tell a Codex session it had missed nothing for a week.
+//   - this build is current, or ahead of the published release (every
+//     development build after a release is): silence. Telling a reader
+//     it is up to date on every connect is noise that trains them to
+//     skip the line that one day says otherwise.
+//   - the two do not compare: say so plainly rather than guess. A
+//     binary with no version information cannot be ranked against a
+//     release, and pretending otherwise is the failure this avoids.
+//   - this build is genuinely behind: say which version, and that the
+//     server verified it.
+func releaseNote(conn *hubconn.Conn) string {
+	rel, stated := conn.VerifiedClientRelease()
+	if !stated || rel.Version == "" {
+		return ""
+	}
+	running := version.Short()
+	newer, err := selfupdate.IsNewer(rel.Version, running)
+	if err != nil {
+		return fmt.Sprintf("\nNOTE: this server has verified %s as the current mcp-hub-client "+
+			"release. This build reports %q, which cannot be ordered against it, so whether you "+
+			"are behind is unknown rather than no.", rel.Version, running)
+	}
+	if !newer {
+		return ""
+	}
+	verified := ""
+	if rel.ReadAt != "" {
+		verified = fmt.Sprintf(" (verified by the server at %s)", rel.ReadAt)
+	}
+	return fmt.Sprintf("\nNOTE: mcp-hub-client %s is the current release%s and this build is %s "+
+		"— hub_self_update installs it, and the update is verified against the release's own "+
+		"signed manifest before anything is replaced.", rel.Version, verified, running)
+}
+
 func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction string, hasInbox bool) string {
 	// In push mode there is nothing for the model to start, so there is
 	// nothing to explain. Saying "events will arrive" and stopping is the
@@ -2289,6 +2339,8 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			"\nNOTE: this mcp-hub-client speaks protocol v%d, ahead of the server's v%d — "+
 				"the server may need updating.", wire.ProtocolVersion, sv)
 	}
+
+	versionNote += releaseNote(conn)
 
 	identityNote := ""
 	if name == "" {
@@ -2820,12 +2872,18 @@ func (h *Hub) resolveAttachment(conn *hubconn.Conn, a wire.Attachment) (raw []by
 		raw, err = base64.StdEncoding.DecodeString(a.ContentBytes)
 		return raw, a.ContentType, err
 	}
-	ev, ok, err := conn.RequestAttachment(a.Token)
+	// The wait is sized from what the server said this fetch will
+	// return, where it said anything — see hubconn.AttachmentWaitFor.
+	waited := hubconn.AttachmentWaitFor(a.Size)
+	ev, ok, err := conn.RequestAttachment(a.Token, a.Size)
 	if err != nil {
 		return nil, "", fmt.Errorf("attachment request failed: %w", err)
 	}
 	if !ok {
-		return nil, "", fmt.Errorf("no reply to attachment request within %v", hubconn.AckWaitTimeout)
+		// Names the deadline that actually applied. This used to print
+		// AckWaitTimeout, which is a different and much shorter bound
+		// than the one that had just expired.
+		return nil, "", fmt.Errorf("no reply to attachment request within %v", waited)
 	}
 	if ev.Kind == "error" {
 		return nil, "", fmt.Errorf("server refused attachment request (code=%s): %s", ev.Code, ev.Text)

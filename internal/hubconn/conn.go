@@ -19,6 +19,7 @@ import (
 
 	"github.com/secforge/mcp-hub/internal/agekey"
 	"github.com/secforge/mcp-hub/internal/sanitize"
+	"github.com/secforge/mcp-hub/internal/version"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -279,6 +280,12 @@ type Conn struct {
 	// unsupported) — both look identical as a missing map entry
 	// otherwise. Immutable after construction, same as the other Joined-
 	// derived fields above; not under mu.
+	// clientRelease is what the server verified the current client
+	// release to be, or nil where it verified nothing. Kept as the
+	// pointer it arrived as, so "said nothing" stays distinguishable
+	// from "said something empty".
+	clientRelease *wire.ClientRelease
+
 	// pinnedAtConnect is what joined.Pinned carried. A snapshot, not a
 	// live set: it is what was pinned when this connection opened, and
 	// pinned/unpinned events move it on from there. Kept so the connect
@@ -478,26 +485,41 @@ type ackClaim struct {
 }
 
 // fatalErrorCodes are the error codes that describe the CONNECTION
-// rather than the request that provoked them: the conversation is gone,
-// or this client may no longer be in it. Only these disable automatic
-// reconnect, because only these are still true on the next dial.
+// rather than the request that provoked them. Only these disable
+// automatic reconnect, because only these are still true on the next
+// dial. Anything else refuses one operation and says nothing about the
+// connection.
 //
-// Anything else non-retryable refuses one operation and says nothing
-// about the connection — which is why the list is an allowlist rather
-// than "everything the server would not retry".
+// ONE ENTRY, from chat-relay's own source rather than from observation.
+// Asked 2026-09-19 for the authoritative list, its answer was that an
+// error frame on that server NEVER means the connection is over: every
+// code it emits (unavailable, send_refused, not_found, bad_request,
+// bad_attachment, bad_ack, bad_ack_cursor, bad_anchor, bad_filter,
+// too_large, unsupported) refuses one request and leaves the connection
+// usable. What ends a connection there is the CLOSE.
+//
+// conversation_unavailable stays because it is the one case where the
+// frame carries the reason and the close (4003) carries the verdict; a
+// reader that saw the frame but missed the close still learns why. The
+// five codes that used to sit beside it — conversation_deleted,
+// unauthorized, forbidden, revoked, expired — were guesses at names that
+// server does not send, and a guess in this map is a live connection
+// killed over a word.
 var fatalErrorCodes = map[string]bool{
 	"conversation_unavailable": true,
-	"conversation_deleted":     true,
-	"unauthorized":             true,
-	"forbidden":                true,
-	"revoked":                  true,
-	"expired":                  true,
 }
 
-// relayCloseNotes maps close codes a teams relay may use to signal a
-// dead credential rather than ordinary network
-// trouble, agreed as: 4001 revoked, 4002 expired, 4003 the link's
-// conversation became unavailable (e.g. the bot was removed from it).
+// relayCloseNotes maps close codes that mean this connection should not
+// be dialled again on its own, rather than ordinary network trouble:
+// 4001 revoked, 4002 expired, 4003 the link's conversation became
+// unavailable (e.g. the bot was removed from it), 4004 superseded.
+//
+// EVERY OTHER CLOSE IS RETRYABLE, 1006 included. chat-relay states that
+// its overflow and write-timeout paths abort the transport rather than
+// sending a close code, deliberately: a close frame is itself a write,
+// and the condition being signalled is that writes do not complete, so a
+// signal that can only be sent when the failure is not happening is not
+// a signal. Recovery therefore cannot key off a code being present.
 // mcp-hub-server itself never sends any of these — a plain drop from it
 // still gets no note, same as before this existed. These are a secondary,
 // best-effort signal: the primary one is a server sending a final "error"
@@ -519,8 +541,33 @@ var fatalErrorCodes = map[string]bool{
 // code isn't worth carrying a note for.
 var relayCloseNotes = map[int]string{
 	4001: " (revoked — do not reconnect)",
+	// 4002 is a constant on chat-relay that nothing currently issues —
+	// its expiry path closes with 4001. Kept because not retrying an
+	// expired credential is right whoever sends it, but a 4002 seen in
+	// the wild is evidence that something new shipped, not evidence
+	// about the server as it stands.
 	4002: " (expired — do not reconnect)",
 	4003: " (conversation unavailable — do not reconnect)",
+	// 4004 SUPERSEDED, added 2026-09-19 when chat-relay gave the
+	// authoritative close-code list. It does not mean the connection was
+	// broken: another connection presented a verified secret and took
+	// this identity, and the socket that lost is simply no longer the one
+	// holding it.
+	//
+	// chat-relay's own recommendation was to reconnect on it. This client
+	// deliberately does not, and the reason is what an automatic
+	// reconnect would BE: presenting the same secret again, which takes
+	// the identity straight back from whoever just claimed it. If that
+	// other holder also reconnects automatically — and if it is this same
+	// client, it does — the two take turns forever, each one's recovery
+	// causing the other's failure.
+	//
+	// The case where this client displaced its OWN socket is unaffected:
+	// the replacement is already connected, so nothing schedules anything.
+	// What is refused here is only the foreign takeover, and refusing it
+	// leaves the decision with whoever can tell the two apart.
+	4004: " (superseded — another connection holds this identity now; " +
+		"reconnecting would take it back from whoever has it, so it is not done automatically)",
 }
 
 // DisconnectNote returns extra text to append to a bare disconnect message
@@ -742,6 +789,17 @@ func Dial(link string, opts DialOptions) (*Conn, error) {
 	header.Set("Authorization", "Bearer "+credential)
 	header.Set("Agent-Secret", opts.ReconnectSecret)
 	header.Set("Hub-Protocol-Version", strconv.Itoa(wire.ProtocolVersion))
+	// AN OBSERVATION, NOT A CLAIM. This is the binary's own word for
+	// itself: unsigned, and forgeable by anything that dials. It is
+	// useful for a server showing who is running what, and it is not
+	// evidence of anything — the only thing that makes a version
+	// evidence is the signed release manifest (see internal/selfupdate).
+	//
+	// Sent for development builds too, which is the case a server most
+	// wants to see, and never omitted as a way of looking current:
+	// version.Short() is never empty, and "unknown" is a more useful
+	// answer than a missing header.
+	header.Set("Agent-Version", version.Short())
 	if opts.AgentID != "" {
 		header.Set("Agent-Id", opts.AgentID)
 	}
@@ -859,6 +917,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		behind:                  joined.Behind,
 		behindSince:             joined.BehindSince,
 		pinnedAtConnect:         pinnedOrNil(joined.Pinned),
+		clientRelease:           joined.ClientRelease,
 		features:                joined.Features,
 		featuresDeclared:        joined.Features != nil,
 		lastFrameKind:           "joined",
@@ -901,6 +960,18 @@ func (c *Conn) ServerVersion() int { return c.serverVersion }
 // runtime fallback (e.g. ConfirmReceived's ackReplyMisses probe) is the
 // only way to find out.
 func (c *Conn) FeaturesDeclared() bool { return c.featuresDeclared }
+
+// VerifiedClientRelease is the release this server says is current, and
+// whether it said anything at all. The second return is the whole point:
+// a server that verified nothing must not read as "you are up to date".
+func (c *Conn) VerifiedClientRelease() (wire.ClientRelease, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.clientRelease == nil {
+		return wire.ClientRelease{}, false
+	}
+	return *c.clientRelease, true
+}
 
 // HasFeature reports whether the server explicitly declared support for
 // the named feature — meaningless (always false) when FeaturesDeclared
@@ -2040,15 +2111,61 @@ var AckWaitTimeout = 5 * time.Second
 // timed out at 5s, the data arrived a moment later, and by then the claim
 // was gone and the bytes were discarded as unsolicited.
 //
-// No size is available to scale this by: the reference form carries
-// contentType, token, name and kind, and no length. So this is one bound,
-// and the number comes from the serving side rather than from taste: a
-// relay's own outbound writer gives up on a frame it cannot hand to the
-// kernel within 20s and closes that peer. Past that point no answer is
-// coming on this connection at all, so waiting longer buys nothing. This
-// sits just above it — long enough to cover a large frame that is still
-// moving, short enough not to outlive the connection that would carry it.
+// This is the FLOOR, used whenever the served size is unknown, and the
+// number comes from the serving side rather than from taste: a relay's
+// own outbound writer gives up on a frame it cannot hand to the kernel
+// within 20s and closes that peer. Past that point no answer is coming on
+// this connection at all, so waiting longer buys nothing. This sits just
+// above it — long enough to cover a large frame that is still moving,
+// short enough not to outlive the connection that would carry it.
+//
+// Where the server states a size (wire.Attachment.Size, declared as the
+// "attachments.size" feature, added by chat-relay 2026-09-19 at this
+// client's request), AttachmentWaitFor scales past this floor: the 20s
+// writer ceiling bounds handing ONE frame to the kernel, not the fetch
+// from an upstream API that has to happen before there is a frame at
+// all, and that part does grow with the file.
 var AttachmentWaitTimeout = 30 * time.Second
+
+// attachmentFetchFloorRate is the slowest end-to-end throughput this
+// client will still wait out, used only to turn a stated size into a
+// deadline. Deliberately pessimistic: the cost of guessing too fast is a
+// timeout that discards bytes already on their way — which is the exact
+// failure that set AttachmentWaitTimeout apart from AckWaitTimeout — and
+// the cost of guessing too slow is waiting a little longer for something
+// that was never coming.
+const attachmentFetchFloorRate = 1 << 20 // bytes per second
+
+// AttachmentMaxWait bounds the scaling, so a server that misstates a size
+// (or states an enormous one) cannot make this client wait indefinitely
+// on a single fetch.
+var AttachmentMaxWait = 3 * time.Minute
+
+// AttachmentWaitFor is how long to wait for the bytes behind a reference
+// whose served length the server stated, or AttachmentWaitTimeout where
+// it did not.
+//
+// A nil size is "the server did not say", which is not the same as zero
+// and must not be scaled from: it means this is the old, sizeless
+// reference form, and the floor is the only honest bound for it.
+func AttachmentWaitFor(size *int64) time.Duration {
+	if size == nil || *size <= 0 {
+		return AttachmentWaitTimeout
+	}
+	// Divided BEFORE the multiply. Nanoseconds times a byte count
+	// overflows int64 at a few gigabytes and comes back negative — which
+	// a misstated size would reach on its own, producing a deadline in
+	// the past and a fetch that fails instantly.
+	secs := *size / attachmentFetchFloorRate
+	if secs > int64(AttachmentMaxWait/time.Second) {
+		return AttachmentMaxWait
+	}
+	d := AttachmentWaitTimeout + time.Duration(secs)*time.Second
+	if d > AttachmentMaxWait {
+		return AttachmentMaxWait
+	}
+	return d
+}
 
 // SendAwaitingAck sends text (broadcast, or to a single peer if to is
 // non-empty) and, only against a server declaring actionAcks (see
@@ -2143,7 +2260,7 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 
 // RequestAttachment fetches the actual bytes behind a reference-form
 // attachment's Token (see wire.Attachment.IsReference) by sending an
-// AttachmentRequest and waiting up to AckWaitTimeout for the server's
+// AttachmentRequest and waiting up to AttachmentWaitFor(size) for the server's
 // reply — an "attachmentData" event on success, an "error" event
 // (bad_attachment/not_found/unavailable) on refusal. Returns (Event{},
 // false, nil) on a bare timeout, same convention as SendAwaitingAck and
@@ -2151,7 +2268,7 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 // never emits a Token in the first place and so never replies to this at
 // all; a caller should only ever call this for a Token actually seen on
 // an Attachment.IsReference()==true entry.
-func (c *Conn) RequestAttachment(token string) (Event, bool, error) {
+func (c *Conn) RequestAttachment(token string, size *int64) (Event, bool, error) {
 	// Narrowed to this token: an attachmentData for any other one is not
 	// this request's answer and must not consume this wait. An error
 	// event carries no token, so it is still taken as this request's
@@ -2167,7 +2284,7 @@ func (c *Conn) RequestAttachment(token string) (Event, bool, error) {
 	select {
 	case ev := <-resultCh:
 		return ev, true, nil
-	case <-time.After(AttachmentWaitTimeout):
+	case <-time.After(AttachmentWaitFor(size)):
 		return Event{}, false, nil
 	}
 }

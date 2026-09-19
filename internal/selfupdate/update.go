@@ -56,6 +56,13 @@ const (
 	// maxAssetBytes bounds a download. The client is ~11MB; this leaves
 	// generous headroom while refusing to write something absurd to disk.
 	maxAssetBytes = 128 << 20
+	// maxManifestBytes bounds the manifest download. It lists a handful
+	// of filenames and digests, so this is orders of magnitude of
+	// headroom rather than a real limit — its job is to stop an
+	// unbounded body being read into memory before anything has been
+	// verified, which is the one point in this flow where nothing is yet
+	// known about what is being served.
+	maxManifestBytes = 1 << 20
 )
 
 var httpTimeout = 60 * time.Second
@@ -112,38 +119,42 @@ func Latest(ctx context.Context) (release, error) {
 // Result describes what an update attempt did, in terms a caller can
 // report without having to interpret anything.
 type Result struct {
-	Running   string
-	Latest    string
-	Replaced  bool
+	Running  string
+	Latest   string
+	Replaced bool
+	// Commit is the commit the release was built from, as stated by the
+	// signed manifest — so a caller reporting an update names something
+	// checkable rather than a tag nothing verified.
+	Commit    string
 	AssetName string
 	Path      string
 }
 
-// Apply checks for a newer release and, only if one exists AND its
-// signature verifies, replaces this process's own binary with it.
+// Apply checks for a newer release and, only if one exists AND the
+// signed manifest accounts for it, replaces this process's own binary
+// with it.
 //
 // Verification happens entirely in memory, before a single byte reaches
 // the executable path: a binary that fails to verify is never written
-// anywhere it could be run from. That is the control.
+// anywhere it could be run from.
 //
-// The newer-than-running check runs first, and it is worth being exact
-// about what it does NOT buy, because the comment here used to claim more.
-// A signature says "we published this", not "this is current" — an old
-// asset stays validly signed forever — so it is true that a signature
-// alone permits a downgrade. But the version being compared is
-// rel.TagName, which comes from the same response as the asset URL and is
-// signed by nothing. Whoever can shape that response can serve tag
-// v99.0.0 alongside the genuine, genuinely signed v0.0.1 binary and its
-// genuine signature: verification passes because the bytes really were
-// published, the comparison passes because the tag says 99, and a
-// known-buggy old binary installs over a good one.
+// THE MANIFEST IS THE AUTHORITY, not the tag. Every binary in a release
+// is signed, so the bytes were always accounted for; the version was
+// not, because it lives in the git tag, which is GitHub metadata and
+// signed by nothing. Whoever could shape that response could serve tag
+// v99.0.0 beside the genuine, genuinely signed v0.0.1 binary and its
+// genuine signature — every check passed and a known-buggy build
+// installed over a good one. The version now comes from inside the
+// signed manifest, and the tag is used only as a cross-check: if the two
+// disagree, something is wrong that neither number can settle, so
+// nothing is installed.
 //
-// What actually prevents that today is TLS to api.github.com, which is a
-// reasonable control and a different one from the ordering. Making the
-// stated reasoning true needs the version bound into the signed material
-// — a small manifest carrying the tag and the asset's digest, verified,
-// then matched against the tag being installed. Recorded rather than
-// silently relied on; see docs/known-issues.md.
+// The per-binary .sig files are still published and this no longer reads
+// them. They are for anyone verifying a download by hand; this client
+// verifies the manifest's signature once and then matches the binary's
+// SHA-256 against what that manifest says. One signature over a
+// statement about every artifact is a stronger claim than one signature
+// per artifact with nothing tying them to a release.
 func Apply(ctx context.Context, running string) (Result, error) {
 	res := Result{Running: running, AssetName: AssetName()}
 
@@ -159,46 +170,92 @@ func Apply(ctx context.Context, running string) (Result, error) {
 	}
 	res.Latest = rel.TagName
 
-	newer, err := isNewer(rel.TagName, running)
+	// A CHEAP PRE-CHECK against the tag, before anything is downloaded.
+	// The tag is not trusted and this does not treat it as though it
+	// were: it can only stop work, never authorise an install. A tag
+	// that claims to be older than what is running means either there is
+	// genuinely nothing to do, or somebody is serving an old release to
+	// suppress an update — and that second case is one they could
+	// produce anyway by serving the old release honestly. What must not
+	// happen is installing on the strength of a tag, and that decision
+	// is still made below, from the signed manifest.
+	if newer, err := isNewer(rel.TagName, running); err == nil && !newer {
+		return res, nil
+	}
+
+	var assetURL, manifestURL, manifestSigURL string
+	for _, a := range rel.Assets {
+		switch a.Name {
+		case res.AssetName:
+			assetURL = a.URL
+		case ManifestName:
+			manifestURL = a.URL
+		case ManifestSigName:
+			manifestSigURL = a.URL
+		}
+	}
+	if manifestURL == "" || manifestSigURL == "" {
+		return res, fmt.Errorf("release %s publishes no signed %s, so nothing states what version "+
+			"its binaries are — refusing to install on the strength of a tag alone. Update by "+
+			"hand from https://github.com/secforge/mcp-hub/releases", rel.TagName, ManifestName)
+	}
+
+	rawManifest, err := download(ctx, manifestURL, maxManifestBytes)
+	if err != nil {
+		return res, err
+	}
+	manifestSig, err := download(ctx, manifestSigURL, 4096)
+	if err != nil {
+		return res, err
+	}
+	manifest, err := VerifyManifest(rawManifest, manifestSig)
+	if err != nil {
+		return res, err
+	}
+	// A cross-check, never the authority. The two disagreeing means the
+	// release is not what it says it is, and no ordering computed from
+	// either number would be worth acting on.
+	if manifest.Version != rel.TagName {
+		return res, fmt.Errorf("release %s publishes a signed manifest for %s — the tag and the "+
+			"signed version disagree, so nothing here can say what this release is. NOT installed",
+			rel.TagName, manifest.Version)
+	}
+	res.Latest = manifest.Version
+	res.Commit = manifest.Commit
+
+	// Compared against the SIGNED version. This is what makes the
+	// ordering mean something: an old release is still validly signed
+	// for ever, so the only thing standing between a replayed v0.0.1 and
+	// this executable is refusing to go backwards.
+	newer, err := isNewer(manifest.Version, running)
 	if err != nil {
 		return res, fmt.Errorf("cannot tell whether %s is newer than %s: %w — refusing to replace "+
-			"a binary on a comparison this client does not understand", rel.TagName, running, err)
+			"a binary on a comparison this client does not understand", manifest.Version, running, err)
 	}
 	if !newer {
 		return res, nil
 	}
 
-	var assetURL, sigURL string
-	for _, a := range rel.Assets {
-		switch a.Name {
-		case res.AssetName:
-			assetURL = a.URL
-		case res.AssetName + signatureSuffix:
-			sigURL = a.URL
-		}
-	}
 	if assetURL == "" {
 		return res, fmt.Errorf("release %s publishes no %s asset — nothing to install for this "+
-			"platform", rel.TagName, res.AssetName)
+			"platform", manifest.Version, res.AssetName)
 	}
-	if sigURL == "" {
-		return res, fmt.Errorf("release %s publishes %s but no %s%s beside it, so it cannot be "+
-			"verified — refusing to install it", rel.TagName, res.AssetName, res.AssetName,
-			signatureSuffix)
+	want, ok := manifest.DigestFor(res.AssetName)
+	if !ok {
+		return res, fmt.Errorf("release %s publishes %s but its signed manifest does not account "+
+			"for that file, so nothing signed says what it should contain — NOT installed",
+			manifest.Version, res.AssetName)
 	}
 
 	binary, err := download(ctx, assetURL, maxAssetBytes)
 	if err != nil {
 		return res, err
 	}
-	sig, err := download(ctx, sigURL, 4096)
-	if err != nil {
-		return res, err
-	}
-	if err := verify(binary, sig); err != nil {
-		return res, fmt.Errorf("%s failed signature verification (%w) — NOT installed. Either the "+
-			"download was corrupted or it was not signed by this project's release key; the "+
-			"binary you are running has not been touched", res.AssetName, err)
+	if got := Digest(binary); got != want {
+		return res, fmt.Errorf("%s does not match the digest its release manifest is signed for "+
+			"(got %s, expected %s) — NOT installed. Either the download was corrupted or the file "+
+			"served is not the one that was released; the binary you are running has not been "+
+			"touched", res.AssetName, got, want)
 	}
 
 	path, err := replaceExecutable(binary)
@@ -357,6 +414,20 @@ var runtimeGOOS = func() string { return runtime.GOOS }
 // cannot parse is an error rather than a guess, because the caller's
 // response to "I don't know" is to refuse to replace a binary, and the
 // response to a wrong guess could be a downgrade.
+// IsNewer reports whether candidate is a later version than running.
+//
+// Exported because the same ordering has to answer two different
+// questions and must not be implemented twice: whether a published
+// release is worth installing, and whether a version a SERVER states is
+// ahead of this binary. The second is why the comparison lives on this
+// side at all — a release tag and a development build's
+// 3.1.3.20260919212933 do not order by any rule a server has reason to
+// know.
+//
+// The error is not a formality: "these do not compare" is a real answer
+// here, and it must never be flattened into "not newer".
+func IsNewer(candidate, running string) (bool, error) { return isNewer(candidate, running) }
+
 func isNewer(candidate, running string) (bool, error) {
 	c, candidatePre, err := parseSemver(candidate)
 	if err != nil {

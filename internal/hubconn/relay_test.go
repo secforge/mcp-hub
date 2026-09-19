@@ -796,7 +796,7 @@ func TestAnActivityCallbackCanAwaitAReplyFromItsOwnConnection(t *testing.T) {
 			return
 		}
 		c.Drain()
-		ev, ok, err := c.RequestAttachment("att-1")
+		ev, ok, err := c.RequestAttachment("att-1", nil)
 		if err != nil || !ok {
 			fetched <- ""
 			return

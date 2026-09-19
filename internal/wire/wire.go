@@ -91,7 +91,7 @@ const (
 const ProtocolVersion = 4
 
 type envelope struct {
-	Type Type `json:"type"`
+	Type Type `json:"type,case:strict"`
 }
 
 // DecodeType reads just the "type" field from a wire message.
@@ -104,19 +104,19 @@ func DecodeType(raw []byte) (Type, error) {
 }
 
 type Joined struct {
-	Type   Type   `json:"type"`
-	PeerID string `json:"peerId"`
+	Type   Type   `json:"type,case:strict"`
+	PeerID string `json:"peerId,case:strict"`
 	// ServerVersion is this server's ProtocolVersion, so the client can tell
 	// if it's behind and surface that to the model.
-	ServerVersion int `json:"serverVersion"`
+	ServerVersion int `json:"serverVersion,case:strict"`
 	// Name echoes back this peer's own display name after sanitization, so
 	// the client can tell if anything was stripped/truncated from what it
 	// requested. Empty if none was supplied.
-	Name string `json:"name,omitempty"`
+	Name string `json:"name,omitempty,case:strict"`
 	// AgePublicKey echoes back this peer's own age public key. Always
 	// exactly what was supplied (already format-validated pre-upgrade) or
 	// empty if none was supplied.
-	AgePublicKey string `json:"agePublicKey,omitempty"`
+	AgePublicKey string `json:"agePublicKey,omitempty,case:strict"`
 
 	// The fields below are for a teams session (e.g. one reached via
 	// teams_relay_connect) backed by a channel with real history and
@@ -138,13 +138,13 @@ type Joined struct {
 	// conversation. A snapshot at connect time, not a guarantee — it can
 	// go stale mid-session (e.g. an external participant joins), so a
 	// later send can still be refused even after this was true.
-	CanSend bool `json:"canSend,omitempty"`
+	CanSend bool `json:"canSend,omitempty,case:strict"`
 	// ConversationKind and Topic describe what was joined (e.g.
 	// "oneOnOne"/"group"/"meeting", and a display name where one exists)
 	// without needing a History request first. Empty/nil when not
 	// applicable or not set by the server.
-	ConversationKind string  `json:"conversationKind,omitempty"`
-	Topic            *string `json:"topic,omitempty"`
+	ConversationKind string  `json:"conversationKind,omitempty,case:strict"`
+	Topic            *string `json:"topic,omitempty,case:strict"`
 	// Behind is how many messages this peer's persisted position (its
 	// own last-acked cursor, server-side) trails the newest message in
 	// this conversation, computed once at connect. Only the server can
@@ -162,7 +162,7 @@ type Joined struct {
 	// has no such concept. Absent and 0 decode identically otherwise, so
 	// the two states merge — Ack.Behind is already a pointer for exactly
 	// this reason, one field over.
-	Behind *int `json:"behind,omitempty"`
+	Behind *int `json:"behind,omitempty,case:strict"`
 	// BehindSince is the timestamp of this peer's last-acked position,
 	// pairing with Behind: Behind says whether to walk (small) or seek
 	// (large) MessageAfter{at:...} from recent context instead;
@@ -170,7 +170,7 @@ type Joined struct {
 	// resulting gap (BehindSince..the seek target) as an explicit,
 	// recorded, recoverable-on-demand range rather than a silent loss.
 	// Omitted under the same conditions as Behind.
-	BehindSince string `json:"behindSince,omitempty"`
+	BehindSince string `json:"behindSince,omitempty,case:strict"`
 	// Features declares this server's supported capabilities explicitly
 	// — added 2026-09-08 (ProtocolVersion 3, a floor meaning "this server
 	// declares its features" — an individual feature needs no version
@@ -189,7 +189,7 @@ type Joined struct {
 	// what the server DOES; it is never an instruction to the client.
 	// Removed in the same change that removes the feature it names —
 	// never left describing a capability that no longer exists.
-	Features map[string]json.RawMessage `json:"features,omitempty"`
+	Features map[string]json.RawMessage `json:"features,omitempty,case:strict"`
 	// Pinned is the conversation's currently pinned messages, by
 	// externalId. Present whenever the "pins" feature is declared and
 	// ALWAYS present then — an EMPTY ARRAY when nothing is pinned, never
@@ -203,18 +203,49 @@ type Joined struct {
 	// an empty slice emits [], and omitempty on a plain slice would
 	// collapse "nothing pinned" into "no pinning" — the exact conflation
 	// the contract exists to prevent.
-	Pinned *[]string `json:"pinned,omitempty"`
+	Pinned *[]string `json:"pinned,omitempty,case:strict"`
+	// ClientRelease is what the SERVER has verified the current client
+	// release to be, from the signed release manifest — never what a
+	// peer reported about itself. Present only where the server declares
+	// the "clientRelease" feature AND has something verified; omitted
+	// otherwise, and its absence means "nothing verified here", never
+	// "you are current".
+	//
+	// A pointer for that reason: the three states are "this server has
+	// no such concept", "it has the concept and has verified nothing",
+	// and "here is a version". The first two are distinguishable through
+	// the feature declaration, and neither is a statement about the
+	// client that is reading it.
+	//
+	// The COMPARISON is the client's, deliberately. A release tag and a
+	// development build's 3.1.3.20260919212933 do not order against each
+	// other by any rule a server has reason to know, and inventing one
+	// server-side would be a confident wrong answer about which of two
+	// binaries is newer.
+	ClientRelease *ClientRelease `json:"clientRelease,omitempty,case:strict"`
+}
+
+// ClientRelease is a server's verified statement of the current client
+// release — see Joined.ClientRelease.
+type ClientRelease struct {
+	// Version is the release tag as it appeared INSIDE the signed
+	// manifest, not the git tag beside it.
+	Version string `json:"version,case:strict"`
+	// ReadAt is when the server last verified it, so a reader can tell a
+	// fresh answer from one cached since before the release it is being
+	// told about.
+	ReadAt string `json:"readAt,omitempty,case:strict"`
 }
 
 // AttachmentsFeature is Features["attachments"]'s own parameter shape —
 // see Joined.Features.
 type AttachmentsFeature struct {
-	MaxRawBytes   int `json:"maxRawBytes,omitempty"`
-	MaxFrameBytes int `json:"maxFrameBytes,omitempty"`
+	MaxRawBytes   int `json:"maxRawBytes,omitempty,case:strict"`
+	MaxFrameBytes int `json:"maxFrameBytes,omitempty,case:strict"`
 	// ImagesOnly is set by a teams relay whose platform only accepts
 	// image attachments (see hub_send's imagePath/filePath split) —
 	// absent (false) for a server that accepts any content type.
-	ImagesOnly bool `json:"imagesOnly,omitempty"`
+	ImagesOnly bool `json:"imagesOnly,omitempty,case:strict"`
 }
 
 // HasFeature reports whether j declares support for the named feature —
@@ -248,18 +279,18 @@ func NewJoined(peerID string, name, agePublicKey string) Joined {
 }
 
 type Error struct {
-	Type    Type   `json:"type"`
-	Message string `json:"message"`
+	Type    Type   `json:"type,case:strict"`
+	Message string `json:"message,case:strict"`
 	// Code, if present, is a stable machine-readable reason a client can
 	// branch on without parsing Message — e.g. a chat-relay-style teams
 	// distinguishing "invalid_credential" (never retry) from "unavailable"
 	// (transient, retry is fine). Empty when a server doesn't set one;
 	// mcp-hub-server itself doesn't today. Additive: an older client that
 	// doesn't know this field still gets Message.
-	Code string `json:"code,omitempty"`
+	Code string `json:"code,omitempty,case:strict"`
 	// Retryable, when Code is set, says whether retrying the operation that
 	// produced this error could succeed. Meaningless without Code.
-	Retryable bool `json:"retryable,omitempty"`
+	Retryable bool `json:"retryable,omitempty,case:strict"`
 }
 
 func NewError(message string) Error {
@@ -288,30 +319,30 @@ func NewError(message string) Error {
 // these rules — a mention that silently becomes plain text would tell a
 // sender somebody was notified when nobody was.
 type Mention struct {
-	Name   string `json:"name,omitempty"`
-	ID     string `json:"id,omitempty"`
-	PeerID string `json:"peerId,omitempty"`
-	Text   string `json:"text,omitempty"`
+	Name   string `json:"name,omitempty,case:strict"`
+	ID     string `json:"id,omitempty,case:strict"`
+	PeerID string `json:"peerId,omitempty,case:strict"`
+	Text   string `json:"text,omitempty,case:strict"`
 }
 
 type Msg struct {
-	Type    Type   `json:"type"`
-	PeerID  string `json:"peerId,omitempty"`
-	Text    string `json:"text"`
-	TS      string `json:"ts,omitempty"`
-	To      string `json:"to,omitempty"`      // set by the client to request directed (private) delivery
-	Private bool   `json:"private,omitempty"` // set by the server on a delivered directed message
+	Type    Type   `json:"type,case:strict"`
+	PeerID  string `json:"peerId,omitempty,case:strict"`
+	Text    string `json:"text,case:strict"`
+	TS      string `json:"ts,omitempty,case:strict"`
+	To      string `json:"to,omitempty,case:strict"`      // set by the client to request directed (private) delivery
+	Private bool   `json:"private,omitempty,case:strict"` // set by the server on a delivered directed message
 	// Historical marks a msg delivered in answer to a History request
 	// rather than live traffic — additive, so a client that doesn't know
 	// the field just renders it as an ordinary message. mcp-hub-server
 	// itself never sets this; it's for a teams relay (e.g. one backed by
 	// a channel with real message history) answering History.
-	Historical bool `json:"historical,omitempty"`
+	Historical bool `json:"historical,omitempty,case:strict"`
 	// ExternalID, for a teams session, is the sending server's own id for
 	// this message (the same value given in a SendAck for the send that
 	// produced it) — correlates a canonical msg with the sendAck that
 	// preceded it. Empty when not applicable.
-	ExternalID string `json:"externalId,omitempty"`
+	ExternalID string `json:"externalId,omitempty,case:strict"`
 	// ReplyTo is the ExternalID of the message this one is a reply to — a
 	// server extension (chat-relay), absent (not null/empty) when this
 	// message isn't a reply. Same id space as ExternalID/SendAck, so it's
@@ -323,7 +354,7 @@ type Msg struct {
 	// apply in that direction (refuse an unrecognized/foreign id outright
 	// rather than send anything, since resolving the citation can surface
 	// that other message's own preview text).
-	ReplyTo string `json:"replyTo,omitempty"`
+	ReplyTo string `json:"replyTo,omitempty,case:strict"`
 	// ReplyPreview is the server's own (lossy — formatting flattened,
 	// possibly truncated) abbreviation of the quoted message's text, for
 	// when ReplyTo names a message outside a client's own history. Not
@@ -333,7 +364,7 @@ type Msg struct {
 	// readers; ReplyTo/ReplyPreview are the structural form of that same
 	// information, so a client surfacing both may want to avoid saying it
 	// twice.
-	ReplyPreview string `json:"replyPreview,omitempty"`
+	ReplyPreview string `json:"replyPreview,omitempty,case:strict"`
 	// Mentions, server->client, lists who this message @-mentions, if any
 	// — a server extension (chat-relay), absent (nil, not an empty slice)
 	// when the message mentions no one. Each entry's ID is the sending
@@ -346,13 +377,13 @@ type Msg struct {
 	// Mention's doc comment for the full request-side contract (exactly
 	// one of ID/PeerID/Name per entry, optional Text, refuse-whole-send
 	// on any violation).
-	Mentions []Mention `json:"mentions,omitempty"`
+	Mentions []Mention `json:"mentions,omitempty,case:strict"`
 	// MentionedMe is true when the receiving connection's own identity is
 	// among Mentions — computed per conversation (all connections on the
 	// same conversation share one identity there), never per hub peerId,
 	// so a client never needs to know its own directory id to use this.
 	// mcp-hub-server never sets it.
-	MentionedMe bool `json:"mentionedMe,omitempty"`
+	MentionedMe bool `json:"mentionedMe,omitempty,case:strict"`
 	// Answers is set when this Msg is the answer to a MessageAfter
 	// request — the exact Anchor that was sent, echoed back, never the
 	// resolved message's own cursor/identity (which is already present
@@ -361,7 +392,7 @@ type Msg struct {
 	// broadcast, History, etc.) — its presence is what tells a client
 	// this frame is the reply to a specific pull, not unrelated traffic,
 	// even if a downstream layer merges the two.
-	Answers *Anchor `json:"answers,omitempty"`
+	Answers *Anchor `json:"answers,omitempty,case:strict"`
 	// Matching echoes the Filter that was APPLIED in producing this
 	// answer — not the one that was received. The distinction is the
 	// useful part: a server that ignored the filter sends no Matching at
@@ -370,32 +401,32 @@ type Msg struct {
 	// held rather than only whether any did, and an unknown filter it
 	// sent comes back absent instead of silently reading as applied.
 	// Nil on any Msg that did not answer a filtered request.
-	Matching *Filter `json:"matching,omitempty"`
+	Matching *Filter `json:"matching,omitempty,case:strict"`
 	// Own, for a teams session, is true when this exact connection is
 	// the one that sent the message. Deliberately a decision for the
 	// receiving client to act on, not the server: whether to skip waking
 	// on your own echoed send is policy, and different consumers of the
 	// same stream (an agent, a UI, a hub client) may want different
 	// answers. mcp-hub-server never sets this.
-	Own bool `json:"own,omitempty"`
+	Own bool `json:"own,omitempty,case:strict"`
 	// Cursor, for a teams session, is this message's own opaque
 	// position — the anchor a client passes back to MessageAfter to read
 	// on from here. mcp-hub-server never sets this, since it has no
 	// history concept at all.
-	Cursor string `json:"cursor,omitempty"`
+	Cursor string `json:"cursor,omitempty,case:strict"`
 	// AckCursor, set by the client, piggybacks a read receipt on this
 	// message: "this is the cursor of the last event I've actually
 	// consumed" — not merely received. See Ack for the standalone form and
 	// the full read-receipt contract. Ignored by mcp-hub-server, which has
 	// no history/read-receipt concept at all.
-	AckCursor string `json:"ackCursor,omitempty"`
+	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 	// Attachments carries inline binary content — see Attachment. A
 	// server extension (not part of the base protocol, hence "unknown
 	// fields ignored" keeps mcp-hub-server's own relay unaffected either
 	// way, same as AckCursor). On an edit (see Edit/MessageEdited), an
 	// absent Attachments must be read as "unchanged", never "remove them"
 	// — there is deliberately no way to express attachment removal here.
-	Attachments []Attachment `json:"attachments,omitempty"`
+	Attachments []Attachment `json:"attachments,omitempty,case:strict"`
 	// Format is a server extension (chat-relay) declaring how Text should
 	// be interpreted: "text" (the default if omitted — plain, escaped
 	// verbatim) or "html" (bold/lists/code/quotes/tables/links, sanitized
@@ -405,7 +436,7 @@ type Msg struct {
 	// it, not silently downgraded to "text" — so don't guess a value the
 	// target server wasn't confirmed to accept. mcp-hub-server's own relay
 	// has no opinion on this field at all, same as Attachments.
-	Format string `json:"format,omitempty"`
+	Format string `json:"format,omitempty,case:strict"`
 }
 
 // Attachment is binary content attached to a Msg/Edit — a server
@@ -431,23 +462,36 @@ type Msg struct {
 //     some content (e.g. a Teams-relayed image, fetched from Graph on
 //     demand) never exists as inline bytes in a msg at all.
 type Attachment struct {
-	ContentType  string `json:"contentType"`
-	ContentBytes string `json:"contentBytes,omitempty"`
+	ContentType  string `json:"contentType,case:strict"`
+	ContentBytes string `json:"contentBytes,omitempty,case:strict"`
 	// Token identifies this attachment for a later AttachmentRequest —
 	// set only on the reference form (see IsReference), never sent by a
 	// client attaching its own content.
-	Token string `json:"token,omitempty"`
+	Token string `json:"token,omitempty,case:strict"`
 	// Name is an optional original filename. Always present on the
 	// reference form when the server has one; also settable on the
 	// inline/outgoing form by a client sending a generic file (see
 	// ReadFileAttachment/NewFileAttachmentFromData) — a receiving server
 	// or client with no use for it just ignores it, same as any other
 	// additive field.
-	Name string `json:"name,omitempty"`
+	Name string `json:"name,omitempty,case:strict"`
 	// Kind is an optional server-defined category (e.g. "image"),
 	// reference form only — informational, not required to interpret
 	// ContentType.
-	Kind string `json:"kind,omitempty"`
+	Kind string `json:"kind,omitempty,case:strict"`
+	// Size is the SERVED length in bytes of what a fetch of Token will
+	// return — the recoded copy, not whatever was originally uploaded,
+	// since the original is never handed out. Reference form only, and
+	// only where the server declares the "attachments.size" feature;
+	// chat-relay declares it on its hub path and deliberately not on a
+	// teams link, where the reference is embedded in rendered text
+	// rather than carried as a structured field.
+	//
+	// A POINTER, so "the server did not say" and "the server said zero"
+	// stay different answers. Omitted rather than zeroed when the blob
+	// row cannot be read, which is exactly the case a plain int would
+	// render as an empty attachment.
+	Size *int64 `json:"size,omitempty,case:strict"`
 }
 
 // IsReference reports whether this Attachment is the reference form (a
@@ -463,8 +507,8 @@ func (a Attachment) IsReference() bool {
 // this against it just gets silently ignored, same as any other
 // unrecognized type.
 type AttachmentRequest struct {
-	Type  Type   `json:"type"`
-	Token string `json:"token"`
+	Type  Type   `json:"type,case:strict"`
+	Token string `json:"token,case:strict"`
 }
 
 func NewAttachmentRequest(token string) AttachmentRequest {
@@ -477,15 +521,15 @@ func NewAttachmentRequest(token string) AttachmentRequest {
 // token), "not_found" (unknown, or belongs to a different session), or
 // "unavailable" (recorded but no servable bytes, e.g. a recode failure).
 type AttachmentData struct {
-	Type        Type   `json:"type"`
-	Token       string `json:"token"`
-	Name        string `json:"name,omitempty"`
-	ContentType string `json:"contentType"`
+	Type        Type   `json:"type,case:strict"`
+	Token       string `json:"token,case:strict"`
+	Name        string `json:"name,omitempty,case:strict"`
+	ContentType string `json:"contentType,case:strict"`
 	// ContentBytes is base64-encoded raw bytes — the recoded copy a
 	// reference-style server actually stores and serves, which may differ
 	// in ContentType from whatever was originally sent (e.g. an upstream
 	// platform's own re-encode).
-	ContentBytes string `json:"contentBytes"`
+	ContentBytes string `json:"contentBytes,case:strict"`
 }
 
 // MaxAttachmentRawBytes is the raw (pre-base64) size cap a sending client
@@ -723,19 +767,19 @@ func NewDirectedMsg(peerID, text, ts string, attachments []Attachment, format, r
 // alone. Built under the same lock that owns the roster, so it cannot
 // interleave with a membership change.
 type Roster struct {
-	Type    Type           `json:"type"`
-	Members []RosterMember `json:"members"`
+	Type    Type           `json:"type,case:strict"`
+	Members []RosterMember `json:"members,case:strict"`
 	// ReadAt is when the conversation behind a teams link was last read,
 	// where the server knows. Absent means no answer about it — not
 	// "never read".
-	ReadAt string `json:"readAt,omitempty"`
+	ReadAt string `json:"readAt,omitempty,case:strict"`
 }
 
 // RosterMember is one entry of a Roster.
 type RosterMember struct {
-	PeerID       string `json:"peerId"`
-	Name         string `json:"name,omitempty"`
-	AgePublicKey string `json:"agePublicKey,omitempty"`
+	PeerID       string `json:"peerId,case:strict"`
+	Name         string `json:"name,omitempty,case:strict"`
+	AgePublicKey string `json:"agePublicKey,omitempty,case:strict"`
 }
 
 func NewRoster(members []RosterMember) Roster {
@@ -797,8 +841,8 @@ func NewRoster(members []RosterMember) Roster {
 // downstream notification layer merges the two, and what lets more than
 // one walk be in flight without confusing their replies.
 type Anchor struct {
-	Cursor string `json:"cursor,omitempty"`
-	At     string `json:"at,omitempty"`
+	Cursor string `json:"cursor,omitempty,case:strict"`
+	At     string `json:"at,omitempty,case:strict"`
 }
 
 // MessageAfter requests the message at the first stream position
@@ -830,7 +874,7 @@ type Anchor struct {
 // consumption of this deliberately never requests more than one message
 // per call, even though the wire itself has no such limit.
 type MessageAfter struct {
-	Type Type `json:"type"`
+	Type Type `json:"type,case:strict"`
 	Anchor
 	Filter
 }
@@ -855,11 +899,11 @@ type Filter struct {
 	// with a value it was given rather than one it has to construct, and
 	// the identity space is the server's own rather than a second one
 	// invented for filtering.
-	Sender string `json:"sender,omitempty"`
+	Sender string `json:"sender,omitempty,case:strict"`
 	// Query matches message text. Two characters minimum; a shorter one
 	// is refused as Error{Code: "bad_filter"} rather than bad_anchor,
 	// since the anchor was fine and retrying that half fixes nothing.
-	Query string `json:"query,omitempty"`
+	Query string `json:"query,omitempty,case:strict"`
 }
 
 // Set reports whether this filter constrains anything at all.
@@ -885,9 +929,9 @@ func NewMessageAfterAt(at string) MessageAfter {
 // PRESENCE is the answer to "was this filtered", so a server that ignored
 // the filter cannot be mistaken for one that honoured it.
 type NoMoreMessages struct {
-	Type     Type    `json:"type"`
-	Answers  *Anchor `json:"answers,omitempty"`
-	Matching *Filter `json:"matching,omitempty"`
+	Type     Type    `json:"type,case:strict"`
+	Answers  *Anchor `json:"answers,omitempty,case:strict"`
+	Matching *Filter `json:"matching,omitempty,case:strict"`
 }
 
 func NewNoMoreMessages(answers Anchor) NoMoreMessages {
@@ -919,14 +963,14 @@ func NewNoMoreMessagesMatching(answers Anchor, matching Filter) NoMoreMessages {
 // that the server did not restart. "The server always warns us" is the
 // rule this must never be allowed to encourage.
 type ServerStopping struct {
-	Type Type `json:"type"`
+	Type Type `json:"type,case:strict"`
 	// ReconnectAfter is the server's own estimate, in seconds, of how
 	// long its restart will take. Advisory, and a FLOOR rather than an
 	// instruction: a client that reconnects at exactly this value, along
 	// with every other peer told the same number, arrives in one burst
 	// against a server that has only just come up. Spread actual retries
 	// across it. Zero when the server offered no estimate.
-	ReconnectAfter int `json:"reconnectAfter,omitempty"`
+	ReconnectAfter int `json:"reconnectAfter,omitempty,case:strict"`
 }
 
 // Ack is a standalone read receipt — the same information Msg/Reaction/
@@ -943,8 +987,8 @@ type ServerStopping struct {
 // be attributed to the ack that caused it) instead of an Ack reply, since
 // that's a protocol violation rather than a stale-but-valid receipt.
 type Ack struct {
-	Type      Type   `json:"type"`
-	AckCursor string `json:"ackCursor,omitempty"`
+	Type      Type   `json:"type,case:strict"`
+	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 	// OK is a POINTER for the same reason every other ack in this family
 	// states the field: absent and false encode identically in Go, so
 	// omitempty throws away the sender's ability to say "refused"
@@ -952,7 +996,7 @@ type Ack struct {
 	// pinAck rendering turned into three states rather than two, one
 	// struct over — and this was the only member of the family built
 	// unlike the rest, which is how such a defect arrives.
-	OK *bool `json:"ok,omitempty"`
+	OK *bool `json:"ok,omitempty,case:strict"`
 	// Behind, on a server's REPLY to a standalone ack (never meaningful
 	// on the outbound request), is how many messages remain after the
 	// position just acknowledged — added 2026-09-08, chat-relay's own
@@ -966,7 +1010,7 @@ type Ack struct {
 	// from where you confirmed"), so this must distinguish that from a
 	// server that simply doesn't send the field at all. Nil means
 	// unknown/unsupported, not zero.
-	Behind *int `json:"behind,omitempty"`
+	Behind *int `json:"behind,omitempty,case:strict"`
 }
 
 func NewAck(ackCursor string) Ack {
@@ -986,9 +1030,9 @@ func NewAck(ackCursor string) Ack {
 // canonical message when it arrives. mcp-hub-server never sends this,
 // since a plain hub_send already completes synchronously.
 type SendAck struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId,omitempty"`
-	OK         bool   `json:"ok"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,omitempty,case:strict"`
+	OK         bool   `json:"ok,case:strict"`
 }
 
 // ReactionChanged reports a reaction added to or removed from an earlier
@@ -1005,18 +1049,18 @@ type SendAck struct {
 // event still fires (the removal itself is real information) with PeerID
 // simply absent, rather than being suppressed for lack of full attribution.
 type ReactionChanged struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId"`
-	PeerID     string `json:"peerId,omitempty"`
-	Reaction   string `json:"reaction"`
-	Label      string `json:"label,omitempty"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,case:strict"`
+	PeerID     string `json:"peerId,omitempty,case:strict"`
+	Reaction   string `json:"reaction,case:strict"`
+	Label      string `json:"label,omitempty,case:strict"`
 	// Action is "add" or "remove".
-	Action string `json:"action"`
-	TS     string `json:"ts,omitempty"`
+	Action string `json:"action,case:strict"`
+	TS     string `json:"ts,omitempty,case:strict"`
 	// Own is true when this exact connection made the reaction change —
 	// see wire.Msg.Own for the identical reasoning (a client's own action
 	// isn't news to itself).
-	Own bool `json:"own,omitempty"`
+	Own bool `json:"own,omitempty,case:strict"`
 }
 
 // MessageEdited reports that an earlier message's content changed — by
@@ -1030,11 +1074,11 @@ type ReactionChanged struct {
 // connection's own prior send, and may be permanently false if the
 // sending server has no write access to make edits at all.
 type MessageEdited struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId"`
-	Text       string `json:"text"`
-	TS         string `json:"ts,omitempty"`
-	Own        bool   `json:"own,omitempty"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,case:strict"`
+	Text       string `json:"text,case:strict"`
+	TS         string `json:"ts,omitempty,case:strict"`
+	Own        bool   `json:"own,omitempty,case:strict"`
 	// Attachments mirrors Msg.Attachments — the edited message's current
 	// attachments (inline or reference form, same as a live Msg), not a
 	// diff against what it had before. Absent means the edit itself
@@ -1042,20 +1086,20 @@ type MessageEdited struct {
 	// left them unchanged; a receiving client should keep whatever
 	// attachments it already associated with this externalId in that
 	// case, not treat an absent field here as "now has none."
-	Attachments []Attachment `json:"attachments,omitempty"`
+	Attachments []Attachment `json:"attachments,omitempty,case:strict"`
 	// Format mirrors Msg.Format — how Text should be interpreted.
-	Format string `json:"format,omitempty"`
+	Format string `json:"format,omitempty,case:strict"`
 	// ReplyTo/ReplyPreview mirror Msg.ReplyTo/Msg.ReplyPreview — an edit
 	// never changes what a message replies to, so these are set from the
 	// same underlying reply reference as the original Msg, present here
 	// too so a client that only ever saw the edited version still has it.
-	ReplyTo      string `json:"replyTo,omitempty"`
-	ReplyPreview string `json:"replyPreview,omitempty"`
+	ReplyTo      string `json:"replyTo,omitempty,case:strict"`
+	ReplyPreview string `json:"replyPreview,omitempty,case:strict"`
 	// Mentions/MentionedMe mirror Msg.Mentions/Msg.MentionedMe — an edit
 	// can change who's mentioned, so these reflect the edited text, not
 	// the original.
-	Mentions    []Mention `json:"mentions,omitempty"`
-	MentionedMe bool      `json:"mentionedMe,omitempty"`
+	Mentions    []Mention `json:"mentions,omitempty,case:strict"`
+	MentionedMe bool      `json:"mentionedMe,omitempty,case:strict"`
 }
 
 // Reaction is a client request to add or remove a reaction on an earlier
@@ -1068,12 +1112,12 @@ type MessageEdited struct {
 // react to; for a teams relay with write access to the underlying
 // platform.
 type Reaction struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId"`
-	Reaction   string `json:"reaction"`
-	Action     string `json:"action"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,case:strict"`
+	Reaction   string `json:"reaction,case:strict"`
+	Action     string `json:"action,case:strict"`
 	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
-	AckCursor string `json:"ackCursor,omitempty"`
+	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 }
 
 func NewReactionRequest(externalID, reaction, action string) Reaction {
@@ -1087,11 +1131,11 @@ func NewReactionRequest(externalID, reaction, action string) Reaction {
 // your own messages" rule) — a server is the authority on whether an edit
 // is permitted, not this package.
 type Edit struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId"`
-	Text       string `json:"text"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,case:strict"`
+	Text       string `json:"text,case:strict"`
 	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
-	AckCursor string `json:"ackCursor,omitempty"`
+	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 	// Attachments, like Msg.Attachments, carries inline content (see
 	// Attachment) to attach — always the inline form (ContentType +
 	// ContentBytes), even against a reference-style server, which is
@@ -1100,11 +1144,11 @@ type Edit struct {
 	// means "leave existing attachments as they are" — there is
 	// deliberately no way to express attachment removal via Edit, same as
 	// Msg.
-	Attachments []Attachment `json:"attachments,omitempty"`
+	Attachments []Attachment `json:"attachments,omitempty,case:strict"`
 	// Format is a server extension — see Msg.Format for the full contract
 	// ("text"/"html", unrecognized values refused). Applies to the new
 	// Text this edit sets.
-	Format string `json:"format,omitempty"`
+	Format string `json:"format,omitempty,case:strict"`
 	// ReplyTo requests a native threaded-reply citation to another
 	// message, identified by its externalId — a server extension
 	// (chat-relay), symmetric with the ReplyTo a client receives (see
@@ -1114,12 +1158,12 @@ type Edit struct {
 	// value, since resolving the citation can surface that message's own
 	// preview text — an unvalidated cross-conversation reference is a
 	// disclosure risk, not just a bad request. Empty means "not a reply."
-	ReplyTo string `json:"replyTo,omitempty"`
+	ReplyTo string `json:"replyTo,omitempty,case:strict"`
 	// Mentions requests real platform-native @-mentions on the new Text —
 	// see Mention's doc comment for the full client->server contract.
 	// Absent (nil) means "leave existing mentions as they are," same as
 	// Attachments — there is no way to clear mentions via Edit either.
-	Mentions []Mention `json:"mentions,omitempty"`
+	Mentions []Mention `json:"mentions,omitempty,case:strict"`
 }
 
 func NewEditRequest(externalID, text string, attachments []Attachment, format, replyTo string, mentions []Mention) Edit {
@@ -1135,17 +1179,17 @@ func NewEditRequest(externalID, text string, attachments []Attachment, format, r
 // kept as a field rather than assumed for symmetry with SendAck and in
 // case a server ever has a reason to send a negative ack explicitly.
 type ReactionAck struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId,omitempty"`
-	Reaction   string `json:"reaction,omitempty"`
-	Action     string `json:"action,omitempty"`
-	OK         bool   `json:"ok"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,omitempty,case:strict"`
+	Reaction   string `json:"reaction,omitempty,case:strict"`
+	Action     string `json:"action,omitempty,case:strict"`
+	OK         bool   `json:"ok,case:strict"`
 }
 
 type EditAck struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId,omitempty"`
-	OK         bool   `json:"ok"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,omitempty,case:strict"`
+	OK         bool   `json:"ok,case:strict"`
 }
 
 // Delete is a client request to remove an earlier message, identified by
@@ -1156,10 +1200,10 @@ type EditAck struct {
 // renders a tombstone — this keeps that distinction on the wire instead
 // of asking every client to reconstruct it.
 type Delete struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,case:strict"`
 	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
-	AckCursor string `json:"ackCursor,omitempty"`
+	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 }
 
 func NewDeleteRequest(externalID string) Delete {
@@ -1167,9 +1211,9 @@ func NewDeleteRequest(externalID string) Delete {
 }
 
 type DeleteAck struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId,omitempty"`
-	OK         bool   `json:"ok"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,omitempty,case:strict"`
+	OK         bool   `json:"ok,case:strict"`
 }
 
 // MessageDeleted reports that an earlier message was removed — by
@@ -1180,11 +1224,11 @@ type DeleteAck struct {
 // needing to have seen the original message first. Own is true only when
 // this connection performed the deletion.
 type MessageDeleted struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId"`
-	Cursor     string `json:"cursor,omitempty"`
-	TS         string `json:"ts,omitempty"`
-	Own        bool   `json:"own,omitempty"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,case:strict"`
+	Cursor     string `json:"cursor,omitempty,case:strict"`
+	TS         string `json:"ts,omitempty,case:strict"`
+	Own        bool   `json:"own,omitempty,case:strict"`
 }
 
 // Identity names a person or account on the platform behind a mirrored
@@ -1192,8 +1236,8 @@ type MessageDeleted struct {
 // says which CONNECTION did something, which is neither what the platform
 // displays nor durable, and pins outlive connections.
 type Identity struct {
-	ID   string `json:"id,omitempty"`
-	Name string `json:"name,omitempty"`
+	ID   string `json:"id,omitempty,case:strict"`
+	Name string `json:"name,omitempty,case:strict"`
 }
 
 // Pinned and Unpinned report a change to the pinned set, from anyone —
@@ -1204,45 +1248,45 @@ type Identity struct {
 // its own pin by the externalId it asked for, and by the ack answering
 // that request directly.
 type Pinned struct {
-	Type       Type     `json:"type"`
-	ExternalID string   `json:"externalId"`
-	By         Identity `json:"by"`
-	At         string   `json:"at,omitempty"`
+	Type       Type     `json:"type,case:strict"`
+	ExternalID string   `json:"externalId,case:strict"`
+	By         Identity `json:"by,case:strict"`
+	At         string   `json:"at,omitempty,case:strict"`
 }
 
 type Unpinned struct {
-	Type       Type     `json:"type"`
-	ExternalID string   `json:"externalId"`
-	By         Identity `json:"by"`
-	At         string   `json:"at,omitempty"`
+	Type       Type     `json:"type,case:strict"`
+	ExternalID string   `json:"externalId,case:strict"`
+	By         Identity `json:"by,case:strict"`
+	At         string   `json:"at,omitempty,case:strict"`
 }
 
 // Pin and Unpin request a change. Answered by PinAck/UnpinAck where the
 // server declares "actionAcks" — "pins" says the action exists, actionAcks
 // says an answer is worth waiting for.
 type Pin struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,case:strict"`
 	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
-	AckCursor string `json:"ackCursor,omitempty"`
+	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 }
 
 type Unpin struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId"`
-	AckCursor  string `json:"ackCursor,omitempty"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,case:strict"`
+	AckCursor  string `json:"ackCursor,omitempty,case:strict"`
 }
 
 type PinAck struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId,omitempty"`
-	OK         bool   `json:"ok"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,omitempty,case:strict"`
+	OK         bool   `json:"ok,case:strict"`
 }
 
 type UnpinAck struct {
-	Type       Type   `json:"type"`
-	ExternalID string `json:"externalId,omitempty"`
-	OK         bool   `json:"ok"`
+	Type       Type   `json:"type,case:strict"`
+	ExternalID string `json:"externalId,omitempty,case:strict"`
+	OK         bool   `json:"ok,case:strict"`
 }
 
 // PinsRequest asks for the current pinned set, and PinsResponse answers
@@ -1255,17 +1299,17 @@ type UnpinAck struct {
 // not from a fresh upstream read — otherwise the two disagree under
 // exactly the conditions the pull exists to resolve.
 type PinsRequest struct {
-	Type      Type   `json:"type"`
-	AckCursor string `json:"ackCursor,omitempty"`
+	Type      Type   `json:"type,case:strict"`
+	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 }
 
 type PinsResponse struct {
-	Type Type `json:"type"`
+	Type Type `json:"type,case:strict"`
 	// A pointer-to-slice so an empty list encodes as [] rather than null,
 	// matching Joined.Pinned. The two answers to "what is pinned" should
 	// not have different empty shapes.
-	List *[]string `json:"list"`
-	At   string    `json:"at,omitempty"`
+	List *[]string `json:"list,case:strict"`
+	At   string    `json:"at,omitempty,case:strict"`
 }
 
 func NewPinRequest(externalID string) Pin {

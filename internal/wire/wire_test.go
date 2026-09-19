@@ -1070,3 +1070,60 @@ func TestAnEndlessAttachmentPathDoesNotHangTheSend(t *testing.T) {
 			"reading the whole file first")
 	}
 }
+
+// TestTheWireIsReadCaseSensitively is the guard on a BUILD SETTING, and
+// it fails rather than skips when that setting is missing, because the
+// failure it prevents is silent.
+//
+// chat-relay found, 2026-09-19, that its server had spelled attachment
+// references PascalCase on the live path and camelCase on the history
+// path for as long as hub attachments had existed. Nothing failed and
+// this client could not have reported it: Go's encoding/json matches
+// field names case-insensitively, so it read both spellings happily. Two
+// tolerant readers on one wire means neither side's tests constrain the
+// spelling at all, and what eventually caught it was a human printing a
+// frame while adding an unrelated field.
+//
+// Every wire field is tagged `case:strict`, which encoding/json honours
+// only when the binary is built with GOEXPERIMENT=jsonv2. Without that
+// the tags are parsed and ignored — the tolerant behaviour returns, and
+// nothing anywhere says so. Hence this test: build and test with
+//
+//	GOEXPERIMENT=jsonv2 go test ./...
+//
+// Unknown fields stay ALLOWED, deliberately. A server adding a field an
+// older client has never heard of is how this protocol is meant to grow
+// — that is exactly how `size` arrived — so rejecting unknown names
+// would trade a spelling bug for a compatibility one.
+func TestTheWireIsReadCaseSensitively(t *testing.T) {
+	var m Msg
+	if err := json.Unmarshal([]byte(`{"Text":"wrong spelling"}`), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.Text != "" {
+		t.Fatal("a wire field was matched case-insensitively: this binary was built without " +
+			"GOEXPERIMENT=jsonv2, so every `case:strict` tag on the wire is being ignored and a " +
+			"server could rename a field by its capitalisation without anything here noticing. " +
+			"Build and test with GOEXPERIMENT=jsonv2.")
+	}
+
+	// The agreed spelling still reads, or the tags would have made the
+	// wire unreadable rather than strict.
+	var ok Msg
+	if err := json.Unmarshal([]byte(`{"text":"right spelling"}`), &ok); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if ok.Text != "right spelling" {
+		t.Fatalf("the agreed spelling must still read, got %q", ok.Text)
+	}
+
+	// And a field this client has never heard of is still accepted: that
+	// is how the protocol grows.
+	var future Msg
+	if err := json.Unmarshal([]byte(`{"text":"hello","somethingAddedLater":42}`), &future); err != nil {
+		t.Fatalf("an unknown field must not be an error, got: %v", err)
+	}
+	if future.Text != "hello" {
+		t.Fatalf("an unknown field must not stop the known ones reading, got %q", future.Text)
+	}
+}

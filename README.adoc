@@ -576,10 +576,22 @@ it.
 
 [source,bash]
 ----
+export GOEXPERIMENT=jsonv2
 go build ./...
 go vet ./...
 go test ./...
 ----
+
+`GOEXPERIMENT=jsonv2` is not optional. Every field in `internal/wire`
+is tagged `case:strict`, and Go honours that tag only under this
+experiment; without it the tags are parsed and ignored and the wire is
+read case-insensitively again. That is not a theoretical concern — a
+server on this hub spelled one field two different ways for weeks and no
+test on either side could see it, because both readers were tolerant.
+`internal/wire`'s `TestTheWireIsReadCaseSensitively` fails rather than
+skips when the experiment is missing, so a plain `go test ./...` is
+meant to fail here. Unknown fields remain accepted, deliberately: that
+is how the protocol grows.
 
 All packages (`internal/wire`, `internal/hublog`, `internal/hubsession`,
 `internal/wsserver`, `internal/hubconn`, `internal/waiter`,

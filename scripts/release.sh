@@ -29,13 +29,40 @@ if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 	exit 1
 fi
 
+# jsonv2 is what makes the wire's `case:strict` tags do anything. Built
+# without it they are parsed and ignored, so a released binary would read
+# field names case-insensitively while the test suite asserted it does
+# not — the strictness would exist only on the machine that ran the
+# tests. Exported here so every cross-build below inherits it, and
+# asserted by internal/wire's own guard test, which fails rather than
+# skips when it is missing.
+export GOEXPERIMENT="${GOEXPERIMENT:-jsonv2}"
+
 KEY="${MCP_HUB_SIGNING_KEY:-$HOME/.config/mcp-hub/release-signing.key}"
 PKG="github.com/secforge/mcp-hub/internal/version"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# The public half, for deriving the manifest's keyId. Defaults beside the
+# private key; a release can point elsewhere. Absent means no keyId,
+# which is exactly right for the original key and wrong the moment a
+# second one exists — so its absence is reported rather than assumed.
+PUBKEY="${MCP_HUB_SIGNING_PUBKEY:-${KEY}.pub}"
+if [[ ! -f "$PUBKEY" ]]; then
+	echo "note: no public key at $PUBKEY, so the manifest will carry no keyId." >&2
+	echo "      Correct while this project has one signing key; set MCP_HUB_SIGNING_PUBKEY" >&2
+	echo "      once there is more than one." >&2
+	PUBKEY=""
+fi
+
 [[ -f "$KEY" ]] || {
 	echo "refusing: no signing key at $KEY — an unsigned release cannot be installed by any client" >&2
+	exit 1
+}
+
+echo "==> testing with GOEXPERIMENT=$GOEXPERIMENT"
+go test ./... >/dev/null || {
+	echo "refusing: the suite does not pass under GOEXPERIMENT=$GOEXPERIMENT" >&2
 	exit 1
 }
 
@@ -88,7 +115,7 @@ for PLATFORM in "${PLATFORMS[@]}"; do
 	ASSET="mcp-hub-client-$GOOS-$GOARCH"
 	[[ "$GOOS" == "windows" ]] && ASSET="$ASSET.exe"
 	echo "==> building $ASSET"
-	GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 \
+	GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 GOEXPERIMENT="$GOEXPERIMENT" \
 		go build -ldflags "-X $PKG.Release=$VERSION" -o "$OUT/$ASSET" ./cmd/mcp-hub-client
 
 	# Only meaningful for a binary that runs here; a cross-built one is
@@ -124,6 +151,26 @@ if ! git branch -r --contains "$HEAD_SHA" >/dev/null 2>&1 || \
 	echo "          something the assets were not built from. Push first." >&2
 	exit 1
 fi
+
+# THE MANIFEST, built after every binary exists and before anything is
+# published. It states the version and each binary's sha256, signed with
+# the same key — which is what makes the version a signed fact rather
+# than a tag anybody could serve beside old bytes. The per-binary .sig
+# files stay published for anyone verifying a download by hand; the
+# client reads this instead.
+echo "==> building and signing the release manifest"
+go run ./internal/selfupdate/cmd/manifest \
+	-version "$VERSION" -commit "$HEAD_SHA" -dir "$OUT" -key "$KEY" \
+	${PUBKEY:+-public-key "$PUBKEY"} -expect "${#PLATFORMS[@]}" \
+	-out "$OUT/mcp-hub-release-manifest.json"
+
+# Verified here, against the same public key the client has compiled in,
+# for the same reason every binary is: a manifest that does not verify
+# would be caught by every client that tried to update rather than by
+# the release that published it.
+go run ./internal/selfupdate/cmd/sign -verify \
+	-in "$OUT/mcp-hub-release-manifest.json" \
+	-sig "$OUT/mcp-hub-release-manifest.json.sig"
 
 echo "==> publishing $VERSION at $HEAD_SHA"
 gh release create "$VERSION" "$OUT"/* --title "$VERSION" --target "$HEAD_SHA" "$@"

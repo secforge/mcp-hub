@@ -2020,8 +2020,11 @@ func TestSelfUpdateComparesADevelopmentBuild(t *testing.T) {
 		t.Fatalf("expected the version to be compared, not refused as uncomparable: %s", textOf(res))
 	}
 	// It got past the comparison and stopped for a real reason, stated.
-	if !strings.Contains(textOf(res), "publishes no mcp-hub-client") {
-		t.Fatalf("expected it to fail on the missing asset, got: %s", textOf(res))
+	// That reason is now the missing signed manifest rather than the
+	// missing binary: since the manifest is what says what a release
+	// IS, it is checked before anything is chosen to install.
+	if !strings.Contains(textOf(res), "mcp-hub-release-manifest.json") {
+		t.Fatalf("expected it to fail on the missing signed manifest, got: %s", textOf(res))
 	}
 	if !strings.Contains(textOf(res), "binary is untouched") {
 		t.Fatalf("expected it to state the binary was untouched, got: %s", textOf(res))

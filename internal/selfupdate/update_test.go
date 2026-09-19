@@ -90,14 +90,37 @@ func stagedExecutable(t *testing.T, content string) string {
 	return exe
 }
 
+// releaseFiles builds the asset set a real release publishes: the
+// binary, its own detached signature (still published, for anyone
+// verifying a download by hand), and the signed manifest this client
+// actually reads.
+func releaseFiles(t *testing.T, sign func([]byte) []byte, tag string, binary []byte) map[string][]byte {
+	t.Helper()
+	m := Manifest{
+		Schema:  ManifestSchema,
+		Version: tag,
+		Commit:  "0123456789abcdef0123456789abcdef01234567",
+		Binaries: []ManifestBinary{
+			{Filename: AssetName(), SHA256: Digest(binary)},
+		},
+	}
+	raw, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("marshalling the manifest: %v", err)
+	}
+	return map[string][]byte{
+		AssetName():                   binary,
+		AssetName() + signatureSuffix: sign(binary),
+		ManifestName:                  raw,
+		ManifestSigName:               sign(raw),
+	}
+}
+
 func TestApplyInstallsAVerifiedNewerRelease(t *testing.T) {
 	sign := withKey(t)
 	exe := stagedExecutable(t, "the old binary")
 	newBinary := []byte("the new binary")
-	f := newFakeReleases(t, "v9.9.9", map[string][]byte{
-		AssetName():                   newBinary,
-		AssetName() + signatureSuffix: sign(newBinary),
-	})
+	f := newFakeReleases(t, "v9.9.9", releaseFiles(t, sign, "v9.9.9", newBinary))
 
 	res, err := Apply(context.Background(), "v2.0.1")
 	if err != nil {
@@ -109,30 +132,43 @@ func TestApplyInstallsAVerifiedNewerRelease(t *testing.T) {
 	if got, _ := os.ReadFile(exe); string(got) != string(newBinary) {
 		t.Fatalf("expected the downloaded binary in place, got %q", got)
 	}
-	if len(f.fetched) != 2 {
-		t.Fatalf("expected the asset and its signature to be fetched, got %v", f.fetched)
+	// The manifest, its signature, and the binary. NOT the binary's own
+	// .sig: that is still published for anyone verifying by hand, and
+	// this client verifies through the manifest instead.
+	if len(f.fetched) != 3 {
+		t.Fatalf("expected the manifest, its signature and the asset to be fetched, got %v", f.fetched)
+	}
+	for _, name := range f.fetched {
+		if name == AssetName()+signatureSuffix {
+			t.Fatalf("the per-binary signature should not be downloaded any more, got %v", f.fetched)
+		}
+	}
+	if res.Commit == "" {
+		t.Fatal("expected the signed manifest's commit to be reported")
 	}
 }
 
 // The check that matters most: a binary whose signature does not verify
 // must never reach the executable path, not even briefly.
 func TestApplyRefusesAnUnverifiableBinaryAndLeavesTheOriginal(t *testing.T) {
-	withKey(t)
+	sign := withKey(t)
 	exe := stagedExecutable(t, "the old binary")
 	_, wrongKey, _ := ed25519.GenerateKey(nil)
 	newBinary := []byte("a binary from somewhere else")
-	forged := []byte(base64.StdEncoding.EncodeToString(ed25519.Sign(wrongKey, newBinary)))
-	newFakeReleases(t, "v9.9.9", map[string][]byte{
-		AssetName():                   newBinary,
-		AssetName() + signatureSuffix: forged,
-	})
+	files := releaseFiles(t, sign, "v9.9.9", newBinary)
+	// The manifest is signed by a key this build does not trust, which
+	// is the whole claim: without a verified manifest nothing says what
+	// this release is, so nothing is installed.
+	forged := []byte(base64.StdEncoding.EncodeToString(ed25519.Sign(wrongKey, files[ManifestName])))
+	files[ManifestSigName] = forged
+	newFakeReleases(t, "v9.9.9", files)
 
 	res, err := Apply(context.Background(), "v2.0.1")
 	if err == nil {
-		t.Fatal("expected a binary signed by another key to be refused")
+		t.Fatal("expected a manifest signed by another key to be refused")
 	}
-	if !strings.Contains(err.Error(), "NOT installed") {
-		t.Fatalf("expected the error to state plainly that nothing was installed, got: %v", err)
+	if !strings.Contains(err.Error(), "failed signature verification") {
+		t.Fatalf("expected the error to name the failed verification, got: %v", err)
 	}
 	if res.Replaced {
 		t.Fatal("expected Replaced=false on a verification failure")
@@ -147,18 +183,22 @@ func TestApplyRefusesAnUnverifiableBinaryAndLeavesTheOriginal(t *testing.T) {
 	}
 }
 
-// A release with no signature beside the asset is refused rather than
-// installed on trust — the state every release before signing existed is
-// in, including the one live right now.
-func TestApplyRefusesAReleaseWithNoSignature(t *testing.T) {
-	withKey(t)
+// A release with no signed manifest is refused rather than installed on
+// the strength of its tag — the state every release published before the
+// manifest existed is in, v3.1.3 included.
+func TestApplyRefusesAReleaseWithNoManifest(t *testing.T) {
+	sign := withKey(t)
 	exe := stagedExecutable(t, "the old binary")
-	newFakeReleases(t, "v9.9.9", map[string][]byte{AssetName(): []byte("unsigned")})
+	body := []byte("signed, but unaccounted for")
+	newFakeReleases(t, "v9.9.9", map[string][]byte{
+		AssetName():                   body,
+		AssetName() + signatureSuffix: sign(body),
+	})
 
 	if _, err := Apply(context.Background(), "v2.0.1"); err == nil {
-		t.Fatal("expected an unsigned release to be refused")
-	} else if !strings.Contains(err.Error(), "cannot be verified") {
-		t.Fatalf("expected the reason to be the missing signature, got: %v", err)
+		t.Fatal("expected a release with no signed manifest to be refused")
+	} else if !strings.Contains(err.Error(), ManifestName) {
+		t.Fatalf("expected the reason to name the missing manifest, got: %v", err)
 	}
 	if got, _ := os.ReadFile(exe); string(got) != "the old binary" {
 		t.Fatalf("expected the original untouched, got %q", got)
@@ -169,10 +209,7 @@ func TestApplyDoesNothingWhenAlreadyCurrent(t *testing.T) {
 	sign := withKey(t)
 	stagedExecutable(t, "the old binary")
 	body := []byte("same release")
-	newFakeReleases(t, "v2.0.1", map[string][]byte{
-		AssetName():                   body,
-		AssetName() + signatureSuffix: sign(body),
-	})
+	newFakeReleases(t, "v2.0.1", releaseFiles(t, sign, "v2.0.1", body))
 
 	res, err := Apply(context.Background(), "v2.0.1")
 	if err != nil {
@@ -190,10 +227,7 @@ func TestApplyRefusesToDowngrade(t *testing.T) {
 	sign := withKey(t)
 	exe := stagedExecutable(t, "the old binary")
 	body := []byte("an older release")
-	newFakeReleases(t, "v1.9.0", map[string][]byte{
-		AssetName():                   body,
-		AssetName() + signatureSuffix: sign(body),
-	})
+	newFakeReleases(t, "v1.9.0", releaseFiles(t, sign, "v1.9.0", body))
 
 	res, err := Apply(context.Background(), "v2.0.1")
 	if err != nil {
@@ -211,12 +245,27 @@ func TestApplyReportsAReleaseWithNothingForThisPlatform(t *testing.T) {
 	sign := withKey(t)
 	stagedExecutable(t, "the old binary")
 	other := []byte("a binary for some other platform")
-	newFakeReleases(t, "v9.9.9", map[string][]byte{
-		"mcp-hub-client-plan9-mips":                   other,
-		"mcp-hub-client-plan9-mips" + signatureSuffix: sign(other),
-	})
+	files := releaseFiles(t, sign, "v9.9.9", other)
+	// Published under a name this platform will never ask for, and the
+	// manifest accounts for that name rather than this one.
+	delete(files, AssetName())
+	delete(files, AssetName()+signatureSuffix)
+	files["mcp-hub-client-plan9-mips"] = other
+	files["mcp-hub-client-plan9-mips"+signatureSuffix] = sign(other)
+	m := Manifest{
+		Schema: ManifestSchema, Version: "v9.9.9",
+		Commit:   "0123456789abcdef0123456789abcdef01234567",
+		Binaries: []ManifestBinary{{Filename: "mcp-hub-client-plan9-mips", SHA256: Digest(other)}},
+	}
+	raw, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("marshalling the manifest: %v", err)
+	}
+	files[ManifestName] = raw
+	files[ManifestSigName] = sign(raw)
+	newFakeReleases(t, "v9.9.9", files)
 
-	_, err := Apply(context.Background(), "v2.0.1")
+	_, err = Apply(context.Background(), "v2.0.1")
 	if err == nil {
 		t.Fatal("expected a release with no asset for this platform to be reported")
 	}
@@ -359,5 +408,119 @@ func TestAReleaseSortsBelowEvenADotZeroDevBuild(t *testing.T) {
 	}
 	if back {
 		t.Fatal("expected 1.4.1 NOT to be newer than 1.4.1.0")
+	}
+}
+
+// TestApplyRefusesAReplayedOldReleaseWearingANewTag is the whole point
+// of the manifest, and the defect docs/known-issues.md recorded from
+// 2026-09-15 until now.
+//
+// Every binary was signed, so the bytes were accounted for; the VERSION
+// was not, because it came from the git tag, which is GitHub metadata
+// and signed by nothing. Whoever could shape that response could serve
+// tag v99.0.0 beside a genuine, genuinely signed old binary and its
+// genuine signature: every signature check passed, the comparison passed
+// because the tag said 99, and a known-buggy build installed over a good
+// one. TLS to api.github.com was the only thing standing in the way,
+// which is a real control and a different one from the ordering the code
+// claimed to rely on.
+func TestApplyRefusesAReplayedOldReleaseWearingANewTag(t *testing.T) {
+	sign := withKey(t)
+	exe := stagedExecutable(t, "the good binary")
+
+	// A genuine old release: really signed, really published, really
+	// v1.0.0 — served under a tag claiming to be far newer.
+	old := []byte("a known-buggy old binary")
+	files := releaseFiles(t, sign, "v1.0.0", old)
+	newFakeReleases(t, "v99.0.0", files)
+
+	res, err := Apply(context.Background(), "v2.0.1")
+	if err == nil {
+		t.Fatal("expected a tag and a signed version that disagree to stop the install")
+	}
+	if !strings.Contains(err.Error(), "disagree") {
+		t.Fatalf("expected the error to name the disagreement, got: %v", err)
+	}
+	if res.Replaced {
+		t.Fatal("expected nothing installed")
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "the good binary" {
+		t.Fatalf("expected the running binary untouched, got %q", got)
+	}
+}
+
+// And the same attack with the tag left honest: an old release replayed
+// as itself is refused by the ordering, now computed from the SIGNED
+// version rather than from the tag.
+func TestApplyRefusesAnOlderSignedVersion(t *testing.T) {
+	sign := withKey(t)
+	exe := stagedExecutable(t, "the good binary")
+	old := []byte("a known-buggy old binary")
+	newFakeReleases(t, "v1.0.0", releaseFiles(t, sign, "v1.0.0", old))
+
+	res, err := Apply(context.Background(), "v2.0.1")
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if res.Replaced {
+		t.Fatal("expected no downgrade to an older signed release")
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "the good binary" {
+		t.Fatalf("expected the running binary untouched, got %q", got)
+	}
+}
+
+// A manifest that verifies but does not account for the file being
+// installed leaves the binary unchecked. Swapping the bytes behind an
+// accounted-for name is the same hole from the other side.
+func TestApplyRefusesABinaryTheManifestDoesNotMatch(t *testing.T) {
+	sign := withKey(t)
+	exe := stagedExecutable(t, "the good binary")
+	announced := []byte("the binary that was released")
+	files := releaseFiles(t, sign, "v9.9.9", announced)
+	// Manifest untouched and validly signed; the served bytes are not
+	// the ones it is signed for.
+	files[AssetName()] = []byte("something else entirely")
+	newFakeReleases(t, "v9.9.9", files)
+
+	res, err := Apply(context.Background(), "v2.0.1")
+	if err == nil {
+		t.Fatal("expected bytes that do not match the signed digest to be refused")
+	}
+	if !strings.Contains(err.Error(), "NOT installed") {
+		t.Fatalf("expected the error to say plainly that nothing was installed, got: %v", err)
+	}
+	if res.Replaced {
+		t.Fatal("expected Replaced=false")
+	}
+	if got, _ := os.ReadFile(exe); string(got) != "the good binary" {
+		t.Fatalf("expected the running binary untouched, got %q", got)
+	}
+}
+
+// A manifest with no entry for this platform's binary is not a reason to
+// install it unchecked.
+func TestApplyRefusesABinaryTheManifestDoesNotMention(t *testing.T) {
+	sign := withKey(t)
+	stagedExecutable(t, "the good binary")
+	body := []byte("unaccounted for")
+	files := releaseFiles(t, sign, "v9.9.9", body)
+	m := Manifest{
+		Schema: ManifestSchema, Version: "v9.9.9",
+		Commit:   "0123456789abcdef0123456789abcdef01234567",
+		Binaries: []ManifestBinary{{Filename: "mcp-hub-client-plan9-mips", SHA256: Digest(body)}},
+	}
+	raw, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("marshalling: %v", err)
+	}
+	files[ManifestName] = raw
+	files[ManifestSigName] = sign(raw)
+	newFakeReleases(t, "v9.9.9", files)
+
+	if _, err := Apply(context.Background(), "v2.0.1"); err == nil {
+		t.Fatal("expected a binary the manifest does not account for to be refused")
+	} else if !strings.Contains(err.Error(), "does not account for") {
+		t.Fatalf("expected the error to say the manifest does not account for it, got: %v", err)
 	}
 }
