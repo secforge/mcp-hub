@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/secforge/mcp-hub/internal/hubsession"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -102,28 +103,87 @@ func TestWaitReturnsImmediatelyIfAlreadyBuffered(t *testing.T) {
 // unambiguous, and everything is still on the server.
 func TestAnUndrainedPeerIsAbandonedRatherThanTrimmed(t *testing.T) {
 	p := newHTTPPeer("p1", "test", "")
-	ended := 0
-	p.onAbandon = func() { ended++ }
+	// Counted through a channel, not a plain int: giving up the
+	// connection now runs on its own goroutine, because doing it inline
+	// deadlocked the session that was calling Deliver.
+	ends := make(chan struct{}, 8)
+	p.onAbandon = func() { ends <- struct{}{} }
+	ended := func() int { return len(ends) }
 
 	for i := 0; i < maxBufferedEvents; i++ {
 		p.Deliver(wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "hello", "2026-09-16T00:00:00Z", nil, "", "", nil))
 	}
-	if p.Abandoned() || ended != 0 {
+	if p.Abandoned() || ended() != 0 {
 		t.Fatalf("expected a peer within the bound to be left alone, abandoned=%v ended=%d",
-			p.Abandoned(), ended)
+			p.Abandoned(), ended())
 	}
 
 	p.Deliver(wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "one too many", "2026-09-16T00:00:00Z", nil, "", "", nil))
 	if !p.Abandoned() {
 		t.Fatal("expected the peer to be abandoned past the bound")
 	}
-	if ended != 1 {
-		t.Fatalf("expected the connection to be ended exactly once, got %d", ended)
+	select {
+	case <-ends:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the connection to be ended once the bound was passed")
+	}
+	// And exactly once: every later Deliver still sees an over-full
+	// buffer, and firing again would repeat a teardown already done.
+	p.Deliver(wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440000", "and another", "2026-09-16T00:00:00Z", nil, "", "", nil))
+	time.Sleep(50 * time.Millisecond)
+	if n := ended(); n != 0 {
+		t.Fatalf("expected the connection to be ended exactly once, got %d more", n)
 	}
 
 	// Nothing was thrown away on the way: what it held is still there to
 	// be read, which is what makes "reconnect and catch up" honest.
-	if got := len(p.Drain()); got != maxBufferedEvents+1 {
+	if got := len(p.Drain()); got != maxBufferedEvents+2 {
 		t.Fatalf("expected everything buffered to survive, got %d", got)
+	}
+}
+
+// TestAnAbandonedPeerDoesNotDeadlockItsSession is Codex's finding,
+// 2026-09-19, reproduced here against the real wiring: Session broadcasts
+// with its own mutex held, so a peer that gives up mid-broadcast and
+// reaches back into Session.Leave takes a non-reentrant lock its caller
+// already holds. The session — every peer in it, not just the one that
+// overflowed — stopped there.
+//
+// The existing overflow test could not see it: its onAbandon only counted,
+// so nothing ever re-entered the session.
+func TestAnAbandonedPeerDoesNotDeadlockItsSession(t *testing.T) {
+	sess := hubsession.NewManager().GetOrCreate("deadlock-session")
+
+	var undrained *httpPeer
+	sess.Join("", func(id string) hubsession.Peer {
+		undrained = newHTTPPeer(id, "nobody is reading me", "")
+		// Exactly what httpmcp's connect path wires up.
+		undrained.onAbandon = func() { sess.Leave(undrained) }
+		return undrained
+	}, nil)
+
+	var reader hubsession.Peer
+	sess.Join("", func(id string) hubsession.Peer {
+		reader = newHTTPPeer(id, "reader", "")
+		return reader
+	}, nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i <= maxBufferedEvents+1; i++ {
+			sess.Broadcast(reader, wire.NewBroadcastMsg(
+				"550e8400-e29b-41d4-a716-446655440000", "flood", "2026-09-19T00:00:00Z", nil, "", "", nil))
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the session deadlocked: a peer abandoned mid-broadcast re-entered Session.Leave " +
+			"while the broadcast still held the session lock")
+	}
+	if !undrained.Abandoned() {
+		t.Fatal("expected the undrained peer to have been given up")
 	}
 }

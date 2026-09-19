@@ -417,7 +417,7 @@ func TestAClosedWindowStillDeliversThisClientsOwnNotices(t *testing.T) {
 func TestAdjustingACostCorrectsTheEntryRatherThanDoubleCharging(t *testing.T) {
 	b := testBudget(t)
 	b.charge("", "c1", 100)
-	b.adjust("c1", 180)
+	b.adjust("", "c1", 180)
 	if b.bytes != 180 {
 		t.Fatalf("bytes = %d, want 180", b.bytes)
 	}
@@ -525,5 +525,42 @@ func TestAForeignCursorReleasesNothing(t *testing.T) {
 	if b.bytes != 200 || len(b.outstanding) != 2 {
 		t.Fatalf("expected nothing released for a foreign cursor, got %d bytes / %d entries",
 			b.bytes, len(b.outstanding))
+	}
+}
+
+// TestTwoConnectionsWithTheSameCursorKeepTheirOwnCharges is Codex's
+// finding, 2026-09-19: cursors are opaque and issued per server, so two
+// connections sharing one ledger can legitimately hold the same value.
+// note and adjust matched on the cursor alone, so one connection's entry
+// answered for the other's — a confirm released nothing, and a byte
+// correction moved the wrong charge.
+func TestTwoConnectionsWithTheSameCursorKeepTheirOwnCharges(t *testing.T) {
+	b := testBudget(t)
+	b.charge("alpha", "same-cursor", 100)
+	b.charge("beta", "same-cursor", 100)
+
+	// The correction belongs to alpha alone.
+	b.adjust("alpha", "same-cursor", 300)
+	for _, ch := range b.outstanding {
+		if ch.owner == "beta" && ch.bytes != 100 {
+			t.Fatalf("beta's charge was moved by alpha's correction: %d", ch.bytes)
+		}
+		if ch.owner == "alpha" && ch.bytes != 300 {
+			t.Fatalf("alpha's own charge was not corrected: %d", ch.bytes)
+		}
+	}
+
+	// And a note for beta must still land, rather than being swallowed
+	// because alpha already holds that cursor.
+	b.note("beta", "noted-cursor")
+	b.note("alpha", "noted-cursor")
+	owners := map[string]bool{}
+	for _, ch := range b.outstanding {
+		if ch.cursor == "noted-cursor" {
+			owners[ch.owner] = true
+		}
+	}
+	if !owners["alpha"] || !owners["beta"] {
+		t.Fatalf("expected both connections to have their own entry for the same cursor, got %v", owners)
 	}
 }

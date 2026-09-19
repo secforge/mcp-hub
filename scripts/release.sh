@@ -112,6 +112,19 @@ for PLATFORM in "${PLATFORMS[@]}"; do
 	go run ./internal/selfupdate/cmd/sign -verify -in "$OUT/$ASSET" -sig "$OUT/$ASSET.sig"
 done
 
-echo "==> publishing $VERSION"
-gh release create "$VERSION" "$OUT"/* --title "$VERSION" "$@"
+# The tag is created at the COMMIT THAT WAS BUILT, named explicitly.
+# Without --target, a new tag is created at the remote default branch's
+# head — so a release cut from a feature branch, or from a commit that
+# was never pushed, tags something other than the code inside the assets
+# it publishes. The binaries would be signed, verified, and wrong.
+HEAD_SHA="$(git rev-parse HEAD)"
+if ! git branch -r --contains "$HEAD_SHA" >/dev/null 2>&1 || \
+	[[ -z "$(git branch -r --contains "$HEAD_SHA" 2>/dev/null)" ]]; then
+	echo "refusing: HEAD ($HEAD_SHA) is not on any remote branch, so the tag would point at" >&2
+	echo "          something the assets were not built from. Push first." >&2
+	exit 1
+fi
+
+echo "==> publishing $VERSION at $HEAD_SHA"
+gh release create "$VERSION" "$OUT"/* --title "$VERSION" --target "$HEAD_SHA" "$@"
 echo "==> done: $(gh release view "$VERSION" --json url --jq .url)"

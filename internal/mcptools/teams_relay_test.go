@@ -1122,14 +1122,19 @@ func TestTeamsRelayConnectRejectsLinkWithoutFragment(t *testing.T) {
 	}
 }
 
-// TestCatchUpWithNoPriorPositionAndNoBehindReportsNothingToCatchUp covers
-// the common case for a fresh connection: no lastHandedOverCursor yet
-// (nothing pulled before) and the server didn't report Behind (or
-// reported 0) — there's nothing to walk or seek from, so this should
-// say so rather than send a request at all.
-func TestCatchUpWithNoPriorPositionAndNoBehindReportsNothingToCatchUp(t *testing.T) {
+// TestCatchUpWithNoPriorPositionAndAZeroBehindReportsNothingToCatchUp
+// covers the fresh connection a server can actually answer about: no
+// lastHandedOverCursor here, and the server states 0 behind — which it
+// can only state because it holds a position for this peer. Nothing to
+// walk, and saying so is honest.
+//
+// The absent case is deliberately NOT this test: see
+// TestAnAbsentBacklogIsNotReportedAsCaughtUp, which is the same shape
+// with the field omitted and the opposite expectation.
+func TestCatchUpWithNoPriorPositionAndAZeroBehindReportsNothingToCatchUp(t *testing.T) {
 	link := startRelayTestServerWithJoined(t, wire.Joined{
 		Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion,
+		Behind: wire.BehindCount(0),
 	})
 	ctx := context.Background()
 	hub := NewHub()
@@ -2391,17 +2396,30 @@ func TestLiveDeliveryConfirmsItselfOnceKnownCaughtUp(t *testing.T) {
 		}
 		raw, _ := json.Marshal(joined)
 		conn.WriteMessage(websocket.TextMessage, raw)
+		// ONE WRITER AT A TIME. This fixture answers reads on its own
+		// goroutine while the test pushes live messages from another,
+		// and a websocket permits exactly one concurrent writer — the
+		// same rule the real server obeys with a single write loop.
+		// Without this the two raced on the connection's write state,
+		// which -race reported against the fixture rather than against
+		// anything it was testing.
+		var writeMu sync.Mutex
+		write := func(v any) {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			conn.WriteJSON(v)
+		}
 		go func() {
 			for {
 				var m wire.MessageAfter
 				if err := conn.ReadJSON(&m); err != nil {
 					return
 				}
-				conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+				write(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
 			}
 		}()
 		for cursor := range live {
-			conn.WriteJSON(wire.Msg{
+			write(wire.Msg{
 				Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440099",
 				Text: "live " + cursor, Cursor: cursor,
 			})
@@ -3541,12 +3559,20 @@ func TestAnnouncedRestartKeepsTheFollowerAlive(t *testing.T) {
 	}
 }
 
-// An ambiguous drop is not a planned restart: nothing says the
-// connection is coming back, so it LEAVES the channel and the reader is
-// told by name. The channel itself stays — it carries the other
-// connections, and a reader released here could not be reattached by the
-// next connect.
-func TestUnannouncedDropDetachesTheConnectionButKeepsTheChannel(t *testing.T) {
+// An ambiguous drop is not a planned restart, but it is not an ending
+// either: nothing said the connection was coming back, and nothing said
+// it was not, so this client tries — the standing rule is that only a
+// permanent refusal stops the retrying. The name is therefore HELD while
+// that runs (a name released mid-reconnect is a name a manual dial could
+// take from under it), and the channel stays either way, because it
+// carries the other connections.
+//
+// This test previously asserted the opposite, and passed for a bad
+// reason: redialLink was recorded after the drop callback was
+// registered, so a drop in that window answered "not coming back" about
+// a connection that was, released the name, and satisfied the
+// assertion. Fixing that window is what exposed the expectation.
+func TestUnannouncedDropKeepsTheNameWhileItComesBack(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	link, _ := restartOnceServer(t, false, 0)
 	ctx := context.Background()
@@ -3558,23 +3584,31 @@ func TestUnannouncedDropDetachesTheConnectionButKeepsTheChannel(t *testing.T) {
 	}
 	defer hub.handleDisconnect(ctx, connReqFor(testConn))
 
-	// The teardown runs on its own goroutine now, so it lands without
-	// waiting for a tool call — and it RELEASES THE NAME, which is the
-	// point: a connection that is not coming back gives its name up so
-	// reconnecting under it works.
-	if !waitFor(t, "teardown", func() bool {
+	// The teardown runs on its own goroutine, so it lands without waiting
+	// for a tool call. What it must NOT do is release the name: a
+	// reconnect is in flight under it.
+	if !waitFor(t, "reconnect pending", func() bool {
 		hub.mu.Lock()
-		defer hub.mu.Unlock()
-		return len(hub.sessions) == 0
+		sess := hub.sessions[testConn]
+		hub.mu.Unlock()
+		if sess == nil {
+			return false
+		}
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return sess.reconnecting
 	}) {
-		t.Fatal("expected the dead connection to be torn down and its name released")
+		t.Fatal("expected the dropped connection to be reconnecting under its own name")
+	}
+	hub.mu.Lock()
+	held := len(hub.sessions)
+	hub.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("expected the name to be held while the reconnect runs, got %d session(s)", held)
 	}
 	w := hub.currentWaiter()
 	if w == nil {
 		t.Fatal("expected the wait channel to survive one connection dropping")
-	}
-	if attached := w.Attached(); len(attached) != 0 {
-		t.Fatalf("expected the dropped connection to leave the channel, still attached: %v", attached)
 	}
 }
 
@@ -4910,5 +4944,39 @@ func TestAReadStartingElsewhereLeavesTheGapAlone(t *testing.T) {
 	}
 	if got.AnchorCursor != "the-gaps-own-anchor" {
 		t.Fatalf("expected the gap's anchor untouched, got %q", got.AnchorCursor)
+	}
+}
+
+// TestAConfirmOfOurOwnCursorIsNotRefusedBecauseAnotherConnectionUsesIt is
+// Codex's finding, 2026-09-19: cursorBelongsElsewhere asked only whether
+// another connection had delivered the cursor, never whether this one
+// had. Two servers can legitimately issue the same opaque value, so a
+// reader that confirmed exactly what it had just been handed was refused,
+// and its position never moved.
+func TestAConfirmOfOurOwnCursorIsNotRefusedBecauseAnotherConnectionUsesIt(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub := NewHub()
+	mine, err := hub.open("mine")
+	if err != nil {
+		t.Fatalf("opening a session: %v", err)
+	}
+	theirs, err := hub.open("theirs")
+	if err != nil {
+		t.Fatalf("opening a second session: %v", err)
+	}
+
+	// The same opaque string handed over by both connections.
+	mine.noteDelivered("shared-cursor")
+	theirs.noteDelivered("shared-cursor")
+
+	if other := hub.cursorBelongsElsewhere(mine, "shared-cursor"); other != "" {
+		t.Fatalf("refused a confirm of a cursor this connection delivered itself, blaming %q", other)
+	}
+
+	// And a cursor this connection never saw is still attributed, which
+	// is the check's whole reason to exist.
+	theirs.noteDelivered("only-theirs")
+	if other := hub.cursorBelongsElsewhere(mine, "only-theirs"); other != "theirs" {
+		t.Fatalf("expected a cursor only the other connection delivered to be named, got %q", other)
 	}
 }

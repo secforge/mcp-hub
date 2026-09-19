@@ -531,6 +531,15 @@ func (h *Hub) cursorBelongsElsewhere(mine *session, cursor string) string {
 	if cursor == "" {
 		return ""
 	}
+	// THIS connection's own delivery settles it. Two servers can issue
+	// the same opaque value, and asking only "did anyone else deliver
+	// this" refused a confirm of a cursor this very connection had handed
+	// over — the reader was told to confirm what it read, did exactly
+	// that, and was turned away. A cursor delivered here is ours whoever
+	// else happens to use the same string.
+	if mine != nil && mine.hasDelivered(cursor) {
+		return ""
+	}
 	for _, other := range h.allSessions() {
 		if other == mine {
 			continue
@@ -583,4 +592,15 @@ func (h *Hub) ensureWaiter() (*waiter.Waiter, error) {
 	}
 	h.waiter = w
 	return w, nil
+}
+
+// owns reports whether name still maps to this exact session. A session
+// that was closed (hub_disconnect) keeps working as an object while
+// anything holds a pointer to it, so "am I still the one" is a question
+// only the hub can answer — see reconnectOnce, which must not install a
+// live connection into a session the name no longer reaches.
+func (h *Hub) owns(s *session) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sessions[s.name] == s
 }

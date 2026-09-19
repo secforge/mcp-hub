@@ -94,7 +94,10 @@ func (p *httpPeer) Deliver(event any) {
 	}
 	p.mu.Lock()
 	p.buffer = append(p.buffer, ev)
-	abandoned := len(p.buffer) > maxBufferedEvents
+	// Only the FIRST crossing gives up the connection. Every later
+	// Deliver still sees an over-full buffer, and firing again would
+	// repeat a teardown that has already happened.
+	abandoned := len(p.buffer) > maxBufferedEvents && !p.abandoned
 	if abandoned {
 		p.abandoned = true
 	}
@@ -102,9 +105,14 @@ func (p *httpPeer) Deliver(event any) {
 	p.woken = make(chan struct{})
 	p.mu.Unlock()
 	if abandoned && p.onAbandon != nil {
-		// Outside the lock: giving up the connection reaches back into
-		// the session, which takes locks of its own.
-		p.onAbandon()
+		// ON ITS OWN GOROUTINE, not merely outside this peer's lock.
+		// Deliver is called from Session.broadcastExceptLocked with the
+		// SESSION's mutex held, and giving up the connection ends by
+		// calling Session.Leave, which takes that same non-reentrant
+		// mutex: the session deadlocked on itself, and with it every
+		// other peer in it. Releasing p.mu here was never enough,
+		// because p.mu was not the lock in the cycle.
+		go p.onAbandon()
 	}
 }
 

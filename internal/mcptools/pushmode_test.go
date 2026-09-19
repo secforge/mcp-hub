@@ -3,14 +3,19 @@ package mcptools
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gorilla/websocket"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/secforge/harness-transport/deliver"
 	"github.com/secforge/mcp-hub/internal/harness"
+	"github.com/secforge/mcp-hub/internal/wire"
 )
 
 // inPushMode makes this process look like an MCP server launched by a
@@ -573,5 +578,131 @@ func TestWithoutAnInboxTheGuidanceSaysToUseHubSend(t *testing.T) {
 	got = buildWaitBlock(context.Background(), nil, "reconnect somehow", true)
 	if !strings.Contains(got, "SendMessage") {
 		t.Errorf("expected the address path where an inbox exists:\n%s", got)
+	}
+}
+
+// TestABacklogIsReturnedWhenThereIsNothingToPushInto covers the report
+// from the owner's own hub, 2026-09-19: a Codex peer called hub_catch_up,
+// was told the messages were being delivered to it, and never saw one.
+// A push-only process whose harness cannot be reached pushed every
+// message into nothing and then pushed the report saying so down the same
+// dead channel. The backlog now comes back in the tool result, which is
+// the one delivery path that cannot fail silently.
+func TestABacklogIsReturnedWhenThereIsNothingToPushInto(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	restore := harness.ClearEnvForTesting()
+	defer restore()
+	codexPushOnly.Store(true)
+	defer codexPushOnly.Store(false)
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			conn.WriteJSON(wire.Msg{
+				Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+				Text: "the message codex could not see", TS: "2026-09-19T17:00:00Z",
+				Cursor: "unpushable-1", ExternalID: "ext-unpushable-1",
+				Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor},
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	res, err := hub.handleCatchUp(ctx, connReqFor(testConn))
+	if err != nil || res.IsError {
+		t.Fatalf("hub_catch_up failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if strings.Contains(text, "being DELIVERED to you") {
+		t.Fatalf("promised a delivery this process cannot make:\n%s", text)
+	}
+	if !strings.Contains(text, "the message codex could not see") {
+		t.Fatalf("expected the backlog to come back in the result, got:\n%s", text)
+	}
+	if !strings.Contains(text, "RETURNED here") {
+		t.Fatalf("expected the result to say why it came back here, got:\n%s", text)
+	}
+}
+
+// TestAnAbsentBacklogIsNotReportedAsCaughtUp is chat-relay's finding,
+// 2026-09-19, from seven days of its own server log: a Codex peer joined
+// three times, was told behind=absent every time, and had never confirmed
+// a cursor. `behind` is omitted when the server holds no acked cursor —
+// "I have no idea where you are", not "you are caught up" — and this
+// client collapsed the two into one answer.
+func TestAnAbsentBacklogIsNotReportedAsCaughtUp(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// No Behind field at all: exactly what a server sends a peer it
+		// holds no acked cursor for.
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000", ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			conn.WriteJSON(wire.Msg{
+				Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+				Text: "a message the server could not say was missed", TS: "2026-09-19T17:20:00Z",
+				Cursor: "absent-1", ExternalID: "ext-absent-1",
+				Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor},
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	res, err := hub.handleCatchUp(ctx, connReqFor(testConn))
+	if err != nil || res.IsError {
+		t.Fatalf("hub_catch_up failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if strings.Contains(text, "nothing to catch up") {
+		t.Fatalf("an absent count was reported as caught up:\n%s", text)
+	}
+	if !strings.Contains(text, "NOT that you are caught up") {
+		t.Fatalf("expected the absence to be named as an absence, got:\n%s", text)
+	}
+	if !strings.Contains(text, "a message the server could not say was missed") {
+		t.Fatalf("expected the backlog to actually be walked, got:\n%s", text)
 	}
 }

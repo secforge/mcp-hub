@@ -570,6 +570,13 @@ func TestManagerGetOrCreateReturnsSameSession(t *testing.T) {
 	if s1 != s2 {
 		t.Fatal("GetOrCreate should return the same session for the same id")
 	}
+	// Each GetOrCreate is an arrival in progress, and a session with
+	// someone still arriving is not empty — so both are joined and left
+	// here rather than dropped on the floor. See GetOrCreate's contract.
+	a := joinFake(s1, "", "", "", nil)
+	b := joinFake(s2, "", "", "", nil)
+	s1.Leave(a)
+	s2.Leave(b)
 	m.Remove("session-1")
 	s3 := m.GetOrCreate("session-1")
 	if s3 == s1 {
@@ -614,5 +621,50 @@ func TestRemoveStillDropsAnEmptySession(t *testing.T) {
 	m.Remove("s2")
 	if got := m.GetOrCreate("s2"); got == s {
 		t.Fatal("expected an empty session to be removed")
+	}
+}
+
+// TestASessionIsNotRemovedWhileSomeoneIsStillArriving is Codex's finding,
+// 2026-09-19: holding the session object was not the same as being in it.
+// A connection could take S from GetOrCreate, be descheduled before Join,
+// and in that window the last peer leaves and Remove deletes S. The
+// pending join then enters a session nobody else can reach, while the
+// next connection for the same id gets a fresh object — two peers
+// correctly joined to one session id, in different objects, invisible to
+// each other with nothing anywhere reporting an error.
+func TestASessionIsNotRemovedWhileSomeoneIsStillArriving(t *testing.T) {
+	m := NewManager()
+
+	first := m.GetOrCreate("split")
+	leaver, _ := first.Join("", func(id string) Peer { return &fakePeer{id: id} }, nil)
+
+	// The second connection has the session in hand but has not joined it
+	// yet — the whole window.
+	arriving := m.GetOrCreate("split")
+
+	if empty := first.Leave(leaver); !empty {
+		t.Fatal("expected the session to report itself empty of PEERS after the only one left")
+	}
+	m.Remove("split")
+
+	// Whoever connects next must land in the same object the pending join
+	// is about to enter.
+	if again := m.GetOrCreate("split"); again != arriving {
+		t.Fatal("the session was removed while a join was still in flight: the next connection " +
+			"got a different object for the same session id")
+	}
+}
+
+// And once everyone really has gone — nobody in it and nobody arriving —
+// removal still works, or a session id would be poisoned for the life of
+// the process.
+func TestAnEmptySessionIsStillRemoved(t *testing.T) {
+	m := NewManager()
+	s := m.GetOrCreate("ordinary")
+	p, _ := s.Join("", func(id string) Peer { return &fakePeer{id: id} }, nil)
+	s.Leave(p)
+	m.Remove("ordinary")
+	if again := m.GetOrCreate("ordinary"); again == s {
+		t.Fatal("expected an empty session with nobody arriving to be removed")
 	}
 }

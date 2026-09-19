@@ -66,6 +66,9 @@ type Session struct {
 	// client and the server ever see it — so only whoever actually holds it
 	// can reclaim the identity it maps to.
 	secretToPeerID map[string]string
+	// joining counts connections that hold this session but have not yet
+	// been added to it — see Manager.GetOrCreate.
+	joining int
 }
 
 func newSession(id string) *Session {
@@ -105,6 +108,13 @@ func newSession(id string) *Session {
 func (s *Session) Join(reconnectSecret string, makePeer func(peerID string) Peer, beforeVisible func()) (p Peer, reused bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The admission GetOrCreate took out is consumed here, under the same
+	// lock hold that adds the peer — so from the manager's point of view
+	// this session goes straight from "someone is arriving" to "someone
+	// is here", with no instant in between where it looks empty.
+	if s.joining > 0 {
+		s.joining--
+	}
 
 	peerID, reused, supersede := s.resolvePeerIDLocked(reconnectSecret)
 	if supersede != nil {
@@ -235,10 +245,12 @@ func (s *Session) Leave(p Peer) (empty bool) {
 // isEmpty reports whether nobody is in this session right now. Used by
 // Manager.Remove to re-check at the moment of deletion rather than act on
 // an answer that was true when Leave returned it.
+// isEmpty is "nobody here AND nobody on their way" — see GetOrCreate for
+// why the second half is not optional.
 func (s *Session) isEmpty() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.peers) == 0
+	return len(s.peers) == 0 && s.joining == 0
 }
 
 // Peers returns a snapshot of everyone currently in the session, in no
@@ -305,14 +317,32 @@ func NewManager() *Manager {
 	return &Manager{sessions: make(map[string]*Session)}
 }
 
+// GetOrCreate returns the session for id, registering an ADMISSION that
+// keeps it alive until the caller's Join consumes it.
+//
+// Without that, holding the object was not the same as being in it: a
+// connection could take S here, be descheduled before Join, and in that
+// window the last peer leaves and Remove deletes S. The pending join then
+// enters a session no longer in the map, while the next connection for
+// the same id gets a fresh object — two peers correctly joined to the
+// same session id, sitting in different objects, invisible to each other
+// with no error anywhere to say so.
+//
+// Every caller must therefore call Join. A caller that takes a session
+// and never joins holds the admission open and leaves an empty session in
+// the map — a leak, but a visible and bounded one, where the alternative
+// was a silent split.
 func (m *Manager) GetOrCreate(id string) *Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[id]; ok {
-		return s
+	s, ok := m.sessions[id]
+	if !ok {
+		s = newSession(id)
+		m.sessions[id] = s
 	}
-	s := newSession(id)
-	m.sessions[id] = s
+	s.mu.Lock()
+	s.joining++
+	s.mu.Unlock()
 	return s
 }
 

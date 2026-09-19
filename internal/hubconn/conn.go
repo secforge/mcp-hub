@@ -303,6 +303,12 @@ type Conn struct {
 	// arriving while one is pending would tell it nothing new.
 	activity     chan struct{}
 	activityOnce sync.Once
+	// activityStop ends activityLoop when the read loop ends. Without it
+	// the loop ranged forever on a channel nothing ever closed, so every
+	// dial/close cycle left a goroutine alive holding its Conn, its
+	// buffer and its callback — three cycles, three leaks.
+	activityStop     chan struct{}
+	activityStopOnce sync.Once
 
 	// writeWait bounds an application write the same way it already
 	// bounds the keepalive's — snapshotted here for the same reason as
@@ -469,6 +475,23 @@ type ackClaim struct {
 	// "what follows X" with what follows Y, and a catch-up caller then
 	// persists a position from a walk it never made.
 	anchor wire.Anchor
+}
+
+// fatalErrorCodes are the error codes that describe the CONNECTION
+// rather than the request that provoked them: the conversation is gone,
+// or this client may no longer be in it. Only these disable automatic
+// reconnect, because only these are still true on the next dial.
+//
+// Anything else non-retryable refuses one operation and says nothing
+// about the connection — which is why the list is an allowlist rather
+// than "everything the server would not retry".
+var fatalErrorCodes = map[string]bool{
+	"conversation_unavailable": true,
+	"conversation_deleted":     true,
+	"unauthorized":             true,
+	"forbidden":                true,
+	"revoked":                  true,
+	"expired":                  true,
 }
 
 // relayCloseNotes maps close codes a teams relay may use to signal a
@@ -809,6 +832,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		pongWait:                snapPongWait,
 		writeWait:               snapWriteWait,
 		activity:                make(chan struct{}, 1),
+		activityStop:            make(chan struct{}),
 		canSend:                 joined.CanSend,
 		conversationKind:        joined.ConversationKind,
 		topic:                   joined.Topic,
@@ -998,7 +1022,7 @@ func (c *Conn) signalActivity() {
 }
 
 func (c *Conn) activityLoop() {
-	for range c.activity {
+	run := func() {
 		c.mu.Lock()
 		f := c.onActivity
 		c.mu.Unlock()
@@ -1006,6 +1030,29 @@ func (c *Conn) activityLoop() {
 			f()
 		}
 	}
+	for {
+		select {
+		case <-c.activity:
+			run()
+		case <-c.activityStop:
+			// One last look before going. The signal saying the
+			// connection ended is the most important one this loop ever
+			// carries and is raised immediately before the stop, so
+			// leaving without checking would drop exactly the callback a
+			// reconnect depends on.
+			select {
+			case <-c.activity:
+				run()
+			default:
+			}
+			return
+		}
+	}
+}
+
+// stopActivity ends activityLoop, once, however the read loop got there.
+func (c *Conn) stopActivity() {
+	c.activityStopOnce.Do(func() { close(c.activityStop) })
 }
 
 // claimNextAck registers to intercept the next event of kind ackKind for
@@ -1403,6 +1450,7 @@ func (c *Conn) readLoop() {
 			}
 			c.mu.Unlock()
 			c.signalActivity()
+			c.stopActivity()
 			return
 		}
 		ev, ok := decodeEvent(raw)
@@ -1461,7 +1509,17 @@ func (c *Conn) readLoop() {
 			// Recorded, not merely delivered: the close that follows
 			// carries no reason, so by the time anything asks whether a
 			// reconnect could work, this is the only thing that knows.
-			if ev.Code != "" && !ev.Retryable {
+			//
+			// ONLY codes about the CONNECTION count. retryable=false
+			// answers the request it refuses — a bad_request about one
+			// send, a bad_anchor about one read — and treating any of
+			// them as fatal disabled automatic reconnect for the whole
+			// connection over a refusal that had nothing to do with
+			// whether the conversation still exists. The close code
+			// remains the primary signal (see relayCloseNotes); this is
+			// the secondary one, for a server that says why before it
+			// goes.
+			if ev.Code != "" && !ev.Retryable && fatalErrorCodes[ev.Code] {
 				c.fatalText = fmt.Sprintf("%s (%s)", ev.Text, ev.Code)
 			}
 		case "serverStopping":
@@ -1484,6 +1542,7 @@ func (c *Conn) readLoop() {
 		c.mu.Unlock()
 		if abandoned {
 			c.abandon()
+			c.stopActivity()
 			return
 		}
 		c.signalActivity()
@@ -2432,7 +2491,7 @@ func (c *Conn) ChargeDelivered(cursor string, n int) {
 	if c.budget == nil || cursor == "" {
 		return
 	}
-	c.budget.adjust(cursor, n)
+	c.budget.adjust(c.budgetOwner, cursor, n)
 }
 
 // PushItem is one event ready to be pushed into a model harness: the

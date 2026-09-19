@@ -1,0 +1,57 @@
+package hubconn
+
+import (
+ "net/http"
+ "net/http/httptest"
+ "runtime"
+ "strings"
+ "testing"
+ "time"
+ "github.com/gorilla/websocket"
+ "github.com/secforge/mcp-hub/internal/wire"
+)
+
+func TestReviewRequestErrorDoesNotMakeConnectionPermanentlyFatal(t *testing.T) {
+ up:=websocket.Upgrader{}
+ ts:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+  ws,err:=up.Upgrade(w,r,nil);if err!=nil{return};defer ws.Close()
+  ws.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000","",""))
+  ws.WriteJSON(wire.Error{Type:wire.TypeError,Code:"bad_request",Message:"invalid operation",Retryable:false})
+  for {if _,_,err:=ws.ReadMessage();err!=nil{return}}
+ }))
+ defer ts.Close()
+ c,err:=Dial("ws"+strings.TrimPrefix(ts.URL,"http")+"#review",DialOptions{ReconnectSecret:"review"})
+ if err!=nil {t.Fatal(err)};defer c.Close()
+ deadline:=time.Now().Add(time.Second)
+ for {if has,_:=c.Peek();has{break};if time.Now().After(deadline){t.Fatal("no error received")};time.Sleep(time.Millisecond)}
+ if reason,fatal:=c.PermanentFailure();fatal {t.Fatalf("operation error disables all future reconnects: %s",reason)}
+}
+
+func TestReviewActivityLoopEndsAfterClose(t *testing.T) {
+ count:=func() int { b:=make([]byte,1<<20);n:=runtime.Stack(b,true);return strings.Count(string(b[:n]),"hubconn.(*Conn).activityLoop") }
+ before:=count()
+ base:=startTestServer(t)
+ for i:=0;i<3;i++ {c,err:=dialTest(base,"550e8400-e29b-41d4-a716-446655440000",DialOptions{});if err!=nil{t.Fatal(err)};c.Close()}
+ time.Sleep(100*time.Millisecond)
+ if after:=count();after>before {t.Fatalf("%d activityLoop goroutines remain after 3 closed connections",after-before)}
+}
+
+func TestReviewBudgetNotesAreScopedToOwner(t *testing.T) {
+ b:=newBudget()
+ b.charge("second","older",20)
+ b.note("first","shared-cursor")
+ b.note("second","shared-cursor")
+ b.release("second","shared-cursor")
+ if b.bytes!=0 {t.Fatalf("second owner's confirmed prefix still charged: %d bytes",b.bytes)}
+}
+
+func TestReviewBudgetAdjustIsScopedToOwner(t *testing.T) {
+ b:=newBudget()
+ first:=&Conn{budget:b,budgetOwner:"first"}
+ second:=&Conn{budget:b,budgetOwner:"second"}
+ b.charge("first","same",10)
+ b.charge("second","same",20)
+ second.ChargeDelivered("same",30)
+ b.release(first.budgetOwner,"same")
+ if b.bytes!=30 {t.Fatalf("second owner's delivery charged to first: remaining %d want 30",b.bytes)}
+}

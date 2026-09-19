@@ -364,7 +364,8 @@ func decisionNote(cursor, project string, conn *hubconn.Conn, measured int, bran
 // they are already on their way. Found live within a minute by two
 // separate clients, 2026-09-16.
 func caughtUpText(buffered bool) string {
-	base := "nothing to catch up — no prior position recorded and the server reports nothing behind"
+	base := "nothing to catch up — the server states 0 behind for this session, which it can only " +
+		"say because a position was confirmed"
 	if !buffered {
 		return base + "; live traffic will arrive normally"
 	}
@@ -852,7 +853,7 @@ func (s *session) reconnectLoop(link, name string, interval time.Duration, sched
 		if cancelled {
 			return
 		}
-		outcome := s.reconnectOnce(link, name, interval, attempt, scheduled)
+		outcome := s.reconnectOnce(link, name, interval, attempt, scheduled, gen)
 		if outcome != reconnectRetry {
 			return
 		}
@@ -878,7 +879,7 @@ const (
 
 // reconnectOnce performs a single redial and says whether trying again
 // could help.
-func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt int, scheduled bool) reconnectOutcome {
+func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt int, scheduled bool, gen int) reconnectOutcome {
 	// The model may have reconnected itself while this was waiting.
 	if prev, _ := s.activeConn(); prev != nil && prev.Connected() {
 		return reconnectDone
@@ -948,10 +949,30 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	// not coming back" about a connection that was — and the follower was
 	// released with "its connection ended" instead of being held across
 	// an announced restart.
+	// CHECKED AGAIN HERE, not only before dialling. hub_disconnect can
+	// land while the handshake is in flight, and the loop's own check
+	// happened before that: a connection installed after the caller left
+	// is live, delivering, and attached to a session the name no longer
+	// maps to — it also restored redialLink, so the leaving was undone by
+	// the attempt it was meant to cancel. Decided and recorded under one
+	// lock hold so nothing can cancel between the test and the install.
 	s.mu.Lock()
-	s.redialLink, s.redialName = link, name
-	s.redialTarget = target
+	cancelled := s.redialLink == "" || s.reconnectGen != gen
+	if !cancelled {
+		s.redialLink, s.redialName = link, name
+		s.redialTarget = target
+	}
 	s.mu.Unlock()
+	if !cancelled && !s.hub.owns(s) {
+		// The name was released while this dialled: whatever holds it now
+		// is not this session, and installing here would deliver into
+		// something nothing can reach.
+		cancelled = true
+	}
+	if cancelled {
+		conn.Close()
+		return reconnectDone
+	}
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
 		// the disconnect to a follower and releases it, so arming
@@ -3290,29 +3311,47 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	var ev hubconn.Event
 	var ok bool
 	var err error
+	// WHY the walk ended, kept as a fact. "Fewer than asked for" is not
+	// evidence of "that is everything": a refusal, a timeout or a
+	// transport error ends the walk in exactly the same shape, and
+	// reporting any of them as a complete history is how a partial read
+	// becomes a confident wrong answer about what was said.
+	cutShort := ""
 	for len(events) < limit {
 		ev, ok, err = conn.RequestMessageAfterFiltered(anchor, filter)
 		if err != nil {
 			if len(events) > 0 {
+				cutShort = fmt.Sprintf("the read then failed (%v)", err)
 				break
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("read failed: %v", err)), nil
 		}
 		if !ok {
 			if len(events) > 0 {
+				cutShort = "the server then stopped answering in time"
 				break
 			}
 			return mcp.NewToolResultText("the server did not answer in time — call hub_read " +
 				"again with the same arguments; nothing about this session's state changed"), nil
 		}
-		if ev.Kind == "error" || ev.Kind == "noMoreMessages" {
+		if ev.Kind == "error" {
+			if len(events) > 0 {
+				cutShort = fmt.Sprintf("the server then refused to go further (%s)", ev.Text)
+			}
+			break
+		}
+		if ev.Kind == "noMoreMessages" {
 			break
 		}
 		events = append(events, ev)
 		spent += len(ev.Text)
 		// A message with no cursor cannot anchor the next step, so the
 		// walk stops rather than asking the same question again.
-		if ev.Cursor == "" || spent >= budget {
+		if ev.Cursor == "" {
+			cutShort = "the last message carried no cursor, so there was nothing to continue from"
+			break
+		}
+		if spent >= budget {
 			break
 		}
 		anchor = wire.Anchor{Cursor: ev.Cursor}
@@ -3374,11 +3413,15 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	last := events[len(events)-1]
 	reached := ""
 	switch {
+	case cutShort != "":
+		reached = fmt.Sprintf(" INCOMPLETE: %s, so this is what was reachable before that, NOT "+
+			"everything there is. Read on from the last cursor to find out what follows.", cutShort)
 	case spent >= budget:
 		reached = fmt.Sprintf(" Stopped at %d KB rather than at the message count, so there may "+
 			"well be more: read on from the last cursor.", spent/1024)
 	case len(events) < limit:
-		reached = " The walk stopped before the limit, so this is everything there was."
+		reached = " The server said there was nothing after the last one, so this is everything " +
+			"there was."
 	}
 	return mcp.NewToolResultText(hubconn.FormatEventsOn(s.name, events) + attachments +
 		"\n\n[hub: this was a read, not a catch-up — your unread position is unchanged, so " +
@@ -4060,6 +4103,28 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		anchor = wire.Anchor{At: seekAt}
 		seekNote = "No prior position recorded for this session — seeking to recent context " +
 			"instead of walking from the start.\n\n"
+	case !conn.BehindStated():
+		// ABSENT IS NOT ZERO. The count is omitted when the server holds
+		// no acked cursor for this peer, which says "I have no idea where
+		// you are" — the opposite of "you are caught up", and the two
+		// arrive here as the same 0. A peer that has never confirmed
+		// anything (a Codex session that never called hub_confirm is the
+		// live example, seven days without one) was told on every single
+		// reconnect that it had missed nothing, while the server was
+		// saying it could not tell.
+		//
+		// Third of its kind: peerCount absent read as "nobody else is
+		// here", pinAck's missing ok read as "the server refused". The
+		// shape is always the same — a benign absence rendered as a
+		// confident negative.
+		branch = "seek (the server holds no read position for this peer)"
+		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
+		anchor = wire.Anchor{At: seekAt}
+		seekNote = "The server stated no backlog for this session — which means it holds no read " +
+			"position for this peer, NOT that you are caught up. The two are different answers " +
+			"and only a confirm turns the first into the second. Seeking to recent context; " +
+			"confirm what you read (hub_confirm) so the next reconnect can be answered " +
+			"precisely.\n\n"
 	default:
 		branch = "nothing to do"
 		s.mu.Lock()
@@ -4088,7 +4153,24 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// asking to catch up should be handed the messages instead of being
 	// made to ask for each. The per-call contract is unchanged everywhere
 	// else — see catchuppush.go for why the two differ.
-	if pushOnly() {
+	// Delivery is PROMISED only where it can happen. A push-only process
+	// whose harness cannot be reached — a Codex server no request has yet
+	// named a thread for, a socket that has gone — used to start the run
+	// anyway: every push failed, and the report saying so was pushed down
+	// the same dead channel, so the caller was told "the messages are
+	// being DELIVERED to you" and then heard nothing at all. Silence
+	// standing in for a failure is the one outcome this client exists to
+	// prevent. Where the harness cannot be reached the backlog is
+	// RETURNED instead, one message per call, which always works because
+	// it is the tool result itself.
+	pushable, whyNot := s.pusher.Available()
+	if pushOnly() && !pushable {
+		seekNote += fmt.Sprintf("[hub: this backlog is being RETURNED here, one message per call, "+
+			"rather than delivered to you as live traffic is: %s. Nothing is lost and nothing "+
+			"about your position changed — call hub_catch_up again for the next one, as on any "+
+			"server without push]\n\n", whyNot)
+	}
+	if pushOnly() && pushable {
 		s.mu.Lock()
 		id := s.catchUpID
 		s.mu.Unlock()
@@ -4134,7 +4216,12 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			return mcp.NewToolResultError(fmt.Sprintf("catch-up request failed: %v", err)), nil
 		}
 		if !ok {
-			return mcp.NewToolResultText(seekNote +
+			// The decision line goes on every answer this call can give,
+			// including the ones that got nowhere: what it chose and what
+			// it chose it from is exactly what a reader needs in order to
+			// tell a timed-out seek from a timed-out walk.
+			return mcp.NewToolResultText(decisionNote(cursor, project, conn, measuredBehind, branch) +
+				seekNote +
 				"catch-up request timed out waiting for the server — call hub_catch_up again to retry"), nil
 		}
 		switch ev.Kind {

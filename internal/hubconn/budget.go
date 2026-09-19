@@ -236,14 +236,18 @@ func (b *budget) release(owner, cursor string) (skipped bool) {
 // a burst — without it a single large batch would pass entirely before
 // anything was counted — and this replaces it with what was actually
 // delivered, rather than adding a second entry for the same message.
-func (b *budget) adjust(cursor string, n int) {
+// Matched on OWNER AND CURSOR, like release and hold: a cursor is opaque
+// and issued by one server, so two connections sharing this ledger can
+// legitimately hold the same value. Matching on the cursor alone moved
+// the other connection's charge.
+func (b *budget) adjust(owner, cursor string, n int) {
 	if cursor == "" {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for i, ch := range b.outstanding {
-		if ch.cursor == cursor {
+		if ch.owner == owner && ch.cursor == cursor {
 			b.bytes += n - ch.bytes
 			b.outstanding[i].bytes = n
 			if b.bytes < 0 {
@@ -252,7 +256,7 @@ func (b *budget) adjust(cursor string, n int) {
 			return
 		}
 	}
-	b.outstanding = append(b.outstanding, charge{cursor: cursor, bytes: n})
+	b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor, bytes: n})
 	b.bytes += n
 }
 
@@ -271,7 +275,11 @@ func (b *budget) note(owner, cursor string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, ch := range b.outstanding {
-		if ch.cursor == cursor {
+		// Owner-scoped for the same reason release is: the same cursor
+		// from a different connection is a different position, and
+		// treating it as already noted left this connection's confirm
+		// with no entry to locate a prefix from.
+		if ch.owner == owner && ch.cursor == cursor {
 			return
 		}
 	}
