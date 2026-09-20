@@ -4,7 +4,6 @@ import (
 	"github.com/secforge/harness-transport/deliver"
 
 	"fmt"
-	"time"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/hubconn"
@@ -39,10 +38,14 @@ const (
 	// receiver — 1.29 MB over four messages killed one, 1.00 MB in a
 	// single message did not kill another.
 	catchUpPushMaxMessages = 200
-	// catchUpPushFetchTimeout bounds waiting for one message from the
-	// server. A run that stalls should end with a report rather than hold
-	// the connection's goroutine indefinitely.
-	catchUpPushFetchTimeout = 30 * time.Second
+	// NO catchUpPushFetchTimeout. One was declared here and never used —
+	// the fetch waits hubconn.AckWaitTimeout like every other request —
+	// so the file documented a 30s bound that did not exist. A constant
+	// nobody reads is a claim about behaviour, and this one was false.
+	// Removed rather than wired up: the walk's per-request bound belongs
+	// with every other request's, not as a second number here that has
+	// to be kept in agreement with it. Pointed out by an external
+	// reviewer, 2026-09-20.
 )
 
 // catchUpWant is how much of the backlog the model asked for. It can
@@ -90,6 +93,15 @@ type catchUpResult struct {
 // goes to the model the same way a live message does.
 func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wire.Anchor,
 	want catchUpWant) {
+	s.pushCatchUpSummary(s.walkCatchUpPush(conn, id, anchor, want))
+}
+
+// walkCatchUpPush is the walk itself, separated from the reporting so a
+// test can assert WHICH ending a run reached without a reachable harness
+// to push into. Separation suggested by the external reviewer whose
+// findings this file's error branch comes from, 2026-09-20.
+func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wire.Anchor,
+	want catchUpWant) catchUpResult {
 	var res catchUpResult
 	maxMessages, maxBytes := want.limits()
 
@@ -105,6 +117,25 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 		}
 		if ev.Kind == "noMoreMessages" {
 			res.CaughtUp = true
+			break
+		}
+		// A REFUSAL, BEFORE THE CURSOR TEST. An error frame carries no
+		// cursor, so testing for a missing cursor first reported every
+		// refusal as "a message arrived with no cursor" and told the
+		// reader to call again — which fails identically, with the same
+		// wrong sentence, and never shows the reason. bad_anchor is the
+		// live case: chat-relay answers it when a stored cursor no
+		// longer resolves, which is exactly when a reader most needs to
+		// be told. The pull walk has always reported this correctly;
+		// this is the path push-mode readers actually use. Found by an
+		// external reviewer, 2026-09-20.
+		if ev.Kind == "error" {
+			code := ev.Code
+			if code == "" {
+				code = "no code"
+			}
+			res.Err = fmt.Errorf("the server refused the walk (code=%s, retryable=%t): %s",
+				code, ev.Retryable, ev.Text)
 			break
 		}
 		if ev.Cursor == "" {
@@ -159,7 +190,7 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 		res.StoppedBy = fmt.Sprintf("this run reached its limit of %d messages or %d KB",
 			maxMessages, maxBytes/1024)
 	}
-	s.pushCatchUpSummary(res)
+	return res
 }
 
 // pushCatchUpSummary is the last thing a run delivers: what happened and

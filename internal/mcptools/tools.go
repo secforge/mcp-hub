@@ -2363,7 +2363,14 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if t := conn.Topic(); t != nil {
 		topic = *t
 	}
-	_ = connstore.Upsert(target, connstore.Entry{
+	// GUARDED, like the reconnect path's own write. A hub_disconnect
+	// landing between the install above and this line has already run
+	// MarkDisconnected, and an unguarded write here overwrites it — the
+	// next process then reports a session still marked open for a
+	// connection the caller explicitly left. reconnectOnce was fixed for
+	// this on 2026-09-20 and the initial connect was not; an external
+	// reviewer found the half that was missed the same day.
+	_ = s.persistConnectedIfStillHolding(conn, installGen, target, connstore.Entry{
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
 		ReconnectSecret: reconnectSecret, LastConnectedAt: time.Now().UTC(), Connected: true,
 	})
@@ -3087,8 +3094,17 @@ func (s *session) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.E
 					ev.PeerID, ev.TS, err)
 				continue
 			}
+			// SAYS HOW LONG IT LASTS. This directory is removed on
+			// hub_disconnect and on every teardown — including an
+			// automatic drop and reconnect, which a reader never asked
+			// for and may not notice. A reviewer was handed a path by
+			// one catch-up and found it gone after the reconnect that
+			// renamed them, 2026-09-20. The spill note has always
+			// stated its lifetime; this one did not.
 			fmt.Fprintf(&b, "\n\n[attachment on the message from %s at %s: saved to %s (%s, %d bytes) — "+
-				"read the file to view/use it]", ev.PeerID, ev.TS, path, contentType, len(raw))
+				"read the file to view/use it. It lives only as long as this connection: a "+
+				"disconnect, or a drop and automatic reconnect, removes it. Copy it elsewhere if "+
+				"you need it after that]", ev.PeerID, ev.TS, path, contentType, len(raw))
 		}
 	}
 	return b.String()
@@ -3103,6 +3119,25 @@ func (s *session) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.E
 // can't be forgotten at a new call site later. See MarkConsumed's doc
 // comment for why the wire-level read-receipt boundary needs the same
 // synchronous-hand-over guarantee recordHandedOver already relies on.
+// resultWithRecoveredAttachments is resultWithReceivedAttachments for a
+// GAP walk: it records the delivery and fetches attachments, and does
+// NOT mark the wire-level receipt.
+//
+// A gap holds messages OLDER than the current position, so marking them
+// consumed drags lastConsumed backwards — and that value is what the
+// next send piggybacks as its ackCursor. chat-relay's own column is
+// last-write-wins rather than monotonic, so a regressed receipt moves
+// the server's position backwards and makes its behind count over-report
+// until something moves it forward again; that server will not refuse it
+// for us. handleRead already avoids exactly this and says why in its own
+// doc comment; the gap path was reached through the consuming helper
+// instead. Found by an external reviewer, 2026-09-20.
+func (s *session) resultWithRecoveredAttachments(conn *hubconn.Conn, formatted string, events []hubconn.Event) *mcp.CallToolResult {
+	s.recordHandedOver(events)
+	conn.NoteHandedOver(events)
+	return mcp.NewToolResultText(formatted + s.saveReceivedAttachments(conn, events))
+}
+
 func (s *session) resultWithReceivedAttachments(conn *hubconn.Conn, formatted string, events []hubconn.Event) *mcp.CallToolResult {
 	// Order matters: recordHandedOver stacks every cursor in the ahead
 	// set, and confirmLiveDelivery is what then takes back out the ones it
@@ -3863,7 +3898,9 @@ func (h *Hub) handleSelfUpdate(ctx context.Context, req mcp.CallToolRequest) (*m
 			latest = "unknown"
 		}
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"Already current: this client is %s and the newest published release is %s, so nothing "+
+			"Already current: this client is %s and GitHub's tag for the newest release READS %s "+
+				"— unverified, because nothing was downloaded, and the tag is not the authority "+
+				"here (the signed manifest is). So nothing "+
 				"was downloaded. If a connect is still failing, the cause is not an out-of-date "+
 				"client — say so rather than retrying the update.\n"+
 				"If what you were looking for is a missing TOOL rather than a failing connect, note "+
@@ -4258,7 +4295,18 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	s.mu.Unlock()
 
 	measuredBehind := 0
-	if cursor != "" && conn.HasFeature("ackReplies") {
+	// NOT WHILE SOMETHING NEWER HAS BEEN CONSUMED. This measuring ack
+	// names the STORED cursor, and sending it is also what repairs the
+	// server's own position — but if this connection has since consumed
+	// anything live, that same ack moves the server BACKWARDS, and
+	// chat-relay's column is last-write-wins rather than monotonic, so
+	// its behind count then over-reports until something moves it
+	// forward. Cursors are opaque, so nothing here can ask "is this
+	// older"; "has anything been consumed at all" is the comparison
+	// available, and declining to measure costs a number rather than a
+	// position. Found by an external reviewer, 2026-09-20.
+	if cursor != "" && conn.HasFeature("ackReplies") &&
+		(conn.ConsumedCursor() == "" || conn.ConsumedCursor() == cursor) {
 		if behind, err := conn.ConfirmReceived(cursor); err == nil && behind != nil {
 			measuredBehind = *behind
 		}
@@ -4729,7 +4777,9 @@ walk:
 			"[hub: more of the gap (%s to %s) may remain — call hub_catch_up(gap: true) again to "+
 				"continue retrieving it]", gap.From(), gap.To)
 	}
-	return s.resultWithReceivedAttachments(
+	// NOT the consuming helper: a gap holds messages older than the
+	// current position — see resultWithRecoveredAttachments.
+	return s.resultWithRecoveredAttachments(
 		conn, hubconn.FormatEventsOn(s.name, events)+"\n\n"+trailer, events), nil
 }
 

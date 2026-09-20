@@ -2837,3 +2837,162 @@ func TestALateAckDoesNotAnswerTheNextRequest(t *testing.T) {
 			"answer must not be attributed to whoever asked next")
 	}
 }
+
+// TestALateAnswerDoesNotRatchetIntoPermanentTimeouts is the external
+// reviewer's finding of 2026-09-20, against the mitigation written hours
+// earlier the same day: the debt a timeout records was only spent when a
+// claim happened to be waiting. A late answer arriving with nobody
+// waiting — the ordinary case, since the caller has already returned —
+// left the debt standing, so the NEXT request's own prompt answer paid
+// it, that caller timed out, and its timeout recorded the debt again.
+// Every later request on the connection took the full timeout.
+func TestALateAnswerDoesNotRatchetIntoPermanentTimeouts(t *testing.T) {
+	prev := AckWaitTimeout
+	AckWaitTimeout = 150 * time.Millisecond
+	defer func() { AckWaitTimeout = prev }()
+
+	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
+		joined.Features = map[string]json.RawMessage{"actionAcks": json.RawMessage(`{}`)}
+		ws.WriteJSON(joined)
+		// ONE WRITER AT A TIME. The held answer goes out on its own
+		// goroutine while the loop answers later sends, and a websocket
+		// permits exactly one concurrent writer. Written without this
+		// first — the same fixture race this suite had fixed in another
+		// test hours earlier.
+		var writeMu sync.Mutex
+		write := func(v any) {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			ws.WriteJSON(v)
+		}
+		n := 0
+		for {
+			var frame map[string]any
+			if err := ws.ReadJSON(&frame); err != nil {
+				return
+			}
+			if frame["type"] != string(wire.TypeMsg) {
+				continue
+			}
+			n++
+			if n == 1 {
+				// A's answer, held until after A has given up AND after
+				// nobody is waiting for it.
+				go func() {
+					<-release
+					write(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "late-A", OK: true})
+				}()
+				continue
+			}
+			// Every later send is answered promptly and correctly.
+			write(wire.SendAck{Type: wire.TypeSendAck, ExternalID: fmt.Sprintf("prompt-%d", n), OK: true})
+		}
+	}))
+	defer srv.Close()
+
+	c, err := Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"#ratchet",
+		DialOptions{ReconnectSecret: "ratchet-secret"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// A times out with its answer still in flight.
+	if _, ok, err := c.SendAwaitingAck("A", "", nil, "", "", nil); err != nil || ok {
+		t.Fatalf("expected the first send to time out, got ok=%v err=%v", ok, err)
+	}
+	// A's answer lands with NOBODY waiting for it.
+	once.Do(func() { close(release) })
+	time.Sleep(50 * time.Millisecond)
+
+	// Three later sends, each answered promptly. All three must be
+	// answered — under the ratchet, all three timed out.
+	for i := 2; i <= 4; i++ {
+		ev, ok, err := c.SendAwaitingAck(fmt.Sprintf("send-%d", i), "", nil, "", "", nil)
+		if err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+		if !ok {
+			t.Fatalf("send %d timed out although the server answered it promptly — one late "+
+				"answer has ratcheted this connection into permanent timeouts", i)
+		}
+		if ev.ExternalID == "late-A" {
+			t.Fatalf("send %d was given the first send's outcome", i)
+		}
+	}
+}
+
+// TestARefusedConfirmIsNotPiggybackedOnTheNextSend is the reviewer's
+// second finding: ConfirmReceived adopted the cursor as this
+// connection's consumed and acked position BEFORE the server answered,
+// so a refusal left it holding the refused value — and the next send
+// carried it as its piggybacked receipt, to be refused again. That
+// second refusal arrives with no claim pending, which is the path that
+// turns receipts off for the connection's life.
+func TestARefusedConfirmIsNotPiggybackedOnTheNextSend(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	acked := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
+		joined.Features = map[string]json.RawMessage{"ackReplies": json.RawMessage(`{}`)}
+		ws.WriteJSON(joined)
+		for {
+			var frame map[string]any
+			if err := ws.ReadJSON(&frame); err != nil {
+				return
+			}
+			switch frame["type"] {
+			case string(wire.TypeAck):
+				ws.WriteJSON(wire.Error{
+					Type: wire.TypeError, Code: "bad_ack_cursor",
+					Message: "that cursor is not from this conversation", Retryable: false,
+				})
+			case string(wire.TypeMsg):
+				cursor, _ := frame["ackCursor"].(string)
+				acked <- cursor
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c, err := Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"#refused",
+		DialOptions{ReconnectSecret: "refused-piggyback"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if _, err := c.ConfirmReceived("a-cursor-from-another-conversation"); err == nil {
+		t.Fatal("expected the server's refusal to be reported")
+	}
+	if err := c.Send("after the refusal", nil, "", "", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case got := <-acked:
+		if got == "a-cursor-from-another-conversation" {
+			t.Fatal("the next send piggybacked the cursor the server had just REFUSED — the " +
+				"refusal has to put this connection's own position back, not only the " +
+				"persisted one")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the send never reached the server")
+	}
+	if c.AckDisabled() {
+		t.Fatal("a refused confirm must not turn receipts off")
+	}
+}

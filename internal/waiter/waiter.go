@@ -619,6 +619,26 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 			}
 		}
 		if len(parts) == 0 {
+			// NOTHING TO SAY IS NOT THE SAME AS DISCONNECTED. A source
+			// being HELD across an announced restart appends nothing
+			// here by design, and a concurrent hub_wait can drain the
+			// buffer between the check that woke this and the Drain
+			// above — both left a one-shot reader told "hub
+			// disconnected" while the follower path was correctly
+			// reporting a hold, so the reader reconnected by hand and
+			// raced the automatic one. Found by an external reviewer,
+			// 2026-09-20.
+			for _, a := range w.sourcesSnapshot() {
+				if holding, _ := w.holdingFor(a.name); holding {
+					writeAndClose(rw.conn, label(a.name)+w.holdingMessage()+"\n")
+					return
+				}
+			}
+			if len(w.sourcesSnapshot()) > 0 {
+				writeAndClose(rw.conn, "nothing new on this channel right now — run the command "+
+					"again to keep receiving\n")
+				return
+			}
 			writeAndClose(rw.conn, w.disconnectedMessage())
 			return
 		}

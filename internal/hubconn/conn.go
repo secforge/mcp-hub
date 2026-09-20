@@ -314,6 +314,15 @@ type Conn struct {
 
 	activity     chan struct{}
 	activityOnce sync.Once
+	// gone is closed when the read loop ends, so a caller blocked on a
+	// claim learns the connection dropped instead of waiting out its
+	// whole deadline. An attachment fetch waits up to three minutes, and
+	// it runs inside the activity callback, so the teardown and the
+	// reconnect that follow it were delayed by that much. Found by an
+	// external reviewer, 2026-09-20.
+	gone     chan struct{}
+	goneOnce sync.Once
+
 	// activityStop ends activityLoop when the read loop ends. Without it
 	// the loop ranged forever on a channel nothing ever closed, so every
 	// dial/close cycle left a goroutine alive holding its Conn, its
@@ -881,7 +890,17 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 	// relies on is only installed further down — so hub_connect hung
 	// indefinitely against a server that had already accepted the socket.
 	// A hang is the one failure a caller cannot report or retry.
-	_ = ws.SetReadDeadline(time.Now().Add(snapPongWait))
+	// A HANDSHAKE DEADLINE, not the keepalive's. pongWait is 100s, which
+	// is the right bound for an idle established connection and far past
+	// most MCP tool timeouts for a server that upgrades and then says
+	// nothing — hub_connect simply hung for it. A joined frame is the
+	// first thing a server sends and it sends it immediately. Found by
+	// an external reviewer, 2026-09-20.
+	handshakeWait := 10 * time.Second
+	if snapPongWait < handshakeWait {
+		handshakeWait = snapPongWait
+	}
+	_ = ws.SetReadDeadline(time.Now().Add(handshakeWait))
 	// Set BEFORE the first read, not with the rest of the connection's
 	// settings further down: the joined frame is itself a frame from a
 	// server this client has not yet learned anything about.
@@ -890,7 +909,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 	if err != nil {
 		ws.Close()
 		return nil, fmt.Errorf("no joined message from the server after the connection was "+
-			"accepted (waited %s): %w", snapPongWait, err)
+			"accepted (waited %s): %w", handshakeWait, err)
 	}
 	var joined wire.Joined
 	if err := json.Unmarshal(raw, &joined); err != nil {
@@ -915,6 +934,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		writeWait:               snapWriteWait,
 		activity:                make(chan struct{}, 1),
 		activityStop:            make(chan struct{}),
+		gone:                    make(chan struct{}),
 		canSend:                 joined.CanSend,
 		conversationKind:        joined.ConversationKind,
 		topic:                   joined.Topic,
@@ -1148,6 +1168,7 @@ func (c *Conn) activityLoop() {
 // stopActivity ends activityLoop, once, however the read loop got there.
 func (c *Conn) stopActivity() {
 	c.activityStopOnce.Do(func() { close(c.activityStop) })
+	c.goneOnce.Do(func() { close(c.gone) })
 }
 
 // claimNextAck registers to intercept the next event of kind ackKind for
@@ -1239,6 +1260,29 @@ func answersAnchor(answers *wire.Anchor, want wire.Anchor) bool {
 // it matches one, delivers it directly and reports true — the caller
 // (readLoop) must skip buffering it and firing OnActivity for it entirely
 // when this returns true. Must be called with c.mu held.
+// spendLateAnswerLocked reports whether ev settles a debt recorded by a
+// request that timed out — see expectLateAnswer — and consumes it if so.
+//
+// ON ANY ARRIVAL OF THAT KIND, not only when a claim is waiting. The
+// first version checked the debt inside the claim branch, so a late
+// answer landing with nobody waiting (the ordinary case: the caller had
+// already returned) left the debt standing at one. The NEXT request's
+// own prompt answer was then charged to it, dropped, and that caller
+// timed out — which recorded the debt again. Every send, react, edit and
+// delete on the connection then took the full timeout and reported no
+// acknowledgement, with the answers arriving as unsolicited events. A
+// ratchet, from the mitigation that was supposed to cost one missing
+// answer. Found by an external reviewer with a reproduction, 2026-09-20,
+// hours after that mitigation was written.
+func (c *Conn) spendLateAnswerLocked(kind string) bool {
+	if c.lateAnswers[kind] <= 0 {
+		return false
+	}
+	c.lateAnswers[kind]--
+	debugf("spendLateAnswerLocked: spent a late %q against the request that timed out", kind)
+	return true
+}
+
 func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 	// pendingMessageAfter's match is not a blind Kind lookup like
 	// pendingAcks below — a "msg" only belongs to it when Answers is
@@ -1276,15 +1320,6 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 		// the buffer, where it is reported as unsolicited — which is
 		// exactly what it is.
 		if claim.token != "" && ev.AttachmentToken != claim.token {
-			return false
-		}
-		// A LATE ANSWER TO SOMEBODY ELSE. See expectLateAnswer: this
-		// arrival is owed to a request that already timed out, so it is
-		// spent here rather than answering the claim that happens to be
-		// waiting now.
-		if c.lateAnswers[ev.Kind] > 0 {
-			c.lateAnswers[ev.Kind]--
-			debugf("tryDivertToClaimLocked: spent a late %q on the request that timed out", ev.Kind)
 			return false
 		}
 		delete(c.pendingAcks, ev.Kind)
@@ -1467,6 +1502,24 @@ var ackReplyMissThreshold = 2
 // expected result — a server that doesn't answer standalone acks is not
 // an error.
 func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
+	// WHAT THIS CONNECTION BELIEVES IT HAS READ, remembered so a refusal
+	// can put it back. Adopting the cursor before the server has
+	// answered meant a REFUSED confirm still left lastConsumed and
+	// lastAckSent holding it, so the next send piggybacked the refused
+	// cursor as its ackCursor — refused again, and that second refusal
+	// arrives with no claim pending, which is the path that silently
+	// turns receipts off for the connection's life. Exactly the outcome
+	// this morning's fix said it had removed, reached by another route.
+	// Found by an external reviewer with a reproduction, 2026-09-20.
+	c.mu.Lock()
+	prevConsumed, prevAckSent := c.lastConsumed, c.lastAckSent
+	c.mu.Unlock()
+	restore := func() {
+		c.mu.Lock()
+		c.lastConsumed, c.lastAckSent = prevConsumed, prevAckSent
+		c.mu.Unlock()
+	}
+
 	c.MarkConsumed([]Event{{Cursor: cursor}})
 	// A confirm names a POSITION, so it releases a prefix of the ledger
 	// rather than clearing it: bytes delivered after this cursor are still
@@ -1498,8 +1551,14 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	}
 	if skipWait {
 		if err := c.writeJSON(wire.NewAck(cursor)); err != nil {
+			restore()
 			return nil, err
 		}
+		// ADOPTED WITHOUT AN ANSWER, deliberately: this server has
+		// declared it does not reply to receipts, so no answer is ever
+		// coming and waiting for one would mean never advancing. A
+		// decision about what this client believes, not a guess about
+		// what happened.
 		c.mu.Lock()
 		c.lastAckSent = cursor
 		c.mu.Unlock()
@@ -1534,6 +1593,11 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 			if code == "" {
 				code = "no code"
 			}
+			// Put the position back. "Has not moved" has to be true of
+			// what this connection will SAY next, not only of what was
+			// persisted — otherwise the refused cursor rides out on the
+			// next send's piggybacked receipt.
+			restore()
 			return nil, fmt.Errorf("the server REFUSED this confirm (%s): %s — your read "+
 				"position has not moved", code, ev.Text)
 		}
@@ -1547,10 +1611,20 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 			if ev.Cursor != "" {
 				where = fmt.Sprintf(" It holds %q for this peer.", ev.Cursor)
 			}
+			// Same reasoning as the error branch — except that the ack
+			// plumbing has already adopted the server's OWN reported
+			// position into lastAckSent, which is the right value to
+			// keep, so only the consumed mark goes back.
+			c.mu.Lock()
+			c.lastConsumed = prevConsumed
+			c.mu.Unlock()
 			return nil, fmt.Errorf("the server did not accept this confirm.%s Your read "+
 				"position has not moved", where)
 		}
 		return ev.Behind, nil
+	case <-c.gone:
+		return nil, fmt.Errorf("the connection dropped before the server answered this confirm — " +
+			"your read position has not moved")
 	case <-time.After(AckWaitTimeout):
 		c.mu.Lock()
 		c.ackReplyMisses++
@@ -1558,6 +1632,16 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		// The answer may still be coming. Marked so it is spent rather
 		// than handed to whoever confirms next — see expectLateAnswer.
 		c.expectLateAnswer("ack")
+		// THE POSITION IS KEPT on an unknown outcome, and the two
+		// records then disagree by design: the receipt was written, so
+		// this client believes it, while the server's own column moves
+		// only when a receipt actually arrives and is accepted. If it
+		// did not, that column sits behind this one and the next
+		// joined.behind counts from THEIRS — over-reporting, and a
+		// re-walk of things already seen rather than a skip. Confirmed
+		// from the server side by chat-relay's author, 2026-09-20. The
+		// safe direction of a disagreement that is invisible until a
+		// reconnect, and the reason this line says so.
 		return nil, nil
 	}
 }
@@ -1672,11 +1756,24 @@ func (c *Conn) readLoop() {
 		// this is where the connection's own nature is known and the
 		// formatter only ever sees the event.
 		ev.Mirrored = c.conversationKind != ""
+		// THE DEBT IS SETTLED BEFORE ANYTHING ELSE LOOKS AT THIS EVENT,
+		// and settling it only stops the DIVERT — see
+		// spendLateAnswerLocked. It has to be spendable by an arrival
+		// that no claim is waiting for, or a debt recorded by one
+		// timeout is still standing when the next request's own answer
+		// comes and the connection ratchets into permanent timeouts.
+		//
+		// The event still goes where it would have gone otherwise: the
+		// ack plumbing keeps its bookkeeping, and anything the plumbing
+		// does not consume reaches the buffer as the unsolicited event
+		// it is. Swallowing it here instead cost the reader the only
+		// evidence that its timed-out request had in fact landed.
+		lateSpent := c.spendLateAnswerLocked(ev.Kind)
 		if c.handleAckPlumbingLocked(ev) {
 			c.mu.Unlock()
 			continue
 		}
-		if c.tryDivertToClaimLocked(ev) {
+		if !lateSpent && c.tryDivertToClaimLocked(ev) {
 			c.mu.Unlock()
 			continue
 		}
@@ -2138,6 +2235,8 @@ func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filte
 		debugf("RequestMessageAfterAwaiting: claim=%p resolved kind=%q cursor=%q answers=%+v",
 			claim, ev.Kind, ev.Cursor, ev.Answers)
 		return ev, true, nil
+	case <-c.gone:
+		return Event{}, false, nil
 	case <-time.After(AckWaitTimeout):
 		debugf("RequestMessageAfterAwaiting: claim=%p timed out after %s waiting for anchor=%+v",
 			claim, AckWaitTimeout, anchor)
@@ -2324,6 +2423,11 @@ func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, f
 	select {
 	case ev := <-resultCh:
 		return ev, true, nil
+	case <-c.gone:
+		// The connection dropped. Waiting out the rest of the deadline
+		// would delay the teardown that this very callback is about to
+		// run — see Conn.gone.
+		return Event{}, false, nil
 	case <-time.After(AckWaitTimeout):
 		// See expectLateAnswer: a late sendAck must not answer the next
 		// request of the same kind.
@@ -2350,6 +2454,11 @@ func (c *Conn) ReactAwaitingAck(externalID, reaction, action string) (Event, boo
 	select {
 	case ev := <-resultCh:
 		return ev, true, nil
+	case <-c.gone:
+		// The connection dropped. Waiting out the rest of the deadline
+		// would delay the teardown that this very callback is about to
+		// run — see Conn.gone.
+		return Event{}, false, nil
 	case <-time.After(AckWaitTimeout):
 		// See expectLateAnswer: a late reactionAck must not answer the next
 		// request of the same kind.
@@ -2376,6 +2485,11 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 	select {
 	case ev := <-resultCh:
 		return ev, true, nil
+	case <-c.gone:
+		// The connection dropped. Waiting out the rest of the deadline
+		// would delay the teardown that this very callback is about to
+		// run — see Conn.gone.
+		return Event{}, false, nil
 	case <-time.After(AckWaitTimeout):
 		// See expectLateAnswer: a late editAck must not answer the next
 		// request of the same kind.
@@ -2410,6 +2524,11 @@ func (c *Conn) RequestAttachment(token string, size *int64) (Event, bool, error)
 	select {
 	case ev := <-resultCh:
 		return ev, true, nil
+	case <-c.gone:
+		// See Conn.gone: an attachment deadline runs to three minutes,
+		// inside the activity callback, so waiting it out on a dead
+		// connection delays the teardown and the reconnect by that much.
+		return Event{}, false, nil
 	case <-time.After(AttachmentWaitFor(size)):
 		return Event{}, false, nil
 	}
@@ -2537,6 +2656,11 @@ func (c *Conn) DeleteMessageAwaitingAck(externalID string) (Event, bool, error) 
 	select {
 	case ev := <-resultCh:
 		return ev, true, nil
+	case <-c.gone:
+		// The connection dropped. Waiting out the rest of the deadline
+		// would delay the teardown that this very callback is about to
+		// run — see Conn.gone.
+		return Event{}, false, nil
 	case <-time.After(AckWaitTimeout):
 		// See expectLateAnswer: a late deleteAck must not answer the next
 		// request of the same kind.
@@ -2867,6 +2991,17 @@ func (c *Conn) DrainEvents() (events []Event, connected bool) {
 // from a genuinely synchronous hand-over — an MCP tool result the model
 // is about to receive directly, mirroring mcptools' session.recordHandedOver's
 // identical reasoning and sharing its call site.
+// ConsumedCursor is the last cursor this connection has marked consumed,
+// or "" if none. Exported so a caller about to send a receipt for an
+// OLDER position can decline instead: cursors are opaque, so nothing
+// here can order two of them, and "anything already consumed" is the
+// only comparison available.
+func (c *Conn) ConsumedCursor() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastConsumed
+}
+
 func (c *Conn) MarkConsumed(events []Event) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

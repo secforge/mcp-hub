@@ -42,15 +42,15 @@ const ManifestSchema = 1
 // The tag becomes a convenience for finding the release, and the
 // manifest becomes the thing that says what it is.
 type Manifest struct {
-	Schema int `json:"schema"`
+	Schema int `json:"schema,case:strict"`
 	// Version is the release this manifest describes, tag form ("v3.1.4").
 	// This is the authority — see Apply, which compares against this and
 	// uses the tag only as a cross-check.
-	Version string `json:"version"`
+	Version string `json:"version,case:strict"`
 	// Commit is the 40-hex commit the binaries were built from. Signed
 	// metadata, so a release can be tied back to a tree even though the
 	// tag that names it cannot be trusted to.
-	Commit string `json:"commit"`
+	Commit string `json:"commit,case:strict"`
 	// KeyID names the signing key, so one can be rotated without a
 	// schema change: the first 16 hex characters of the SHA-256 of the
 	// public key — see KeyIDFor.
@@ -64,16 +64,16 @@ type Manifest struct {
 	//
 	// Empty means the original key, which is what every manifest
 	// published before a rotation ever happens says.
-	KeyID string `json:"keyId,omitempty"`
+	KeyID string `json:"keyId,omitempty,case:strict"`
 	// Binaries lists every published binary with its digest, sorted by
 	// filename so the bytes signed are reproducible from the same inputs.
-	Binaries []ManifestBinary `json:"binaries"`
+	Binaries []ManifestBinary `json:"binaries,case:strict"`
 }
 
 // ManifestBinary is one published artifact and its digest.
 type ManifestBinary struct {
-	Filename string `json:"filename"`
-	SHA256   string `json:"sha256"`
+	Filename string `json:"filename,case:strict"`
+	SHA256   string `json:"sha256,case:strict"`
 }
 
 // Digest returns the lowercase hex SHA-256 of b, the form a manifest
