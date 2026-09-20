@@ -120,12 +120,23 @@ func TestAnAnswerBearingAnUnknownIdIsNotDivertedToAWaitingCaller(t *testing.T) {
 	}
 }
 
-// The late-answer debt is the fallback for a server with no id, and it
-// must not run alongside one. Recorded here, it would never be spendable
-// — a late answer carries the dead request's id and matches no claim — so
-// it would only ever increment, and the next correctly-correlated answer
-// would be swallowed against it. That is the ratchet in reverse.
-func TestTheLateAnswerDebtIsNotRecordedAgainstACorrelatingServer(t *testing.T) {
+// The late-answer debt must not swallow a CORRELATED answer — that is
+// the ratchet, and it is the only thing the debt was ever accused of.
+//
+// This test previously asserted that no debt was recorded at all against
+// a correlating server, and that assertion was wrong in a way worth
+// keeping a note of. Suppressing the debt at the connection's
+// DECLARATION left a server that declares the feature and has not yet
+// echoed it on some kind — every server mid-rollout — with kind-only
+// matching and no mitigation, which is strictly worse than never
+// declaring it. Found by the external reviewer.
+//
+// The debt is recorded again. What changed is where the knowledge is
+// applied: it can only be SPENT against an answer that carries no id,
+// because an answer that names its request is knowledge and the debt is
+// a guess. So it protects exactly the kinds a server has not echoed, and
+// cannot touch the ones it has.
+func TestACorrelatedAnswerIsNotSwallowedByAnEarlierTimeoutsDebt(t *testing.T) {
 	shortAckTimeout(t)
 
 	var mu sync.Mutex
@@ -139,14 +150,14 @@ func TestTheLateAnswerDebtIsNotRecordedAgainstACorrelatingServer(t *testing.T) {
 		seq := n
 		mu.Unlock()
 		if seq == 1 {
-			return // never answered: this caller times out
+			return // never answered: this caller times out and records a debt
 		}
 		id, _ := frame["id"].(string)
 		text, _ := frame["text"].(string)
 		w.write(wire.SendAck{Type: wire.TypeSendAck, ID: id, ExternalID: text, OK: true})
 	})
 
-	c, err := dialTest(base, "corr-nodebt", DialOptions{})
+	c, err := dialTest(base, "corr-noratchet", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -155,17 +166,14 @@ func TestTheLateAnswerDebtIsNotRecordedAgainstACorrelatingServer(t *testing.T) {
 	if _, ok, _ := c.SendAwaitingAck("first", "", nil, "", "", nil); ok {
 		t.Fatal("the first send was supposed to time out")
 	}
-	c.mu.Lock()
-	debt := c.lateAnswers["sendAck"]
-	c.mu.Unlock()
-	if debt != 0 {
-		t.Fatalf("a late-answer debt of %d was recorded against a correlating server — the id "+
-			"already makes a late answer unattributable, so this counter can only ratchet", debt)
-	}
 
+	// The debt from that timeout exists. It must not be charged against
+	// the next send's own, correctly correlated, answer.
 	ev, ok, err := c.SendAwaitingAck("second", "", nil, "", "", nil)
 	if err != nil || !ok {
-		t.Fatalf("the second send was answered promptly and still did not resolve: ok=%v err=%v", ok, err)
+		t.Fatalf("the second send was answered promptly, with its own correlation id, and still did "+
+			"not resolve: ok=%v err=%v — the earlier timeout's debt was spent against an answer whose "+
+			"owner was certain", ok, err)
 	}
 	if ev.ExternalID != "second" {
 		t.Fatalf("got %q, want the second send's own ack", ev.ExternalID)
@@ -570,5 +578,58 @@ func TestAnIdLessAttachmentAnswerStillResolvesItsRequest(t *testing.T) {
 	}
 	if ev.AttachmentToken != "tok-1" {
 		t.Fatalf("got token %q, want tok-1", ev.AttachmentToken)
+	}
+}
+
+// Every frame chat-relay echoes the id on must arrive with it readable.
+//
+// This exists because a decode line being PRESENT proved nothing twice
+// today: `msg` had no CorrelationID at all while ten siblings did, and
+// the server side had a reflection test proving its records could carry
+// the field while four call sites set nothing. Both gaps were invisible
+// from a green suite and from reading the list.
+//
+// So the list is walked rather than reasoned about — chat-relay's own
+// enumeration of what it echoes, checked end to end through the real
+// decoder.
+func TestTheIdSurvivesDecodingOnEveryFrameThatEchoesIt(t *testing.T) {
+	const id = "the-echoed-id"
+	for _, tc := range []struct {
+		kind  string
+		frame any
+	}{
+		{"sendAck", wire.SendAck{Type: wire.TypeSendAck, ID: id}},
+		{"reactionAck", wire.ReactionAck{Type: wire.TypeReactionAck, ID: id}},
+		{"editAck", wire.EditAck{Type: wire.TypeEditAck, ID: id}},
+		{"deleteAck", wire.DeleteAck{Type: wire.TypeDeleteAck, ID: id}},
+		{"pinAck", wire.PinAck{Type: wire.TypePinAck, ID: id}},
+		{"unpinAck", wire.UnpinAck{Type: wire.TypeUnpinAck, ID: id}},
+		{"ack", wire.Ack{Type: wire.TypeAck, ID: id}},
+		{"error", wire.Error{Type: wire.TypeError, ID: id, Message: "no"}},
+		{"msg", wire.Msg{Type: wire.TypeMsg, ID: id, Text: "hi",
+			PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}},
+		{"noMoreMessages", wire.NoMoreMessages{Type: wire.TypeNoMoreMessages, ID: id}},
+		{"pins", wire.PinsResponse{Type: wire.TypePins, ID: id}},
+		{"attachmentData", wire.AttachmentData{Type: wire.TypeAttachmentData, ID: id,
+			Token: "t", ContentType: "text/plain"}},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			raw, err := json.Marshal(tc.frame)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			ev, ok := decodeEvent(raw)
+			if !ok {
+				t.Fatalf("decodeEvent rejected %s: %s", tc.kind, raw)
+			}
+			if ev.Kind != tc.kind {
+				t.Fatalf("decoded as %q, want %q", ev.Kind, tc.kind)
+			}
+			if ev.CorrelationID != id {
+				t.Fatalf("the id was dropped decoding %s: got %q, want %q — the frame carries it and "+
+					"nothing downstream can correlate what the decoder threw away",
+					tc.kind, ev.CorrelationID, id)
+			}
+		})
 	}
 }

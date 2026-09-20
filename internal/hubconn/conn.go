@@ -1435,8 +1435,22 @@ func answersHistoryClaim(ev Event, claim *ackClaim) bool {
 // ratchet, from the mitigation that was supposed to cost one missing
 // answer. Found by an external reviewer with a reproduction, 2026-09-20,
 // hours after that mitigation was written.
-func (c *Conn) spendLateAnswerLocked(kind string) bool {
+func (c *Conn) spendLateAnswerLocked(ev Event) bool {
+	kind := ev.Kind
 	if c.lateAnswers[kind] <= 0 {
+		return false
+	}
+	// AN ANSWER THAT NAMES ITS REQUEST IS NEVER SPENT AGAINST A DEBT.
+	// The debt is a guess about which request an answer belongs to, and
+	// an id is knowledge; spending the debt against a correlated answer
+	// would swallow an answer whose owner is certain, which is the
+	// ratchet this mechanism is otherwise accused of.
+	//
+	// This is also what lets the debt be recorded on a correlating
+	// connection at all. It can now only ever fire on an id-LESS answer
+	// — exactly the case where the kind is once again the only key,
+	// which is every kind a declaring server has not yet echoed.
+	if ev.CorrelationID != "" {
 		return false
 	}
 	c.lateAnswers[kind]--
@@ -1619,16 +1633,6 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 func (c *Conn) expectLateAnswer(kind string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// NOT RECORDED AT ALL when the server correlates. A late answer then
-	// carries the id of the request that gave up, finds no claim holding
-	// it, and reaches the buffer as the unsolicited event it is — so the
-	// debt would never be spendable, and a counter that only ever
-	// increments is a ratchet whose trigger nobody can reach. Exactly one
-	// attribution scheme is live per connection; see Conn.correlates for
-	// the condition under which this whole mechanism can be deleted.
-	if c.correlates {
-		return
-	}
 	if c.lateAnswers == nil {
 		c.lateAnswers = make(map[string]int)
 	}
@@ -2031,7 +2035,7 @@ func (c *Conn) readLoop() {
 		// does not consume reaches the buffer as the unsolicited event
 		// it is. Swallowing it here instead cost the reader the only
 		// evidence that its timed-out request had in fact landed.
-		lateSpent := c.spendLateAnswerLocked(ev.Kind)
+		lateSpent := c.spendLateAnswerLocked(ev)
 		if c.handleAckPlumbingLocked(ev) {
 			c.mu.Unlock()
 			continue
