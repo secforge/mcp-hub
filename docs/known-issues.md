@@ -817,7 +817,24 @@ that looks self-verifying. A hash carries its own air of proof, which is
 precisely why a wrong one passes unsquinted — catching it costs a fetch,
 and nobody reading it had a reason to spend one.
 
-The only rule that covers it is the blunt one: do not write an
+**And once the cause was outside both systems entirely.** On the same
+afternoon a peer took a fresh identity with its working directory,
+environment and link string all byte-identical to the connect before it.
+Five mechanisms were proposed across two codebases and every one was
+eliminated. The answer: the operator had deleted that project's stored
+data by hand. The lookup missed because the row was gone, not because the
+key changed, and the row that looked "overwritten" was simply written
+into an empty bucket.
+
+Every mechanism proposed assumed the two systems were a closed world, and
+the artefact that would have settled it — the store as it stood before the
+mint — was destroyed by the same action that caused it. So "unexplained"
+was the right verdict on the evidence, and the evidence could not have
+contained the answer. When every mechanism is eliminated, the remaining
+possibility is that something outside the system acted; ask, rather than
+proposing a sixth.
+
+The only rule that covers the rest is the blunt one: do not write an
 identifier you have not just read. Not a shortened hash, not a line
 number, not a version. They are the cheapest things in this document to
 verify and the most expensive to be wrong about, because everything
