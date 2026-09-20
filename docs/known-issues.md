@@ -1107,3 +1107,40 @@ half that was missing.
 even when no data is touched and the change is a bug fix. Ask what
 becomes unreachable, not merely what moves — and ask it per path, since
 the same move was survivable on one and terminal on the other.
+
+## Nothing prompts the re-read
+
+Four entries on this page are about an entry on this page. That is not
+self-indulgence; it is one failure mode recurring, and it has a remedy
+specific enough to act on.
+
+**The shape.** A lesson gets written down and acquires a tidy form —
+that is what makes it worth writing. The counterexample arrives later
+wearing different clothes: as a bug fix, a release note, a field added
+to a wire. Nobody goes back to check what it invalidated, because
+nothing connects the two. The fix is filed under its own defect, and the
+entry it disproves sits a few hundred lines away looking as settled as
+the day it was written.
+
+Concretely, on 2026-09-20: this page acquired a rule that when every
+mechanism is eliminated, something outside the system acted. Hours
+later the roots deadline was fixed — for its own reasons, in its own
+commit, with its own test — and that fix WAS the sixth mechanism the
+rule had assumed did not exist. The author of both did not notice. The
+peer on the other side of the wire did, from the release note.
+
+**The remedy, and it is a question rather than a process.** When a fix
+lands, ask what it makes untrue. Not what it improves — what it
+FALSIFIES: a claim in a comment, an entry here, a number quoted to
+somebody else, a rule that was sound only while the defect existed.
+Most fixes falsify nothing. The ones that do are exactly the ones whose
+defect had been reasoned around rather than merely endured, and the
+reasoning is still written down somewhere.
+
+**Why this cannot be a checklist item.** The entry and the fix are
+authored at different times, by someone holding different context, and
+the connection is semantic rather than textual — no grep finds it. What
+found it here was another party reading a release note against a
+document they had helped write. That is not a process anyone can
+guarantee; it is a reason to say what a fix changes, out loud, to
+somebody who has the old version in their head.
