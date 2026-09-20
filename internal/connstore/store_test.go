@@ -33,7 +33,7 @@ func TestConcurrentUpsertsUnderLockDoNotLoseUpdates(t *testing.T) {
 	}
 	wg.Wait()
 
-	entries, err := List()
+	entries, err := ListForProject("")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -85,13 +85,29 @@ func TestDifferentProjectsWithTheSameLinkAreDistinctEntries(t *testing.T) {
 		t.Fatalf("expected project b's own entry, got %+v (ok=%v)", gotB, ok)
 	}
 
-	entries, err := List()
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 distinct entries for the same link under different projects, got %d: %+v",
-			len(entries), entries)
+	// Each project sees ITS OWN entry and only that one. Asserted per
+	// scope rather than by listing both at once, because there is no
+	// cross-project read to list them with — that is the property under
+	// test, and a test that needed one would be asserting the isolation
+	// through a hole in it.
+	for _, tc := range []struct {
+		project, secret string
+	}{
+		{"/projects/a", "secret-a"},
+		{"/projects/b", "secret-b"},
+	} {
+		entries, err := ListForProject(tc.project)
+		if err != nil {
+			t.Fatalf("list %s: %v", tc.project, err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("%s sees %d entries, want exactly its own: %+v", tc.project, len(entries), entries)
+		}
+		if entries[0].Entry.ReconnectSecret != tc.secret {
+			t.Fatalf("%s sees %q, want its own %q — the same link under another project is another "+
+				"entry, and neither scope may see the other's",
+				tc.project, entries[0].Entry.ReconnectSecret, tc.secret)
+		}
 	}
 }
 
@@ -110,7 +126,7 @@ func TestSameProjectAndLinkOverwritesNotDuplicates(t *testing.T) {
 	if !ok || got.PeerID != "peer-2" {
 		t.Fatalf("expected the second upsert to overwrite the first within the same project, got %+v (ok=%v)", got, ok)
 	}
-	entries, err := List()
+	entries, err := ListForProject("/projects/a")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -235,7 +251,7 @@ func TestListReturnsAllEntries(t *testing.T) {
 		t.Fatalf("upsert b: %v", err)
 	}
 
-	entries, err := List()
+	entries, err := ListForProject("")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -247,7 +263,7 @@ func TestListReturnsAllEntries(t *testing.T) {
 func TestListReturnsEmptyWhenNothingPersisted(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 
-	entries, err := List()
+	entries, err := ListForProject("")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

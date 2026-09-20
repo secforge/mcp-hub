@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -143,6 +144,10 @@ type Event struct {
 	// read, where the server says. Empty means no answer about it, which
 	// is not the same as never read.
 	RosterReadAt string
+	// RosterNameTaken says another peer in this roster already answers to
+	// this connection's own display name. Set only on a "roster" event,
+	// and only where this connection has a name of its own to collide.
+	RosterNameTaken bool
 
 	// Mirrored says the connection this event arrived on is a mirror of
 	// some other conversation (a teams link), where a message we send is
@@ -2034,6 +2039,22 @@ func (c *Conn) confirmReminderLoop() {
 	}
 }
 
+// nameTaken reports whether any of these peers already answers to mine.
+//
+// Separated from the read loop so it can be tested against the real
+// predicate rather than a copy of it: a test that reimplements the rule
+// it is checking passes whenever the two copies agree, including when
+// both are wrong.
+//
+// An empty name cannot collide — a connection that gave none is shown as
+// a bare peerId, which is unambiguous by construction.
+func nameTaken(mine string, others []PeerInfo) bool {
+	if mine == "" {
+		return false
+	}
+	return slices.ContainsFunc(others, func(p PeerInfo) bool { return p.Name == mine })
+}
+
 func (c *Conn) readLoop() {
 	for {
 		_, raw, err := c.ws.ReadMessage()
@@ -2101,6 +2122,17 @@ func (c *Conn) readLoop() {
 					others = append(others, p)
 				}
 			}
+			// WHETHER THIS PEER'S NAME IS ALREADY TAKEN, decided here
+			// because this is the only place that has both the roster
+			// and this connection's own name — the formatter is a free
+			// function and sees only the event.
+			//
+			// A display name is how everyone in the room refers to each
+			// other; two peers answering to one name makes every later
+			// "as X said" ambiguous, and neither of them can tell from
+			// their own side, since each sees a roster with the other
+			// in it and itself removed.
+			ev.RosterNameTaken = nameTaken(c.name, others)
 			ev.RosterPeers = others
 		}
 		c.buffer = append(c.buffer, ev)

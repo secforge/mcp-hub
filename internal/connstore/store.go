@@ -609,78 +609,27 @@ func SetTopic(target Target, topic string) error {
 	})
 }
 
-// List returns every stored connection across all projects.
-// CountOtherScopesHoldingLink counts the projects, other than except,
-// whose stored entry for link carries a reconnect secret — i.e. how many
-// scopes this link could be RESUMED from rather than joined afresh.
+// THERE IS NO CROSS-PROJECT READ HERE, AND THERE MUST NOT BE ONE.
 //
-// A COUNT, AND DELIBERATELY NOT THE NAMES. The first version of this
-// returned the project paths so a caller could be told which scope to
-// switch to, which is more actionable and is a disclosure channel: a
-// project path is the name of a directory on this machine, and this
-// store holds them for every project that has ever used any link. A
-// session working in one project would have been handed the paths of
-// unrelated ones — including directories its user has put out of bounds
-// for anything leaving the session — in a connect result that a model
-// then quotes onward. Six scopes hold a resumable identity for one link
-// on this machine today, and they are not all in the same tree.
+// A List() over every project stood here, and a count of which other
+// scopes held a given link stood beside it. Both looked legitimate: one
+// counted sessions left open, the other warned a connect that a link was
+// resumable under a different scope. Both handed a session facts about
+// projects that are not its own — their paths, their number, that they
+// exist — and a connect result is quoted onward by whatever reads it.
 //
-// So the fact travels and the names do not. A caller learns that this
-// link is resumable elsewhere, which is what it needs to know it has
-// crossed a scope boundary; where to look is its own configuration,
-// which it can read without being told.
+// A client acting in one project interacts with that project's data and
+// nothing else. That is not a rule applied at each call site, where the
+// next caller has to remember it; it is the absence of any function that
+// could do otherwise. Every accessor takes a Target or a project, so the
+// scope is an argument the caller must supply and cannot omit.
 //
-// A Target is {link, project}, so the same link under a different
-// project is a different identity by design. That is the isolation
-// working; what was missing is any way for a caller to notice it had
-// crossed it. Connecting in a scope that holds nothing looks exactly
-// like a first-ever connect, and the client mints a new secret and a new
-// peer id without a word — which costs a read position on a hub link and
-// costs ACCESS, permanently, on a single-use link already redeemed,
-// because the only resumption credential is the secret stored beside it
-// and there is no mint path.
-func CountOtherScopesHoldingLink(link, except string) (int, error) {
-	n := 0
-	err := withLock(false, func() error {
-		st, err := load()
-		if err != nil {
-			return err
-		}
-		for project, byLink := range st {
-			if project == except {
-				continue
-			}
-			if e, ok := byLink[link]; ok && e.ReconnectSecret != "" && e.PeerID != "" {
-				n++
-			}
-		}
-		return nil
-	})
-	return n, err
-}
+// load() reads the whole file because one file holds every project, and
+// it is unexported for exactly that reason.
 
-func List() ([]ListedEntry, error) {
-	var out []ListedEntry
-	err := withLock(false, func() error {
-		st, err := load()
-		if err != nil {
-			return err
-		}
-		for project, byLink := range st {
-			for link, e := range byLink {
-				out = append(out, ListedEntry{
-					Target: Target{Link: link, Project: project},
-					Entry:  e,
-				})
-			}
-		}
-		return nil
-	})
-	return out, err
-}
-
-// ListForProject is List scoped to one project — a direct single-key
-// lookup rather than a scan, since project is the outermost key on disk.
+// ListForProject returns one project's stored connections — a direct
+// single-key lookup rather than a scan, since project is the outermost
+// key on disk.
 func ListForProject(project string) ([]ListedEntry, error) {
 	var out []ListedEntry
 	err := withLock(false, func() error {

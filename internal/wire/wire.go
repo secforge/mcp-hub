@@ -223,6 +223,24 @@ type Joined struct {
 	// server-side would be a confident wrong answer about which of two
 	// binaries is newer.
 	ClientRelease *ClientRelease `json:"clientRelease,omitempty,case:strict"`
+	// ResumablePeers is how many peers in THIS conversation still hold a
+	// reconnect secret, sent only when the server has just MINTED a fresh
+	// identity for this connection and absent when it reclaimed one.
+	//
+	// It answers a question no client can answer for itself without
+	// looking where it has no business looking. A client's stored
+	// identities are scoped to one project, so a bucket holding nothing
+	// for this link is indistinguishable from a first-ever connect — and
+	// the only local way to tell the difference is to read other
+	// projects' entries, which is not this client's data. The server has
+	// the fact already, about its own conversation, with no other project
+	// in it.
+	//
+	// A POINTER, and zero is sent rather than omitted: "this link has no
+	// other resumable peers" is an answer, and must stay distinguishable
+	// from a server that does not say. Declared as FeatureMintNotice, so
+	// its absence means one thing.
+	ResumablePeers *int `json:"resumablePeers,omitempty,case:strict"`
 }
 
 // ClientRelease is a server's verified statement of the current client
@@ -299,6 +317,12 @@ type Error struct {
 // echoed into frames a server has to bound, so it needs a limit; 128 is
 // agreed with chat-relay and is ample for the uuid this client sends.
 const MaxCorrelationIDLen = 128
+
+// FeatureMintNotice is the Joined.Features key a server sets to promise
+// it reports Joined.ResumablePeers whenever it mints a fresh identity.
+// Without it a missing count means "this server does not say" rather than
+// "there was nothing to resume", which are opposite answers.
+const FeatureMintNotice = "mintNotice"
 
 // FeatureCorrelation is the Joined.Features key a server sets to promise
 // it echoes Msg.ID on answers and errors. Without it a client cannot tell

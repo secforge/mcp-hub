@@ -482,92 +482,17 @@ func TestConnectingWithoutANameKeepsTheStoredOne(t *testing.T) {
 	}
 }
 
-// Connecting in a scope that holds nothing for this link looks exactly
-// like a first-ever connect from the inside, and the result said so —
-// reassuringly — while the link's real identity sat in another scope.
+// The two tests that stood here asserted a connect warning naming which
+// OTHER project scope could have resumed a link. The warning is gone and
+// so are they: a client acting in one project reads that project's data
+// and nothing else, so it cannot know another scope holds anything, and
+// a test for a capability that must not exist is a test that would
+// reintroduce it.
 //
-// On a hub link that costs a read position. On a single-use link already
-// redeemed it costs ACCESS: the only resumption credential is the secret
-// stored beside it, a scope without that secret cannot present it, and
-// the server refuses with no mint path. That happened to a live session
-// on 2026-09-20 after a change to how the scope is resolved moved it into
-// a different bucket.
-func TestConnectingInAScopeThatCannotResumeSaysSo(t *testing.T) {
-	link := startRelayTestServerWithJoined(t, wire.Joined{
-		Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
-		ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
-		ConversationKind: "group", CanSend: true,
-	})
-
-	// The link already has an identity under one scope.
-	t.Setenv("MCP_HUB_PROJECT_DIR", "/source/somewhere/original")
-	ctx := context.Background()
-	hub := NewHub()
-	req := mcp.CallToolRequest{}
-	req.Params.Arguments = map[string]any{"as": testConn, "link": link}
-	res, err := hub.handleConnect(ctx, req)
-	if err != nil || res.IsError {
-		t.Fatalf("first connect: err=%v result=%+v", err, res)
-	}
-	hub.handleDisconnect(ctx, connReqFor(testConn))
-
-	// A different scope, same link. This is a new identity, and the
-	// caller has to be told rather than reassured.
-	t.Setenv("MCP_HUB_PROJECT_DIR", "/source/somewhere/else")
-	hub2 := NewHub()
-	res, err = hub2.handleConnect(ctx, req)
-	if err != nil || res.IsError {
-		t.Fatalf("second connect: err=%v result=%+v", err, res)
-	}
-	defer hub2.handleDisconnect(ctx, connReqFor(testConn))
-
-	text := textOf(res)
-	for _, want := range []string{
-		"ALREADY has a stored identity", // that it could have been resumed
-		"another project scope",         // how many, without naming them
-		"/source/somewhere/else",        // where it actually landed, which is this session's own
-		"MCP_HUB_PROJECT_DIR",           // what decides it
-		"SINGLE-USE",                    // why it may not be recoverable
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("the connect result never mentions %q — a caller that has just lost access to a "+
-				"single-use link is told only that this is a first connection:\n%s", want, text)
-		}
-	}
-
-	// AND NOT THE OTHER SCOPE'S PATH. This store holds a project path for
-	// every project that has ever used any link, including directories a
-	// user has put out of bounds for anything leaving the session. Naming
-	// one here hands it to a session that has no business with it, in a
-	// result a model then quotes onward.
-	if strings.Contains(text, "/source/somewhere/original") {
-		t.Errorf("the connect result named another project's path:\n%s", text)
-	}
-}
-
-// And a genuine first connect is not cluttered with a warning about
-// scopes that hold nothing.
-func TestAGenuineFirstConnectSaysNothingAboutOtherScopes(t *testing.T) {
-	link := startRelayTestServerWithJoined(t, wire.Joined{
-		Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
-		ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
-		ConversationKind: "group", CanSend: true,
-	})
-	t.Setenv("MCP_HUB_PROJECT_DIR", "/source/only/scope")
-	ctx := context.Background()
-	hub := NewHub()
-	req := mcp.CallToolRequest{}
-	req.Params.Arguments = map[string]any{"as": testConn, "link": link}
-	res, err := hub.handleConnect(ctx, req)
-	if err != nil || res.IsError {
-		t.Fatalf("connect: err=%v result=%+v", err, res)
-	}
-	defer hub.handleDisconnect(ctx, connReqFor(testConn))
-
-	if strings.Contains(textOf(res), "ALREADY has a stored identity") {
-		t.Errorf("a first-ever connect was warned about other scopes:\n%s", textOf(res))
-	}
-}
+// What replaces the warning comes from the only party entitled to give
+// it — the server's own joined.resumablePeers, a count of peers in THIS
+// conversation, which is its data about this link with no other project
+// in it.
 
 // hub_send must refuse a "#hub …" first line rather than relay it.
 //

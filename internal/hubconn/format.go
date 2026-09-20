@@ -246,8 +246,28 @@ func FormatEvent(e Event) string {
 		for _, p := range e.RosterPeers {
 			who = append(who, rosterName(p))
 		}
+		// OFFERED, NOT DEMANDED. Somebody here already answers to this
+		// connection's display name, which makes every later "as X
+		// said" ambiguous for everyone in the room — and neither of the
+		// two can see it from their own side, since each gets a roster
+		// with the other in it and itself removed. Whoever is told
+		// first is simply whoever reconnects next, and that is reason
+		// enough to mention it rather than to decide it.
+		//
+		// Not renamed automatically: the name is how this agent has
+		// been addressed all session, a caller may have chosen it
+		// deliberately, and the collision is not necessarily this
+		// peer's to resolve. Stated as a choice with the cost named, so
+		// a reader can weigh it.
+		clash := ""
+		if e.RosterNameTaken {
+			clash = " NOTE: somebody here already goes by your display name, so anything either " +
+				"of you says is attributed ambiguously from now on. You may reconnect with a " +
+				"different name if you want to be distinguishable — optional, and only you can " +
+				"judge whether yours is the one that should change."
+		}
 		return fmt.Sprintf("[hub: %d already here — %s. That is everyone; a join or leave from "+
-			"here on is a real change]", len(who), strings.Join(who, ", "))
+			"here on is a real change]%s", len(who), strings.Join(who, ", "), clash)
 	case "confirmReminder":
 		// SAYS WHOSE VOICE THIS IS. A notice arrives through the same
 		// channel as a peer's message and in a similar shape, so the

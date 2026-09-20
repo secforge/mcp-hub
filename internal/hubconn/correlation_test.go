@@ -859,3 +859,68 @@ func TestAPiggybackRefusalDoesNotDisableReceiptsOrTheConnection(t *testing.T) {
 		t.Fatalf("%q was treated as fatal to the connection: %q", code, why)
 	}
 }
+
+// Two peers answering to one display name makes every later "as X said"
+// ambiguous, and neither of them can see it: each gets a roster with the
+// other in it and itself removed. So the roster line says so — as an
+// offer, since the name may have been chosen deliberately and the
+// collision is not necessarily this peer's to resolve.
+func TestTheRosterSaysWhenThisPeersNameIsAlreadyTaken(t *testing.T) {
+	const mine = "Claude Code (mcp-hub)"
+	for _, tc := range []struct {
+		name   string
+		others []PeerInfo
+		want   bool
+	}{
+		{"somebody already has it", []PeerInfo{
+			{ID: "a", Name: mine}, {ID: "b", Name: "coordinator"}}, true},
+		{"nobody does", []PeerInfo{
+			{ID: "a", Name: "reviewer"}, {ID: "b", Name: "coordinator"}}, false},
+		{"a peer with no name is not a clash", []PeerInfo{{ID: "a"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			line := FormatEvent(Event{Kind: "roster", RosterPeers: tc.others,
+				RosterNameTaken: tc.want})
+			said := strings.Contains(line, "already goes by your display name")
+			if said != tc.want {
+				t.Fatalf("clash mentioned=%v, want %v: %s", said, tc.want, line)
+			}
+			if tc.want {
+				if !strings.Contains(line, "optional") {
+					t.Errorf("the rename reads as an instruction rather than an offer: %s", line)
+				}
+				// The roster itself must still be there — the note is an
+				// addition, not a replacement.
+				if !strings.Contains(line, "coordinator") {
+					t.Errorf("the clash note displaced the roster: %s", line)
+				}
+			}
+		})
+	}
+}
+
+// And the clash is decided against this connection's own name, by the
+// real predicate rather than a copy of it in the test.
+func TestTheNameClashIsDecidedAgainstThisConnectionsOwnName(t *testing.T) {
+	const mine = "Claude Code (mcp-hub)"
+	for _, tc := range []struct {
+		name   string
+		myName string
+		others []PeerInfo
+		want   bool
+	}{
+		{"another peer has my name", mine, []PeerInfo{
+			{ID: "b", Name: mine}, {ID: "c", Name: "reviewer"}}, true},
+		{"nobody else does", mine, []PeerInfo{{ID: "b", Name: "reviewer"}}, false},
+		{"I have no name, so nothing of mine can collide", "", []PeerInfo{{ID: "b"}}, false},
+		{"and a nameless peer does not collide with a nameless me", "", []PeerInfo{
+			{ID: "b", Name: ""}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nameTaken(tc.myName, tc.others); got != tc.want {
+				t.Fatalf("nameTaken(%q, %d peers) = %v, want %v",
+					tc.myName, len(tc.others), got, tc.want)
+			}
+		})
+	}
+}

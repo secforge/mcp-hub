@@ -270,7 +270,11 @@ func suggestedConnName(dir string) string {
 // deferring full schemas by default, may not be immediately) — a
 // best-effort notice, not a guaranteed one.
 func startupConnectionsNote() string {
-	entries, err := connstore.List()
+	// THIS PROJECT ONLY. Counting every project's entries told a session
+	// how many sessions were open elsewhere on the machine — a fact about
+	// other projects, in a note about this one, and one it could neither
+	// see nor act on.
+	entries, err := connstore.ListForProject(connstore.CurrentProject())
 	if err != nil {
 		return ""
 	}
@@ -2357,10 +2361,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// server-side notice cannot reach this case even in principle, and a
 	// notice that fires on a MINT cannot either, because that path never
 	// mints. Established with chat-relay from their own code.
-	resumableElsewhere := 0
-	if stored.ReconnectSecret == "" {
-		resumableElsewhere, _ = connstore.CountOtherScopesHoldingLink(link, target.Project)
-	}
+
 	if storeErr != nil {
 		// Refused rather than served with a new identity: minting one
 		// here is what silently retires whatever the unreadable file
@@ -2618,29 +2619,19 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// different project is a new participant by design — but the
 		// branch above reads as reassurance, and it is exactly the
 		// reassurance a caller got moments before losing access.
-		if resumableElsewhere > 0 {
-			scopes := "another project scope"
-			if resumableElsewhere > 1 {
-				scopes = fmt.Sprintf("%d other project scopes", resumableElsewhere)
-			}
-			// The COUNT, never the paths. Naming the scope would be more
-			// actionable and would hand this session the directory names
-			// of unrelated projects, which a model then quotes onward.
-			// The caller can read its own configuration.
-			identityNote += fmt.Sprintf(
-				"\nNOTE: this link ALREADY has a stored identity, in %s — this one is %q, which "+
-					"held none. A stored identity belongs to one scope, so connecting here took a "+
-					"NEW one rather than resuming it, and the old one still sits where it was with "+
-					"its own read position.\n"+
-					"If that was not intended, the scope comes from MCP_HUB_PROJECT_DIR when set, "+
-					"otherwise from the MCP client's project root — check which of those is in "+
-					"force here.\n"+
-					"This matters more than it reads for a SINGLE-USE link. Such a link is "+
-					"resumable only with the secret stored beside it, and a scope that does not "+
-					"hold that secret cannot present it — which the server refuses as an invalid "+
-					"credential, with no way to mint a replacement.",
-				scopes, target.Project)
-		}
+		// NOTHING HERE LOOKS AT ANOTHER SCOPE. An earlier version
+		// checked whether this link was resumable under a different
+		// project and said so, which is useful and is not this
+		// client's to know: a session scoped to one project sees its
+		// own data and nothing else, not the paths of other projects,
+		// not their count, not that they exist. The store holds a
+		// directory name for every project that has ever used any
+		// link, and a connect result is quoted onward.
+		//
+		// The same warning from the only party entitled to give it is
+		// the server's own joined.resumablePeers, which counts peers
+		// in THIS conversation — its data, about this link, with no
+		// other project in it. See resumablePeersNote below.
 	case conn.PeerID() == stored.PeerID:
 		identityNote += "\nYour previous identity here was resumed: the server reassigned the " +
 			"same peerId this link last used. Nothing about that is yours to remember or pass."

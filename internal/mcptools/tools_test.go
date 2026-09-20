@@ -1467,7 +1467,8 @@ func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 	}
 
 	if err := connstore.Upsert(
-		connstore.Target{Link: "wss://a/550e8400-e29b-41d4-a716-446655440000"},
+		connstore.Target{Link: "wss://a/550e8400-e29b-41d4-a716-446655440000",
+			Project: connstore.CurrentProject()},
 		connstore.Entry{Connected: true},
 	); err != nil {
 		t.Fatalf("upsert: %v", err)
@@ -1476,6 +1477,21 @@ func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 	note := startupConnectionsNote()
 	if !strings.Contains(note, "1 session") || !strings.Contains(note, "hub_list_connections") {
 		t.Fatalf("expected a note naming 1 open session, got: %s", note)
+	}
+
+	// ANOTHER PROJECT'S OPEN SESSION IS NOT THIS ONE'S BUSINESS. The
+	// count used to span every project on the machine, so a session was
+	// told about sessions it could neither see nor act on — a fact about
+	// other projects, in a note about this one.
+	if err := connstore.Upsert(
+		connstore.Target{Link: "wss://b/6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Project: "/some/other/project"},
+		connstore.Entry{Connected: true},
+	); err != nil {
+		t.Fatalf("upsert elsewhere: %v", err)
+	}
+	if note := startupConnectionsNote(); !strings.Contains(note, "1 session") {
+		t.Fatalf("another project's open session was counted into this project's note: %s", note)
 	}
 }
 
