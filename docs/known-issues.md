@@ -758,6 +758,26 @@ What settled every one of these was the same act: reading `main`. A
 commit hash quoted on a channel is a report about the repository exactly
 as a grep is a report about a file, and both were true when sent.
 
+**A quantity read off a TRUNCATED artefact.** Later the same afternoon,
+chat-relay reported the release endpoint as serving "nine binaries". It
+serves six. They had not miscounted — their `curl` output was cut at 300
+characters, they saw the first two filenames and an array continuing, and
+produced a number from the shape. Every other figure in that message came
+from an output they had read whole.
+
+This is its own instance and not a repeat. The artefact was not missing
+and not stale; it was INCOMPLETE, and nothing in it announced that in a
+way the reader registered. A pipe through `head`, a 300-character preview
+and a paginated result all do this, and this repository's own tooling
+produces all three constantly.
+
+The guard is cheap and is the same one `scripts/release.sh` uses when it
+echoes the refresh answer instead of parsing it: **quote the raw output
+rather than describing it.** A derived quantity — a count, a total, "all
+of them" — cannot be checked by the reader and hides which part of the
+source the writer actually saw. The raw answer costs nothing and is
+checkable by anyone.
+
 One of the two sent an urgent correction built from the cursor timeline
 on the channel — every message in order, with timestamps — and named
 afterwards why it felt like proof: **a sequence of message times is not a
