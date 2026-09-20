@@ -47,6 +47,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -610,6 +611,49 @@ func SetTopic(target Target, topic string) error {
 }
 
 // List returns every stored connection across all projects.
+// OtherProjectsHoldingLink returns the projects, other than except, whose
+// stored entry for link carries a reconnect secret — i.e. the buckets
+// from which this link could be RESUMED rather than joined afresh.
+//
+// A Target is {link, project}, so the same link under a different project
+// is a different identity by design. That is the isolation working; what
+// is missing is any way for a caller to notice it has crossed the
+// boundary. Connecting in a bucket that holds nothing looks exactly like
+// a first-ever connect, and the client mints a new secret and a new peer
+// id without a word.
+//
+// For a hub link that costs an identity and a read position, which is
+// recoverable. For a single-use link — one already redeemed, whose only
+// resumption credential is the secret stored beside it — it costs ACCESS,
+// permanently, because there is no mint path: the server verifies the
+// presented secret against the one the link was redeemed with, and a
+// freshly minted one can never match. Seen live on 2026-09-20 after a
+// change to how the project is resolved moved a session into a different
+// bucket.
+//
+// This is what lets a caller be told. It does not let one bucket reach
+// into another, which would defeat the isolation entirely.
+func OtherProjectsHoldingLink(link, except string) ([]string, error) {
+	var out []string
+	err := withLock(false, func() error {
+		st, err := load()
+		if err != nil {
+			return err
+		}
+		for project, byLink := range st {
+			if project == except {
+				continue
+			}
+			if e, ok := byLink[link]; ok && e.ReconnectSecret != "" && e.PeerID != "" {
+				out = append(out, project)
+			}
+		}
+		return nil
+	})
+	sort.Strings(out)
+	return out, err
+}
+
 func List() ([]ListedEntry, error) {
 	var out []ListedEntry
 	err := withLock(false, func() error {

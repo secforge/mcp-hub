@@ -2336,6 +2336,22 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if name == "" {
 		name = stored.Name
 	}
+	// ABOUT TO MINT, AND THIS LINK IS RESUMABLE SOMEWHERE ELSE. Nothing
+	// here can adopt that identity — a Target is {link, project} and
+	// crossing that boundary silently is exactly what the isolation
+	// prevents — but a caller is entitled to know it has crossed it,
+	// because from the inside a bucket holding nothing is
+	// indistinguishable from a first-ever connect.
+	//
+	// The cost is not uniform, which is why this says so rather than
+	// shrugging: on a hub link a new identity loses a read position and
+	// is recoverable, while on a single-use link already redeemed it
+	// loses ACCESS with no mint path, since the server verifies the
+	// presented secret against the one the link was redeemed with.
+	var resumableElsewhere []string
+	if stored.ReconnectSecret == "" {
+		resumableElsewhere, _ = connstore.OtherProjectsHoldingLink(link, target.Project)
+	}
 	if storeErr != nil {
 		// Refused rather than served with a new identity: minting one
 		// here is what silently retires whatever the unreadable file
@@ -2587,6 +2603,27 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		identityNote += "\nThis is a first connection to this link, so the identity the server " +
 			"assigned has been recorded for it — connecting again with the same link asks for " +
 			"this same peerId back. Nothing about that is yours to remember or pass."
+		// FIRST IN THIS SCOPE IS NOT FIRST EVER, and the difference is
+		// invisible from here without saying so. A stored identity is
+		// keyed by {link, project}, so the same link opened under a
+		// different project is a new participant by design — but the
+		// branch above reads as reassurance, and it is exactly the
+		// reassurance a caller got moments before losing access.
+		if len(resumableElsewhere) > 0 {
+			identityNote += fmt.Sprintf(
+				"\nNOTE: this link ALREADY has a stored identity, under a different project scope "+
+					"(%s) — this one is %q. A stored identity belongs to one scope, so connecting "+
+					"here took a NEW one rather than resuming it, and the old one still sits where "+
+					"it was with its own read position.\n"+
+					"If that was not intended, the scope comes from MCP_HUB_PROJECT_DIR when set, "+
+					"otherwise from the MCP client's project root: set it to the scope above and "+
+					"connect again.\n"+
+					"This matters more than it reads for a SINGLE-USE link. Such a link is "+
+					"resumable only with the secret stored beside it, and a scope that does not "+
+					"hold that secret cannot present it — which the server refuses as an invalid "+
+					"credential, with no way to mint a replacement.",
+				strings.Join(resumableElsewhere, ", "), target.Project)
+		}
 	case conn.PeerID() == stored.PeerID:
 		identityNote += "\nYour previous identity here was resumed: the server reassigned the " +
 			"same peerId this link last used. Nothing about that is yours to remember or pass."
