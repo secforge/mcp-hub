@@ -1004,3 +1004,48 @@ AND one carrying none — the first alone passes a client that ignores the
 field, the second alone passes one that refuses everything. Then run the
 test against the unfixed code and read the failure message: if it does
 not name the defect, the test is describing something else.
+
+## Changing how a scope is resolved can cost a single-use link outright
+
+Shipped in v3.1.7 and its cost landed the same afternoon. Recorded
+because the fix was correct and the consequence was not foreseen.
+
+A stored identity is keyed by `{link, project}`. v3.1.7 made
+`MCP_HUB_PROJECT_DIR` actually take effect — before it, the variable was
+read only when the MCP client reported no roots, and a client that
+answers roots always answers, so it did nothing in an MCP session. Every
+session whose resolved project therefore CHANGED moved to a different
+bucket, found nothing there, and was treated as a first-ever connect.
+
+**The cost is not uniform, and only one half is recoverable.**
+
+- On a hub link, a new identity loses a peer id and a read position. The
+  old row sits intact under the old key. Annoying, reversible.
+- On a single-use link already redeemed, it loses ACCESS, permanently.
+  The only resumption credential is the secret stored beside it; a scope
+  that does not hold that secret cannot present one that verifies, and
+  there is no mint path, because such a peer id derives from the link
+  rather than being assigned.
+
+A live session lost a link it had held for three hours this way. The
+connect that did it reported "This is a first connection to this link."
+
+**Why the warning has to be here and cannot be on the wire.** On the
+single-use path the resume is refused BEFORE the websocket upgrade, so
+there is no `joined` frame to carry a notice; and the refusal is
+deliberately generic, since distinguishing "valid link, wrong secret"
+would help somebody holding a link but not its secret. A server-side
+signal cannot reach this case even in principle. Nor can one that fires
+on a mint — that path never mints. The client, before dialling, is the
+only place that knows both that this scope holds nothing and that another
+scope holds something.
+
+So a connect about to mint looks for the same link in other scopes and
+names them. It does NOT adopt another scope's identity; crossing that
+boundary silently is what the isolation exists for, and being told is the
+half that was missing.
+
+**The general rule.** Changing how a key is DERIVED is a data migration,
+even when no data is touched and the change is a bug fix. Ask what
+becomes unreachable, not merely what moves — and ask it per path, since
+the same move was survivable on one and terminal on the other.

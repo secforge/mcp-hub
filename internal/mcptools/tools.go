@@ -2348,6 +2348,15 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// is recoverable, while on a single-use link already redeemed it
 	// loses ACCESS with no mint path, since the server verifies the
 	// presented secret against the one the link was redeemed with.
+	//
+	// AND THIS IS THE ONLY PLACE THE WARNING CAN EXIST. On the single-use
+	// path a failed resume is refused before the websocket upgrade, so
+	// there is no joined frame to carry anything back; the refusal is
+	// deliberately generic, because distinguishing "valid link, wrong
+	// secret" would help somebody holding a link but not its secret. A
+	// server-side notice cannot reach this case even in principle, and a
+	// notice that fires on a MINT cannot either, because that path never
+	// mints. Established with chat-relay from their own code.
 	var resumableElsewhere []string
 	if stored.ReconnectSecret == "" {
 		resumableElsewhere, _ = connstore.OtherProjectsHoldingLink(link, target.Project)
