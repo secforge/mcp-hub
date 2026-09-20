@@ -864,3 +864,44 @@ Related in shape and not in cause: chat-relay's reflection test proved
 its records COULD carry the id and said nothing about whether any call
 site set one; four of seven acks did not. The capability was present, the
 wiring absent, and a green suite spanned the gap.
+
+## A declared capability with nothing wired to it
+
+Three times on 2026-09-20, in different code, by different authors, with
+a green suite over all three.
+
+- `decodeEvent` carried the correlation id onto ten frame kinds and not
+  onto `msg` — the one kind a history answer arrives as. The id was
+  minted, sent and echoed back, then dropped before anything compared it.
+- `Joined.AttachmentsFeature()` decodes `maxRawBytes` and `imagesOnly`.
+  Its only callers were on this module's SERVER side. So a `.pdf` to a
+  server that declared images-only was read, base64-encoded and pushed in
+  full, and learned it was unwanted from a refusal that arrived after the
+  transfer.
+- On the server side, a reflection test proved every ack record COULD
+  carry the id; four of seven call sites set none. The failure beside
+  each of them did set it, so a pin reported its refusal correlated and
+  its success uncorrelated.
+
+**The shape.** A capability exists — a field on the wire, a helper that
+decodes it, a struct that can hold it — and nothing calls it. It is not
+dead code, so a linter is quiet. The type is used, so the compiler is
+quiet. The tests exercise the helper, so coverage is quiet. Every
+instrument reports a wired feature and the wire is not connected.
+
+**What found all three: enumeration.** Every construction site of an
+answering frame; every `writeJSON` call that awaits a reply; every decode
+case against the list of kinds a server says it echoes. Not one was found
+by reasoning about the design, and reasoning is what left them out to
+begin with — the design was right in all three cases.
+
+**The cheap standing check.** Where two sides agree a list, walk the list
+in a test rather than trusting that each item was handled. This
+repository now does that for the twelve kinds that echo a correlation
+id; the entry exists because writing that test took ten minutes and
+would have caught two of the three on the day they were written.
+
+Related: a capability read from a DECLARATION is a promise, not a
+delivery — see the correlation entry's rollout window, where suppressing
+a mitigation because a server said it correlates left the client
+unprotected on every kind that server had not yet echoed.
