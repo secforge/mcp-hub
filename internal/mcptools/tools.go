@@ -280,8 +280,8 @@ func startupConnectionsNote() string {
 	// asked for and $PWD may name a different project than roots will.
 	// A count taken from the wrong bucket is the same disclosure in a
 	// quieter form. Silent when the scope is not certain — see
-	// connstore.ScopeAtStartup.
-	project, known := connstore.ScopeAtStartup()
+	// scopeIfKnown.
+	project, known := scopeIfKnown()
 	if !known {
 		return ""
 	}
@@ -308,13 +308,6 @@ func startupConnectionsNote() string {
 			"hub_list_connections() to see them.", openCount, plural)
 }
 
-// rootsRequestTimeout bounds how long projectForConnect waits for the MCP
-// client's roots/list reply before falling back to connstore.CurrentProject
-// — RequestRoots itself has no built-in timeout (it just blocks on ctx or a
-// reply), so a client that claims roots support but never actually answers
-// would otherwise hang a connect call indefinitely.
-var rootsRequestTimeout = 2 * time.Second
-
 // projectForConnect resolves the project scope for a connstore.Target,
 // in three steps, most explicit first.
 //
@@ -334,8 +327,98 @@ var rootsRequestTimeout = 2 * time.Second
 // ClientSession in ctx, does not support roots, times out, or reports
 // none, and it degrades safely to "" in the worst case.
 func projectForConnect(ctx context.Context) string {
-	return resolveProject(connstore.ProjectOverride(), func() string { return rootFromClient(ctx) },
-		connstore.CurrentProject)
+	return resolveProject(connstore.ProjectOverride(),
+		func() string { return cachedRootScope(ctx) }, connstore.CurrentProject)
+}
+
+// scopeCache holds the project scope this process resolved from the MCP
+// client's roots, once.
+//
+// THE SCOPE MUST NOT MOVE WHILE THE PROCESS RUNS. It is half the key
+// every stored identity is filed under, so a scope that answers
+// differently on two calls files the same link under two buckets — the
+// second finds nothing, mints a fresh secret and a new peer id, and
+// strands the first. That is not hypothetical: it is what a changed
+// scope cost a live session today, and asking roots per call makes it
+// reachable with no configuration change at all, because
+// rootFromClient returns "" on a timeout and the answer then falls
+// through to $PWD. A two-second stall would be enough.
+//
+// So roots is asked at most once and the answer is kept. A timeout is
+// NOT cached: it is an absence of an answer rather than an answer, and
+// freezing it would make one slow reply permanent for the process.
+var scopeCache struct {
+	sync.Mutex
+	root     string
+	resolved bool
+}
+
+// cachedRootScope is the scope for a process with no override: the MCP
+// client's first advertised root, remembered, else the working
+// directory.
+//
+// The residual, stated because it is not closed: if the first call's
+// roots request times out, this returns $PWD for that call while leaving
+// the question open, so a later call can still establish the real scope.
+// A connect in that window uses $PWD and would be filed there. Narrowing
+// that further means refusing to act until roots answers, which trades a
+// rare wrong bucket for a common hard failure.
+func cachedRootScope(ctx context.Context) string {
+	return cachedRootScopeFrom(func() string { return rootFromClient(ctx) })
+}
+
+// cachedRootScopeFrom is cachedRootScope with the asking separated out,
+// so the holding can be tested against the real cache rather than a
+// reimplementation of it.
+func cachedRootScopeFrom(ask func() string) string {
+	scopeCache.Lock()
+	defer scopeCache.Unlock()
+	if scopeCache.resolved {
+		return scopeCache.root
+	}
+	if root := ask(); root != "" {
+		scopeCache.root = root
+		scopeCache.resolved = true
+		return root
+	}
+	// No answer, and nothing cached: resolveProject falls through to the
+	// working directory for this call and asks again on the next.
+	return ""
+}
+
+// scopeIfKnown is projectForConnect for code with no request to ask
+// over — process start, before any tool call — and reports whether the
+// scope can be known at all there.
+//
+// It is the SAME resolver, not a second one. Two resolvers that can
+// disagree is the defect this replaces: the startup notices used a
+// cwd-based one while every tool call used a roots-based one, so where
+// those differ the notices described a project the session would never
+// touch. One function now answers, and the only difference here is that
+// it may answer "not yet".
+//
+// Known when the override states it, or when roots has already been
+// asked and answered. Not known otherwise — $PWD is available but may
+// name a different project than roots will, and a count taken from the
+// wrong bucket is a statement about somebody else's project.
+func scopeIfKnown() (string, bool) {
+	if ov := connstore.ProjectOverride(); ov != "" {
+		return ov, true
+	}
+	scopeCache.Lock()
+	defer scopeCache.Unlock()
+	if scopeCache.resolved {
+		return scopeCache.root, true
+	}
+	return "", false
+}
+
+// ResetScopeCacheForTesting forgets the resolved scope. The cache is
+// per process and a test process is many sessions.
+func ResetScopeCacheForTesting() {
+	scopeCache.Lock()
+	defer scopeCache.Unlock()
+	scopeCache.root, scopeCache.resolved = "", false
 }
 
 // resolveProject is the precedence itself, separated from the plumbing
@@ -366,9 +449,19 @@ func rootFromClient(ctx context.Context) string {
 	if mcpServer == nil {
 		return ""
 	}
-	rootsCtx, cancel := context.WithTimeout(ctx, rootsRequestTimeout)
-	defer cancel()
-	result, err := mcpServer.RequestRoots(rootsCtx, mcp.ListRootsRequest{
+	// NO TIMEOUT OF ITS OWN. A deadline here turns a slow client into a
+	// DIFFERENT ANSWER: the request gives up, this returns nothing, and
+	// the scope falls through to $PWD — silently filing this session's
+	// identities in another bucket because a reply was late. The scope
+	// is half the key every stored identity is filed under, so a value
+	// that depends on timing is the one thing it must not be.
+	//
+	// Waiting on the request's own context instead: it ends when the
+	// caller's request ends, so this cannot outlive the call that asked,
+	// and a client that never answers fails that call rather than
+	// quietly answering it wrong. An error or an empty list is a
+	// definite "no roots" and is treated as one.
+	result, err := mcpServer.RequestRoots(ctx, mcp.ListRootsRequest{
 		Request: mcp.Request{Method: string(mcp.MethodListRoots)},
 	})
 	if err != nil || len(result.Roots) == 0 {

@@ -31,12 +31,13 @@ import (
 // judgement, and a client that silently rejoined something the user had
 // finished with would be its own kind of surprise.
 func (h *Hub) reportAbandonedConnections() {
-	// Only when this session's scope is certain — see
-	// connstore.ScopeAtStartup. Roots cannot be asked for before a
-	// request exists, so $PWD may name a different project than the one
-	// every later call will use, and reporting another scope's
-	// connections is the disclosure this scoping exists to stop.
-	project, known := connstore.ScopeAtStartup()
+	// Only when this session's scope is certain — see scopeIfKnown,
+	// which is the same resolver every tool call uses. Roots cannot be
+	// asked for before a request exists, so $PWD may name a different
+	// project than the one every later call will use, and reporting
+	// another scope's connections is the disclosure this scoping exists
+	// to stop.
+	project, known := scopeIfKnown()
 	if !known {
 		return
 	}

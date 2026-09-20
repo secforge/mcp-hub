@@ -529,3 +529,86 @@ func TestHubSendRefusesADirectiveLineRatherThanRelayingIt(t *testing.T) {
 		})
 	}
 }
+
+// The scope must not move while the process runs: it is half the key
+// every stored identity is filed under, so a scope that answers
+// differently on two calls files the same link under two buckets — the
+// second finds nothing, mints, and strands the first.
+//
+// Asking the MCP client's roots per call made that reachable on timing
+// alone, because a roots request that times out returns nothing and the
+// answer falls through to $PWD. So the answer is asked for once and kept.
+func TestTheProjectScopeIsResolvedOnceAndThenHeld(t *testing.T) {
+	ResetScopeCacheForTesting()
+	t.Cleanup(ResetScopeCacheForTesting)
+	t.Setenv("MCP_HUB_PROJECT_DIR", "")
+
+	asked := 0
+	roots := func() string {
+		asked++
+		if asked == 1 {
+			return "/projects/from-roots"
+		}
+		// Every later ask "times out" — which is exactly the case that
+		// used to change the scope underneath a running process.
+		return ""
+	}
+
+	scope := func() string {
+		return resolveProject("", func() string { return cachedRootScopeFrom(roots) },
+			func() string { return "/somewhere/else" })
+	}
+
+	if first := scope(); first != "/projects/from-roots" {
+		t.Fatalf("first resolution = %q, want the root the client advertised", first)
+	}
+	for i := 0; i < 3; i++ {
+		if again := scope(); again != "/projects/from-roots" {
+			t.Fatalf("call %d resolved %q after roots stopped answering — every identity stored "+
+				"under the first value is now unreachable, and the next connect mints a new one",
+				i+2, again)
+		}
+	}
+	if asked != 1 {
+		t.Errorf("roots was asked %d times; once resolved it must not be asked again, or a slow "+
+			"reply can move the scope under a running process", asked)
+	}
+}
+
+// A roots request that never answers is NOT cached: an absence of an
+// answer is not an answer, and freezing it would make one slow reply
+// permanent for the life of the process. The working directory carries
+// that call, and the next one asks again.
+func TestATimedOutRootsRequestDoesNotFreezeTheScope(t *testing.T) {
+	ResetScopeCacheForTesting()
+	t.Cleanup(ResetScopeCacheForTesting)
+	t.Setenv("MCP_HUB_PROJECT_DIR", "")
+
+	answers := []string{"", "", "/projects/eventually"}
+	i := 0
+	roots := func() string {
+		v := answers[i]
+		if i < len(answers)-1 {
+			i++
+		}
+		return v
+	}
+	scope := func() string {
+		return resolveProject("", func() string { return cachedRootScopeFrom(roots) },
+			func() string { return "/the/working/dir" })
+	}
+
+	if got := scope(); got != "/the/working/dir" {
+		t.Fatalf("with no roots answer the scope is %q, want the working directory", got)
+	}
+	if got := scope(); got != "/the/working/dir" {
+		t.Fatalf("second call resolved %q, want the working directory again", got)
+	}
+	if got := scope(); got != "/projects/eventually" {
+		t.Fatalf("roots answered and the scope stayed %q — a timeout was cached as though it "+
+			"were an answer", got)
+	}
+	if got := scope(); got != "/projects/eventually" {
+		t.Fatalf("the scope moved again after being established: %q", got)
+	}
+}
