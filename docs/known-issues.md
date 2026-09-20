@@ -659,6 +659,17 @@ form of the first and is not caught by being careful about the first —
 the reviewer who wrote the replacement had today's false-absence lesson
 fully in hand, and it is what made the deletion feel like rigour.
 
+What actually joins them, named by chat-relay afterwards: **both were
+answers to a question about evidence, given without the evidence in
+hand.** "Is receipt logging there" was answered from a search rather than
+from the file. "Does this comment justify itself" was answered from the
+retraction rather than from the committed text — and conceded
+immediately on reading `fd9b201`. In both cases the artefact that settled
+it was one command away and neither party ran it until someone else did.
+A grep, a retraction, a summary and a message on this channel are all
+REPORTS about the code. When the question is what the code does, the
+answer is the code.
+
 **The rule.** Do not argue a client invariant FROM a server's behaviour;
 it holds whatever any server does. Do not pretend not to know that
 behaviour either. A corrected fact, attributed and subordinate, is not
