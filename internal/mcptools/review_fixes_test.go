@@ -392,3 +392,92 @@ func TestTheSuggestedConnectionNameIsUsableAsGiven(t *testing.T) {
 		}
 	}
 }
+
+// Connecting without a name keeps the one this link last used, rather
+// than erasing it.
+//
+// The whole entry is rewritten after a successful connect, so an omitted
+// name taken literally blanks the display name every other peer sees this
+// connection by — and nothing reports it, the peer just becomes a bare
+// peerId to everyone in the session. Reconnecting is both the common case
+// and the one least likely to repeat a name. Observed live: this client's
+// own hub identity lost its name that way while every other peer kept
+// theirs.
+func TestConnectingWithoutANameKeepsTheStoredOne(t *testing.T) {
+	// The stored name is whatever the SERVER echoed in joined, not what
+	// was sent — so the fixture has to echo the Agent-Name header, as a
+	// real relay does. A fixture that ignores it cannot tell a client
+	// that sent no name from one whose name was dropped, which is the
+	// whole question here.
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent := r.Header.Get("Agent-Name")
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		raw, _ := json.Marshal(wire.Joined{
+			Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(),
+			ConversationKind: "group", CanSend: true, Name: sent,
+		})
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#name-secret"
+	ctx := context.Background()
+
+	connect := func(hub *Hub, args map[string]any) {
+		t.Helper()
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = args
+		if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+			t.Fatalf("connect: err=%v result=%+v", err, res)
+		}
+	}
+
+	hub := NewHub()
+	connect(hub, map[string]any{"as": testConn, "link": link, "name": "Claude Code (mcp-hub)"})
+	hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	stored, _, err := connstore.Get(targetForLink(ctx, link))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.Name != "Claude Code (mcp-hub)" {
+		t.Fatalf("the name was not stored on the first connect: %q", stored.Name)
+	}
+
+	// Reconnect with no name at all, as a reconnect usually does.
+	hub2 := NewHub()
+	connect(hub2, map[string]any{"as": testConn, "link": link})
+	defer hub2.handleDisconnect(ctx, connReqFor(testConn))
+
+	stored, _, err = connstore.Get(targetForLink(ctx, link))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.Name != "Claude Code (mcp-hub)" {
+		t.Fatalf("connecting without a name erased the stored one (now %q) — every peer in the "+
+			"session sees this connection as a bare peerId from then on, and nothing says so",
+			stored.Name)
+	}
+
+	// A name that IS given still wins.
+	hub3 := NewHub()
+	connect(hub3, map[string]any{"as": testConn, "link": link, "name": "something else"})
+	defer hub3.handleDisconnect(ctx, connReqFor(testConn))
+	stored, _, err = connstore.Get(targetForLink(ctx, link))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.Name != "something else" {
+		t.Fatalf("an explicit name did not replace the stored one: %q", stored.Name)
+	}
+}

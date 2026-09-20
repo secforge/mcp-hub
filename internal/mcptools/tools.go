@@ -2320,6 +2320,22 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 
 	target := targetForLink(ctx, link)
 	stored, _, storeErr := connstore.Get(target)
+	// AN OMITTED NAME KEEPS THE ONE THIS LINK LAST USED. The whole entry
+	// is rewritten after a successful connect, so taking "" literally
+	// erases the display name every other peer sees this connection by,
+	// and nothing says it happened — the peer simply becomes a bare
+	// peerId to everyone in the session. Reconnecting is the common case
+	// and the one least likely to repeat a name, which is exactly when
+	// it would be lost.
+	//
+	// The same courtesy this store already extends to the local name
+	// (LocalName, offered back as what this link was last opened as).
+	// There is deliberately no way to CLEAR a name: omitted and empty are
+	// indistinguishable here, so the only safe reading of empty is "not
+	// stated", and a caller that wants a different name states one.
+	if name == "" {
+		name = stored.Name
+	}
 	if storeErr != nil {
 		// Refused rather than served with a new identity: minting one
 		// here is what silently retires whatever the unreadable file
