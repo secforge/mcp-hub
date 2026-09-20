@@ -528,3 +528,47 @@ func TestATerminatorBearingAnotherRequestsIdDoesNotEndThisWalk(t *testing.T) {
 			"states an id, that id is the whole test", ev)
 	}
 }
+
+// attachmentData answers a request and carries no id today — the echo
+// agreed with chat-relay covers the acks and "error", and this frame is
+// neither. The claim for it mints an id like every other, so a rule that
+// demands one on the answer makes every attachment fetch time out against
+// the server that declares the feature: the same hang the history path
+// was just saved from, one path over.
+func TestAnIdLessAttachmentAnswerStillResolvesItsRequest(t *testing.T) {
+	shortAckTimeout(t)
+
+	base := startCorrelatingServer(t, map[string]json.RawMessage{
+		wire.FeatureCorrelation: json.RawMessage(`{"maxLength":128}`),
+		"attachments":           json.RawMessage(`{}`),
+	}, func(w *serialWriter, frame map[string]any) {
+		if frame["type"] != string(wire.TypeAttachment) {
+			return
+		}
+		token, _ := frame["token"].(string)
+		w.write(wire.AttachmentData{Type: wire.TypeAttachmentData, Token: token,
+			Name: "f.txt", ContentType: "text/plain", ContentBytes: "aGk="})
+	})
+
+	c, err := dialTest(base, "corr-attach", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if !c.correlates {
+		t.Fatal("the server declared the correlation feature and this connection did not take it up")
+	}
+
+	ev, ok, err := c.RequestAttachment("tok-1", nil)
+	if err != nil {
+		t.Fatalf("attachment request: %v", err)
+	}
+	if !ok {
+		t.Fatal("an id-less attachmentData did not resolve its request — the claim minted an id the " +
+			"server never promised to echo, so every attachment fetch hangs against a correlating " +
+			"server. The token already narrows this claim; the id must not be demanded on top of it")
+	}
+	if ev.AttachmentToken != "tok-1" {
+		t.Fatalf("got token %q, want tok-1", ev.AttachmentToken)
+	}
+}

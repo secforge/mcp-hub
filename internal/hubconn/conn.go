@@ -1355,6 +1355,31 @@ func answersAnchor(answers *wire.Anchor, want wire.Anchor) bool {
 	return answers.Cursor == want.Cursor && answers.At == want.At
 }
 
+// idMatches is the ONE rule every match site uses for a correlation id:
+// where the claim minted an id AND the answer states one, they must be
+// equal; otherwise the id decides nothing and the site's own rule stands.
+//
+// Both conditions are load-bearing and the second is the one that was
+// learned the hard way. A claim always mints an id on a correlating
+// connection, but only some ANSWERS carry one: the echo agreed with
+// chat-relay covers the acks and "error", so "noMoreMessages",
+// "attachmentData" and a historical "msg" arrive without one until a
+// server extends it. Demanding an id on those hangs the caller for its
+// whole deadline against the very server that declares the feature —
+// which is a worse failure than the misattribution being fixed, and is
+// this client punishing itself for an echo nobody promised.
+//
+// Stated once and shared because it was NOT shared, and the three sites
+// drifted: the history match ignored the id entirely while the ack match
+// demanded it, so one path misattributed and another hung, from the same
+// commit.
+func idMatches(ev Event, claim *ackClaim) bool {
+	if claim.corrID == "" || ev.CorrelationID == "" {
+		return true
+	}
+	return ev.CorrelationID == claim.corrID
+}
+
 // answersHistoryClaim reports whether ev is the answer to this pending
 // MessageAfter claim.
 //
@@ -1380,8 +1405,14 @@ func answersAnchor(answers *wire.Anchor, want wire.Anchor) bool {
 // whole class. Closing the class needs the echo extended to the history
 // frames, which is a wire change and not this function's to assume.
 func answersHistoryClaim(ev Event, claim *ackClaim) bool {
+	if !idMatches(ev, claim) {
+		return false
+	}
+	// Where the answer stated a MATCHING id, it has already identified
+	// itself and the anchor adds nothing. Where it stated none, the
+	// anchor is all there is.
 	if claim.corrID != "" && ev.CorrelationID != "" {
-		return ev.CorrelationID == claim.corrID
+		return true
 	}
 	return answersAnchor(ev.Answers, claim.anchor)
 }
@@ -1464,7 +1495,7 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 		// establish, so it is not handed over. Silence is the honest
 		// outcome; inheriting it would be the exact misattribution the
 		// id was added to end.
-		if claim.corrID != "" && ev.CorrelationID != claim.corrID {
+		if !idMatches(ev, claim) {
 			debugf("tryDivertToClaimLocked: %q carries id %q, claim holds %q — not this claim's answer",
 				ev.Kind, ev.CorrelationID, claim.corrID)
 			return false
@@ -1630,7 +1661,7 @@ func (c *Conn) ackClaimTakes(ev Event) bool {
 	if !claimed {
 		return false
 	}
-	return claim.corrID == "" || claim.corrID == ev.CorrelationID
+	return idMatches(ev, claim)
 }
 
 func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
