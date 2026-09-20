@@ -1461,6 +1461,10 @@ func TestHandleListConnectionsIncludesTeamsSessionsAndTopics(t *testing.T) {
 
 func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	// The scope has to be CERTAIN for this note to say anything — see
+	// connstore.ScopeAtStartup. Without the override, roots cannot be
+	// asked for this early and $PWD may name a different project.
+	t.Setenv("MCP_HUB_PROJECT_DIR", "/projects/this-one")
 
 	if note := startupConnectionsNote(); note != "" {
 		t.Fatalf("expected no note with an empty store, got: %s", note)
@@ -1468,7 +1472,7 @@ func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 
 	if err := connstore.Upsert(
 		connstore.Target{Link: "wss://a/550e8400-e29b-41d4-a716-446655440000",
-			Project: connstore.CurrentProject()},
+			Project: "/projects/this-one"},
 		connstore.Entry{Connected: true},
 	); err != nil {
 		t.Fatalf("upsert: %v", err)
@@ -1492,6 +1496,15 @@ func TestStartupConnectionsNoteReflectsOpenEntries(t *testing.T) {
 	}
 	if note := startupConnectionsNote(); !strings.Contains(note, "1 session") {
 		t.Fatalf("another project's open session was counted into this project's note: %s", note)
+	}
+
+	// AND SILENT WHEN THE SCOPE IS NOT KNOWN. Without the override this
+	// runs too early to ask the MCP client which project it has open, so
+	// $PWD may name a different one — and a count from the wrong bucket
+	// is a statement about a project this session will never touch.
+	t.Setenv("MCP_HUB_PROJECT_DIR", "")
+	if note := startupConnectionsNote(); note != "" {
+		t.Fatalf("a count was reported for a scope this process cannot yet establish: %s", note)
 	}
 }
 

@@ -239,6 +239,27 @@ type state map[string]map[string]Entry
 // the one place it is most likely to be used.
 func ProjectOverride() string { return os.Getenv("MCP_HUB_PROJECT_DIR") }
 
+// ScopeAtStartup is the project scope for code that runs before any MCP
+// request exists, and reports whether it can be known at all.
+//
+// The full resolution is override, then the MCP client's advertised
+// roots, then the working directory — and roots needs a request context
+// to ask over. At process start there is none, so a caller here can be
+// certain of the scope only when the override states it. Otherwise roots
+// may name a different project than $PWD does, and anything reported
+// from $PWD would be a statement about a bucket this session may never
+// touch.
+//
+// Returning ok=false rather than guessing, because the guess is wrong
+// exactly when it matters: a client reads its own project's data, and
+// "which project is mine" is the thing in question.
+func ScopeAtStartup() (project string, ok bool) {
+	if p := ProjectOverride(); p != "" {
+		return p, true
+	}
+	return "", false
+}
+
 // CurrentProject identifies "this working directory" for Target.Project —
 // MCP_HUB_PROJECT_DIR if set (an explicit override, and how tests get
 // isolation without touching the real cwd), else the process's actual

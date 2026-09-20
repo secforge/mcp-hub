@@ -31,7 +31,16 @@ import (
 // judgement, and a client that silently rejoined something the user had
 // finished with would be its own kind of surprise.
 func (h *Hub) reportAbandonedConnections() {
-	entries, err := connstore.ListForProject(connstore.CurrentProject())
+	// Only when this session's scope is certain — see
+	// connstore.ScopeAtStartup. Roots cannot be asked for before a
+	// request exists, so $PWD may name a different project than the one
+	// every later call will use, and reporting another scope's
+	// connections is the disclosure this scoping exists to stop.
+	project, known := connstore.ScopeAtStartup()
+	if !known {
+		return
+	}
+	entries, err := connstore.ListForProject(project)
 	if err != nil {
 		// Nothing to report FROM is different from nothing to report, and
 		// only the first is worth a word — a store that cannot be read is

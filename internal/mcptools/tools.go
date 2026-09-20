@@ -270,11 +270,22 @@ func suggestedConnName(dir string) string {
 // deferring full schemas by default, may not be immediately) — a
 // best-effort notice, not a guaranteed one.
 func startupConnectionsNote() string {
-	// THIS PROJECT ONLY. Counting every project's entries told a session
-	// how many sessions were open elsewhere on the machine — a fact about
-	// other projects, in a note about this one, and one it could neither
-	// see nor act on.
-	entries, err := connstore.ListForProject(connstore.CurrentProject())
+	// THIS PROJECT ONLY, AND ONLY WHEN THIS PROJECT IS KNOWN. Counting
+	// every project's entries told a session how many were open elsewhere
+	// on the machine — a fact about other projects, in a note about this
+	// one, and one it could neither see nor act on.
+	//
+	// Scoping it is not enough on its own: this runs at process start,
+	// before any request exists, so the MCP client's roots cannot be
+	// asked for and $PWD may name a different project than roots will.
+	// A count taken from the wrong bucket is the same disclosure in a
+	// quieter form. Silent when the scope is not certain — see
+	// connstore.ScopeAtStartup.
+	project, known := connstore.ScopeAtStartup()
+	if !known {
+		return ""
+	}
+	entries, err := connstore.ListForProject(project)
 	if err != nil {
 		return ""
 	}
