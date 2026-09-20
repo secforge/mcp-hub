@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	"github.com/secforge/mcp-hub/internal/agekey"
@@ -107,6 +108,14 @@ type Event struct {
 	// if the server set one — see wire.Error.
 	Code      string
 	Retryable bool
+	// CorrelationID is the id this client put on the request, echoed back
+	// by a correlating server — see wire.Msg.ID. Empty on live traffic
+	// nobody asked for, on every frame from a server without the feature,
+	// and on an error that is not about a request (a close reason, or
+	// wire.CodeBadCorrelation, which cannot echo the value it refuses).
+	// So an empty one is never evidence that an echo failed; only the
+	// absence of the declared feature says the server does not echo.
+	CorrelationID string
 	// ExternalID carries a "sendAck"/"reactionAck"/"editAck" event's
 	// payload (see wire.SendAck/wire.ReactionAck/wire.EditAck), or — on a
 	// "msg" — the same id correlating it with the sendAck that preceded
@@ -473,12 +482,36 @@ type Conn struct {
 	// must NOT be diverted here, unlike pendingAcks' blind kind match;
 	// see tryDivertToClaimLocked.
 	pendingMessageAfter *ackClaim
+	// correlates is set when the server declared wire.FeatureCorrelation
+	// at join: every request that awaits an answer then carries a
+	// client-chosen id which the server echoes on the answer and on any
+	// error refusing it.
+	//
+	// It selects between two attribution schemes and never runs both.
+	// With it, a claim is matched by id and a late answer simply finds
+	// no claim holding its id, so the late-answer debt (expectLateAnswer)
+	// is not recorded at all — its trigger would be unreachable and a
+	// live ratchet nobody can trigger is a bug with no reproduction.
+	// Without it, the debt machinery runs exactly as before.
+	//
+	// DELETION TRIGGER for expectLateAnswer/spendLateAnswerLocked and
+	// everything they carry: when no server this client supports is
+	// still without the feature. Until then both paths are load-bearing.
+	correlates bool
 }
 
 // ackClaim is a one-shot subscription for the next event matching a
 // specific ack kind (or a generic "error") — see claimNextAck.
 type ackClaim struct {
 	result chan Event // buffered, size 1; written to exactly once
+	// corrID is this claim's correlation id (see wire.Msg.ID), set only
+	// when the server declared the "correlation" feature. When it is
+	// set it is the WHOLE match: an answer of the right kind carrying a
+	// different id is somebody else's and falls through to the buffer,
+	// and an answer carrying this id belongs here however long it took.
+	// Empty against a server that does not correlate, where the kind is
+	// the only key there is and expectLateAnswer covers the rest.
+	corrID string
 	// token, where set, narrows this claim to one attachmentData: the
 	// claim is keyed by event kind and is consumed by the FIRST event of
 	// that kind, so without this a late answer to an abandoned request
@@ -944,6 +977,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		clientRelease:           joined.ClientRelease,
 		features:                joined.Features,
 		featuresDeclared:        joined.Features != nil,
+		correlates:              joined.HasFeature(wire.FeatureCorrelation),
 		lastFrameKind:           "joined",
 		lastFrameAt:             time.Now(),
 		ackIdleInterval:         snapAckIdleInterval,
@@ -1186,23 +1220,49 @@ func (c *Conn) stopActivity() {
 // answer directly and nothing else is waiting to be told about it again.
 //
 // A generic "error" is diverted, not just an exact ackKind match, because
-// that's how this protocol reports a refusal (e.g. the tenant lock) —
-// there is no per-request id linking an error back to the specific
-// action that caused it, so an error arriving while a claim is pending is
-// assumed to be that claim's outcome. This is a real, acknowledged
-// protocol limitation, not something this method can fully close: in
-// principle a claim can absorb an error that was actually about a
-// different concurrent action. cancel releases the claim (e.g. on
+// that's how this protocol reports a refusal (e.g. the tenant lock).
+// Against a server that does not declare wire.FeatureCorrelation there is
+// no per-request id linking an error back to the action that caused it,
+// so an error arriving while a SINGLE claim is pending is assumed to be
+// that claim's outcome — a real, acknowledged protocol limitation there,
+// not something this method can fully close. Where the server does
+// correlate, the id decides and the assumption is never made. cancel releases the claim (e.g. on
 // timeout) so a later, unrelated event isn't wrongly attributed once the
 // caller has stopped waiting — after cancel, or once the claim has fired,
 // everything reverts to the normal buffer path.
 func (c *Conn) claimNextAck(ackKind string) (result <-chan Event, cancel func(), err error) {
-	return c.claimNextAckForToken(ackKind, "")
+	_, result, cancel, err = c.claimNextAckCorrelated(ackKind, "")
+	return result, cancel, err
 }
 
-// claimNextAckForToken is claimNextAck narrowed to one attachment token —
-// see ackClaim.token for why the narrowing has to live in the claim.
-func (c *Conn) claimNextAckForToken(ackKind, token string) (result <-chan Event, cancel func(), err error) {
+// claimNextAckCorrelated is claimNextAck plus the correlation id to stamp
+// on the request this claim is about to await — empty against a server
+// that did not declare the feature, in which case nothing changes and the
+// kind remains the only key.
+//
+// The id is minted HERE, with the claim, and handed to the caller to put
+// on the frame. Registering the claim and choosing the id in one step is
+// what makes the pairing impossible to get wrong: there is no window in
+// which a request carries an id no claim is holding, and no way to write
+// a request whose id belongs to a different claim.
+func (c *Conn) claimNextAckCorrelated(ackKind, token string) (corrID string, result <-chan Event, cancel func(), err error) {
+	if c.correlates {
+		corrID = newCorrelationID()
+	}
+	result, cancel, err = c.registerClaim(ackKind, token, corrID)
+	if err != nil {
+		return "", nil, cancel, err
+	}
+	return corrID, result, cancel, nil
+}
+
+// newCorrelationID mints one. A uuid is well inside
+// wire.MaxCorrelationIDLen and carries nothing about this peer — the id
+// is opaque to the server by contract, and choosing a value that would
+// stop being opaque if the contract were ignored is free.
+func newCorrelationID() string { return uuid.NewString() }
+
+func (c *Conn) registerClaim(ackKind, token, corrID string) (result <-chan Event, cancel func(), err error) {
 	ch := make(chan Event, 1)
 	c.mu.Lock()
 	if c.pendingAcks == nil {
@@ -1228,7 +1288,7 @@ func (c *Conn) claimNextAckForToken(ackKind, token string) (result <-chan Event,
 			"another %s request is already awaiting its answer on this connection; "+
 				"retry once it has returned", ackKind)
 	}
-	claim := &ackClaim{result: ch, token: token}
+	claim := &ackClaim{result: ch, token: token, corrID: corrID}
 	c.pendingAcks[ackKind] = claim
 	c.mu.Unlock()
 	cancel = func() {
@@ -1322,14 +1382,71 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 		if claim.token != "" && ev.AttachmentToken != claim.token {
 			return false
 		}
+		// Against a correlating server the id decides, not the kind. An
+		// answer carrying a DIFFERENT id is the late answer to a request
+		// that already gave up, and it falls through to the buffer as
+		// the unsolicited event it is — which is what makes the
+		// late-answer debt unnecessary here rather than merely unlikely.
+		//
+		// An answer carrying NO id, from a server that promised to echo
+		// one, is the case the feature declaration exists to rule out:
+		// it is not this claim's answer as far as anything here can
+		// establish, so it is not handed over. Silence is the honest
+		// outcome; inheriting it would be the exact misattribution the
+		// id was added to end.
+		if claim.corrID != "" && ev.CorrelationID != claim.corrID {
+			debugf("tryDivertToClaimLocked: %q carries id %q, claim holds %q — not this claim's answer",
+				ev.Kind, ev.CorrelationID, claim.corrID)
+			return false
+		}
 		delete(c.pendingAcks, ev.Kind)
 		claim.result <- ev
 		return true
 	}
+	if ev.Kind == "error" && c.correlates {
+		// CORRELATED, SO NOT A GUESS. An error naming an id belongs to
+		// whichever claim holds that id, however many are pending — the
+		// whole ambiguity below simply does not arise.
+		if ev.CorrelationID != "" {
+			if c.pendingMessageAfter != nil && c.pendingMessageAfter.corrID == ev.CorrelationID {
+				claim := c.pendingMessageAfter
+				c.pendingMessageAfter = nil
+				claim.result <- ev
+				return true
+			}
+			for kind, claim := range c.pendingAcks {
+				if claim.corrID == ev.CorrelationID {
+					delete(c.pendingAcks, kind)
+					claim.result <- ev
+					return true
+				}
+			}
+			// The id names a request nobody is waiting for any more.
+			return false
+		}
+		// NO ID, FROM A SERVER THAT ECHOES THEM. Two things look like
+		// this and only one is anybody's outcome: a genuinely
+		// unsolicited error (a close reason, a refusal with no frame
+		// behind it), and wire.CodeBadCorrelation, which refuses a
+		// request and cannot echo the id it is bounding.
+		//
+		// So the code is what distinguishes them, never the absence —
+		// reading the absence is the inference this whole feature
+		// exists to remove. bad_correlation falls through to the
+		// uncorrelated rule below, where a single pending claim owns it
+		// and two do not; every other id-less error is unsolicited and
+		// is delivered to nobody.
+		if ev.Code != wire.CodeBadCorrelation {
+			debugf("tryDivertToClaimLocked: error %q with no correlation id from a correlating "+
+				"server — unsolicited, delivered to no claim", ev.Code)
+			return false
+		}
+	}
 	if ev.Kind == "error" {
-		// AMBIGUOUS BY CONSTRUCTION. An error carries no correlation id,
-		// so with more than one claim pending, nothing here can say
-		// which operation it refuses — and handing it to whichever the
+		// AMBIGUOUS BY CONSTRUCTION — on a server that does not declare
+		// wire.FeatureCorrelation, which is the only way execution
+		// reaches here. Such an error carries no id, so with more than
+		// one claim pending, nothing can say which operation it refuses — and handing it to whichever the
 		// map yields first tells one caller about the other's failure
 		// with full confidence. An external reviewer demonstrated
 		// exactly that, 2026-09-20: with a history read and a send both
@@ -1384,21 +1501,33 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 // leaves the outcome depending on whether somebody happens to be
 // waiting, where consuming the debt holds regardless of traffic.
 //
-// The wire offers nothing to correlate on: an ack carries externalId and
-// ok, an error carries a code, and neither echoes anything the request
-// chose. chat-relay's author confirmed that from the server side and
-// offered an echoed client id as an addition — to be DECLARED in
-// features rather than inferred, since a server that does not echo it
-// looks exactly like one that does not implement it, and this fallback
-// is what makes that safe either way. Until it exists this is
-// the honest half of the trade — a late answer becomes UNATTRIBUTED
-// rather than MISATTRIBUTED. The cost is that B may time out on an
-// answer that was really A's, which reports "no answer" about something
-// unknown. That is the true state; the alternative was a confident wrong
-// one.
+// THIS IS THE FALLBACK, and it runs only where the wire offers nothing to
+// correlate on: an ack carries externalId and ok, an error carries a
+// code, and against such a server neither echoes anything the request
+// chose. It is the honest half of the trade there — a late answer becomes
+// UNATTRIBUTED rather than MISATTRIBUTED. The cost is that B may time out
+// on an answer that was really A's, which reports "no answer" about
+// something unknown. That is the true state; the alternative was a
+// confident wrong one.
+//
+// A server declaring wire.FeatureCorrelation echoes a client-chosen id on
+// the answer and on any error refusing it, which makes the attribution
+// exact and this mechanism dead weight — so it is not recorded at all
+// there. See Conn.correlates for why the two never run together, and for
+// the condition under which this whole mechanism can be deleted.
 func (c *Conn) expectLateAnswer(kind string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// NOT RECORDED AT ALL when the server correlates. A late answer then
+	// carries the id of the request that gave up, finds no claim holding
+	// it, and reaches the buffer as the unsolicited event it is — so the
+	// debt would never be spendable, and a counter that only ever
+	// increments is a ratchet whose trigger nobody can reach. Exactly one
+	// attribution scheme is live per connection; see Conn.correlates for
+	// the condition under which this whole mechanism can be deleted.
+	if c.correlates {
+		return
+	}
 	if c.lateAnswers == nil {
 		c.lateAnswers = make(map[string]int)
 	}
@@ -1414,6 +1543,26 @@ func (c *Conn) expectLateAnswer(kind string) {
 // server it has read. Reports whether ev was consumed here (true) or
 // should fall through to normal handling (false). Must be called with c.mu
 // held.
+// ackClaimTakes reports whether a pending "ack" claim would actually
+// accept ev, which is the same question tryDivertToClaimLocked asks and
+// has to be asked HERE too: this function decides between falling through
+// (so the claim can be delivered to) and consuming the event as internal
+// plumbing. Answering it by the claim's mere existence was right while
+// the kind was the only key; against a correlating server an ack bearing
+// somebody else's id would fall through, match nothing below, and surface
+// to the model as an unsolicited receipt reply — plumbing made visible.
+//
+// So a claim holding an id takes only that id, and anything else stays
+// plumbing and is discarded exactly as a background receipt's reply
+// always was. Must be called with c.mu held.
+func (c *Conn) ackClaimTakes(ev Event) bool {
+	claim, claimed := c.pendingAcks["ack"]
+	if !claimed {
+		return false
+	}
+	return claim.corrID == "" || claim.corrID == ev.CorrelationID
+}
+
 func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 	if ev.Kind == "ack" {
 		if !ev.ActionOK {
@@ -1433,7 +1582,7 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 		// here, same as every other ack kind's claim path. ackLoop's own
 		// background standalone acks never register a claim, so they
 		// keep being silently discarded exactly as before.
-		if _, claimed := c.pendingAcks["ack"]; claimed {
+		if c.ackClaimTakes(ev) {
 			return false
 		}
 		return true
@@ -1465,7 +1614,7 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 		// a cursor from another conversation is a caller's mistake about
 		// one call, not this client miscounting for the rest of the
 		// connection's life.
-		if _, claimed := c.pendingAcks["ack"]; claimed {
+		if c.ackClaimTakes(ev) {
 			return false
 		}
 		c.ackDisabled = true
@@ -1564,12 +1713,14 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		c.mu.Unlock()
 		return nil, nil
 	}
-	resultCh, cancel, err := c.claimNextAck("ack")
+	corrID, resultCh, cancel, err := c.claimNextAckCorrelated("ack", "")
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
-	if err := c.writeJSON(wire.NewAck(cursor)); err != nil {
+	ackFrame := wire.NewAck(cursor)
+	ackFrame.ID = corrID
+	if err := c.writeJSON(ackFrame); err != nil {
 		// Nothing was sent, so nothing was consumed — the skipWait path
 		// above already restores here and this one did not.
 		restore()
@@ -1974,7 +2125,8 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &e); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "error", Text: e.Message, Code: e.Code, Retryable: e.Retryable}, true
+		return Event{Kind: "error", Text: e.Message, Code: e.Code, Retryable: e.Retryable,
+			CorrelationID: e.ID}, true
 	case wire.TypeRoster:
 		var r wire.Roster
 		if err := json.Unmarshal(raw, &r); err != nil {
@@ -1994,7 +2146,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "sendAck", ExternalID: a.ExternalID, ActionOK: a.OK,
-			ActionOKStated: statesOK(raw)}, true
+			ActionOKStated: statesOK(raw), CorrelationID: a.ID}, true
 	case wire.TypeReactionChanged:
 		var r wire.ReactionChanged
 		if err := json.Unmarshal(raw, &r); err != nil {
@@ -2019,21 +2171,22 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "reactionAck", ExternalID: a.ExternalID, Reaction: a.Reaction,
-			ReactionAction: a.Action, ActionOK: a.OK, ActionOKStated: statesOK(raw)}, true
+			ReactionAction: a.Action, ActionOK: a.OK, ActionOKStated: statesOK(raw),
+			CorrelationID: a.ID}, true
 	case wire.TypeEditAck:
 		var a wire.EditAck
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return Event{}, false
 		}
 		return Event{Kind: "editAck", ExternalID: a.ExternalID, ActionOK: a.OK,
-			ActionOKStated: statesOK(raw)}, true
+			ActionOKStated: statesOK(raw), CorrelationID: a.ID}, true
 	case wire.TypeDeleteAck:
 		var a wire.DeleteAck
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return Event{}, false
 		}
 		return Event{Kind: "deleteAck", ExternalID: a.ExternalID, ActionOK: a.OK,
-			ActionOKStated: statesOK(raw)}, true
+			ActionOKStated: statesOK(raw), CorrelationID: a.ID}, true
 	case wire.TypePinned:
 		var p wire.Pinned
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -2052,14 +2205,14 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "pinAck", ExternalID: a.ExternalID, ActionOK: a.OK,
-			ActionOKStated: statesOK(raw)}, true
+			ActionOKStated: statesOK(raw), CorrelationID: a.ID}, true
 	case wire.TypeUnpinAck:
 		var a wire.UnpinAck
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return Event{}, false
 		}
 		return Event{Kind: "unpinAck", ExternalID: a.ExternalID, ActionOK: a.OK,
-			ActionOKStated: statesOK(raw)}, true
+			ActionOKStated: statesOK(raw), CorrelationID: a.ID}, true
 	case wire.TypePins:
 		var p wire.PinsResponse
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -2071,7 +2224,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if p.List != nil {
 			list = *p.List
 		}
-		return Event{Kind: "pins", PinnedList: list, TS: p.At}, true
+		return Event{Kind: "pins", PinnedList: list, TS: p.At, CorrelationID: p.ID}, true
 	case wire.TypeMessageDeleted:
 		var d wire.MessageDeleted
 		if err := json.Unmarshal(raw, &d); err != nil {
@@ -2092,14 +2245,15 @@ func decodeEvent(raw []byte) (Event, bool) {
 		// absent means it said nothing, and false is a refusal rather
 		// than a default.
 		return Event{Kind: "ack", Cursor: a.AckCursor, ActionOK: a.OK != nil && *a.OK,
-			Behind: a.Behind, ActionOKStated: a.OK != nil}, true
+			Behind: a.Behind, ActionOKStated: a.OK != nil, CorrelationID: a.ID}, true
 	case wire.TypeAttachmentData:
 		var a wire.AttachmentData
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return Event{}, false
 		}
 		return Event{Kind: "attachmentData", AttachmentToken: a.Token, AttachmentName: a.Name,
-			AttachmentContentType: a.ContentType, AttachmentContentBytes: a.ContentBytes}, true
+			AttachmentContentType: a.ContentType, AttachmentContentBytes: a.ContentBytes,
+			CorrelationID: a.ID}, true
 	default:
 		return Event{}, false
 	}
@@ -2132,7 +2286,12 @@ func (c *Conn) ackCursorForOutbound() string {
 }
 
 func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) error {
+	return c.sendWithID(text, attachments, format, replyTo, mentions, "")
+}
+
+func (c *Conn) sendWithID(text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention, corrID string) error {
 	m := wire.NewOutgoingMsg(text)
+	m.ID = corrID
 	m.AckCursor = c.ackCursorForOutbound()
 	m.Attachments = attachments
 	m.Format = format
@@ -2146,7 +2305,12 @@ func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo 
 // or departed peer) does not surface as a returned error here, but as a
 // buffered "error" event picked up by a later Peek/Drain.
 func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) error {
+	return c.sendToWithID(text, peerID, attachments, format, replyTo, mentions, "")
+}
+
+func (c *Conn) sendToWithID(text, peerID string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention, corrID string) error {
 	m := wire.NewOutgoingDirectedMsg(text, peerID)
+	m.ID = corrID
 	m.AckCursor = c.ackCursorForOutbound()
 	m.Attachments = attachments
 	m.Format = format
@@ -2232,6 +2396,9 @@ func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filte
 				"retry once it has returned")
 	}
 	claim := &ackClaim{result: ch, anchor: anchor}
+	if c.correlates {
+		claim.corrID = newCorrelationID()
+	}
 	c.pendingMessageAfter = claim
 	c.mu.Unlock()
 	debugf("RequestMessageAfterAwaiting: anchor=%+v claim=%p", anchor, claim)
@@ -2244,7 +2411,7 @@ func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filte
 	}
 	defer cancel()
 
-	m := wire.MessageAfter{Type: wire.TypeMessageAfter, Anchor: anchor, Filter: filter}
+	m := wire.MessageAfter{Type: wire.TypeMessageAfter, Anchor: anchor, Filter: filter, ID: claim.corrID}
 	if err := c.writeJSON(m); err != nil {
 		debugf("RequestMessageAfterAwaiting: claim=%p write error: %v", claim, err)
 		return Event{}, false, err
@@ -2290,10 +2457,15 @@ func (c *Conn) requireAction(feature string) error {
 }
 
 func (c *Conn) React(externalID, reaction, action string) error {
+	return c.reactWithID(externalID, reaction, action, "")
+}
+
+func (c *Conn) reactWithID(externalID, reaction, action, corrID string) error {
 	if err := c.requireAction("reactions"); err != nil {
 		return err
 	}
 	r := wire.NewReactionRequest(externalID, reaction, action)
+	r.ID = corrID
 	r.AckCursor = c.ackCursorForOutbound()
 	return c.writeJSON(r)
 }
@@ -2305,10 +2477,15 @@ func (c *Conn) React(externalID, reaction, action string) error {
 // replaces the message's attachments (always the inline form — see
 // wire.Edit.Attachments); pass nil to leave existing attachments alone.
 func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) error {
+	return c.editMessageWithID(externalID, text, attachments, format, replyTo, mentions, "")
+}
+
+func (c *Conn) editMessageWithID(externalID, text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention, corrID string) error {
 	if err := c.requireAction("edit"); err != nil {
 		return err
 	}
 	e := wire.NewEditRequest(externalID, text, attachments, format, replyTo, mentions)
+	e.ID = corrID
 	e.AckCursor = c.ackCursorForOutbound()
 	return c.writeJSON(e)
 }
@@ -2318,10 +2495,15 @@ func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachmen
 // Success/failure arrives asynchronously as a "deleteAck" (or an "error"
 // event on refusal), like React/EditMessage.
 func (c *Conn) DeleteMessage(externalID string) error {
+	return c.deleteMessageWithID(externalID, "")
+}
+
+func (c *Conn) deleteMessageWithID(externalID, corrID string) error {
 	if err := c.requireAction("delete"); err != nil {
 		return err
 	}
 	d := wire.NewDeleteRequest(externalID)
+	d.ID = corrID
 	d.AckCursor = c.ackCursorForOutbound()
 	return c.writeJSON(d)
 }
@@ -2425,16 +2607,16 @@ func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, f
 		}
 		return Event{}, false, c.SendTo(text, to, attachments, format, replyTo, mentions)
 	}
-	resultCh, cancel, claimErr := c.claimNextAck("sendAck")
+	corrID, resultCh, cancel, claimErr := c.claimNextAckCorrelated("sendAck", "")
 	if claimErr != nil {
 		return Event{}, false, claimErr
 	}
 	defer cancel()
 	var err error
 	if to == "" {
-		err = c.Send(text, attachments, format, replyTo, mentions)
+		err = c.sendWithID(text, attachments, format, replyTo, mentions, corrID)
 	} else {
-		err = c.SendTo(text, to, attachments, format, replyTo, mentions)
+		err = c.sendToWithID(text, to, attachments, format, replyTo, mentions, corrID)
 	}
 	if err != nil {
 		return Event{}, false, err
@@ -2462,12 +2644,12 @@ func (c *Conn) ReactAwaitingAck(externalID, reaction, action string) (Event, boo
 	if !c.WantsActionAcks() {
 		return Event{}, false, c.React(externalID, reaction, action)
 	}
-	resultCh, cancel, claimErr := c.claimNextAck("reactionAck")
+	corrID, resultCh, cancel, claimErr := c.claimNextAckCorrelated("reactionAck", "")
 	if claimErr != nil {
 		return Event{}, false, claimErr
 	}
 	defer cancel()
-	if err := c.React(externalID, reaction, action); err != nil {
+	if err := c.reactWithID(externalID, reaction, action, corrID); err != nil {
 		return Event{}, false, err
 	}
 	select {
@@ -2493,12 +2675,12 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 	if !c.WantsActionAcks() {
 		return Event{}, false, c.EditMessage(externalID, text, attachments, format, replyTo, mentions)
 	}
-	resultCh, cancel, claimErr := c.claimNextAck("editAck")
+	corrID, resultCh, cancel, claimErr := c.claimNextAckCorrelated("editAck", "")
 	if claimErr != nil {
 		return Event{}, false, claimErr
 	}
 	defer cancel()
-	if err := c.EditMessage(externalID, text, attachments, format, replyTo, mentions); err != nil {
+	if err := c.editMessageWithID(externalID, text, attachments, format, replyTo, mentions, corrID); err != nil {
 		return Event{}, false, err
 	}
 	select {
@@ -2532,12 +2714,14 @@ func (c *Conn) RequestAttachment(token string, size *int64) (Event, bool, error)
 	// this request's answer and must not consume this wait. An error
 	// event carries no token, so it is still taken as this request's
 	// outcome — the only reading available for it.
-	resultCh, cancel, claimErr := c.claimNextAckForToken("attachmentData", token)
+	corrID, resultCh, cancel, claimErr := c.claimNextAckCorrelated("attachmentData", token)
 	if claimErr != nil {
 		return Event{}, false, claimErr
 	}
 	defer cancel()
-	if err := c.writeJSON(wire.NewAttachmentRequest(token)); err != nil {
+	req := wire.NewAttachmentRequest(token)
+	req.ID = corrID
+	if err := c.writeJSON(req); err != nil {
 		return Event{}, false, err
 	}
 	select {
@@ -2582,19 +2766,29 @@ func (c *Conn) PinnedAtConnect() []string { return c.pinnedAtConnect }
 // where the server declares no "pins" feature, rather than sent into
 // silence.
 func (c *Conn) Pin(externalID string) error {
+	return c.pinWithID(externalID, "")
+}
+
+func (c *Conn) pinWithID(externalID, corrID string) error {
 	if err := c.requireAction("pins"); err != nil {
 		return err
 	}
 	r := wire.NewPinRequest(externalID)
+	r.ID = corrID
 	r.AckCursor = c.ackCursorForOutbound()
 	return c.writeJSON(r)
 }
 
 func (c *Conn) Unpin(externalID string) error {
+	return c.unpinWithID(externalID, "")
+}
+
+func (c *Conn) unpinWithID(externalID, corrID string) error {
 	if err := c.requireAction("pins"); err != nil {
 		return err
 	}
 	r := wire.NewUnpinRequest(externalID)
+	r.ID = corrID
 	r.AckCursor = c.ackCursorForOutbound()
 	return c.writeJSON(r)
 }
@@ -2604,23 +2798,23 @@ func (c *Conn) Unpin(externalID string) error {
 // every other write action: "pins" decides whether to send, "actionAcks"
 // decides whether an answer is worth waiting for.
 func (c *Conn) PinAwaitingAck(externalID string) (Event, bool, error) {
-	return c.pinAwaiting(externalID, c.Pin, "pinAck")
+	return c.pinAwaiting(externalID, c.pinWithID, "pinAck")
 }
 
 func (c *Conn) UnpinAwaitingAck(externalID string) (Event, bool, error) {
-	return c.pinAwaiting(externalID, c.Unpin, "unpinAck")
+	return c.pinAwaiting(externalID, c.unpinWithID, "unpinAck")
 }
 
-func (c *Conn) pinAwaiting(externalID string, send func(string) error, ackKind string) (Event, bool, error) {
+func (c *Conn) pinAwaiting(externalID string, send func(externalID, corrID string) error, ackKind string) (Event, bool, error) {
 	if !c.WantsActionAcks() {
-		return Event{}, false, send(externalID)
+		return Event{}, false, send(externalID, "")
 	}
-	resultCh, cancel, claimErr := c.claimNextAck(ackKind)
+	corrID, resultCh, cancel, claimErr := c.claimNextAckCorrelated(ackKind, "")
 	if claimErr != nil {
 		return Event{}, false, claimErr
 	}
 	defer cancel()
-	if err := send(externalID); err != nil {
+	if err := send(externalID, corrID); err != nil {
 		return Event{}, false, err
 	}
 	select {
@@ -2639,12 +2833,13 @@ func (c *Conn) Pins() (Event, bool, error) {
 	if err := c.requireAction("pins"); err != nil {
 		return Event{}, false, err
 	}
-	resultCh, cancel, claimErr := c.claimNextAck("pins")
+	corrID, resultCh, cancel, claimErr := c.claimNextAckCorrelated("pins", "")
 	if claimErr != nil {
 		return Event{}, false, claimErr
 	}
 	defer cancel()
 	r := wire.NewPinsRequest()
+	r.ID = corrID
 	r.AckCursor = c.ackCursorForOutbound()
 	if err := c.writeJSON(r); err != nil {
 		return Event{}, false, err
@@ -2664,12 +2859,12 @@ func (c *Conn) DeleteMessageAwaitingAck(externalID string) (Event, bool, error) 
 	if !c.WantsActionAcks() {
 		return Event{}, false, c.DeleteMessage(externalID)
 	}
-	resultCh, cancel, claimErr := c.claimNextAck("deleteAck")
+	corrID, resultCh, cancel, claimErr := c.claimNextAckCorrelated("deleteAck", "")
 	if claimErr != nil {
 		return Event{}, false, claimErr
 	}
 	defer cancel()
-	if err := c.DeleteMessage(externalID); err != nil {
+	if err := c.deleteMessageWithID(externalID, corrID); err != nil {
 		return Event{}, false, err
 	}
 	select {

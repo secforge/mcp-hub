@@ -751,3 +751,43 @@ identifier you have not just read. Not a shortened hash, not a line
 number, not a version. They are the cheapest things in this document to
 verify and the most expensive to be wrong about, because everything
 downstream treats them as the thing itself rather than as a claim.
+
+## Two attribution schemes, one live per connection
+
+The late-answer debt (`expectLateAnswer`/`spendLateAnswerLocked`) and the
+correlation id do the same job by different means, and only one of them
+runs on any given connection.
+
+Without `features.correlation` a claim is keyed by ACK KIND alone, so a
+late answer to a request that gave up matches the next request of that
+kind. The debt is what stops that: a timeout records an owed answer,
+routing spends it, and a late answer becomes unattributed rather than
+misattributed. The cost is real — a caller can time out on an answer that
+was actually its predecessor's.
+
+With the feature, the server echoes a client-chosen id on the answer and
+on any error refusing it. A late answer then carries the id of the
+request that gave up, matches no claim, and reaches the buffer as the
+unsolicited event it is.
+
+**They must not be layered.** Recorded on a correlating connection, the
+debt would never be spendable — no late answer can match a claim, so
+nothing would ever consume it — and a counter that only increments is a
+ratchet whose trigger nobody can reach. So `expectLateAnswer` returns
+immediately when `Conn.correlates` is set, and the gate lives in that one
+function rather than at its nine call sites.
+
+**DELETION TRIGGER.** The debt machinery, the "two claims pending, so
+this error goes to nobody" rule, and the tests for both can be deleted
+when no server this client supports is still without
+`wire.FeatureCorrelation`. Until then every one of them is load-bearing
+against exactly the servers that do not declare it. Written down because
+the alternative is meeting dead-looking code in six months with no way to
+tell whether it is reachable.
+
+The feature is DECLARED rather than inferred for the reason everything
+else on this page is about: a server that does not echo an id looks
+identical to one that failed to echo it, and an id-less error from a
+correlating server is the ordinary case (an unsolicited notice, or
+`bad_correlation`, which cannot echo the value it is bounding). The code
+distinguishes them, never the absence.

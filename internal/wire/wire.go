@@ -279,7 +279,9 @@ func NewJoined(peerID string, name, agePublicKey string) Joined {
 }
 
 type Error struct {
-	Type    Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID      string `json:"id,omitempty,case:strict"`
 	Message string `json:"message,case:strict"`
 	// Code, if present, is a stable machine-readable reason a client can
 	// branch on without parsing Message — e.g. a chat-relay-style teams
@@ -292,6 +294,22 @@ type Error struct {
 	// produced this error could succeed. Meaningless without Code.
 	Retryable bool `json:"retryable,omitempty,case:strict"`
 }
+
+// MaxCorrelationIDLen bounds a correlation id (see Msg.ID). The value is
+// echoed into frames a server has to bound, so it needs a limit; 128 is
+// agreed with chat-relay and is ample for the uuid this client sends.
+const MaxCorrelationIDLen = 128
+
+// FeatureCorrelation is the Joined.Features key a server sets to promise
+// it echoes Msg.ID on answers and errors. Without it a client cannot tell
+// "not implemented" from "failed to echo", which is why it is declared
+// rather than inferred from a missing echo.
+const FeatureCorrelation = "correlation"
+
+// CodeBadCorrelation refuses one request whose correlation id was
+// malformed or over MaxCorrelationIDLen. It says nothing about the
+// connection and must never be treated as fatal to it.
+const CodeBadCorrelation = "bad_correlation"
 
 func NewError(message string) Error {
 	return Error{Type: TypeError, Message: message}
@@ -326,7 +344,26 @@ type Mention struct {
 }
 
 type Msg struct {
-	Type    Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID is this client's own correlation id for the request — optional,
+	// client-chosen, opaque to the server, echoed VERBATIM on the frame
+	// that answers it and on an "error" refusing it. Declared as the
+	// "correlation" feature rather than inferred, because a server that
+	// does not echo it is indistinguishable from one that failed to.
+	//
+	// It names the FRAME, and a frame carries exactly one answerable
+	// request: a piggybacked AckCursor is recorded fire-and-forget and is
+	// never replied to, refusal included, so there is no second outcome
+	// here to misattribute. Only a standalone Ack produces a receipt
+	// outcome, and that is its own frame with its own id.
+	//
+	// At most MaxCorrelationIDLen bytes; longer is refused with
+	// "bad_correlation", which is the one error that carries NO id — it
+	// cannot echo the value it is bounding. A client recognises it by the
+	// CODE, never by the absence, since an unsolicited error (a close
+	// reason, a server-side refusal with no frame behind it) legitimately
+	// carries no id either.
+	ID      string `json:"id,omitempty,case:strict"`
 	PeerID  string `json:"peerId,omitempty,case:strict"`
 	Text    string `json:"text,case:strict"`
 	TS      string `json:"ts,omitempty,case:strict"`
@@ -507,7 +544,9 @@ func (a Attachment) IsReference() bool {
 // this against it just gets silently ignored, same as any other
 // unrecognized type.
 type AttachmentRequest struct {
-	Type  Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID    string `json:"id,omitempty,case:strict"`
 	Token string `json:"token,case:strict"`
 }
 
@@ -521,7 +560,9 @@ func NewAttachmentRequest(token string) AttachmentRequest {
 // token), "not_found" (unknown, or belongs to a different session), or
 // "unavailable" (recorded but no servable bytes, e.g. a recode failure).
 type AttachmentData struct {
-	Type        Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID          string `json:"id,omitempty,case:strict"`
 	Token       string `json:"token,case:strict"`
 	Name        string `json:"name,omitempty,case:strict"`
 	ContentType string `json:"contentType,case:strict"`
@@ -875,6 +916,8 @@ type Anchor struct {
 // per call, even though the wire itself has no such limit.
 type MessageAfter struct {
 	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID string `json:"id,omitempty,case:strict"`
 	Anchor
 	Filter
 }
@@ -987,7 +1030,9 @@ type ServerStopping struct {
 // be attributed to the ack that caused it) instead of an Ack reply, since
 // that's a protocol violation rather than a stale-but-valid receipt.
 type Ack struct {
-	Type      Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID        string `json:"id,omitempty,case:strict"`
 	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 	// OK is a POINTER for the same reason every other ack in this family
 	// states the field: absent and false encode identically in Go, so
@@ -1030,7 +1075,9 @@ func NewAck(ackCursor string) Ack {
 // canonical message when it arrives. mcp-hub-server never sends this,
 // since a plain hub_send already completes synchronously.
 type SendAck struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,omitempty,case:strict"`
 	OK         bool   `json:"ok,case:strict"`
 }
@@ -1112,7 +1159,9 @@ type MessageEdited struct {
 // react to; for a teams relay with write access to the underlying
 // platform.
 type Reaction struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,case:strict"`
 	Reaction   string `json:"reaction,case:strict"`
 	Action     string `json:"action,case:strict"`
@@ -1131,7 +1180,9 @@ func NewReactionRequest(externalID, reaction, action string) Reaction {
 // your own messages" rule) — a server is the authority on whether an edit
 // is permitted, not this package.
 type Edit struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,case:strict"`
 	Text       string `json:"text,case:strict"`
 	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
@@ -1179,7 +1230,9 @@ func NewEditRequest(externalID, text string, attachments []Attachment, format, r
 // kept as a field rather than assumed for symmetry with SendAck and in
 // case a server ever has a reason to send a negative ack explicitly.
 type ReactionAck struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,omitempty,case:strict"`
 	Reaction   string `json:"reaction,omitempty,case:strict"`
 	Action     string `json:"action,omitempty,case:strict"`
@@ -1187,7 +1240,9 @@ type ReactionAck struct {
 }
 
 type EditAck struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,omitempty,case:strict"`
 	OK         bool   `json:"ok,case:strict"`
 }
@@ -1200,7 +1255,9 @@ type EditAck struct {
 // renders a tombstone — this keeps that distinction on the wire instead
 // of asking every client to reconstruct it.
 type Delete struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,case:strict"`
 	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
 	AckCursor string `json:"ackCursor,omitempty,case:strict"`
@@ -1211,7 +1268,9 @@ func NewDeleteRequest(externalID string) Delete {
 }
 
 type DeleteAck struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,omitempty,case:strict"`
 	OK         bool   `json:"ok,case:strict"`
 }
@@ -1265,26 +1324,34 @@ type Unpinned struct {
 // server declares "actionAcks" — "pins" says the action exists, actionAcks
 // says an answer is worth waiting for.
 type Pin struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,case:strict"`
 	// AckCursor piggybacks a read receipt — see Msg.AckCursor.
 	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 }
 
 type Unpin struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,case:strict"`
 	AckCursor  string `json:"ackCursor,omitempty,case:strict"`
 }
 
 type PinAck struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,omitempty,case:strict"`
 	OK         bool   `json:"ok,case:strict"`
 }
 
 type UnpinAck struct {
-	Type       Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,omitempty,case:strict"`
 	OK         bool   `json:"ok,case:strict"`
 }
@@ -1299,12 +1366,16 @@ type UnpinAck struct {
 // not from a fresh upstream read — otherwise the two disagree under
 // exactly the conditions the pull exists to resolve.
 type PinsRequest struct {
-	Type      Type   `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID        string `json:"id,omitempty,case:strict"`
 	AckCursor string `json:"ackCursor,omitempty,case:strict"`
 }
 
 type PinsResponse struct {
 	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID.
+	ID string `json:"id,omitempty,case:strict"`
 	// A pointer-to-slice so an empty list encodes as [] rather than null,
 	// matching Joined.Pinned. The two answers to "what is pinned" should
 	// not have different empty shapes.
