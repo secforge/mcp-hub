@@ -17,11 +17,21 @@ import (
 )
 
 // A gap retrieval hands over messages from BEHIND the reading position, so
-// it must not move the wire-level read receipt: chat-relay's acked position
-// is last-write-wins (its author, 2026-09-20), so a regressed receipt moves
-// that server's view of this peer backwards and makes joined.behind
-// over-report. hub_read already keeps the receipt out for this reason; the
-// gap walk did not.
+// it must not move the wire-level read receipt.
+//
+// The rationale this test was first written with was wrong and is recorded
+// because the correction is the point: chat-relay's author said on
+// 2026-09-20 that their acked position was last-write-wins, so a regressed
+// receipt would move that server's view of this peer backwards. Reading
+// their code later the same day, they found it monotonic — a backwards
+// standalone ack is refused, a backwards piggyback ignored. So the
+// consequence this test was named for does not occur against that server.
+//
+// The behaviour is still required, and against a monotonic server the cost
+// of getting it wrong is merely different, not absent: the client would
+// send a receipt that is silently dropped, believe a position acknowledged
+// that never was, and no wire signal would ever say otherwise. hub_read
+// already keeps the receipt out; the gap walk did not.
 func TestGapRetrievalDoesNotMoveTheWireReceipt(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

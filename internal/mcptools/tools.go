@@ -3125,13 +3125,16 @@ func (s *session) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.E
 //
 // A gap holds messages OLDER than the current position, so marking them
 // consumed drags lastConsumed backwards — and that value is what the
-// next send piggybacks as its ackCursor. chat-relay's own column is
-// last-write-wins rather than monotonic, so a regressed receipt moves
-// the server's position backwards and makes its behind count over-report
-// until something moves it forward again; that server will not refuse it
-// for us. handleRead already avoids exactly this and says why in its own
-// doc comment; the gap path was reached through the consuming helper
-// instead. Found by an external reviewer, 2026-09-20.
+// next send piggybacks as its ackCursor. A client must not offer a
+// position it cannot justify, whatever the server does with it: against
+// a server that takes the last value it is told, the receipt regresses
+// and the behind count over-reports; against one that only moves
+// forward, the receipt is dropped without a word and this client goes on
+// believing a position was acknowledged that never was. The second is
+// what chat-relay does, and it is the worse of the two, because nothing
+// on the wire ever says so. handleRead already avoids exactly this and
+// says why in its own doc comment; the gap path was reached through the
+// consuming helper instead. Found by an external reviewer, 2026-09-20.
 func (s *session) resultWithRecoveredAttachments(conn *hubconn.Conn, formatted string, events []hubconn.Event) *mcp.CallToolResult {
 	s.recordHandedOver(events)
 	conn.NoteHandedOver(events)
@@ -4298,13 +4301,15 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// NOT WHILE SOMETHING NEWER HAS BEEN CONSUMED. This measuring ack
 	// names the STORED cursor, and sending it is also what repairs the
 	// server's own position — but if this connection has since consumed
-	// anything live, that same ack moves the server BACKWARDS, and
-	// chat-relay's column is last-write-wins rather than monotonic, so
-	// its behind count then over-reports until something moves it
-	// forward. Cursors are opaque, so nothing here can ask "is this
-	// older"; "has anything been consumed at all" is the comparison
-	// available, and declining to measure costs a number rather than a
-	// position. Found by an external reviewer, 2026-09-20.
+	// anything live, that same ack asks the server to go BACKWARDS. A
+	// server that obeys over-reports its behind count until something
+	// moves it forward; chat-relay instead refuses it, which costs a
+	// measurement and gains nothing. Either way there is no version of
+	// this where sending it is right. Cursors are opaque, so nothing
+	// here can ask "is this older"; "has anything been consumed at all"
+	// is the comparison available, and declining to measure costs a
+	// number rather than a position. Found by an external reviewer,
+	// 2026-09-20.
 	if cursor != "" && conn.HasFeature("ackReplies") &&
 		(conn.ConsumedCursor() == "" || conn.ConsumedCursor() == cursor) {
 		if behind, err := conn.ConfirmReceived(cursor); err == nil && behind != nil {
