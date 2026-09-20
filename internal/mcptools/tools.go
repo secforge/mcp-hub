@@ -193,6 +193,73 @@ func parseMentions(raw any) ([]wire.Mention, error) {
 	return mentions, nil
 }
 
+// projectOverrideNote returns text to append to hub_connect's own
+// description when MCP_HUB_PROJECT_DIR is set, naming the scope and
+// suggesting a connection name derived from it.
+//
+// The variable decides which bucket of stored identities this client
+// reads and writes (see projectForConnect). Two sessions differing only
+// by it are separate agents to the store — separate peer ids, separate
+// read positions — while looking identical to a reader, because the one
+// thing that distinguishes them is an environment variable nothing
+// displays. A connection named after the working directory then says
+// nothing about which of them it is.
+//
+// Same delivery as startupConnectionsNote, with the same limit: MCP gives
+// a server no way to push into the model's context, so this is seen only
+// when the model reads the description, which tool search may defer.
+func projectOverrideNote() string {
+	dir := connstore.ProjectOverride()
+	if dir == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"\n\nNOTE: MCP_HUB_PROJECT_DIR is set to %q, so this client's stored connections are "+
+			"scoped to that name rather than to the working directory. A connection opened here "+
+			"is a SEPARATE identity from one opened by a session without it — its own peer id and "+
+			"its own read position — and nothing a reader sees says so. Name this connection "+
+			"after that scope, e.g. as: %q, so the two are distinguishable later.",
+		dir, suggestedConnName(dir))
+}
+
+// suggestedConnName turns a project scope into a name that satisfies the
+// "as" parameter's own rule: lowercase letters, digits, - and _, at most
+// 32 characters.
+//
+// The last path segment, because that is the part that distinguishes one
+// scope from another — a full path is both too long and identical to
+// every sibling for its first several segments. Sanitised rather than
+// validated: a suggestion that has to be corrected before it can be used
+// is worse than none.
+func suggestedConnName(dir string) string {
+	base := strings.ToLower(filepath.Base(strings.TrimRight(dir, "/")))
+	var b strings.Builder
+	lastDash := true // leading dashes are trimmed by never being written
+	for _, r := range base {
+		ok := r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if !ok {
+			r = '-'
+		}
+		if r == '-' {
+			if lastDash {
+				continue
+			}
+			lastDash = true
+		} else {
+			lastDash = false
+		}
+		if b.Len() >= 32 {
+			break
+		}
+		b.WriteRune(r)
+	}
+	name := strings.TrimRight(b.String(), "-")
+	if name == "" {
+		return "scoped"
+	}
+	return name
+}
+
 // startupConnectionsNote returns text to append to hub_connect's own
 // description when connstore has any entry still marked Connected from a
 // prior process — computed once, when Register() runs, i.e. at process
@@ -1477,7 +1544,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"something to work out from the link, and hub_send/"+receiveTools()+"/"+
 				"hub_peers/hub_catch_up work the same way either way. The connect result states "+
 				"what this particular server declared about itself"+
-				startupConnectionsNote()),
+				projectOverrideNote()+startupConnectionsNote()),
 			mcp.WithString("as", mcp.Required(), mcp.Description(
 				"REQUIRED: a short name for THIS connection, which every later call uses to "+
 					"refer to it — hub_send(connection: \"<name>\"), hub_catch_up(connection: "+

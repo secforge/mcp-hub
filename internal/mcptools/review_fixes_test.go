@@ -330,3 +330,65 @@ func TestTheProjectOverrideIsReadFromTheEnvironment(t *testing.T) {
 		t.Fatalf("ProjectOverride() = %q with the variable unset, want empty", got)
 	}
 }
+
+// A session scoped by MCP_HUB_PROJECT_DIR keeps its own bucket of stored
+// identities, so a connection opened there is a separate peer with its
+// own read position from one opened without it — and nothing a reader
+// sees says so, because the only difference is an environment variable
+// nothing displays. hub_connect's description says so, and suggests a
+// name, so the two are distinguishable afterwards.
+func TestConnectSaysWhenTheProjectScopeIsOverridden(t *testing.T) {
+	t.Setenv("MCP_HUB_PROJECT_DIR", "")
+	if note := projectOverrideNote(); note != "" {
+		t.Fatalf("a note was offered with no override set: %q", note)
+	}
+
+	t.Setenv("MCP_HUB_PROJECT_DIR", "/source/mcp-hub/x+test")
+	note := projectOverrideNote()
+	if !strings.Contains(note, "/source/mcp-hub/x+test") {
+		t.Errorf("the note does not name the scope it is about: %q", note)
+	}
+	if !strings.Contains(note, `as: "x-test"`) {
+		t.Errorf("the note does not suggest a usable name: %q", note)
+	}
+	if !strings.Contains(note, "SEPARATE identity") {
+		t.Errorf("the note does not say what the scope costs, which is the reason it exists: %q", note)
+	}
+}
+
+// The suggested name has to satisfy the "as" parameter's own rule —
+// lowercase letters, digits, - and _, at most 32 characters — or it is a
+// suggestion that must be corrected before it can be used, which is worse
+// than none.
+func TestTheSuggestedConnectionNameIsUsableAsGiven(t *testing.T) {
+	valid := func(s string) bool {
+		if s == "" || len(s) > 32 {
+			return false
+		}
+		for _, r := range s {
+			if r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				continue
+			}
+			return false
+		}
+		return true
+	}
+	for _, tc := range []struct{ dir, want string }{
+		{"/source/mcp-hub/x+test", "x-test"},
+		{"/source/mcp-hub+review", "mcp-hub-review"},
+		{"/source/mcp-hub/y", "y"},
+		{"/source/Some Project/", "some-project"},
+		{"/source/weird!!!name", "weird-name"},
+		{"/source/" + strings.Repeat("long", 20), strings.Repeat("long", 8)},
+		{"/source/+++", "scoped"},
+		{"/", "scoped"},
+	} {
+		got := suggestedConnName(tc.dir)
+		if got != tc.want {
+			t.Errorf("suggestedConnName(%q) = %q, want %q", tc.dir, got, tc.want)
+		}
+		if !valid(got) {
+			t.Errorf("suggestedConnName(%q) = %q, which the \"as\" parameter would reject", tc.dir, got)
+		}
+	}
+}
