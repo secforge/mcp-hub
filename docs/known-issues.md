@@ -830,9 +830,31 @@ Every mechanism proposed assumed the two systems were a closed world, and
 the artefact that would have settled it — the store as it stood before the
 mint — was destroyed by the same action that caused it. So "unexplained"
 was the right verdict on the evidence, and the evidence could not have
-contained the answer. When every mechanism is eliminated, the remaining
-possibility is that something outside the system acted; ask, rather than
-proposing a sixth.
+contained the answer.
+
+**The rule first written here was "when every mechanism is eliminated,
+the remaining possibility is that something outside acted". That is
+unsound and is corrected rather than deleted, because the correction is
+the useful part.** Hours later a SIXTH mechanism turned up, internal to
+this client and capable of producing the same shape with no
+configuration change: the project scope was resolved from the MCP
+client's roots on every call, under a two-second deadline, so a slow
+reply was not a delay but a different answer and the scope fell through
+to $PWD. "Every mechanism eliminated" had never been true; it meant
+"every mechanism anyone had thought of".
+
+What saves the conclusion in THIS case is not the reasoning but a
+separate fact, checked afterwards: that session had MCP_HUB_PROJECT_DIR
+set, and an explicit override outranks roots, so the deadline was never
+consulted for it. The deletion remains a confirmed cause rather than a
+surviving candidate. The inference reached the right answer and was not
+sound when it was made.
+
+So the honest rule is narrower. When every mechanism you can name is
+eliminated, one possibility is that something outside acted — and
+another is that you have not named them all. Ask about the first, and
+keep looking for the second. An eliminated list is evidence about the
+list, not about the world.
 
 The only rule that covers the rest is the blunt one: do not write an
 identifier you have not just read. Not a shortened hash, not a line
