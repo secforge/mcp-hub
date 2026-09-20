@@ -1570,6 +1570,9 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	}
 	defer cancel()
 	if err := c.writeJSON(wire.NewAck(cursor)); err != nil {
+		// Nothing was sent, so nothing was consumed — the skipWait path
+		// above already restores here and this one did not.
+		restore()
 		return nil, err
 	}
 	c.mu.Lock()
@@ -1623,6 +1626,14 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		}
 		return ev.Behind, nil
 	case <-c.gone:
+		// Restored so the sentence is true of this connection's own
+		// state and not only of what was persisted. The Conn is
+		// discarded after a drop, so nothing downstream depends on it —
+		// but a message that says a position did not move while it did
+		// is the exact class of defect this function was just fixed
+		// for, and leaving two instances of it here would be worse than
+		// the bug.
+		restore()
 		return nil, fmt.Errorf("the connection dropped before the server answered this confirm — " +
 			"your read position has not moved")
 	case <-time.After(AckWaitTimeout):
@@ -2102,6 +2113,14 @@ func decodeEvent(raw []byte) (Event, bool) {
 // only the idle timer (ackLoop) additionally checks whether it moved.
 // Empty once ackDisabled (a prior bad_ack/bad_ack_cursor) or before
 // anything has been consumed yet.
+//
+// What this sends is lastConsumed, and it is sent without ever being
+// answered: the server records a piggybacked receipt fire-and-forget and
+// replies to nothing about it, refusal included. So a wrong value here is
+// invisible from the wire — it can only be prevented, never detected. That
+// is why ConfirmReceived rolls lastConsumed back on every path that does
+// not end in an accepted confirm: a position the server refused must never
+// survive to be piggybacked, because nothing downstream would ever notice.
 func (c *Conn) ackCursorForOutbound() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
