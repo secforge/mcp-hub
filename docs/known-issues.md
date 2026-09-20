@@ -829,6 +829,20 @@ ratchet whose trigger nobody can reach. So `expectLateAnswer` returns
 immediately when `Conn.correlates` is set, and the gate lives in that one
 function rather than at its nine call sites.
 
+**NEITHER HALF HAS RUN IN THE WILD.** Released in v3.1.6 and deployed on
+chat-relay the same afternoon, and every exercise of both halves is
+fixtures written by the people who wrote the code. Three symptoms to
+watch for, all silent: an attachment fetch that hangs for its whole
+deadline and returns nothing, a catch-up that reports a timeout instead
+of "caught up", and an action that reports another action's outcome.
+
+**How to tell the two causes apart, which neither side could do alone
+this afternoon.** chat-relay holds a server log recording what it sent
+and with which id. Given the minute of a symptom, that separates "the
+echo was absent" from "the echo arrived and was not matched" — a client
+defect from a server one. Ask for it before theorising; the whole of
+2026-09-20 is what theorising from one side costs.
+
 **DELETION TRIGGER.** The debt machinery, the "two claims pending, so
 this error goes to nobody" rule, and the tests for both can be deleted
 when no server this client supports is still without
