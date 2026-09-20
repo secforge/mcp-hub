@@ -493,6 +493,19 @@ type Conn struct {
 	// must NOT be diverted here, unlike pendingAcks' blind kind match;
 	// see tryDivertToClaimLocked.
 	pendingMessageAfter *ackClaim
+	// resumablePeers is joined.ResumablePeers as the server sent it: how
+	// many peers in this conversation still hold a reconnect secret,
+	// present only when the server MINTED a fresh identity for this
+	// connection and nil when it reclaimed one.
+	//
+	// Nil and zero are different answers and are kept apart. Nil means
+	// either "this identity was resumed, so the question does not
+	// arise" or "this server does not say"; mintNoticeDeclared tells
+	// those apart. Zero means the server minted and there was genuinely
+	// nothing to resume, which is the reassuring case and is worth being
+	// able to state.
+	resumablePeers     *int
+	mintNoticeDeclared bool
 	// correlates is set when the server declared wire.FeatureCorrelation
 	// at join: every request that awaits an answer then carries a
 	// client-chosen id which the server echoes on the answer and on any
@@ -998,6 +1011,8 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfir
 		featuresDeclared:        joined.Features != nil,
 		correlates:              correlationUsable(joined),
 		attachments:             attachmentsDeclared(joined),
+		resumablePeers:          joined.ResumablePeers,
+		mintNoticeDeclared:      joined.HasFeature(wire.FeatureMintNotice),
 		attachmentsSaid:         attachmentsStated(joined),
 		lastFrameKind:           "joined",
 		lastFrameAt:             time.Now(),
@@ -1063,6 +1078,29 @@ func (c *Conn) MaxAttachmentBytes() int {
 // behaviour here, since neither is grounds to refuse locally.
 func (c *Conn) AcceptsImagesOnly() bool {
 	return c.attachmentsSaid && c.attachments.ImagesOnly
+}
+
+// MintedWithResumablePeers reports that the server gave this connection a
+// NEW identity while the conversation still held peers that could have
+// been resumed, and how many.
+//
+// A client cannot work this out for itself. Its own stored identities
+// are scoped to one project, so a scope holding nothing for this link is
+// indistinguishable from a first-ever connect — and the only local way
+// to tell the two apart would be to read other projects' entries, which
+// is not this client's data to read. The server has the fact already,
+// about its own conversation, with no other project in it.
+//
+// Reports false when the server did not mint (the identity was
+// reclaimed, so nothing was lost), when it minted and nothing was
+// resumable, and when it does not declare the feature at all — the last
+// of which is silence rather than a zero, and must not be rendered as
+// "there was nothing to resume".
+func (c *Conn) MintedWithResumablePeers() (int, bool) {
+	if !c.mintNoticeDeclared || c.resumablePeers == nil || *c.resumablePeers == 0 {
+		return 0, false
+	}
+	return *c.resumablePeers, true
 }
 
 // FeaturesDeclared reports whether the server sent a Features object at

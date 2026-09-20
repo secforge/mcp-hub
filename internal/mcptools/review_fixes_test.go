@@ -612,3 +612,59 @@ func TestATimedOutRootsRequestDoesNotFreezeTheScope(t *testing.T) {
 		t.Fatalf("the scope moved again after being established: %q", got)
 	}
 }
+
+// The connect result says when the server reports a fresh identity was
+// minted while resumable peers existed. That is the only signal for it:
+// this client reads its own project's scope and nothing else, so a scope
+// holding nothing for a link looks exactly like a first-ever connect.
+func TestConnectReportsAMintWhenPeersCouldHaveBeenResumed(t *testing.T) {
+	four := 4
+	zero := 0
+	for _, tc := range []struct {
+		name     string
+		declared bool
+		peers    *int
+		wantSaid bool
+	}{
+		{"minted while four could have been resumed", true, &four, true},
+		{"minted and nothing was resumable", true, &zero, false},
+		{"reclaimed, so the question does not arise", true, nil, false},
+		{"a server that does not declare it says nothing", false, &four, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			features := teamsTestFeatures()
+			if tc.declared {
+				features[wire.FeatureMintNotice] = json.RawMessage(`{}`)
+			}
+			link := startRelayTestServerWithJoined(t, wire.Joined{
+				Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+				ServerVersion: wire.ProtocolVersion, Features: features,
+				ConversationKind: "group", CanSend: true,
+				ResumablePeers: tc.peers,
+			})
+			ctx := context.Background()
+			hub := NewHub()
+			req := mcp.CallToolRequest{}
+			req.Params.Arguments = map[string]any{"as": testConn, "link": link}
+			res, err := hub.handleConnect(ctx, req)
+			if err != nil || res.IsError {
+				t.Fatalf("connect: err=%v result=%+v", err, res)
+			}
+			defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+			text := textOf(res)
+			said := strings.Contains(text, "gave this connection a NEW identity")
+			if said != tc.wantSaid {
+				t.Fatalf("mint notice said=%v, want %v:\n%s", said, tc.wantSaid, text)
+			}
+			if tc.wantSaid {
+				if !strings.Contains(text, "4 peers") {
+					t.Errorf("the count is not in what the reader is told:\n%s", text)
+				}
+				if !strings.Contains(text, "MCP_HUB_PROJECT_DIR") {
+					t.Errorf("the reader is not told what decides the scope:\n%s", text)
+				}
+			}
+		})
+	}
+}

@@ -2723,6 +2723,28 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// different project is a new participant by design — but the
 		// branch above reads as reassurance, and it is exactly the
 		// reassurance a caller got moments before losing access.
+		// WHAT THE SERVER SAYS, WHICH IS THE ONLY PARTY THAT CAN.
+		// A fresh identity where the conversation still held resumable
+		// peers is the case worth naming: this looks like a first
+		// connection from here, and the server can see it was not one
+		// for this link.
+		if n, minted := conn.MintedWithResumablePeers(); minted {
+			peers := "1 peer"
+			if n > 1 {
+				peers = fmt.Sprintf("%d peers", n)
+			}
+			identityNote += fmt.Sprintf(
+				"\nNOTE: the server says it gave this connection a NEW identity while this "+
+					"conversation still held %s that could have been resumed. This client had "+
+					"nothing stored for that link in its own project scope, which is why it asked "+
+					"for none — a stored identity belongs to ONE scope, and the scope comes from "+
+					"MCP_HUB_PROJECT_DIR when set, otherwise from the MCP client's project root.\n"+
+					"If this session was meant to continue an earlier one, it is not: the earlier "+
+					"identity still exists with its own read position, and nothing here can adopt "+
+					"it. Check which scope is in force before sending anything that assumes "+
+					"continuity.", peers)
+		}
+
 		// NOTHING HERE LOOKS AT ANOTHER SCOPE. An earlier version
 		// checked whether this link was resumable under a different
 		// project and said so, which is useful and is not this

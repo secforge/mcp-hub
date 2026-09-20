@@ -924,3 +924,78 @@ func TestTheNameClashIsDecidedAgainstThisConnectionsOwnName(t *testing.T) {
 		})
 	}
 }
+
+// joined.resumablePeers is the only way a client can learn it took a new
+// identity where one could have been resumed. Its own stored identities
+// are scoped to one project, so a scope holding nothing for a link is
+// indistinguishable from a first-ever connect — and the only local way
+// to tell them apart would be reading other projects' entries, which is
+// not this client's data.
+//
+// Nil, zero and a count are three answers, not two. Nil with the feature
+// declared means the identity was RECLAIMED, so the question does not
+// arise. Nil without it means the server does not say. Zero means it
+// minted and there was genuinely nothing to resume — the reassuring
+// case, and the reason zero is sent rather than omitted.
+func TestTheMintNoticeKeepsSilenceAndZeroApart(t *testing.T) {
+	n := func(i int) *int { return &i }
+	for _, tc := range []struct {
+		name     string
+		declared bool
+		peers    *int
+		wantN    int
+		wantSaid bool
+	}{
+		{"minted with peers to resume", true, n(4), 4, true},
+		{"minted with exactly one", true, n(1), 1, true},
+		{"minted and nothing was resumable", true, n(0), 0, false},
+		{"reclaimed, so the question does not arise", true, nil, 0, false},
+		{"a server that does not say is not a zero", false, nil, 0, false},
+		{"a count from a server that never declared it is not believed", false, n(3), 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Conn{mintNoticeDeclared: tc.declared, resumablePeers: tc.peers}
+			got, said := c.MintedWithResumablePeers()
+			if said != tc.wantSaid || got != tc.wantN {
+				t.Fatalf("MintedWithResumablePeers() = (%d, %v), want (%d, %v)",
+					got, said, tc.wantN, tc.wantSaid)
+			}
+		})
+	}
+}
+
+// And the field survives the real decoder — the capability existing on
+// the struct proved nothing twice today.
+func TestResumablePeersSurvivesDecodingJoined(t *testing.T) {
+	zero := 0
+	four := 4
+	for _, tc := range []struct {
+		name string
+		in   *int
+	}{
+		{"a count", &four},
+		{"an explicit zero", &zero},
+		{"absent", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
+			j.ResumablePeers = tc.in
+			raw, err := json.Marshal(j)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var back wire.Joined
+			if err := json.Unmarshal(raw, &back); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			switch {
+			case tc.in == nil && back.ResumablePeers != nil:
+				t.Fatalf("absent became %d", *back.ResumablePeers)
+			case tc.in != nil && back.ResumablePeers == nil:
+				t.Fatalf("%d was dropped — an explicit zero must not decode as absent", *tc.in)
+			case tc.in != nil && *back.ResumablePeers != *tc.in:
+				t.Fatalf("got %d, want %d", *back.ResumablePeers, *tc.in)
+			}
+		})
+	}
+}
