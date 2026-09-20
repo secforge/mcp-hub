@@ -369,7 +369,17 @@ with A's externalId. An uncorrelated error with several claims pending
 went to whichever the map yielded first, so a send's refusal could be
 reported as a history read's failure.
 
-MITIGATED, 2026-09-20, without touching the wire: a timed-out request
+MITIGATED, 2026-09-20, without touching the wire — and the first
+version of that mitigation carried a defect worse than the bug. The debt
+a timeout recorded was only spent while a claim was waiting, so a late
+answer arriving with nobody waiting left it standing: the next request's
+own prompt answer paid it, that caller timed out, and its timeout
+recorded the debt again. One timeout disabled acks of that kind for the
+life of the connection. Found by an external reviewer with a
+reproduction, hours after the mitigation was written, and fixed by
+settling the debt on any arrival of that kind.
+
+The mitigation itself: a timed-out request
 records one owed answer of its kind, and routing spends the late answer
 against that record rather than the next caller; an error arriving while
 more than one claim is pending is delivered to nobody and falls through
@@ -501,3 +511,77 @@ runs the suite under it before publishing), the Dockerfile sets it, and
 `internal/wire`'s `TestTheWireIsReadCaseSensitively` FAILS rather than
 skips when it is absent — so a plain `go test ./...` is meant to fail.
 Run `GOEXPERIMENT=jsonv2 go test ./...`.
+
+## A plain `go test ./...` is red here, by design
+
+`internal/wire`'s `TestTheWireIsReadCaseSensitively` FAILS without
+`GOEXPERIMENT=jsonv2`, deliberately: every wire field is tagged
+`case:strict`, Go honours that tag only under the experiment, and a
+build without it reads the wire case-insensitively while the suite would
+otherwise claim it does not. The test fails rather than skips so that a
+binary which quietly lost the strictness cannot pass.
+
+The cost is that the first thing anyone does with a fresh clone — run
+the tests — goes red, and the failure message is the only thing that
+says why. Run:
+
+	GOEXPERIMENT=jsonv2 go test ./...
+
+Recorded here as well as in the README because an external reviewer ran
+into it, 2026-09-20, and reasonably expected the entry to mention it.
+
+## Several sessions can share one working tree
+
+Not a defect in this code, and worth knowing before committing from it.
+
+On 2026-09-20 three agent sessions worked in `/source/mcp-hub` at once.
+Two of them described themselves as being in `/source/mcp-hub/y` and
+`/source/mcp-hub/x`, which sound like separate checkouts and are not:
+
+	git worktree list  →  /source/mcp-hub   (one entry)
+	x, y               →  plain directories inside it
+
+So `git status` is a SHARED surface. `git add -A` from any session
+sweeps in whatever the others have left mid-edit, and the failure is
+silent — the commit succeeds, and it looks like yours. Use explicit
+paths (`git add internal/`, `git add docs/`) and read `git status`
+as everyone's work rather than your own.
+
+SETTLED the same day by the project owner: one session writes to this
+checkout and the others touch nothing in it — no edits, no new files, no
+scratch files, no deletions, whether or not git ever sees them. A
+session that needs to write anything makes a real worktree, a separate
+clone, or a scratch directory outside the checkout. A plain directory
+inside it, as `x/` and `y/` are, is none of those: it shares this index
+completely and is the arrangement being retired.
+
+Recorded as a near-miss rather than an incident: the commits of
+2026-09-20 used explicit paths out of habit, before anyone knew the tree
+was shared. `scripts/release.sh` is the other guard — it refuses a dirty
+tree outright, so another session's uncommitted work blocks a release
+rather than being published in one.
+
+## A peerId names an identity, not an agent
+
+Also 2026-09-20, and the reason entries here name a session and a date
+rather than a peer id alone.
+
+A peerId is resumed from the stored reconnect secret for a link. It is a
+stable name for WHOEVER HOLDS THAT SECRET, which is not the same as the
+agent behind it: that day, the id `f54fd3f8…` was a Codex session all
+morning — the one whose pull-mode answers are the evidence in the Codex
+push entry above — and then presented as a Claude Code session in the
+afternoon, same id, same link — then as `reviewer` twenty minutes after
+that. Three names, one id, and nothing in the roster history or the
+transcript distinguishes one agent renaming itself from three sessions
+sharing a secret. The peer that could have said which left mid-question.
+
+The observations stay true; they were correct when made and the entry
+dates them. What is not true is that the id identifies the agent. The
+server has the same exposure in reverse: its rows and its "X joined"
+lines carry a peerId, and the display name beside it is whatever the
+client sent at that moment, so "who was in the room" is answerable as
+which IDENTITY and never as which agent.
+
+Neither side treats this as a defect and neither intends to change it —
+it is what resuming an identity from a secret means.

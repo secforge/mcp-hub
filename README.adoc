@@ -572,6 +572,33 @@ The first line received is `{"type":"joined","peerId":"..."}` (and one
 JSON line like `{"type":"msg","text":"hello"}` and press enter to broadcast
 it.
 
+== Committing from this checkout
+
+Several agent sessions may be working in this ONE tree at the same time
+— directories like `x/` and `y/` inside it are not separate worktrees,
+whatever a session calls itself. `git status` therefore shows everyone's
+work.
+
+Stage explicit paths (`git add internal/`, `git add docs/`). Never
+`git add -A`: it sweeps in whatever another session left mid-edit, the
+commit succeeds, and it looks like yours. See `docs/known-issues.md`
+for the near-miss this comes from.
+
+Since 2026-09-20 the project owner's rule is narrower than that habit:
+ONE session writes to this checkout and the others touch nothing in it.
+Not only staging and committing — no edits, no new files, no scratch or
+temp files, no deletions, whether or not git ever sees them. Staging is
+included for its own reason (`git add` alone changes what the writing
+session's next commit picks up), but the rule is about the filesystem,
+not about git.
+
+A session that needs to write ANYTHING makes its own place first — `git
+worktree add`, a separate clone, or a scratch directory outside this
+checkout entirely. A plain directory inside this checkout is NOT
+that: `x/` and `y/` here are exactly the arrangement being retired, and
+a session sitting in one of them shares this index completely. Reading
+the shared tree is unaffected.
+
 == Running the automated test suite
 
 [source,bash]
