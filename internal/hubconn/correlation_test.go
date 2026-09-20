@@ -441,3 +441,90 @@ func TestADeclaredCapThatFitsOrIsAbsentStillCorrelates(t *testing.T) {
 		})
 	}
 }
+
+// THE CASE NEITHER SIDE HAD. A history walk's terminator, noMoreMessages,
+// carries no correlation id today: the echo agreed with chat-relay covers
+// the acks and "error", and this frame is neither. A client that demanded
+// an id on a history answer would therefore never see a walk end against
+// the very server that declares the feature — every hub_catch_up would
+// report a timeout instead of "caught up", which is a worse failure than
+// the misattribution being fixed and one this client would have inflicted
+// on itself by assuming an echo nobody promised.
+//
+// So an answer with no id falls back to the anchor rule. Both directions
+// are asserted here because each one alone passes a broken
+// implementation: the id case passes a client that ignores ids if the
+// anchors differ, and the fallback passes a client that ignores ids
+// entirely.
+func TestAnIdLessTerminatorStillEndsAWalkAgainstACorrelatingServer(t *testing.T) {
+	shortAckTimeout(t)
+
+	base := startCorrelatingServer(t, map[string]json.RawMessage{
+		wire.FeatureCorrelation: json.RawMessage(`{"maxLength":128}`),
+		"messageAfter":          json.RawMessage(`{}`),
+	}, func(w *serialWriter, frame map[string]any) {
+		if frame["type"] != string(wire.TypeMessageAfter) {
+			return
+		}
+		// Exactly what chat-relay sends today: the terminator, echoing
+		// the anchor and nothing else.
+		w.write(wire.NoMoreMessages{Type: wire.TypeNoMoreMessages,
+			Answers: &wire.Anchor{Cursor: "anchor-here"}})
+	})
+
+	c, err := dialTest(base, "corr-terminator", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if !c.correlates {
+		t.Fatal("the server declared the correlation feature and this connection did not take it up")
+	}
+
+	ev, ok, err := c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "anchor-here"})
+	if err != nil {
+		t.Fatalf("history request: %v", err)
+	}
+	if !ok {
+		t.Fatal("an id-less noMoreMessages did not end the walk — a client that demands a correlation " +
+			"id on a history answer hangs on every catch-up against a correlating server, because " +
+			"the terminator was never in the agreed echo")
+	}
+	if ev.Kind != "noMoreMessages" {
+		t.Fatalf("got %q, want the terminator", ev.Kind)
+	}
+}
+
+// And once a server DOES echo it on the terminator, the id is believed:
+// a terminator bearing another request's id must not end this walk. The
+// field exists for that day; nothing sends it yet.
+func TestATerminatorBearingAnotherRequestsIdDoesNotEndThisWalk(t *testing.T) {
+	shortAckTimeout(t)
+
+	base := startCorrelatingServer(t, map[string]json.RawMessage{
+		wire.FeatureCorrelation: json.RawMessage(`{"maxLength":128}`),
+		"messageAfter":          json.RawMessage(`{}`),
+	}, func(w *serialWriter, frame map[string]any) {
+		if frame["type"] != string(wire.TypeMessageAfter) {
+			return
+		}
+		w.write(wire.NoMoreMessages{Type: wire.TypeNoMoreMessages,
+			ID:      "the-id-of-some-earlier-request",
+			Answers: &wire.Anchor{Cursor: "anchor-here"}})
+	})
+
+	c, err := dialTest(base, "corr-foreign-terminator", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	ev, ok, err := c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "anchor-here"})
+	if err != nil {
+		t.Fatalf("history request: %v", err)
+	}
+	if ok {
+		t.Fatalf("a terminator carrying another request's id ended this walk (%+v) — where the answer "+
+			"states an id, that id is the whole test", ev)
+	}
+}

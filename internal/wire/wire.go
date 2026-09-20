@@ -972,7 +972,12 @@ func NewMessageAfterAt(at string) MessageAfter {
 // PRESENCE is the answer to "was this filtered", so a server that ignored
 // the filter cannot be mistaken for one that honoured it.
 type NoMoreMessages struct {
-	Type     Type    `json:"type,case:strict"`
+	Type Type `json:"type,case:strict"`
+	// ID echoes the request's correlation id — see Msg.ID. This frame
+	// TERMINATES a history walk, so without the echo the walk's last
+	// answer is the one thing on that path that cannot be attributed,
+	// and a client demanding an id here would hang instead of finishing.
+	ID       string  `json:"id,omitempty,case:strict"`
 	Answers  *Anchor `json:"answers,omitempty,case:strict"`
 	Matching *Filter `json:"matching,omitempty,case:strict"`
 }

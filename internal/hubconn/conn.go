@@ -1355,6 +1355,37 @@ func answersAnchor(answers *wire.Anchor, want wire.Anchor) bool {
 	return answers.Cursor == want.Cursor && answers.At == want.At
 }
 
+// answersHistoryClaim reports whether ev is the answer to this pending
+// MessageAfter claim.
+//
+// WHERE THE ANSWER CARRIES AN ID, THE ID IS THE WHOLE TEST. The anchor
+// cannot separate two requests that asked the same question, and asking
+// the same question twice is this client's own documented recovery — a
+// timed-out catch-up is retried with the same anchor, because that is
+// what the tool tells the model to do. So request 1's late answer matched
+// request 2's anchor and was handed over as request 2's outcome: the
+// exact misattribution the correlation id exists to end, in the one path
+// that minted an id and then ignored it.
+//
+// WHERE IT DOES NOT, THE ANCHOR RULE STANDS. A history answer is not an
+// ack, and the echo agreed with chat-relay covers the acks and "error" —
+// "noMoreMessages" carries no id at all today and a historical "msg" is
+// not guaranteed to. Demanding one would make every walk against such a
+// server time out, which is a worse failure than the one being fixed and
+// would be caused by this client assuming an echo nobody promised.
+//
+// So the rule is: believe an id when there is one, fall back when there
+// is not. Note what that does NOT do — an id-less late answer still
+// matches by anchor, so this closes the demonstrated hole and not the
+// whole class. Closing the class needs the echo extended to the history
+// frames, which is a wire change and not this function's to assume.
+func answersHistoryClaim(ev Event, claim *ackClaim) bool {
+	if claim.corrID != "" && ev.CorrelationID != "" {
+		return ev.CorrelationID == claim.corrID
+	}
+	return answersAnchor(ev.Answers, claim.anchor)
+}
+
 // tryDivertToClaimLocked checks ev against any pending ack claims and, if
 // it matches one, delivers it directly and reports true — the caller
 // (readLoop) must skip buffering it and firing OnActivity for it entirely
@@ -1394,7 +1425,7 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 	if c.pendingMessageAfter != nil {
 		switch {
 		case (ev.Kind == "msg" && ev.Answers != nil || ev.Kind == "noMoreMessages") &&
-			answersAnchor(ev.Answers, c.pendingMessageAfter.anchor):
+			answersHistoryClaim(ev, c.pendingMessageAfter):
 			claim := c.pendingMessageAfter
 			c.pendingMessageAfter = nil
 			debugf("tryDivertToClaimLocked: matched claim=%p kind=%q cursor=%q answers=%+v",
@@ -2146,7 +2177,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,
-			Matching: m.Matching}, true
+			Matching: m.Matching, CorrelationID: m.ID}, true
 	case wire.TypeServerStopping:
 		var st wire.ServerStopping
 		if err := json.Unmarshal(raw, &st); err != nil {
@@ -2158,7 +2189,8 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "noMoreMessages", Answers: n.Answers, Matching: n.Matching}, true
+		return Event{Kind: "noMoreMessages", Answers: n.Answers, Matching: n.Matching,
+			CorrelationID: n.ID}, true
 	case wire.TypeError:
 		var e wire.Error
 		if err := json.Unmarshal(raw, &e); err != nil {
