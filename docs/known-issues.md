@@ -585,3 +585,41 @@ which IDENTITY and never as which agent.
 
 Neither side treats this as a defect and neither intends to change it —
 it is what resuming an identity from a secret means.
+
+## A handed-over position is piggybacked as if it were a confirmed one
+
+Open, live, and this client's bug. Found 2026-09-20 by the external
+reviewer, who hit it by following this client's own instruction.
+
+`lastConsumed` means HANDED OVER TO THE MODEL. A confirm means THE MODEL
+HAS IT COMPLETE. Those are two different facts, and `ackCursorForOutbound`
+piggybacks the first into the wire column that holds the second, on every
+outbound message.
+
+The confirm reminder this client generates then asks the reader to
+confirm the last message it has complete, "possibly earlier than" the
+last one delivered, and not to confirm past anything that was cut. A
+reader that obeys is refused: messages 1..5 are delivered and consumed, a
+send has already piggybacked 5, message 4 arrived truncated, the reader
+honestly confirms 3 — and chat-relay's column is monotonic, so the
+standalone ack naming 3 comes back `ok:false` and the persisted position
+stays where it was. The reader is told its read position has not moved,
+for doing exactly what this client asked of it.
+
+The honest confirm looks like the error because the client already
+asserted, on the reader's behalf, something the reader had not decided.
+
+**chat-relay was asked NOT to special-case it** (2026-09-20, agreed by
+its author): an accommodation would make a client asserting what it does
+not know survivable, and the refusal is the only pressure toward the real
+fix. The failure is loud, which is why this is recorded rather than
+rushed.
+
+The fix is on this side and wants its own decision: the piggyback should
+carry the last CONFIRMED position, and `lastConsumed` should stop being
+an ack source at all. That is a behaviour change, not a repair, so it is
+not being made under the heading of a bug fix.
+
+Until then: a reader following the reminder on a monotonic server gets a
+refusal. `ConfirmReceived` reports it truthfully and rolls back, so
+nothing is corrupted — the confirm simply does not take.
