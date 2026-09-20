@@ -47,7 +47,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -611,30 +610,37 @@ func SetTopic(target Target, topic string) error {
 }
 
 // List returns every stored connection across all projects.
-// OtherProjectsHoldingLink returns the projects, other than except, whose
-// stored entry for link carries a reconnect secret — i.e. the buckets
-// from which this link could be RESUMED rather than joined afresh.
+// CountOtherScopesHoldingLink counts the projects, other than except,
+// whose stored entry for link carries a reconnect secret — i.e. how many
+// scopes this link could be RESUMED from rather than joined afresh.
 //
-// A Target is {link, project}, so the same link under a different project
-// is a different identity by design. That is the isolation working; what
-// is missing is any way for a caller to notice it has crossed the
-// boundary. Connecting in a bucket that holds nothing looks exactly like
-// a first-ever connect, and the client mints a new secret and a new peer
-// id without a word.
+// A COUNT, AND DELIBERATELY NOT THE NAMES. The first version of this
+// returned the project paths so a caller could be told which scope to
+// switch to, which is more actionable and is a disclosure channel: a
+// project path is the name of a directory on this machine, and this
+// store holds them for every project that has ever used any link. A
+// session working in one project would have been handed the paths of
+// unrelated ones — including directories its user has put out of bounds
+// for anything leaving the session — in a connect result that a model
+// then quotes onward. Six scopes hold a resumable identity for one link
+// on this machine today, and they are not all in the same tree.
 //
-// For a hub link that costs an identity and a read position, which is
-// recoverable. For a single-use link — one already redeemed, whose only
-// resumption credential is the secret stored beside it — it costs ACCESS,
-// permanently, because there is no mint path: the server verifies the
-// presented secret against the one the link was redeemed with, and a
-// freshly minted one can never match. Seen live on 2026-09-20 after a
-// change to how the project is resolved moved a session into a different
-// bucket.
+// So the fact travels and the names do not. A caller learns that this
+// link is resumable elsewhere, which is what it needs to know it has
+// crossed a scope boundary; where to look is its own configuration,
+// which it can read without being told.
 //
-// This is what lets a caller be told. It does not let one bucket reach
-// into another, which would defeat the isolation entirely.
-func OtherProjectsHoldingLink(link, except string) ([]string, error) {
-	var out []string
+// A Target is {link, project}, so the same link under a different
+// project is a different identity by design. That is the isolation
+// working; what was missing is any way for a caller to notice it had
+// crossed it. Connecting in a scope that holds nothing looks exactly
+// like a first-ever connect, and the client mints a new secret and a new
+// peer id without a word — which costs a read position on a hub link and
+// costs ACCESS, permanently, on a single-use link already redeemed,
+// because the only resumption credential is the secret stored beside it
+// and there is no mint path.
+func CountOtherScopesHoldingLink(link, except string) (int, error) {
+	n := 0
 	err := withLock(false, func() error {
 		st, err := load()
 		if err != nil {
@@ -645,13 +651,12 @@ func OtherProjectsHoldingLink(link, except string) ([]string, error) {
 				continue
 			}
 			if e, ok := byLink[link]; ok && e.ReconnectSecret != "" && e.PeerID != "" {
-				out = append(out, project)
+				n++
 			}
 		}
 		return nil
 	})
-	sort.Strings(out)
-	return out, err
+	return n, err
 }
 
 func List() ([]ListedEntry, error) {

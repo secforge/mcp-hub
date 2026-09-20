@@ -523,15 +523,25 @@ func TestConnectingInAScopeThatCannotResumeSaysSo(t *testing.T) {
 
 	text := textOf(res)
 	for _, want := range []string{
-		"/source/somewhere/original", // where it could have been resumed from
-		"/source/somewhere/else",     // where it actually landed
-		"MCP_HUB_PROJECT_DIR",        // what to change
-		"SINGLE-USE",                 // why it may not be recoverable
+		"ALREADY has a stored identity", // that it could have been resumed
+		"another project scope",         // how many, without naming them
+		"/source/somewhere/else",        // where it actually landed, which is this session's own
+		"MCP_HUB_PROJECT_DIR",           // what decides it
+		"SINGLE-USE",                    // why it may not be recoverable
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the connect result never mentions %q — a caller that has just lost access to a "+
 				"single-use link is told only that this is a first connection:\n%s", want, text)
 		}
+	}
+
+	// AND NOT THE OTHER SCOPE'S PATH. This store holds a project path for
+	// every project that has ever used any link, including directories a
+	// user has put out of bounds for anything leaving the session. Naming
+	// one here hands it to a session that has no business with it, in a
+	// result a model then quotes onward.
+	if strings.Contains(text, "/source/somewhere/original") {
+		t.Errorf("the connect result named another project's path:\n%s", text)
 	}
 }
 

@@ -2357,9 +2357,9 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// server-side notice cannot reach this case even in principle, and a
 	// notice that fires on a MINT cannot either, because that path never
 	// mints. Established with chat-relay from their own code.
-	var resumableElsewhere []string
+	resumableElsewhere := 0
 	if stored.ReconnectSecret == "" {
-		resumableElsewhere, _ = connstore.OtherProjectsHoldingLink(link, target.Project)
+		resumableElsewhere, _ = connstore.CountOtherScopesHoldingLink(link, target.Project)
 	}
 	if storeErr != nil {
 		// Refused rather than served with a new identity: minting one
@@ -2618,20 +2618,28 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// different project is a new participant by design — but the
 		// branch above reads as reassurance, and it is exactly the
 		// reassurance a caller got moments before losing access.
-		if len(resumableElsewhere) > 0 {
+		if resumableElsewhere > 0 {
+			scopes := "another project scope"
+			if resumableElsewhere > 1 {
+				scopes = fmt.Sprintf("%d other project scopes", resumableElsewhere)
+			}
+			// The COUNT, never the paths. Naming the scope would be more
+			// actionable and would hand this session the directory names
+			// of unrelated projects, which a model then quotes onward.
+			// The caller can read its own configuration.
 			identityNote += fmt.Sprintf(
-				"\nNOTE: this link ALREADY has a stored identity, under a different project scope "+
-					"(%s) — this one is %q. A stored identity belongs to one scope, so connecting "+
-					"here took a NEW one rather than resuming it, and the old one still sits where "+
-					"it was with its own read position.\n"+
+				"\nNOTE: this link ALREADY has a stored identity, in %s — this one is %q, which "+
+					"held none. A stored identity belongs to one scope, so connecting here took a "+
+					"NEW one rather than resuming it, and the old one still sits where it was with "+
+					"its own read position.\n"+
 					"If that was not intended, the scope comes from MCP_HUB_PROJECT_DIR when set, "+
-					"otherwise from the MCP client's project root: set it to the scope above and "+
-					"connect again.\n"+
+					"otherwise from the MCP client's project root — check which of those is in "+
+					"force here.\n"+
 					"This matters more than it reads for a SINGLE-USE link. Such a link is "+
 					"resumable only with the secret stored beside it, and a scope that does not "+
 					"hold that secret cannot present it — which the server refuses as an invalid "+
 					"credential, with no way to mint a replacement.",
-				strings.Join(resumableElsewhere, ", "), target.Project)
+				scopes, target.Project)
 		}
 	case conn.PeerID() == stored.PeerID:
 		identityNote += "\nYour previous identity here was resumed: the server reassigned the " +
