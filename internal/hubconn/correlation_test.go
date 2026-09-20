@@ -792,3 +792,70 @@ func TestASendDoesNotAssertAPositionTheReaderHasNotConfirmed(t *testing.T) {
 		t.Fatal("the server never saw the second send")
 	}
 }
+
+// A refusal of a PIGGYBACKED receipt must not disable this connection's
+// receipts, must not be fatal to it, and must reach the reader.
+//
+// chat-relay is adding `bad_piggyback_ack` for a condition their hub path
+// currently reports as silence. It is unsolicited by construction — a
+// piggyback has no request behind it, so the refusal carries no
+// correlation id — which means the CODE is the only thing that can
+// identify it. This pins the three gates it must not trip, before the
+// other end ships against them.
+func TestAPiggybackRefusalDoesNotDisableReceiptsOrTheConnection(t *testing.T) {
+	const code = "bad_piggyback_ack"
+
+	if fatalErrorCodes[code] {
+		t.Fatalf("%q is in fatalErrorCodes — it refuses one receipt and says nothing about whether "+
+			"the conversation still exists", code)
+	}
+
+	base := startCorrelatingServer(t, correlatingFeatures(), func(w *serialWriter, frame map[string]any) {
+		if frame["type"] != string(wire.TypeMsg) {
+			return
+		}
+		// Unsolicited and id-less, exactly as a piggyback's refusal is.
+		w.write(wire.Error{Type: wire.TypeError, Code: code,
+			Message: "that ackCursor names a message from another conversation", Retryable: false})
+	})
+
+	c, err := dialTest(base, "piggyback-refusal", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.Send("something", nil, "", "", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var seen bool
+	for time.Now().Before(deadline) && !seen {
+		events, _ := c.DrainEvents()
+		for _, e := range events {
+			if e.Kind == "error" && e.Code == code {
+				seen = true
+			}
+		}
+		if !seen {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !seen {
+		t.Fatal("the refusal never reached the reader — it is unsolicited and id-less, so nothing " +
+			"claims it, and the buffer is the only place it can surface")
+	}
+
+	c.mu.Lock()
+	disabled := c.ackDisabled
+	c.mu.Unlock()
+	if disabled {
+		t.Fatalf("%q turned this connection's receipts off for the rest of its life. That is the "+
+			"response to bad_ack/bad_ack_cursor, which mean this client's own bookkeeping is "+
+			"broken; a refused piggyback means one cursor was wrong", code)
+	}
+	if why, fatal := c.PermanentFailure(); fatal {
+		t.Fatalf("%q was treated as fatal to the connection: %q", code, why)
+	}
+}
