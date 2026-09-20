@@ -175,3 +175,38 @@ go run ./internal/selfupdate/cmd/sign -verify \
 echo "==> publishing $VERSION at $HEAD_SHA"
 gh release create "$VERSION" "$OUT"/* --title "$VERSION" --target "$HEAD_SHA" "$@"
 echo "==> done: $(gh release view "$VERSION" --json url --jq .url)"
+
+# THE RELEASE IS NOT REACHABLE UNTIL CHAT-RELAY RE-READS IT. That server
+# serves the client binaries and caches what it last read from GitHub, so
+# until it refreshes, a published release and one that was never cut look
+# identical to every client that would update to it. The owner's rule,
+# 2026-09-20: every release triggers the refresh.
+#
+# It runs LAST, after the release exists, because it asks the server to go
+# and read what was just published.
+#
+# A failure here does NOT fail the release. The release is already
+# published and signed at this point; there is nothing to roll back and
+# exiting non-zero would report a successful publish as a failed one.
+# What a failure costs is freshness — chat-relay keeps serving the
+# previous verified value rather than a wrong one — so it is reported
+# loudly and left for a human to repeat.
+REFRESH_URL="${MCP_HUB_RELEASE_REFRESH_URL:-https://chat-relay.secforge.de/api/hub/client-release/refresh}"
+if [[ -z "$REFRESH_URL" ]]; then
+	echo "==> skipping the chat-relay refresh: MCP_HUB_RELEASE_REFRESH_URL is empty" >&2
+else
+	echo "==> asking chat-relay to re-read the release"
+	if REFRESH_OUT="$(curl -fsS --max-time 30 -X POST "$REFRESH_URL" 2>&1)"; then
+		echo "    $REFRESH_OUT"
+		# Reported, not parsed. The server answering is what was asked
+		# for; asserting the shape of its answer here would make this
+		# script fail on a change to a field it does not own.
+		echo "==> chat-relay refreshed. Check the version above names $VERSION; if it does not,"
+		echo "    the refresh ran before GitHub served the new release and wants repeating."
+	else
+		echo "WARNING: the chat-relay refresh failed: $REFRESH_OUT" >&2
+		echo "WARNING: $VERSION IS published and signed, but chat-relay is still serving whatever" >&2
+		echo "         it last read. Clients will not see this release until someone repeats:" >&2
+		echo "             curl -fsS -X POST $REFRESH_URL" >&2
+	fi
+fi
