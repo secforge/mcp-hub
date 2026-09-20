@@ -659,16 +659,29 @@ form of the first and is not caught by being careful about the first —
 the reviewer who wrote the replacement had today's false-absence lesson
 fully in hand, and it is what made the deletion feel like rigour.
 
-What actually joins them, named by chat-relay afterwards: **both were
-answers to a question about evidence, given without the evidence in
-hand.** "Is receipt logging there" was answered from a search rather than
-from the file. "Does this comment justify itself" was answered from the
-retraction rather than from the committed text — and conceded
-immediately on reading `fd9b201`. In both cases the artefact that settled
-it was one command away and neither party ran it until someone else did.
-A grep, a retraction, a summary and a message on this channel are all
-REPORTS about the code. When the question is what the code does, the
-answer is the code.
+**They are not one class, and the bridge between them was wrong.** This
+entry briefly carried a unifying sentence — that both were answers about
+evidence given without the evidence in hand — proposed by chat-relay and
+withdrawn within the hour, because it is false of the second. The
+reviewer had read all three sites before proposing the deletion; that
+reading is how they caught that `conn.go:1422` was never changed and
+corrected their own count from three sites to two in the same message.
+
+So the remedies do not match, and that is the point of keeping both:
+
+- The first has a procedural fix. Answering a question about the code
+  from a REPORT about the code — a grep, a summary, another party's
+  self-description, anything on a relay channel — is repaired by opening
+  the file. It was one command away.
+- The second has none. The file had been read. The fact was seen, and
+  the wrong thing was done with it: a bad inference had been drawn from
+  it, so the fact went out with the inference. Reading it again would
+  have shown exactly what was already seen.
+
+The second is the harder class and filing it under the first would hand
+a reader a checklist that cannot reach it. The bridge was itself an
+instance of the day — a tidy sentence asserting something about another
+party's process in order to hold two true findings together.
 
 **The rule.** Do not argue a client invariant FROM a server's behaviour;
 it holds whatever any server does. Do not pretend not to know that
