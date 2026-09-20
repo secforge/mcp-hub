@@ -939,3 +939,68 @@ Related: a capability read from a DECLARATION is a promise, not a
 delivery — see the correlation entry's rollout window, where suppressing
 a mitigation because a server said it correlates left the client
 unprotected on every kind that server had not yet echoed.
+
+## A snapshot composed at one moment and read at another
+
+Adjacent to the capability-without-wiring class above and distinct from
+it. There, the thing was never connected. Here it was connected, and
+described a moment that had passed.
+
+`confirmReminderLoop` composed a reminder on a ticker and appended it to
+the buffer; the model saw it at its next drain. The cursor to confirm,
+the count outstanding, the age of the run — all captured at compose time.
+A reader that confirmed in between was then told to confirm a position it
+had already confirmed, with a count that was no longer true.
+
+**Why no test caught it.** At compose time every value was right. The
+statement only becomes false by being read later, and nothing in it
+carries the moment it was true of. Four separate mechanisms were proposed
+for the symptom before this one — a live echo, catch-up replay, other
+peers' traffic, the confirm path itself — and three were eliminated by
+evidence from the end that could see it. All three were wrong in the same
+way: they assumed the counter was wrong, when the counter was right and
+the message was old.
+
+The fix is to resolve at the drain rather than at the tick: a reminder
+whose premise has been answered is dropped, one that survives is
+rewritten with the position as it stands, and only the last survives
+since several ticks can pass before one drain.
+
+**The general shape**, named by chat-relay, who has the same problem in
+`rosterReadAt`: a snapshot with no date reads exactly like a fresh one.
+Anything composed early and delivered late needs either the moment it
+describes attached to it, or a check at delivery that its premise still
+holds. This codebase now does the second.
+
+## A fixture that does not speak the other end's dialect
+
+Three times on 2026-09-20, and it is the most common failure shape of the
+day — ahead of the capability-without-wiring class, and worse, because it
+makes a test report success.
+
+- A seam test for the correlation id passed against a proposed fix, for a
+  reason unrelated to the fix: the id had been emptied further upstream,
+  so the "match by id" rule refused everything and the test read that as
+  the bug being cured. The proposed fix would have hung every history
+  walk.
+- A test asserting the late-answer debt was not recorded passed because
+  the arrangement it described could not be reached from a test context
+  at all — no client session, so the branch under test never ran.
+- A fixture for the display-name fix answered `joined` without echoing
+  the `Agent-Name` header it had been sent. The stored name comes from
+  the server's ECHO, so that fixture cannot distinguish a client that
+  sent no name from one whose name was dropped — which is the entire
+  question. It failed on its own first assertion; had it asserted
+  slightly less, it would have passed against the bug.
+
+**The common shape.** The test's environment did not speak the dialect
+the real other end speaks. Not a mocking problem and not a coverage
+problem: each fixture was a reasonable simplification, and the thing it
+simplified away was the thing under test.
+
+**What catches it.** Assert both directions, every time. A rule that
+believes a field must be tested with an answer carrying the right value
+AND one carrying none — the first alone passes a client that ignores the
+field, the second alone passes one that refuses everything. Then run the
+test against the unfixed code and read the failure message: if it does
+not name the defect, the test is describing something else.
