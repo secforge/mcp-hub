@@ -308,6 +308,10 @@ type Conn struct {
 	// ONLY place onActivity is called from. Capacity 1 and a non-blocking
 	// send: every callback drains whatever is there, so a second signal
 	// arriving while one is pending would tell it nothing new.
+	// lateAnswers counts, per ack kind, the answers still owed to
+	// requests that timed out — see expectLateAnswer.
+	lateAnswers map[string]int
+
 	activity     chan struct{}
 	activityOnce sync.Once
 	// activityStop ends activityLoop when the read loop ends. Without it
@@ -1274,19 +1278,48 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 		if claim.token != "" && ev.AttachmentToken != claim.token {
 			return false
 		}
+		// A LATE ANSWER TO SOMEBODY ELSE. See expectLateAnswer: this
+		// arrival is owed to a request that already timed out, so it is
+		// spent here rather than answering the claim that happens to be
+		// waiting now.
+		if c.lateAnswers[ev.Kind] > 0 {
+			c.lateAnswers[ev.Kind]--
+			debugf("tryDivertToClaimLocked: spent a late %q on the request that timed out", ev.Kind)
+			return false
+		}
 		delete(c.pendingAcks, ev.Kind)
 		claim.result <- ev
 		return true
 	}
 	if ev.Kind == "error" {
-		// Any one pending claim can absorb a generic error — there is no
-		// per-request id to pick the "right" one. With more than one
-		// claim active concurrently this is already an edge case (see
-		// claimNextAck's doc comment), so an arbitrary choice (Go map
-		// iteration order) is acceptable rather than correctness-critical.
-		// pendingMessageAfter is included in that pool: an error with no
-		// correlation id is equally ambiguous between an ack claim and a
-		// MessageAfter claim.
+		// AMBIGUOUS BY CONSTRUCTION. An error carries no correlation id,
+		// so with more than one claim pending, nothing here can say
+		// which operation it refuses — and handing it to whichever the
+		// map yields first tells one caller about the other's failure
+		// with full confidence. An external reviewer demonstrated
+		// exactly that, 2026-09-20: with a history read and a send both
+		// outstanding, send_refused was reported to the history caller.
+		//
+		// So a genuinely ambiguous error is given to NOBODY. It falls
+		// through to the buffer, where the reader sees it as what it is,
+		// and both callers time out — two honest "no answer"s instead of
+		// one confident wrong one. Where exactly ONE claim is pending
+		// the attribution is not a guess and the old behaviour stands.
+		//
+		// THIS WILL READ LIKE A REGRESSION to whoever meets it first:
+		// two callers now time out where one used to get an answer. The
+		// answer they got was confidently wrong about which operation it
+		// described, which is the worse failure of the two and the
+		// harder one to notice.
+		pending := len(c.pendingAcks)
+		if c.pendingMessageAfter != nil {
+			pending++
+		}
+		if pending > 1 {
+			debugf("tryDivertToClaimLocked: %d claims pending and an error with no correlation "+
+				"id — delivered to none of them", pending)
+			return false
+		}
 		if c.pendingMessageAfter != nil {
 			claim := c.pendingMessageAfter
 			c.pendingMessageAfter = nil
@@ -1300,6 +1333,41 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 		}
 	}
 	return false
+}
+
+// expectLateAnswer records that a request of this kind timed out, so the
+// answer that may still arrive is not handed to whatever asks next.
+//
+// Without it, per-kind claims establish ORDER, not ownership: send A
+// times out and releases its claim, send B takes one, and A's late
+// sendAck matches B by kind alone — B is then told A's outcome and A's
+// externalId, which a caller renders to a model as a delivered message.
+// Demonstrated by an external reviewer, 2026-09-20.
+//
+// Spending the debt, rather than merely refusing to divert, is what
+// makes this independent of what arrives NEXT: a rule that only refuses
+// leaves the outcome depending on whether somebody happens to be
+// waiting, where consuming the debt holds regardless of traffic.
+//
+// The wire offers nothing to correlate on: an ack carries externalId and
+// ok, an error carries a code, and neither echoes anything the request
+// chose. chat-relay's author confirmed that from the server side and
+// offered an echoed client id as an addition — to be DECLARED in
+// features rather than inferred, since a server that does not echo it
+// looks exactly like one that does not implement it, and this fallback
+// is what makes that safe either way. Until it exists this is
+// the honest half of the trade — a late answer becomes UNATTRIBUTED
+// rather than MISATTRIBUTED. The cost is that B may time out on an
+// answer that was really A's, which reports "no answer" about something
+// unknown. That is the true state; the alternative was a confident wrong
+// one.
+func (c *Conn) expectLateAnswer(kind string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lateAnswers == nil {
+		c.lateAnswers = make(map[string]int)
+	}
+	c.lateAnswers[kind]++
 }
 
 // handleAckPlumbingLocked intercepts the read-receipt protocol's own
@@ -1345,9 +1413,26 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 		// missing ack cursor is a bug in this client's own bookkeeping, not
 		// a transient condition (retryable is false, and resending would
 		// fail identically) — stop sending receipts entirely rather than
-		// repeat the same mistake on every future event. Not surfaced to
-		// the model: it never asked for this ack,
-		// so an error about it would be pure noise.
+		// repeat the same mistake on every future event.
+		//
+		// UNLESS SOMEBODY ASKED. "It never asked for this ack" is true of
+		// ackLoop's background receipts and false of an explicit
+		// hub_confirm, which is waiting on exactly this answer. Swallowed
+		// here, that caller saw only its five-second timeout — and a
+		// timeout reports success, so the server's REFUSAL became a
+		// confirmation and the refused cursor was persisted: the silent
+		// skip bad_ack_cursor exists to prevent, one layer below it.
+		// Found by an external reviewer against a real server,
+		// 2026-09-20, who then pointed out that checking the kind inside
+		// ConfirmReceived did not help while this consumed it first.
+		//
+		// Delivered to the claim instead, and receipts are NOT disabled:
+		// a cursor from another conversation is a caller's mistake about
+		// one call, not this client miscounting for the rest of the
+		// connection's life.
+		if _, claimed := c.pendingAcks["ack"]; claimed {
+			return false
+		}
 		c.ackDisabled = true
 		return true
 	}
@@ -1436,11 +1521,43 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		c.mu.Lock()
 		c.ackReplyMisses = 0
 		c.mu.Unlock()
+		// WHAT ARRIVED DECIDES, not the fact that something did. The
+		// claim intercepts the next "ack" OR the next generic error, and
+		// this returned success for either — so a server's explicit
+		// bad_ack_cursor refusal was consumed here, reported as a
+		// confirmation, and the refused cursor was then PERSISTED by the
+		// caller. That is the silent skip bad_ack_cursor exists to
+		// prevent, reintroduced one layer below it. Found by an external
+		// reviewer against a real loopback server, 2026-09-20.
+		if ev.Kind == "error" {
+			code := ev.Code
+			if code == "" {
+				code = "no code"
+			}
+			return nil, fmt.Errorf("the server REFUSED this confirm (%s): %s — your read "+
+				"position has not moved", code, ev.Text)
+		}
+		// An ack that states ok:false is a refusal too, and its cursor
+		// is the position the server actually holds rather than an echo
+		// of what was sent (see wire.Ack). Absent ok is not a refusal:
+		// it is a server that said nothing either way, which every
+		// older server does.
+		if ev.ActionOKStated && !ev.ActionOK {
+			where := ""
+			if ev.Cursor != "" {
+				where = fmt.Sprintf(" It holds %q for this peer.", ev.Cursor)
+			}
+			return nil, fmt.Errorf("the server did not accept this confirm.%s Your read "+
+				"position has not moved", where)
+		}
 		return ev.Behind, nil
 	case <-time.After(AckWaitTimeout):
 		c.mu.Lock()
 		c.ackReplyMisses++
 		c.mu.Unlock()
+		// The answer may still be coming. Marked so it is spent rather
+		// than handed to whoever confirms next — see expectLateAnswer.
+		c.expectLateAnswer("ack")
 		return nil, nil
 	}
 }
@@ -2208,6 +2325,9 @@ func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, f
 	case ev := <-resultCh:
 		return ev, true, nil
 	case <-time.After(AckWaitTimeout):
+		// See expectLateAnswer: a late sendAck must not answer the next
+		// request of the same kind.
+		c.expectLateAnswer("sendAck")
 		return Event{}, false, nil
 	}
 }
@@ -2231,6 +2351,9 @@ func (c *Conn) ReactAwaitingAck(externalID, reaction, action string) (Event, boo
 	case ev := <-resultCh:
 		return ev, true, nil
 	case <-time.After(AckWaitTimeout):
+		// See expectLateAnswer: a late reactionAck must not answer the next
+		// request of the same kind.
+		c.expectLateAnswer("reactionAck")
 		return Event{}, false, nil
 	}
 }
@@ -2254,6 +2377,9 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 	case ev := <-resultCh:
 		return ev, true, nil
 	case <-time.After(AckWaitTimeout):
+		// See expectLateAnswer: a late editAck must not answer the next
+		// request of the same kind.
+		c.expectLateAnswer("editAck")
 		return Event{}, false, nil
 	}
 }
@@ -2412,6 +2538,9 @@ func (c *Conn) DeleteMessageAwaitingAck(externalID string) (Event, bool, error) 
 	case ev := <-resultCh:
 		return ev, true, nil
 	case <-time.After(AckWaitTimeout):
+		// See expectLateAnswer: a late deleteAck must not answer the next
+		// request of the same kind.
+		c.expectLateAnswer("deleteAck")
 		return Event{}, false, nil
 	}
 }

@@ -143,12 +143,28 @@ func (w *Waiter) SetSource(name string, s Source) {
 // reading, by name. The socket stays open: another conversation may still
 // be running on it, and even if none is, a reader released here could not
 // be reattached when the next connect happens.
-func (w *Waiter) Detach(name, why string) {
+func (w *Waiter) Detach(name, why string) { w.detach(name, nil, why) }
+
+// DetachIf retires name only while src is still the source bound to it.
+//
+// A drain that found a source disconnected can finish after a NEW
+// connection has taken that name — a reconnect is exactly that sequence
+// — and retiring the name then removes the live one on the strength of
+// the dead one's state. Identity, not name, is what the retirement is
+// about.
+func (w *Waiter) DetachIf(name string, src Source, why string) { w.detach(name, src, why) }
+
+func (w *Waiter) detach(name string, only Source, why string) {
 	if w == nil {
 		return
 	}
 	w.mu.Lock()
 	a := w.sources[name]
+	if a != nil && only != nil && a.src != only {
+		// Someone else holds this name now. Nothing to retire.
+		w.mu.Unlock()
+		return
+	}
 	delete(w.sources, name)
 	for i, n := range w.order {
 		if n == name {
@@ -182,16 +198,29 @@ func (w *Waiter) Attached() []string {
 	return append([]string(nil), w.order...)
 }
 
+// sourceSnap is one attachment as it stood when the snapshot was taken:
+// a name and the source bound to it AT THAT MOMENT.
+//
+// A VALUE, not the live *attached. Returning the pointer meant deliver
+// read a.src outside w.mu while SetSource wrote it under the lock — a
+// data race the Go detector reports, found by an external reviewer,
+// 2026-09-20 — and, worse than the race, it meant a delivery could
+// start against one connection and finish against its replacement.
+type sourceSnap struct {
+	name string
+	src  Source
+}
+
 // sourcesSnapshot copies the attachment list for iteration outside the
 // lock — deliver writes to a socket, which must never happen while
 // holding a lock a Poke needs.
-func (w *Waiter) sourcesSnapshot() []*attached {
+func (w *Waiter) sourcesSnapshot() []sourceSnap {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	out := make([]*attached, 0, len(w.order))
+	out := make([]sourceSnap, 0, len(w.order))
 	for _, n := range w.order {
 		if a := w.sources[n]; a != nil {
-			out = append(out, a)
+			out = append(out, sourceSnap{name: n, src: a.src})
 		}
 	}
 	return out
@@ -472,20 +501,33 @@ func (w *Waiter) handleAccept(conn net.Conn) {
 		conn.Close()
 		return
 	}
-	// Cleared once it has arrived: a follower then sits idle by design,
-	// and a deadline that outlived the handshake would end it.
+	// Cleared once the mode byte has arrived: a follower then sits idle
+	// by design, and a deadline that outlived the handshake would end it.
 	_ = conn.SetReadDeadline(time.Time{})
 	rw := &registeredWaiter{conn: conn, follow: mode[0] == ModeFollow}
 
-	// The source's Peek() and the w.current registration below are checked
-	// under one uninterrupted lock hold — see the comment on deliver's tail
-	// for why the two must never be split, on pain of a permanently
-	// undelivered event.
-	// Registered, then poked — rather than delivering on this goroutine.
-	// The poke is unconditional, so anything already buffered is picked
-	// up by the delivery loop; registering first means no event can land
-	// in the gap and find nobody to wake.
+	// CLOSED-CHECK AND REGISTRATION IN ONE LOCK HOLD. Reading the mode
+	// byte happens on its own goroutine, so a Close can land between the
+	// accept and here — and registering after that sets w.current on a
+	// waiter whose delivery loop has already exited, leaving the reader
+	// hanging on a channel nobody will ever poke. Checking under one
+	// lock and registering under another leaves the same window a little
+	// smaller, which is not the same as closing it: an external reviewer
+	// made exactly that point about the first version of this, 2026-09-20.
+	//
+	// The source's Peek() and this registration are likewise one
+	// uninterrupted hold — see the comment on deliver's tail for why the
+	// two must never be split, on pain of a permanently undelivered
+	// event. Registered, then poked, rather than delivering on this
+	// goroutine: the poke is unconditional, so anything already buffered
+	// is picked up by the delivery loop, and registering first means no
+	// event can land in the gap and find nobody to wake.
 	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		writeAndClose(conn, "this wait channel has closed; nothing further will arrive on it\n")
+		return
+	}
 	old := w.current
 	w.current = rw
 	w.mu.Unlock()
@@ -572,7 +614,7 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 			if !connected {
 				if holding, _ := w.holdingFor(a.name); !holding {
 					parts = append(parts, endedMessage(a))
-					w.Detach(a.name, "its connection ended")
+					w.DetachIf(a.name, a.src, "its connection ended")
 				}
 			}
 		}
@@ -647,7 +689,7 @@ func (w *Waiter) deliver(rw *registeredWaiter) {
 				return
 			}
 			wrote++
-			w.Detach(a.name, "its connection ended")
+			w.DetachIf(a.name, a.src, "its connection ended")
 		}
 	}
 
@@ -774,7 +816,7 @@ func (w *Waiter) disconnectedMessage() string {
 // closing: the other conversations on this channel have not ended, and a
 // reader told "disconnected" would have no way to tell which of those two
 // things happened.
-func endedMessage(a *attached) string {
+func endedMessage(a sourceSnap) string {
 	note := ""
 	if n, ok := a.src.(disconnectNoter); ok {
 		note = n.DisconnectNote()

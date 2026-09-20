@@ -27,6 +27,7 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
+	"sync"
 )
 
 // Release is the release tag this binary was built as — set only by a
@@ -38,6 +39,22 @@ import (
 // deliberately not defaulted: an empty Release means "this is not a
 // release", which is a true and useful thing to say.
 var Release string
+
+// releaseMu guards Release and modified against the ONE writer that
+// exists after start-up: SetReleaseForTest. The ldflags value is written
+// by the linker before any goroutine runs, so production needs no lock —
+// but this package is read from the connect path now (Agent-Version, and
+// the comparison against a server-verified release), and a test changing
+// the version while another test's connect reads it is a genuine data
+// race, reported by -race and found by an external reviewer's run,
+// 2026-09-19.
+var releaseMu sync.RWMutex
+
+func release() (string, bool) {
+	releaseMu.RLock()
+	defer releaseMu.RUnlock()
+	return Release, modified
+}
 
 // LastRelease names the most recent published release, and exists so a
 // development build can say what it is a development build OF. Updated by
@@ -55,7 +72,45 @@ const LastRelease = "v3.1.4"
 // string — which is exactly the case that defeated a staleness check
 // this morning, where a rebuilt client and the one it replaced reported
 // identical versions.
-func devStamp() string {
+func devStamp() string { return devStampValue }
+
+// READ ONCE, at process start, and never again. It used to stat the
+// executable on every call, which made a running process's own identity
+// a function of a file on disk: touching that file changed what the
+// process said it was, and replacing the installed binary made an old
+// process report the replacement's timestamp. A version that moves
+// underneath a running process is worse than a coarse one — it is now
+// sent on every handshake and compared against a server's verified
+// release, so it has to describe THIS process for as long as it runs.
+// Found by an external reviewer, 2026-09-20.
+//
+// It also defeated the check it fed. The mtime-versus-process-start
+// signal exists to catch "installed but not loaded" — and while the
+// installed file's mtime also decided the version the RUNNING process
+// reported, replacing the binary moved both halves together and the
+// staleness became invisible, which is the one case that check was
+// added for. chat-relay's author made that point the same day.
+//
+// A release build never reaches here (Release is injected), so this
+// bounds a development build only.
+// Captured at PROCESS START, not at first use. First-use caching still
+// depended on what the file looked like whenever something first asked —
+// so a binary replaced before the first call was read as this process's
+// own version — which an external reviewer noted is a narrower fix than
+// it appears, since a stable wrong value looks like a measurement and a
+// lazy first caller makes the window the whole session.
+//
+// What this does NOT remove, stated because the earlier wording here
+// overclaimed it: the file can still be replaced between exec and this
+// init, so the value is the file's as of start-up rather than the
+// running code's. Only an embedded build stamp (injected like Release)
+// makes "what is running" and "what is on disk" independent facts —
+// which is what the installed-but-not-loaded check needs in order to
+// compare them at all. Not done here because it changes the release
+// process for a value only development builds use.
+var devStampValue = readDevStamp()
+
+func readDevStamp() string {
 	exe, err := os.Executable()
 	if err != nil {
 		return ""
@@ -95,9 +150,15 @@ func init() {
 // — which is correct, and makes every code path that only runs for a
 // real release untestable without a seam.
 func SetReleaseForTest(release string) func() {
+	releaseMu.Lock()
 	prevRelease, prevModified := Release, modified
 	Release, modified = release, false
-	return func() { Release, modified = prevRelease, prevModified }
+	releaseMu.Unlock()
+	return func() {
+		releaseMu.Lock()
+		Release, modified = prevRelease, prevModified
+		releaseMu.Unlock()
+	}
 }
 
 // Revision is the commit this binary was built from, or "" when it was
@@ -107,23 +168,32 @@ func Revision() string { return revision }
 // Modified reports whether the tree had uncommitted changes at build time.
 // A release build must never have this set — a binary that cannot be
 // reproduced from a commit is not a release, whatever it is labelled.
-func Modified() bool { return modified }
+func Modified() bool {
+	_, m := release()
+	return m
+}
 
 // IsRelease reports whether this build carries an injected release tag and
 // was built from a clean tree. Both halves matter: a labelled build from a
 // dirty tree is a development build wearing a release's name.
-func IsRelease() bool { return Release != "" && !modified }
+func IsRelease() bool {
+	r, m := release()
+	return r != "" && !m
+}
 
 // Short is the version as one token, for a header value or a log line:
 // the release tag when there is one, otherwise the short revision. Never
 // empty — "unknown" when a build carries no VCS information at all, which
 // is still more useful than a blank field.
 func Short() string {
+	// READ ONCE, under the lock, and used throughout: two reads could
+	// straddle a change and describe neither state.
+	rel, mod := release()
 	switch {
-	case IsRelease():
-		return Release
-	case Release != "":
-		return Release + "+modified"
+	case rel != "" && !mod:
+		return rel
+	case rel != "":
+		return rel + "+modified"
 	}
 	// A development build is numbered from the last release plus the
 	// moment this binary was built: 2.4.1.20260916170302. It sorts after
@@ -142,13 +212,13 @@ func Short() string {
 		if revision == "" {
 			return v
 		}
-		if modified {
+		if mod {
 			return v + "+" + shortRevision() + "+modified"
 		}
 		return v + "+" + shortRevision()
 	}
 	switch {
-	case revision != "" && modified:
+	case revision != "" && mod:
 		return shortRevision() + "+modified"
 	case revision != "":
 		return shortRevision()
@@ -168,16 +238,17 @@ func String() string {
 			fmt.Fprintf(&b, " at %s", buildTime)
 		}
 	}
+	rel, mod := release()
 	switch {
-	case IsRelease():
-	case Release != "":
-		b.WriteString("\nNOTE: labelled " + Release + " but built from a modified tree — not a release build")
+	case rel != "" && !mod:
+	case rel != "":
+		b.WriteString("\nNOTE: labelled " + rel + " but built from a modified tree — not a release build")
 	case revision == "":
 		b.WriteString("\nNOTE: no build information; this binary cannot say which commit it came from")
 	default:
 		b.WriteString("\nNOTE: development build — no release tag was injected at link time")
 	}
-	if modified {
+	if mod {
 		b.WriteString("\nNOTE: the tree had uncommitted changes when this was built")
 	}
 	return b.String()

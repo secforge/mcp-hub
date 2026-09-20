@@ -5100,3 +5100,248 @@ func TestTheConnectResultIsSilentWhenThereIsNothingToSay(t *testing.T) {
 		})
 	}
 }
+
+// TestADisconnectAfterValidationStillCancelsTheInstall is the external
+// reviewer's P1 of 2026-09-19, found after the first fix for this: the
+// generation and ownership were checked, and the connection was
+// installed later, so a disconnect landing between the two found nothing
+// to close and the dial then published a live connection into a session
+// the caller had already left.
+//
+// Driven here without a scheduler hook: the check-then-install sequence
+// is what installIfStillWanted collapses into one lock hold, so clearing
+// the link first and installing after is exactly the state that window
+// produced.
+func TestADisconnectAfterValidationStillCancelsTheInstall(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub := NewHub()
+	sess, err := hub.open(testConn)
+	if err != nil {
+		t.Fatalf("opening a session: %v", err)
+	}
+	w, err := hub.ensureWaiter()
+	if err != nil {
+		t.Skipf("no wait socket available here: %v", err)
+	}
+
+	sess.mu.Lock()
+	sess.redialLink, sess.redialName = "wss://example.invalid/hub/join#secret", "t"
+	gen := sess.reconnectGen
+	sess.mu.Unlock()
+
+	// hub_disconnect's first act, under the same mutex: the standing
+	// permission to come back is gone.
+	sess.mu.Lock()
+	sess.redialLink, sess.redialName = "", ""
+	sess.mu.Unlock()
+
+	// A handshake that completed while that happened must not be
+	// published.
+	if sess.installIfStillWanted(&hubconn.Conn{}, w, connstore.Target{}, gen) {
+		t.Fatal("a connection was installed into a session that had already disconnected")
+	}
+	if got, _ := sess.activeConn(); got != nil {
+		t.Fatal("expected no connection installed after the disconnect")
+	}
+
+	// And a generation bumped by a manual connect taking over has the
+	// same effect: this dial is no longer the one that speaks for the
+	// session.
+	sess.mu.Lock()
+	sess.redialLink = "wss://example.invalid/hub/join#secret"
+	sess.reconnectGen++
+	sess.mu.Unlock()
+	if sess.installIfStillWanted(&hubconn.Conn{}, w, connstore.Target{}, gen) {
+		t.Fatal("a superseded reconnect installed its result over the one that took over")
+	}
+
+	// The ordinary case still works, or this would have closed the
+	// window by breaking reconnects.
+	sess.mu.Lock()
+	current := sess.reconnectGen
+	sess.mu.Unlock()
+	if !sess.installIfStillWanted(&hubconn.Conn{}, w, connstore.Target{}, current) {
+		t.Fatal("a still-wanted reconnect must install")
+	}
+}
+
+// TestAFilteredReadDoesNotClaimToBeAllHistory is the reviewer's P2 of
+// 2026-09-19, and the sentence was mine from earlier the same day: a
+// filtered walk that ends on noMoreMessages has exhausted MATCHES, not
+// history, and the result said "this is everything there was" while its
+// own suffix said the filter had been applied.
+func TestAFilteredReadDoesNotClaimToBeAllHistory(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"}
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		first := true
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			applied := &wire.Filter{Sender: m.Sender, Query: m.Query}
+			if first {
+				first = false
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+					Text: "the one match", TS: "2026-09-19T10:00:00Z",
+					Historical: true, Cursor: "filtered-1", ExternalID: "ext-filtered-1",
+					Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor}, Matching: applied,
+				})
+				continue
+			}
+			no := wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor})
+			no.Matching = applied
+			conn.WriteJSON(no)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+
+	readReq := mcp.CallToolRequest{}
+	readReq.Params.Arguments = map[string]any{
+		"connection": testConn, "at": "2026-09-19T09:00:00Z", "limit": 3, "query": "match",
+	}
+	res, err := hub.handleRead(ctx, readReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_read failed: err=%v result=%+v", err, res)
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "the one match") {
+		t.Fatalf("expected the matching message, got: %s", text)
+	}
+	if strings.Contains(text, "everything there was") {
+		t.Fatalf("a filtered read claimed to be all of history:\n%s", text)
+	}
+	if !strings.Contains(text, "FURTHER MATCHES") {
+		t.Fatalf("expected the end of the walk to be stated as the end of MATCHES, got:\n%s", text)
+	}
+}
+
+// TestADisconnectAfterInstallStaysDisconnectedOnDisk is the reviewer's
+// remaining P2 of 2026-09-19: closing the install window left the
+// bookkeeping after it unsynchronised. A disconnect landing between the
+// install and the store write had already marked the entry
+// disconnected, and the reconnect's own Upsert then made the disk claim
+// a connection the caller had explicitly left.
+func TestADisconnectAfterInstallStaysDisconnectedOnDisk(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	hub := NewHub()
+	sess, err := hub.open(testConn)
+	if err != nil {
+		t.Fatalf("opening a session: %v", err)
+	}
+
+	sess.mu.Lock()
+	sess.redialLink, sess.redialName = "wss://example.invalid/hub/join#secret", "t"
+	gen := sess.reconnectGen
+	sess.mu.Unlock()
+
+	// Installed, then the caller disconnects: redialLink cleared and the
+	// connection given up, which is exactly what handleDisconnect does
+	// before it writes the store.
+	stand := &hubconn.Conn{}
+	sess.mu.Lock()
+	sess.conn = stand
+	sess.mu.Unlock()
+	if !sess.stillHolds(stand, gen) {
+		t.Fatal("expected an installed connection to be held")
+	}
+
+	sess.mu.Lock()
+	sess.redialLink, sess.redialName = "", ""
+	sess.mu.Unlock()
+
+	// From here the reconnect must NOT report itself as the current
+	// state — which is what the store write depends on.
+	if sess.stillHolds(stand, gen) {
+		t.Fatal("a session that has been disconnected must not still hold its connection for " +
+			"the purposes of persisting Connected:true")
+	}
+
+	// And a connection given up in favour of another (a manual connect
+	// taking over) is the same answer for a different reason.
+	sess.mu.Lock()
+	sess.redialLink = "wss://example.invalid/hub/join#secret"
+	sess.conn = &hubconn.Conn{}
+	sess.mu.Unlock()
+	if sess.stillHolds(stand, gen) {
+		t.Fatal("a superseded connection must not persist its own success")
+	}
+}
+
+// TestTheSweepDecidesOnEvidenceNotAge covers all four cases of the
+// decision, including the one this platform cannot produce: a probe
+// that cannot answer.
+//
+// The corrections are in the middle. A blanket 30-day ceiling deleted a
+// PROVEN-live owner's files — pointed out by an external reviewer,
+// 2026-09-20, and right: age is evidence about the filesystem, not
+// about the process. The ceiling exists only for a platform whose probe
+// can never answer, or such a platform would never clean anything up.
+func TestTheSweepDecidesOnEvidenceNotAge(t *testing.T) {
+	young := staleAttachmentAge / 2
+	old := staleAttachmentAge + time.Hour
+	ancient := abandonedAttachmentAge + time.Hour
+
+	for _, tc := range []struct {
+		name           string
+		owned, certain bool
+		age            time.Duration
+		sweep          bool
+	}{
+		{"a proven-live owner, young", true, true, young, false},
+		{"a proven-live owner, old", true, true, old, false},
+		{"a proven-live owner, ancient", true, true, ancient, false},
+		{"no owner, young", false, true, young, false},
+		{"no owner or a dead one, old", false, true, old, true},
+		{"liveness unknown, old", true, false, old, false},
+		{"liveness unknown, past the ceiling", true, false, ancient, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldSweepAttachmentDir(tc.owned, tc.certain, tc.age); got != tc.sweep {
+				t.Fatalf("sweep = %v, want %v", got, tc.sweep)
+			}
+		})
+	}
+}
+
+// And end to end: this process owns a directory, so however old it
+// looks, it survives.
+func TestALiveOwnersDirectoryIsNeverSweptForAge(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	dir, err := os.MkdirTemp("", "mcp-hub-attachments-")
+	if err != nil {
+		t.Fatalf("making the directory: %v", err)
+	}
+	markAttachmentDirOwner(dir)
+	ancient := time.Now().Add(-abandonedAttachmentAge - time.Hour)
+	if err := os.Chtimes(dir, ancient, ancient); err != nil {
+		t.Fatalf("ageing: %v", err)
+	}
+	sweepStaleAttachmentDirs()
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("a proven-live owner's directory was swept for being old: %v", err)
+	}
+}

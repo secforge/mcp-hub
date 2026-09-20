@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"mime"
 	"os"
@@ -524,15 +525,30 @@ func getCatchUpGap(id connstore.Target) (from, to string, ok bool) {
 // used to live under separate namespaced keys in one string-keyed
 // store — see connstore's package doc comment for the 2026-09-08
 // rewrite).
-func setCatchUpCursor(id connstore.Target, cursor string) {
+// setCatchUpCursor persists the position and REPORTS whether it did.
+//
+// It used to swallow the outcome into a queued warning, and hub_confirm
+// then told the caller "persisted" whether or not anything had been
+// written — the word that is the entire contract of that call. A confirm
+// that succeeds without a durable write sends the next reconnect back to
+// an older position, which reads as the SERVER re-sending rather than as
+// this client having failed to save, and the tool result is the evidence
+// that sends a reader looking at the wrong side. Found by an external
+// reviewer, 2026-09-20, by making the temp file unwritable.
+//
+// The warning is still queued, because a caller that ignores the error
+// should still leave a trace.
+func setCatchUpCursor(id connstore.Target, cursor string) error {
 	if id.Link == "" {
-		return
+		return nil
 	}
 	if err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
 		cs.Cursor = cursor
 	}); err != nil {
 		noteCatchUpWriteFailure(err)
+		return err
 	}
+	return nil
 }
 
 // saveHandedOverAhead persists ahead (a snapshot, not a delta) under id,
@@ -999,16 +1015,31 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 			s.scheduleReconnect(conn)
 		}
 	})
-	s.setActiveConn(conn, w, target)
+	// The last word on whether this connection is wanted, taken under
+	// the same lock that publishes it. Everything checked earlier could
+	// have changed while the handshake completed.
+	if !s.installIfStillWanted(conn, w, target, gen) {
+		conn.Close()
+		return reconnectDone
+	}
 	s.setCatchUpKey(target)
 	topic := ""
 	if t := conn.Topic(); t != nil {
 		topic = *t
 	}
-	_ = connstore.Upsert(target, connstore.Entry{
+	// THE WRITE IS THE CHECK. A disconnect landing between the install
+	// and here must leave the store saying disconnected, and a fresh
+	// connect for the same link must not have its Connected:true undone
+	// by this older run — see persistConnectedIfStillHolding, which
+	// decides and writes under one lock hold rather than writing and
+	// then trying to compensate.
+	if !s.persistConnectedIfStillHolding(conn, gen, target, connstore.Entry{
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
 		ReconnectSecret: secret, LastConnectedAt: time.Now().UTC(), Connected: true,
-	})
+	}) {
+		conn.Close()
+		return reconnectDone
+	}
 	// FOUR different facts, and a reader acts differently on each: push
 	// mode, where there is no channel and none is wanted; a follower that
 	// survived and is live again; a channel that survived with nothing
@@ -2191,6 +2222,20 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		}
 	}
 
+	// RESERVED BEFORE THE DIAL, not after it. The guard below asks
+	// whether this session still wants a connection, and asking that
+	// against state written after the handshake answers the wrong
+	// question: a hub_disconnect landing mid-handshake clears the link,
+	// and re-writing it afterwards resurrects exactly what the guard was
+	// meant to notice. An external reviewer made this point about the
+	// first version of the guard, 2026-09-20 — which had moved the
+	// window rather than closed it.
+	s.mu.Lock()
+	s.redialLink, s.redialName = link, name
+	s.redialTarget = target
+	installGen := s.reconnectGen
+	s.mu.Unlock()
+
 	conn, err := hubconn.Dial(link, hubconn.DialOptions{
 		ReconnectSecret: reconnectSecret,
 		AgentID:         stored.PeerID,
@@ -2200,6 +2245,17 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		Topic:           req.GetString("topic", ""),
 	})
 	if err != nil {
+		// The reservation goes back if nothing came of it, so a failed
+		// dial does not leave a session claiming it wants to reconnect
+		// to something it never reached. Only if this attempt is still
+		// the current one: a disconnect or a takeover has its own state
+		// and clearing it here would undo their decision.
+		s.mu.Lock()
+		if s.reconnectGen == installGen && s.redialLink == link {
+			s.redialLink, s.redialName = "", ""
+			s.redialTarget = connstore.Target{}
+		}
+		s.mu.Unlock()
 		// A failed connect is where "is this process even running the
 		// installed code?" stops being trivia. An MCP server outlives the
 		// binary it was launched from, so a handshake that a rebuilt client
@@ -2236,10 +2292,6 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// coming back" about a connection that was — and the follower was
 	// released with "its connection ended" instead of being held across
 	// the announced restart it was meant to sit through.
-	s.mu.Lock()
-	s.redialLink, s.redialName = link, name
-	s.redialTarget = target
-	s.mu.Unlock()
 	conn.OnActivity(func() {
 		// The hold is armed BEFORE Poke, not after. Poke is what delivers
 		// the disconnect to a follower and releases it, so arming
@@ -2271,7 +2323,20 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			s.scheduleReconnect(conn)
 		}
 	})
-	s.setActiveConn(conn, w, target)
+	// THE SAME GUARD THE RECONNECT PATH USES. A hub_disconnect for this
+	// name can land while the server is still completing the handshake,
+	// and installing afterwards publishes a live connection into a
+	// session the caller has already left — nothing closes it and
+	// nothing can reach it. The first fix for this covered only the
+	// automatic reconnect; an external reviewer showed the initial
+	// connect had the identical window, 2026-09-20.
+	if !s.installIfStillWanted(conn, w, target, installGen) {
+		conn.Close()
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"connected, but %q was disconnected while the handshake was completing — the "+
+				"connection has been closed rather than left running unreachable. Call "+
+				"hub_connect again if that was not what you intended.", s.name)), nil
+	}
 	s.setCatchUpKey(target)
 	s.openReturnPath()
 	// A server can close between Dial returning and the callback above
@@ -2571,20 +2636,44 @@ func markAttachmentDirOwner(dir string) {
 // Wrong in the SAFE direction when it is wrong: a recycled pid makes a
 // dead session's directory look alive and it is kept, costing disk. The
 // opposite mistake deletes a file a running session is about to read.
-func attachmentDirIsOwned(dir string) bool {
+func attachmentDirIsOwned(dir string) (owned, certain bool) {
 	raw, err := os.ReadFile(filepath.Join(dir, attachmentOwnerFile))
 	if err != nil {
-		return false
+		return false, true
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if err != nil || pid <= 0 {
-		return false
+		return false, true
 	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return false
+		return false, true
 	}
-	return proc.Signal(syscall.Signal(0)) == nil
+	err = proc.Signal(syscall.Signal(0))
+	if err == nil {
+		// KNOWN alive. No age overrides this: a directory's timestamp is
+		// not evidence that the process holding it has ended, and the
+		// ceiling exists only for the platforms that cannot answer this
+		// question at all.
+		return true, true
+	}
+	// COULD NOT TELL is not the same as NOT RUNNING. Go's Windows
+	// implementation answers EWINDOWS ("not supported by windows") to
+	// signal 0 whatever the process is doing, so reading that as "the
+	// owner is gone" deleted a live session's files on every Windows
+	// machine while the comment here claimed they were protected.
+	// Source-confirmed by an external reviewer, 2026-09-19.
+	//
+	// Anything that is not an explicit "no such process" therefore keeps
+	// the directory. The cost of being wrong that way is disk; the cost
+	// of the other way is deleting a file a running session is about to
+	// read.
+	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		return false, true
+	}
+	// Could not tell. Kept, but not certainly — which is what the
+	// ceiling is allowed to override, and nothing else is.
+	return true, false
 }
 
 // staleAttachmentAge is how long an abandoned attachment directory is left
@@ -2593,12 +2682,36 @@ func attachmentDirIsOwned(dir string) bool {
 // live session is still about to read.
 const staleAttachmentAge = 24 * time.Hour
 
+// abandonedAttachmentAge is the ceiling past which a directory is swept
+// even though its owner still looks alive.
+//
+// It applies ONLY where liveness could not be determined. A proven-live
+// owner is never swept however old its directory is: age is not evidence
+// that a process ended, and an external reviewer pointed out that a
+// blanket ceiling deleted a live session's files on Linux too — where
+// the probe works and the ceiling had no business firing.
+//
+// It exists because "looks alive" is not the same claim on every
+// platform. Go's Windows implementation answers EWINDOWS to signal 0
+// whatever the process is doing, so a liveness probe there can only ever
+// say "could not tell" — and since being unable to tell keeps the
+// directory (the safe direction for data), a Windows machine would never
+// sweep an owned directory at all and its temp space would grow without
+// bound. This bounds that without going back to deleting live sessions'
+// files: a month is far longer than any session, and a process that has
+// genuinely held one open that long has a different problem.
+const abandonedAttachmentAge = 30 * 24 * time.Hour
+
 // sweepStaleAttachmentDirs removes attachment directories left behind by a
 // process that ended without running clearAttachDir — a crash, a kill -9,
 // a harness simply terminating the MCP server, none of which run a defer.
 // Without this they accumulate for the life of the machine, and now that
 // oversized message bodies are spilled into them (see hubconn's delivery
 // budget) what accumulates is message content, not just attachments.
+//
+// OWNERSHIP FIRST, age second — with a ceiling, because on a platform
+// where liveness cannot be probed at all (see abandonedAttachmentAge)
+// ownership alone would mean nothing is ever swept.
 //
 // OWNERSHIP FIRST, age second. Each directory records the pid that made
 // it, and a directory whose owner is still running is never swept however
@@ -2608,6 +2721,31 @@ const staleAttachmentAge = 24 * time.Hour
 // a day easily. Age remains the fallback, and is the whole test for a
 // directory left by a process that died before writing an owner, or by a
 // version that never wrote one.
+
+// shouldSweepAttachmentDir is the whole decision, as one function,
+// because it has four cases and three of them are easy to get wrong:
+//
+//   - owner PROVEN alive: never swept, at any age. A directory's
+//     timestamp is evidence about the filesystem, not about the process
+//     holding it — and a blanket ceiling deleted live sessions' files on
+//     Linux, where the probe works perfectly.
+//   - owner proven GONE, or no owner recorded: the ordinary age rule.
+//   - liveness UNKNOWN (a platform whose probe cannot answer — see
+//     abandonedAttachmentAge): kept, until the ceiling, which exists so
+//     that such a platform still cleans up eventually.
+//
+// Pure, so every combination is testable — including the unknown case,
+// which the platform running these tests cannot itself produce.
+func shouldSweepAttachmentDir(owned, certain bool, age time.Duration) bool {
+	if owned && certain {
+		return false
+	}
+	if owned {
+		return age > abandonedAttachmentAge
+	}
+	return age > staleAttachmentAge
+}
+
 func sweepStaleAttachmentDirs() {
 	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "mcp-hub-attachments-*"))
 	if err != nil {
@@ -2618,10 +2756,8 @@ func sweepStaleAttachmentDirs() {
 		if err != nil || !fi.IsDir() {
 			continue
 		}
-		if attachmentDirIsOwned(p) {
-			continue
-		}
-		if time.Since(fi.ModTime()) > staleAttachmentAge {
+		owned, certain := attachmentDirIsOwned(p)
+		if shouldSweepAttachmentDir(owned, certain, time.Since(fi.ModTime())) {
 			_ = os.RemoveAll(p)
 		}
 	}
@@ -3026,7 +3162,7 @@ func (s *session) confirmLiveDelivery(events []hubconn.Event) {
 	}
 	s.mu.Unlock()
 
-	setCatchUpCursor(id, advanced)
+	_ = setCatchUpCursor(id, advanced)
 	saveHandedOverAhead(id, snapshot)
 }
 
@@ -3523,6 +3659,22 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	case spent >= budget:
 		reached = fmt.Sprintf(" Stopped at %d KB rather than at the message count, so there may "+
 			"well be more: read on from the last cursor.", spent/1024)
+	case len(events) < limit && filter.Set() && ev.Matching == nil:
+		// The filter was never applied, so the walk ended at the end of
+		// the UNFILTERED stream. Saying "everything there was" here
+		// would answer a question that was never asked.
+		reached = " NOT A COMPLETE ANSWER to the filter you gave: this server sent back no record " +
+			"of having applied one, so the walk ended at the end of the unfiltered stream. Do not " +
+			"report this as nothing further from that sender or nothing further mentioning that " +
+			"text."
+	case len(events) < limit && filter.Set():
+		// A FILTERED end is a different statement, and the difference is
+		// the whole reason the zero-result path below distinguishes
+		// them: there may well be more messages, and this says only that
+		// none of them match.
+		reached = " The server said nothing FURTHER MATCHES after the last one. That is not the " +
+			"same as there being no more messages — read on from the last cursor without the " +
+			"filter to find out whether there are any."
 	case len(events) < limit:
 		reached = " The server said there was nothing after the last one, so this is everything " +
 			"there was."
@@ -4365,7 +4517,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 					snapshot[c] = true
 				}
 				s.mu.Unlock()
-				setCatchUpCursor(id, ev.Cursor)
+				_ = setCatchUpCursor(id, ev.Cursor)
 				saveHandedOverAhead(id, snapshot)
 				anchor = wire.Anchor{Cursor: ev.Cursor}
 				continue
@@ -4381,7 +4533,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				s.lastHandedOverCursor = ev.Cursor
 				id := s.catchUpID
 				s.mu.Unlock()
-				setCatchUpCursor(id, ev.Cursor)
+				_ = setCatchUpCursor(id, ev.Cursor)
 			}
 			formatted := decisionNote(cursor, project, conn, measuredBehind, branch) +
 				seekNote + hubconn.FormatEventOn(s.name, ev) +
@@ -4606,8 +4758,26 @@ func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	behind, err := s.confirmCursor(conn, cursor)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("confirm failed: %v", err)), nil
+	var notPersisted errNotPersisted
+	switch {
+	case errors.As(err, &notPersisted):
+		// The ONLY case where the server accepted it. What failed is the
+		// part that has to survive a restart, and "persisted" is the one
+		// word this result cannot honestly use.
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"confirmed handed over up to %q for THIS PROCESS, but NOT persisted: %v. The server "+
+				"has the receipt and this session will not re-walk it, so nothing is lost now — "+
+				"but a restart or a reconnect resumes from the older position on disk and walks "+
+				"these again. Fix the store (see the path in the warning) and confirm again%s",
+			cursor, notPersisted.err, formatBehindNote(behind),
+		)), nil
+	case err != nil:
+		// Refused, or never answered. Both leave the position where it
+		// was, and neither is a receipt — saying otherwise would turn an
+		// explicit server refusal into a false all-clear.
+		return mcp.NewToolResultError(fmt.Sprintf(
+			"confirm failed: %v. Your read position has NOT moved — this is not a receipt, and "+
+				"nothing here says the server accepted anything.", err)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf(
 		"confirmed handed over up to %q — persisted; a future hub_catch_up or reconnect resumes "+
@@ -4643,6 +4813,25 @@ func formatBehindNote(behind *int) string {
 // conn.ConfirmReceived), not a piggybacked one — chat-relay's own note:
 // a piggybacked receipt is fire-and-forget by design and never answers
 // with a pending count, where a standalone one does.
+
+// errNotPersisted marks the ONE confirm failure where the server did
+// accept the receipt: the position could not be written to disk.
+//
+// It exists because the three ways a confirm can fail are three
+// different facts and a caller renders them to a model as three
+// different sentences. The server ACCEPTED and the disk did not
+// (nothing is lost now, a restart re-walks); the server REFUSED —
+// bad_ack_cursor for a cursor from another conversation, which is a
+// deliberate rejection and the position did not move; or nothing was
+// said at all, a transport failure, where the outcome is simply
+// unknown. Collapsing them was a defect introduced while fixing the
+// first, and caught within the hour by an external reviewer and by
+// chat-relay's author, whose server emits that refusal.
+type errNotPersisted struct{ err error }
+
+func (e errNotPersisted) Error() string { return e.err.Error() }
+func (e errNotPersisted) Unwrap() error { return e.err }
+
 func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
 	// Refused only on proof: another open connection delivered this exact
 	// cursor and this one did not. Confirming it here would move THIS
@@ -4681,8 +4870,10 @@ func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error)
 	s.handedOverAhead = nil
 	id := s.catchUpID
 	s.mu.Unlock()
-	setCatchUpCursor(id, cursor)
 	saveHandedOverAhead(id, nil)
+	if err := setCatchUpCursor(id, cursor); err != nil {
+		return behind, errNotPersisted{err}
+	}
 	return behind, nil
 }
 

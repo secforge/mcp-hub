@@ -604,3 +604,77 @@ func (h *Hub) owns(s *session) bool {
 	defer h.mu.Unlock()
 	return h.sessions[s.name] == s
 }
+
+// installIfStillWanted publishes conn as this session's connection, but
+// only if the session still wants one — the same generation, and a
+// redialLink that hub_disconnect has not cleared — decided under the
+// lock that does the publishing.
+//
+// The two-step version of this (validate, then install) left a window an
+// external reviewer reproduced on 2026-09-19 with a scheduler hook: a
+// disconnect landing between the check and the install found no
+// connection to close, because the dial had not installed one yet, and
+// the dial then installed a live connection into a session the caller
+// had already left. Nothing closed it and nothing could reach it.
+//
+// hub_disconnect clears redialLink under this same mutex BEFORE it looks
+// for a connection to close, which is what makes one lock enough: either
+// this runs first and disconnect finds the connection and closes it, or
+// disconnect runs first and this sees the cleared link and refuses.
+func (s *session) installIfStillWanted(conn *hubconn.Conn, w *waiter.Waiter, target connstore.Target, gen int) bool {
+	s.mu.Lock()
+	if s.redialLink == "" || s.reconnectGen != gen {
+		s.mu.Unlock()
+		return false
+	}
+	s.everConnected = true
+	s.conn, s.connTarget = conn, target
+	s.mu.Unlock()
+	w.SetSource(s.name, conn)
+	return true
+}
+
+// stillHolds reports whether conn is still this session's connection and
+// this dial is still the one speaking for it.
+//
+// The install is atomic (see installIfStillWanted); what follows it is
+// not one operation. A disconnect landing after a successful install
+// closes the connection and writes Connected:false to the store, and the
+// reconnect then carried on to write Connected:true — the last writer
+// wins and the disk claims a connection the caller had explicitly left.
+// Found by the same external reviewer, 2026-09-19, immediately after the
+// install window was closed.
+func (s *session) stillHolds(conn *hubconn.Conn, gen int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn == conn && s.reconnectGen == gen && s.redialLink != ""
+}
+
+// persistConnectedIfStillHolding writes this connection's store entry,
+// but ONLY while it is still this session's connection — decided and
+// written under one lock hold.
+//
+// The three-step version (write, then check, then compensate with
+// MarkDisconnected) could not be made correct by adding conditions to
+// the compensation: unconditional, a stale reconnect marked a NEW live
+// session disconnected; conditioned on still owning the name, an
+// explicit disconnect with no replacement left Connected:true standing,
+// because by then the name was gone. Both are the same error — writing
+// on behalf of something you no longer are — and an external reviewer
+// pointed out that validating apart from the write just moves the race.
+//
+// So the write itself is the decision. hub_disconnect clears redialLink
+// under this mutex and only afterwards tears the connection down and
+// marks the store: either this runs first and the disconnect's own
+// MarkDisconnected lands after it, or the disconnect runs first and
+// this writes nothing. There is no third ordering and nothing left to
+// compensate for.
+func (s *session) persistConnectedIfStillHolding(conn *hubconn.Conn, gen int, target connstore.Target, entry connstore.Entry) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn != conn || s.reconnectGen != gen || s.redialLink == "" {
+		return false
+	}
+	_ = connstore.Upsert(target, entry)
+	return true
+}

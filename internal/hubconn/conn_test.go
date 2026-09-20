@@ -2700,3 +2700,140 @@ func TestASupersededCloseIsNotRetriedAutomatically(t *testing.T) {
 		}
 	}
 }
+
+// TestAnExplicitConfirmLearnsItWasRefused is the external reviewer's
+// finding of 2026-09-20, reproduced here against a real loopback server:
+// the server answered hub_confirm's receipt with error/bad_ack_cursor,
+// the ack plumbing consumed that code before any claim could see it, and
+// the caller fell through to its five-second timeout — which reports
+// success. The refused cursor was then persisted, which is the silent
+// skip bad_ack_cursor exists to prevent.
+func TestAnExplicitConfirmLearnsItWasRefused(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
+		joined.Features = map[string]json.RawMessage{"ackReplies": json.RawMessage(`{}`)}
+		ws.WriteJSON(joined)
+		for {
+			var frame map[string]any
+			if err := ws.ReadJSON(&frame); err != nil {
+				return
+			}
+			if frame["type"] == string(wire.TypeAck) {
+				ws.WriteJSON(wire.Error{
+					Type: wire.TypeError, Code: "bad_ack_cursor",
+					Message: "that cursor is not from this conversation", Retryable: false,
+				})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c, err := Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"#refused",
+		DialOptions{ReconnectSecret: "refused-secret"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	_, err = c.ConfirmReceived("a-cursor-from-somewhere-else")
+	if err == nil {
+		t.Fatal("a server that REFUSED the confirm must not be reported as having accepted it — " +
+			"the caller persists the cursor on a nil error")
+	}
+	if !strings.Contains(err.Error(), "bad_ack_cursor") {
+		t.Fatalf("the refusal must name the server's own code, got: %v", err)
+	}
+	// And the refusal must not disable receipts for the rest of this
+	// connection's life: it is a caller's mistake about one call, not
+	// this client miscounting.
+	if c.AckDisabled() {
+		t.Fatal("an explicit confirm's refusal must not turn off read receipts")
+	}
+}
+
+// TestALateAckDoesNotAnswerTheNextRequest is the external reviewer's P1
+// of 2026-09-20: per-kind claims establish ORDER, not ownership. Send A
+// times out and releases its claim, send B takes one, and A's late
+// sendAck matches B by kind alone — so B was told A's outcome and A's
+// externalId, which a caller renders to a model as a delivered message.
+//
+// The wire offers nothing to correlate on, confirmed from the server
+// side, so the fix is not attribution but refusing to guess: the late
+// answer is spent and B times out. "No answer" about something unknown
+// is the true state; the alternative was a confident wrong one.
+func TestALateAckDoesNotAnswerTheNextRequest(t *testing.T) {
+	prev := AckWaitTimeout
+	AckWaitTimeout = 100 * time.Millisecond
+	defer func() { AckWaitTimeout = prev }()
+
+	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
+		joined.Features = map[string]json.RawMessage{"actionAcks": json.RawMessage(`{}`)}
+		ws.WriteJSON(joined)
+		first := true
+		for {
+			var frame map[string]any
+			if err := ws.ReadJSON(&frame); err != nil {
+				return
+			}
+			if frame["type"] != string(wire.TypeMsg) {
+				continue
+			}
+			if first {
+				first = false
+				// A's answer, held until after A has given up and B is
+				// waiting.
+				go func() {
+					<-release
+					ws.WriteJSON(wire.SendAck{
+						Type: wire.TypeSendAck, ExternalID: "the-first-send", OK: true,
+					})
+				}()
+				continue
+			}
+			// B's own answer never comes, so anything B receives came
+			// from A.
+		}
+	}))
+	defer srv.Close()
+
+	c, err := Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"#late",
+		DialOptions{ReconnectSecret: "late-secret"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// A: times out with its answer still in flight.
+	if _, ok, err := c.SendAwaitingAck("first", "", nil, "", "", nil); err != nil || ok {
+		t.Fatalf("expected the first send to time out, got ok=%v err=%v", ok, err)
+	}
+
+	// B: asks while A's answer is about to land.
+	done := make(chan Event, 1)
+	go func() {
+		ev, _, _ := c.SendAwaitingAck("second", "", nil, "", "", nil)
+		done <- ev
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	ev := <-done
+	if ev.ExternalID == "the-first-send" {
+		t.Fatal("the second send was given the first send's outcome and externalId — a late " +
+			"answer must not be attributed to whoever asked next")
+	}
+}
