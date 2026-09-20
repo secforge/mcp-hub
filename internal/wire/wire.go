@@ -484,7 +484,8 @@ type Msg struct {
 //   - Sent by a client, and as mcp-hub-server's own relay delivers it:
 //     ContentType + ContentBytes (base64-encoded raw bytes) inline, no
 //     Token. Servers that enforce a size cap generally do so on the raw
-//     byte size (8MB is the number chat-relay settled on) — the wire/JSON
+//     byte size, and declare it as attachments.maxRawBytes for a client to
+//     read rather than discover — the wire/JSON
 //     size after base64 inflation (~33%) and envelope overhead is
 //     implementation detail a client shouldn't need to reason about, so
 //     check raw size client-side before encoding, not the encoded
@@ -577,13 +578,17 @@ type AttachmentData struct {
 // should enforce before ever encoding a file — see Attachment's doc
 // comment on why this is checked against raw bytes, not the inflated wire
 // size. Shared by every send path (mcptools, httpmcp) so the limit can't
-// drift between them. 32MB, coordinated live with chat-relay when it
-// raised its own limit from 8MB for the same reason (arbitrary binary
-// attachments, not just images) — its own two caps (per-attachment raw,
-// whole-frame after base64+JSON overhead) live in one place on its side
-// specifically so they can't disagree the way an earlier 1MB-vs-12MB split
-// once did there; matching its number here is the same discipline applied
-// across servers, not just within one.
+// drift between them. 32MB, coordinated with chat-relay, which declares
+// the same number as attachments.maxRawBytes.
+//
+// This is the FLOOR, not the answer. It is what this client enforces when
+// a server says nothing. Where a server DECLARES a cap, that cap is read
+// and applied first — see mcptools.checkAgainstDeclaredLimits. A
+// hardcoded number that matches one server is worth exactly as much as
+// that server not changing, and an earlier version of this comment
+// asserted a historical 8MB for chat-relay that its own author says was
+// never its limit. The declared value is the one that is true by
+// construction.
 const MaxAttachmentRawBytes = 32 * 1024 * 1024
 
 // AllowedAttachmentContentTypes are the content types a server that

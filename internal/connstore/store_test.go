@@ -528,3 +528,47 @@ func TestMain(m *testing.M) {
 	}
 	os.Exit(m.Run())
 }
+
+// The mode contract in this package's doc comment is enforced, not
+// merely requested. Both halves were stated and neither was true:
+// os.MkdirAll leaves an existing directory's mode alone, and
+// os.WriteFile's perm applies only when it creates the file — so a
+// state.json.tmp left behind by a save that died between the write and
+// the rename was reopened at its old mode and the rename handed that mode
+// to state.json. Found by an external reviewer.
+func TestTheModeContractIsEnforcedNotRequested(t *testing.T) {
+	sub := filepath.Join(t.TempDir(), "store")
+	// A directory that already exists, loosely: MkdirAll will not touch it.
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", sub)
+
+	// A leftover temp file from a crashed save, world-readable.
+	tmp := filepath.Join(sub, filepath.Base(path())+".tmp")
+	if err := os.WriteFile(tmp, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("seed tmp: %v", err)
+	}
+
+	if err := save(state{}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	di, err := os.Stat(sub)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := di.Mode().Perm(); got != 0o700 {
+		t.Errorf("state directory is %04o, want 0700 — a pre-existing loose directory stays loose "+
+			"for the life of the install while the package doc claims otherwise", got)
+	}
+
+	fi, err := os.Stat(path())
+	if err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("state file is %04o, want 0600 — it inherited the mode of a temp file left behind "+
+			"by an earlier crash, and it holds every reconnect secret this client has", got)
+	}
+}

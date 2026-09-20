@@ -498,6 +498,14 @@ type Conn struct {
 	// everything they carry: when no server this client supports is
 	// still without the feature. Until then both paths are load-bearing.
 	correlates bool
+	// attachments is what the server declared under "attachments" — its
+	// own per-attachment raw cap and whether it accepts images only.
+	// Read at connect so a send can be refused BEFORE a file is encoded
+	// and pushed, rather than learning the answer from a refusal that
+	// arrives after the whole thing is on the wire. The helper that
+	// decodes this shape existed and had no client caller at all.
+	attachments     wire.AttachmentsFeature
+	attachmentsSaid bool
 }
 
 // ackClaim is a one-shot subscription for the next event matching a
@@ -978,6 +986,8 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		features:                joined.Features,
 		featuresDeclared:        joined.Features != nil,
 		correlates:              correlationUsable(joined),
+		attachments:             attachmentsDeclared(joined),
+		attachmentsSaid:         attachmentsStated(joined),
 		lastFrameKind:           "joined",
 		lastFrameAt:             time.Now(),
 		ackIdleInterval:         snapAckIdleInterval,
@@ -1011,6 +1021,40 @@ func (c *Conn) AgePublicKey() string { return c.agePublicKey }
 // ServerVersion is the wire.ProtocolVersion the server reported in "joined".
 // Compare against wire.ProtocolVersion to tell if this client is behind.
 func (c *Conn) ServerVersion() int { return c.serverVersion }
+
+// attachmentsDeclared and attachmentsStated split what the server said
+// about attachments from whether it said anything, because the two are
+// different facts and collapsing them is how a silent server ends up
+// treated as one declaring zero.
+func attachmentsDeclared(joined wire.Joined) wire.AttachmentsFeature {
+	af, _ := joined.AttachmentsFeature()
+	return af
+}
+
+func attachmentsStated(joined wire.Joined) bool {
+	_, ok := joined.AttachmentsFeature()
+	return ok
+}
+
+// MaxAttachmentBytes is the per-attachment raw cap this server declared,
+// or 0 when it declared none. A caller checks this BEFORE encoding: the
+// alternative is pushing a file the server will refuse, which on this
+// path costs the whole transfer and then returns the refusal
+// asynchronously, as an error the caller still has to attribute.
+func (c *Conn) MaxAttachmentBytes() int {
+	if !c.attachmentsSaid {
+		return 0
+	}
+	return c.attachments.MaxRawBytes
+}
+
+// AcceptsImagesOnly reports whether this server said it takes images and
+// nothing else. False when it said nothing, which is not the same as a
+// server that stated it accepts anything — but the two call for the same
+// behaviour here, since neither is grounds to refuse locally.
+func (c *Conn) AcceptsImagesOnly() bool {
+	return c.attachmentsSaid && c.attachments.ImagesOnly
+}
 
 // FeaturesDeclared reports whether the server sent a Features object at
 // all (see wire.Joined.Features) — false for a pre-v3 server, where

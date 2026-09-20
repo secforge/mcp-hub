@@ -288,7 +288,7 @@ func lockPath() string {
 // racing here now serialize instead of one silently overwriting the
 // other's change with a stale snapshot.
 func withLock(exclusive bool, fn func() error) error {
-	if err := os.MkdirAll(dir(), 0o700); err != nil {
+	if err := ensureDir(); err != nil {
 		return err
 	}
 	fl := flock.New(lockPath())
@@ -362,8 +362,23 @@ func load() (state, error) {
 // save durably persists s, overwriting whatever was stored before, via a
 // write-to-temp-then-rename so a concurrent load never observes a
 // partially-written file.
+//
+// "Durably" is two properties and the rename only buys one. The rename is
+// what makes the replacement ATOMIC to a concurrent reader. It does
+// nothing about a crash or a power loss: without an fsync the rename can
+// be visible while the bytes behind it are not, and this file holds every
+// reconnect secret and reading position this client has — losing it means
+// every session comes back as a stranger with no position and nothing
+// anywhere reporting why. So the data is flushed before the rename and
+// the directory entry after it. An external reviewer pointed out that the
+// word was doing work the code did not.
+//
+// The directory fsync is best-effort: a platform that refuses to open a
+// directory for this still leaves a correct file, just one whose NAME may
+// not survive a power loss, and failing the save outright over that would
+// be the worse trade.
 func save(s state) error {
-	if err := os.MkdirAll(dir(), 0o700); err != nil {
+	if err := ensureDir(); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
@@ -372,10 +387,69 @@ func save(s state) error {
 	}
 	target := path()
 	tmp := target + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := writeFileSynced(tmp, data); err != nil {
 		return err
 	}
-	return os.Rename(tmp, target)
+	if err := os.Rename(tmp, target); err != nil {
+		return err
+	}
+	syncDir(dir())
+	return nil
+}
+
+// ensureDir creates the state directory and ENFORCES its mode rather than
+// merely requesting it. os.MkdirAll returns nil without touching a
+// directory that already exists, so a pre-existing loose
+// ~/.config/mcp-hub stayed loose for the life of the install while the
+// package doc claimed 0700 as part of its contract. Found by an external
+// reviewer.
+func ensureDir() error {
+	d := dir()
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(d); err == nil && fi.Mode().Perm() != 0o700 {
+		return os.Chmod(d, 0o700)
+	}
+	return nil
+}
+
+// writeFileSynced writes data to name at 0600 and flushes it to the disk
+// before returning.
+//
+// O_TRUNC plus an explicit Chmod, not os.WriteFile: WriteFile's perm
+// applies only when it CREATES the file, so a state.json.tmp left behind
+// by a save that died between the write and the rename was reopened with
+// whatever mode it already carried — and the rename then handed that mode
+// to state.json. A credential store cannot inherit its permissions from
+// the wreckage of an earlier crash.
+func writeFileSynced(name string, data []byte) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func syncDir(d string) {
+	f, err := os.Open(d)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_ = f.Sync()
 }
 
 func getEntry(s state, project, key string) (Entry, bool) {

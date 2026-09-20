@@ -3249,16 +3249,71 @@ func (s *session) recordHandedOver(events []hubconn.Event) {
 // does, like chat-relay, may refuse a non-image sent this way) into a
 // single attachments slice, erroring if both are given at once rather
 // than silently picking one.
-func readAttachmentParam(req mcp.CallToolRequest) ([]wire.Attachment, error) {
+func readAttachmentParam(req mcp.CallToolRequest, conn *hubconn.Conn) ([]wire.Attachment, error) {
 	imagePath := req.GetString("imagePath", "")
 	filePath := req.GetString("filePath", "")
 	if imagePath != "" && filePath != "" {
 		return nil, fmt.Errorf("pass at most one of imagePath and filePath, not both")
 	}
+	var attachments []wire.Attachment
+	var err error
 	if filePath != "" {
-		return wire.ReadFileAttachment(filePath)
+		attachments, err = wire.ReadFileAttachment(filePath)
+	} else {
+		attachments, err = wire.ReadAttachmentFile(imagePath)
 	}
-	return wire.ReadAttachmentFile(imagePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkAgainstDeclaredLimits(attachments, conn); err != nil {
+		return nil, err
+	}
+	return attachments, nil
+}
+
+// checkAgainstDeclaredLimits refuses locally what the server has already
+// said it will not take.
+//
+// The server declares attachments.maxRawBytes and attachments.imagesOnly
+// precisely so a client can act on them, and nothing here ever read them:
+// the helper that decodes the shape had no caller outside the server side
+// of this module. So a .pdf sent with filePath to an images-only server
+// was fully read, fully base64-encoded and fully pushed before the
+// refusal came back — and it came back as an asynchronous error the
+// caller then has to attribute, which is the one thing today has shown is
+// hard to do well.
+//
+// Both checks use the SERVER'S OWN numbers in the message rather than
+// this client's constants. A refusal that says "too large" without saying
+// what the limit is sends the reader to guess, and the guess is this
+// client's 32MB cap, which is not what refused it.
+func checkAgainstDeclaredLimits(attachments []wire.Attachment, conn *hubconn.Conn) error {
+	if conn == nil || len(attachments) == 0 {
+		return nil
+	}
+	maxRaw := conn.MaxAttachmentBytes()
+	imagesOnly := conn.AcceptsImagesOnly()
+	for _, a := range attachments {
+		if imagesOnly && !wire.AllowedAttachmentContentTypes[a.ContentType] {
+			return fmt.Errorf("this server accepts images only (it declares attachments.imagesOnly) "+
+				"and %q is %s — send an image, or send this file somewhere that takes one; pushing "+
+				"it would transfer the whole file and then be refused",
+				a.Name, a.ContentType)
+		}
+		if maxRaw <= 0 {
+			continue
+		}
+		// The raw size is what a server caps, so it is what is checked —
+		// the base64 inflation on the wire is the server's own business
+		// and not something a caller should have to reason about.
+		raw := base64.StdEncoding.DecodedLen(len(a.ContentBytes))
+		if raw > maxRaw {
+			return fmt.Errorf("this server accepts at most %d bytes per attachment (it declares "+
+				"attachments.maxRawBytes) and %q is about %d — refused here rather than after "+
+				"transferring it", maxRaw, a.Name, raw)
+		}
+	}
+	return nil
 }
 
 func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -3278,7 +3333,7 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if to != "" && !wire.IsValidID(to) {
 		return mcp.NewToolResultError("to must be a UUID"), nil
 	}
-	attachments, err := readAttachmentParam(req)
+	attachments, err := readAttachmentParam(req, conn)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -4992,7 +5047,7 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	attachments, err := readAttachmentParam(req)
+	attachments, err := readAttachmentParam(req, conn)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}

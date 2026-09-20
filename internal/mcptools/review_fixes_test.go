@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -158,5 +160,97 @@ func TestPushCatchUpReportsAServerRefusalRatherThanACursorlessMessage(t *testing
 	}
 	if strings.Contains(res.StoppedBy, "no cursor") {
 		t.Fatalf("a refusal was reported as a cursorless message: %+v", res)
+	}
+}
+
+// A server declares attachments.maxRawBytes and attachments.imagesOnly so
+// a client can act on them BEFORE encoding a file. The helper that
+// decodes that shape had no caller on this side at all, so a .pdf to an
+// images-only server was read, base64-encoded and pushed in full, and the
+// refusal arrived after the transfer — as an asynchronous error the
+// caller then has to attribute.
+//
+// Both directions are asserted. A client that refuses everything passes
+// the first half alone; a client that refuses nothing passes the second.
+func TestTheServersDeclaredAttachmentLimitsAreConsultedBeforeEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		feature  string
+		file     string
+		content  []byte
+		wantErr  string
+		wantPass bool
+	}{
+		{
+			name:    "an images-only server refuses a pdf locally",
+			feature: `{"imagesOnly":true}`,
+			file:    "doc.pdf", content: []byte("%PDF-1.4 not an image"),
+			wantErr: "images only",
+		},
+		{
+			name:    "and still takes an image",
+			feature: `{"imagesOnly":true}`,
+			file:    "pic.png", content: []byte("\x89PNG\r\n\x1a\n"),
+			wantPass: true,
+		},
+		{
+			name:    "a declared byte cap is applied with the server's own number",
+			feature: `{"maxRawBytes":16}`,
+			file:    "big.png", content: []byte("\x89PNG\r\n\x1a\naaaaaaaaaaaaaaaaaaaaaaaa"),
+			wantErr: "at most 16 bytes",
+		},
+		{
+			name:    "a server that declares nothing refuses nothing locally",
+			feature: `{}`,
+			file:    "doc.pdf", content: []byte("%PDF-1.4 not an image"),
+			wantPass: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), tc.file)
+			if err := os.WriteFile(path, tc.content, 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			features := teamsTestFeatures()
+			features["attachments"] = json.RawMessage(tc.feature)
+			link := startRelayTestServerWithJoined(t, wire.Joined{
+				Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+				ServerVersion: wire.ProtocolVersion, Features: features,
+				ConversationKind: "group", CanSend: true,
+			})
+
+			ctx := context.Background()
+			hub := NewHub()
+			connReq := mcp.CallToolRequest{}
+			connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+			if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+				t.Fatalf("connect: err=%v result=%+v", err, res)
+			}
+			defer hub.handleDisconnect(ctx, connReqFor(testConn))
+			s, err := hub.session(testConn)
+			if err != nil {
+				t.Fatalf("session: %v", err)
+			}
+			conn, _ := s.activeConn()
+
+			req := mcp.CallToolRequest{}
+			req.Params.Arguments = map[string]any{"connection": testConn, "filePath": path}
+			_, err = readAttachmentParam(req, conn)
+
+			if tc.wantPass {
+				if err != nil {
+					t.Fatalf("refused an attachment the server never said it would reject: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("the server declared %s and this attachment was accepted for encoding "+
+					"anyway — the whole file would be transferred and then refused", tc.feature)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("refusal does not state the server's own limit: %v", err)
+			}
+		})
 	}
 }
