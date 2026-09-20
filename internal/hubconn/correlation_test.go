@@ -719,3 +719,76 @@ func TestASurvivingConfirmReminderCarriesTheCurrentPosition(t *testing.T) {
 		t.Fatalf("the rest of the buffer was disturbed: %+v", events)
 	}
 }
+
+// THE BUG THIS SPLIT EXISTS FOR. A reader is handed messages 1..5, sends
+// something (which piggybacks a receipt), then finds message 4 arrived
+// truncated and confirms 3 — exactly what this client's own confirm
+// reminder asks for, "the last message you have COMPLETE, possibly
+// earlier than" the last delivered.
+//
+// While the piggyback carried lastConsumed, that send had already told a
+// monotonic server the position was 5, and the reader's honest 3 came
+// back refused. The reader was punished for obeying an instruction this
+// client wrote, because this client had answered the question on its
+// behalf first.
+func TestASendDoesNotAssertAPositionTheReaderHasNotConfirmed(t *testing.T) {
+	sends := make(chan wire.Msg, 4)
+	base := startCorrelatingServer(t, map[string]json.RawMessage{},
+		func(w *serialWriter, frame map[string]any) {
+			if frame["type"] != string(wire.TypeMsg) {
+				return
+			}
+			raw, _ := json.Marshal(frame)
+			var m wire.Msg
+			json.Unmarshal(raw, &m)
+			sends <- m
+		})
+
+	c, err := dialTest(base, "confirmed-only", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// Five delivered and handed to the model; nothing confirmed.
+	var events []Event
+	for _, cur := range []string{"c1", "c2", "c3", "c4", "c5"} {
+		events = append(events, Event{Kind: "msg", Cursor: cur})
+	}
+	c.MarkConsumed(events)
+
+	if err := c.Send("a reply", nil, "", "", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case m := <-sends:
+		if m.AckCursor != "" {
+			t.Fatalf("the send asserted position %q, which the reader never confirmed — a monotonic "+
+				"server now holds it, and the reader's own honest, lower confirm will be refused",
+				m.AckCursor)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the server never saw the send")
+	}
+
+	// The reader confirms what it actually has complete: c3, not c5.
+	if _, err := c.ConfirmReceived("c3"); err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+	if got := c.ConfirmedCursor(); got != "c3" {
+		t.Fatalf("ConfirmedCursor is %q, want c3", got)
+	}
+
+	// And THAT is what rides out from now on.
+	if err := c.Send("another", nil, "", "", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case m := <-sends:
+		if m.AckCursor != "c3" {
+			t.Fatalf("the send piggybacked %q, want the confirmed c3", m.AckCursor)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the server never saw the second send")
+	}
+}

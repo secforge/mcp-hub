@@ -4536,10 +4536,13 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	s.mu.Unlock()
 
 	measuredBehind := 0
-	// NOT WHILE SOMETHING NEWER HAS BEEN CONSUMED. This measuring ack
+	// NOT WHILE SOMETHING NEWER HAS BEEN CONFIRMED. This measuring ack
 	// names the STORED cursor, and sending it is also what repairs the
 	// server's own position — but if this connection has since consumed
-	// anything live, that same ack asks the server to go BACKWARDS. A
+	// anything live, that same ack asks the server to go BACKWARDS. The
+	// question is what this connection has CONFIRMED rather than what it
+	// has merely been handed, because confirmed is what a receipt
+	// carries. A
 	// server that obeys over-reports its behind count until something
 	// moves it forward; chat-relay instead refuses it, which costs a
 	// measurement and gains nothing. Either way there is no version of
@@ -4549,7 +4552,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// number rather than a position. Found by an external reviewer,
 	// 2026-09-20.
 	if cursor != "" && conn.HasFeature("ackReplies") &&
-		(conn.ConsumedCursor() == "" || conn.ConsumedCursor() == cursor) {
+		(conn.ConfirmedCursor() == "" || conn.ConfirmedCursor() == cursor) {
 		if behind, err := conn.ConfirmReceived(cursor); err == nil && behind != nil {
 			measuredBehind = *behind
 		}

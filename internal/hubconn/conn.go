@@ -81,11 +81,6 @@ func debugf(format string, args ...any) {
 var (
 	pongWait  = 100 * time.Second
 	writeWait = 10 * time.Second
-	// ackIdleInterval is how long to wait, with nothing else about to be
-	// sent anyway, before firing a standalone read receipt for a consumed
-	// position that hasn't been reported yet — see Conn.ackLoop. Var so
-	// tests can shorten it.
-	ackIdleInterval = 60 * time.Second
 	// confirmReminderInterval is how often confirmReminderLoop checks for
 	// something delivered live but never confirmed via hub_confirm (or an
 	// intervening hub_receive/hub_wait/hub_catch_up) — see that method's
@@ -344,13 +339,8 @@ type Conn struct {
 	// pongWait above.
 	writeWait time.Duration
 
-	// ackIdleInterval is snapshotted the same way and for the same reason
-	// as pongWait above — read only by ackLoop, captured before it's
-	// spawned.
-	ackIdleInterval time.Duration
-
 	// confirmReminderInterval is snapshotted the same way and for the
-	// same reason as ackIdleInterval above — read only by
+	// same reason as pongWait above — read only by
 	// confirmReminderLoop, captured before it's spawned.
 	confirmReminderInterval time.Duration
 
@@ -419,7 +409,7 @@ type Conn struct {
 	unconfirmedCount int
 	unconfirmedSince time.Time
 	// lastConsumed/lastAckSent/ackDisabled implement the read-receipt
-	// contract — see LastConsumedCursor, Drain, and ackLoop.
+	// contract — see LastConsumedCursor and Drain.
 	//   - lastConsumed: cursor of the most recent event actually returned
 	//     by Drain (i.e. delivered to the model, not merely buffered).
 	//   - lastAckSent: cursor value of the last read receipt actually sent
@@ -432,16 +422,32 @@ type Conn struct {
 	//     bug, not transient, so retrying (with any cursor) would fail
 	//     identically; stop trying rather than loop.
 	lastConsumed string
-	lastAckSent  string
-	ackDisabled  bool
-	onActivity   func()
+	// lastConfirmed is the position the MODEL has confirmed it has
+	// complete, and is the only thing this client ever offers as a read
+	// receipt. lastConsumed above means HANDED OVER; a confirm means
+	// COMPLETE. They are different facts and the wire has one column for
+	// the second, so piggybacking the first was this client asserting,
+	// on the reader's behalf, something the reader had not decided.
+	//
+	// The reader then saw it: the confirm reminder asks for the last
+	// message it has complete, "possibly earlier than" the last
+	// delivered — and an honest lower answer was refused by a monotonic
+	// server, because a send had already offered the higher one. The
+	// honest confirm looked like the error.
+	//
+	// Advanced only by an accepted ConfirmReceived, never by
+	// MarkConsumed.
+	lastConfirmed string
+	lastAckSent   string
+	ackDisabled   bool
+	onActivity    func()
 	// budget governs what may be PUSHED to a reader unbidden — see
 	// budget's own doc comment for why the receiver's context, rather than
 	// the transport, is the scarce resource here.
 	// writeMu serializes every frame written to ws. gorilla/websocket
 	// permits exactly ONE concurrent writer and panics when it detects a
 	// second ("concurrent write to websocket connection"), so this is not
-	// a tidiness lock: ackLoop writes a receipt on a timer for the whole
+	// a tidiness lock: the reminder loop runs on a timer for the whole
 	// life of the connection while the MCP request goroutine writes
 	// whatever tool the model just called, and the two coinciding is
 	// ordinary rather than unlucky. A panic inside an MCP server takes the
@@ -803,7 +809,7 @@ type DialOptions struct {
 func Dial(link string, opts DialOptions) (*Conn, error) {
 	// Snapshot once, synchronously, before any goroutine is spawned — see
 	// the pongWait field's doc comment on Conn for why.
-	snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval := pongWait, writeWait, ackIdleInterval, confirmReminderInterval
+	snapPongWait, snapWriteWait, snapConfirmReminderInterval := pongWait, writeWait, confirmReminderInterval
 
 	target, credential, _ := strings.Cut(link, "#")
 	if target == "" || credential == "" {
@@ -874,7 +880,7 @@ func Dial(link string, opts DialOptions) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return finishHandshake(ws, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval)
+	return finishHandshake(ws, snapPongWait, snapWriteWait, snapConfirmReminderInterval)
 }
 
 // dialWS opens the WebSocket and, when the server answers with anything
@@ -924,7 +930,7 @@ const maxReadFrameBytes = 48 * 1024 * 1024
 // Authorization/etc. header). Nothing downstream of here differs between
 // the two: everything behavioural comes from the server's declared
 // features, never from which of them dialled.
-func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdleInterval, snapConfirmReminderInterval time.Duration) (*Conn, error) {
+func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfirmReminderInterval time.Duration) (*Conn, error) {
 	// BOUNDED, because an upgrade is not an answer. A server that
 	// completes the HTTP upgrade and then says nothing left this read
 	// blocked with no deadline set yet — the deadline the read loop
@@ -990,7 +996,6 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		attachmentsSaid:         attachmentsStated(joined),
 		lastFrameKind:           "joined",
 		lastFrameAt:             time.Now(),
-		ackIdleInterval:         snapAckIdleInterval,
 		confirmReminderInterval: snapConfirmReminderInterval,
 		budget:                  newBudget(),
 	}
@@ -1002,7 +1007,6 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(snapWriteWait))
 	})
 	go c.readLoop()
-	go c.ackLoop()
 	go c.activityLoop()
 	go c.confirmReminderLoop()
 	return c, nil
@@ -1728,9 +1732,7 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 		// The bookkeeping above still applies unconditionally either
 		// way; only the delivery differs — a claimed reply falls through
 		// to tryDivertToClaimLocked below instead of being discarded
-		// here, same as every other ack kind's claim path. ackLoop's own
-		// background standalone acks never register a claim, so they
-		// keep being silently discarded exactly as before.
+		// here, same as every other ack kind's claim path.
 		if c.ackClaimTakes(ev) {
 			return false
 		}
@@ -1748,8 +1750,8 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 		// fail identically) — stop sending receipts entirely rather than
 		// repeat the same mistake on every future event.
 		//
-		// UNLESS SOMEBODY ASKED. "It never asked for this ack" is true of
-		// ackLoop's background receipts and false of an explicit
+		// UNLESS SOMEBODY ASKED. "It never asked for this ack" is false of
+		// an explicit
 		// hub_confirm, which is waiting on exactly this answer. Swallowed
 		// here, that caller saw only its five-second timeout — and a
 		// timeout reports success, so the server's REFUSAL became a
@@ -1774,13 +1776,13 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 
 // ConfirmReceived sends an immediate standalone read receipt (wire.Ack)
 // for cursor and marks it as this connection's consumed boundary — the
-// same lastConsumed/lastAckSent state ackLoop's idle timer and Send's
+// same lastConfirmed/lastAckSent state Send's
 // piggybacking already read (see MarkConsumed's doc comment). Unlike
 // those, which a caller drives from its own drain, this is a caller
 // asserting the boundary directly: for mcp-hub-client, the model itself,
 // via hub_confirm, since nothing else in this client's async delivery
 // paths (wait --follow, one-shot wait) can honestly claim the model read
-// anything. Sent immediately rather than waiting for ackLoop's idle tick
+// anything. Sent immediately
 // — a caller invoking this wants the receipt to land now, not on the
 // next timer.
 //
@@ -1789,7 +1791,7 @@ func (c *Conn) handleAckPlumbingLocked(ev Event) bool {
 // reply must not read as "this server never answers" for the rest of
 // the connection's life. Var so tests can shorten the number of stalls
 // they need to pay to exercise the ratchet, the same pattern
-// ackIdleInterval/confirmReminderInterval already use for their own
+// confirmReminderInterval already uses for its own
 // tunables.
 var ackReplyMissThreshold = 2
 
@@ -1811,10 +1813,12 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	// Found by an external reviewer with a reproduction, 2026-09-20.
 	c.mu.Lock()
 	prevConsumed, prevAckSent := c.lastConsumed, c.lastAckSent
+	prevConfirmed := c.lastConfirmed
 	c.mu.Unlock()
 	restore := func() {
 		c.mu.Lock()
 		c.lastConsumed, c.lastAckSent = prevConsumed, prevAckSent
+		c.lastConfirmed = prevConfirmed
 		c.mu.Unlock()
 	}
 
@@ -1859,6 +1863,7 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		// what happened.
 		c.mu.Lock()
 		c.lastAckSent = cursor
+		c.lastConfirmed = cursor
 		c.mu.Unlock()
 		return nil, nil
 	}
@@ -1924,6 +1929,9 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 			return nil, fmt.Errorf("the server did not accept this confirm.%s Your read "+
 				"position has not moved", where)
 		}
+		c.mu.Lock()
+		c.lastConfirmed = cursor
+		c.mu.Unlock()
 		return ev.Behind, nil
 	case <-c.gone:
 		// Restored so the sentence is true of this connection's own
@@ -1953,40 +1961,30 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		// from the server side by chat-relay's author, 2026-09-20. The
 		// safe direction of a disagreement that is invisible until a
 		// reconnect, and the reason this line says so.
+		c.mu.Lock()
+		c.lastConfirmed = cursor
+		c.mu.Unlock()
 		return nil, nil
 	}
 }
 
-// ackLoop periodically sends a standalone read receipt (wire.Ack) if
-// lastConsumed has moved past lastAckSent since the last one actually sent
-// — piggybacked or standalone — since the last tick. Sends nothing when
-// nothing new has been read: an idle receipt repeating a position the
-// server already holds would turn a read receipt into a heartbeat. Runs
-// for the connection's lifetime; a write to a closed connection simply
-// errors and ends the loop on its own, the same shape pingLoop uses
-// server-side (see wsserver.peer.pingLoop).
-func (c *Conn) ackLoop() {
-	ticker := time.NewTicker(c.ackIdleInterval)
-	defer ticker.Stop()
-	for range ticker.C {
-		c.mu.Lock()
-		if c.ackDisabled || c.closed {
-			c.mu.Unlock()
-			return
-		}
-		consumed, sent := c.lastConsumed, c.lastAckSent
-		c.mu.Unlock()
-		if consumed == "" || consumed == sent {
-			continue
-		}
-		if err := c.writeJSON(wire.NewAck(consumed)); err != nil {
-			return
-		}
-		c.mu.Lock()
-		c.lastAckSent = consumed
-		c.mu.Unlock()
-	}
-}
+// THE IDLE RECEIPT LOOP IS GONE, and this is where it was.
+//
+// It existed because the reported position was lastConsumed, which moved
+// silently on every drain and so needed flushing on a timer. The position
+// now moves only through ConfirmReceived, and every path there writes its
+// receipt before returning — so a timer could only ever find the two
+// already equal.
+//
+// Except once, which is why it is deleted rather than left harmless: when
+// a server REFUSES a confirm with ok:false, the ack plumbing adopts the
+// server's own reported position into lastAckSent while the confirmed
+// position rolls back. A loop comparing the two would then see them
+// differ and helpfully re-send the OLD position — a backwards receipt, on
+// exactly the servers that refuse those, generated by nobody asking.
+//
+// A mechanism whose only reachable path does the wrong thing is worse
+// than one that never runs.
 
 // confirmReminderLoop periodically checks whether anything live-delivered
 // is still awaiting a genuine synchronous hand-over (liveUnconfirmed —
@@ -2414,25 +2412,49 @@ func decodeEvent(raw []byte) (Event, bool) {
 // lastAckSent) — see the Conn field doc comments for the full contract.
 // Every outbound method sends this unconditionally (rule: "piggyback it on
 // every outbound message"), even when unchanged from the last one sent;
-// only the idle timer (ackLoop) additionally checks whether it moved.
+// unchanged from the last one sent.
 // Empty once ackDisabled (a prior bad_ack/bad_ack_cursor) or before
 // anything has been consumed yet.
 //
-// What this sends is lastConsumed, and it is sent without ever being
-// answered: the server records a piggybacked receipt fire-and-forget and
-// replies to nothing about it, refusal included. So a wrong value here is
-// invisible from the wire — it can only be prevented, never detected. That
-// is why ConfirmReceived rolls lastConsumed back on every path that does
-// not end in an accepted confirm: a position the server refused must never
-// survive to be piggybacked, because nothing downstream would ever notice.
+// What this sends is lastCONFIRMED — the position the model said it has
+// complete — and never lastConsumed, which only means handed over. Those
+// are different facts and this column holds the second one. Offering the
+// first made this client assert, on the reader's behalf, something the
+// reader had not decided, and the reader then met its own assertion
+// coming back as a refusal when it answered the confirm reminder
+// honestly with a lower position.
+//
+// It is sent without ever being answered: the server records a
+// piggybacked receipt fire-and-forget and replies to nothing about it,
+// refusal included. So a wrong value here is invisible from the wire — it
+// can only be prevented, never detected. That is why ConfirmReceived
+// rolls its position back on every path that does not end in an accepted
+// confirm: a position the server refused must never survive to be
+// piggybacked, because nothing downstream would ever notice.
+//
+// A reader that never confirms therefore sends no receipt, and that is
+// the intended shape rather than an oversight: the server's column then
+// says what the reader actually vouched for. The pressure to confirm
+// belongs on the confirm reminder, which exists, and not on this client
+// quietly answering for the model.
 func (c *Conn) ackCursorForOutbound() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.ackDisabled || c.lastConsumed == "" {
+	if c.ackDisabled || c.lastConfirmed == "" {
 		return ""
 	}
-	c.lastAckSent = c.lastConsumed
-	return c.lastConsumed
+	c.lastAckSent = c.lastConfirmed
+	return c.lastConfirmed
+}
+
+// ConfirmedCursor is the last position the model confirmed, or "" if it
+// has confirmed nothing on this connection. This is what a receipt would
+// carry, so a caller deciding whether to send one asks this rather than
+// ConsumedCursor.
+func (c *Conn) ConfirmedCursor() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastConfirmed
 }
 
 func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention) error {
@@ -3390,7 +3412,7 @@ func (c *Conn) freshenRemindersLocked(evs []Event) []Event {
 }
 
 // MarkConsumed records the given events' cursors as delivered to the
-// model, for the read-receipt system (ack piggybacking, and ackLoop's
+// model, for the read-receipt system (ack piggybacking, and the
 // idle-triggered standalone ack) — moved out of Drain/DrainBatch/
 // DrainEvents themselves and into this explicit call, found live,
 // 2026-09-07: those three are also what waiter's follow-mode delivery

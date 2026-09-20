@@ -620,7 +620,7 @@ it is what resuming an identity from a secret means.
 
 ## A handed-over position is piggybacked as if it were a confirmed one
 
-Open, live, and this client's bug. Found 2026-09-20 by the external
+FIXED. The description below is what it was; the fix is at the end. Found 2026-09-20 by the external
 reviewer, who hit it by following this client's own instruction.
 
 `lastConsumed` means HANDED OVER TO THE MODEL. A confirm means THE MODEL
@@ -652,9 +652,28 @@ carry the last CONFIRMED position, and `lastConsumed` should stop being
 an ack source at all. That is a behaviour change, not a repair, so it is
 not being made under the heading of a bug fix.
 
-Until then: a reader following the reminder on a monotonic server gets a
-refusal. `ConfirmReceived` reports it truthfully and rolls back, so
-nothing is corrupted — the confirm simply does not take.
+**The fix.** `lastConfirmed` is now its own field, advanced only by an
+accepted `ConfirmReceived` and never by `MarkConsumed`, and it is the only
+thing this client ever offers as a receipt — piggybacked or standalone.
+`lastConsumed` keeps its other jobs and stops being an assertion about
+what the reader has read.
+
+A reader that never confirms therefore sends no receipt at all, which is
+the intended shape rather than a gap: the server's column then says what
+the reader actually vouched for. The pressure to confirm belongs on the
+confirm reminder, which exists.
+
+**And the idle receipt loop was deleted rather than converted**, which is
+the part worth keeping. It existed because the reported position moved
+silently on every drain and needed flushing on a timer. The confirmed
+position only moves through `ConfirmReceived`, and every path there writes
+its receipt before returning — so a timer could only ever find the two
+equal. Except in one case: after a server refuses a confirm with
+`ok:false`, the ack plumbing adopts the server's own reported position
+into `lastAckSent` while the confirmed position rolls back, and a loop
+comparing the two would then re-send the OLD position to a server that
+refuses exactly those. A mechanism whose only reachable path does the
+wrong thing is worse than one that never runs.
 
 ## A correction that deletes the evidence
 

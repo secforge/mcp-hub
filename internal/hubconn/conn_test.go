@@ -225,7 +225,11 @@ func TestLastSeenCursorTracksMostRecentDeliveredMsg(t *testing.T) {
 	}
 }
 
-func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
+// A receipt carries what the model CONFIRMED, not what it was handed.
+// Consuming alone offers nothing: lastConsumed means handed over, and
+// asserting it as a read position was this client answering the confirm
+// question on the reader's behalf.
+func TestAckCursorPiggybacksTheConfirmedPositionNotTheConsumedOne(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	gotMsg := make(chan wire.Msg, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -272,6 +276,18 @@ func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
 		t.Fatalf("expected LastConsumedCursor cursor-1, got %q", c.LastConsumedCursor())
 	}
 
+	// Consumed but NOT confirmed: nothing to offer yet.
+	if got := c.ackCursorForOutbound(); got != "" {
+		t.Fatalf("a send would have piggybacked %q after a mere hand-over — the model has not "+
+			"confirmed anything, so this client has nothing to assert on its behalf", got)
+	}
+
+	// The model confirms. This server declares no features, so the
+	// confirm is adopted without waiting for a reply it will never get.
+	if _, err := c.ConfirmReceived("cursor-1"); err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
+
 	if err := c.Send("hello", nil, "", "", nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -279,7 +295,7 @@ func TestAckCursorPiggybacksOnSendAfterConsuming(t *testing.T) {
 	select {
 	case m := <-gotMsg:
 		if m.AckCursor != "cursor-1" {
-			t.Fatalf("expected piggybacked ackCursor %q, got %q", "cursor-1", m.AckCursor)
+			t.Fatalf("expected the confirmed cursor %q to be piggybacked, got %q", "cursor-1", m.AckCursor)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received the send")
@@ -918,13 +934,18 @@ func TestConfirmReceivedOnTeamsSessionReturnsNilWhenServerDoesNotReply(t *testin
 	}
 }
 
-func TestAckLoopSendsStandaloneAckWhenIdleAndConsumedMoved(t *testing.T) {
-	origAckIdleInterval := ackIdleInterval
-	ackIdleInterval = 50 * time.Millisecond
-	defer func() { ackIdleInterval = origAckIdleInterval }()
-
+// The idle receipt loop is gone, and a test that it fires would now be a
+// test of nothing. Every path that advances the confirmed position writes
+// its receipt before returning, so a timer could only find the two
+// already equal — except after a refusal, where it would have re-sent the
+// OLD position to a server that refuses exactly those. See the note where
+// the loop used to live.
+//
+// What replaces it is asserted instead: a confirm sends its receipt
+// itself, and nothing else does.
+func TestAConfirmSendsItsOwnReceiptAndNoTimerRepeatsIt(t *testing.T) {
 	upgrader := websocket.Upgrader{}
-	gotAck := make(chan wire.Ack, 1)
+	acks := make(chan wire.Ack, 8)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -932,26 +953,22 @@ func TestAckLoopSendsStandaloneAckWhenIdleAndConsumedMoved(t *testing.T) {
 		}
 		defer conn.Close()
 		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
-		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "hi", TS: "ts1", Cursor: "cursor-1"})
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text: "hi", TS: "ts1", Cursor: "cursor-1"})
 		for {
-			var raw json.RawMessage
-			if err := conn.ReadJSON(&raw); err != nil {
+			var a wire.Ack
+			if err := conn.ReadJSON(&a); err != nil {
 				return
 			}
-			typ, err := wire.DecodeType(raw)
-			if err != nil || typ != wire.TypeAck {
-				continue
+			if a.Type == wire.TypeAck {
+				acks <- a
 			}
-			var a wire.Ack
-			json.Unmarshal(raw, &a)
-			gotAck <- a
-			return
 		}
 	}))
 	defer srv.Close()
 
-	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, err := dialTest(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
+	c, err := dialTest("ws"+strings.TrimPrefix(srv.URL, "http"),
+		"6ba7b810-9dad-11d1-80b4-00c04fd430c8", DialOptions{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -967,13 +984,23 @@ func TestAckLoopSendsStandaloneAckWhenIdleAndConsumedMoved(t *testing.T) {
 	events, _ := c.DrainEvents()
 	c.MarkConsumed(events)
 
+	if _, err := c.ConfirmReceived("cursor-1"); err != nil {
+		t.Fatalf("ConfirmReceived: %v", err)
+	}
 	select {
-	case a := <-gotAck:
+	case a := <-acks:
 		if a.AckCursor != "cursor-1" {
-			t.Fatalf("expected standalone ack for cursor-1, got %+v", a)
+			t.Fatalf("the confirm's own receipt named %q, want cursor-1", a.AckCursor)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("never received a standalone ack after the idle interval")
+		t.Fatal("a confirm sent no receipt of its own")
+	}
+
+	// Nothing repeats it.
+	select {
+	case a := <-acks:
+		t.Fatalf("a second receipt was sent with nothing newly confirmed: %+v", a)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 
