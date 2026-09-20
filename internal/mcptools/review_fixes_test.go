@@ -558,3 +558,39 @@ func TestAGenuineFirstConnectSaysNothingAboutOtherScopes(t *testing.T) {
 		t.Errorf("a first-ever connect was warned about other scopes:\n%s", textOf(res))
 	}
 }
+
+// hub_send must refuse a "#hub …" first line rather than relay it.
+//
+// That line is understood only by the relayed-reply path, which parses it
+// out and acts on it. hub_send takes the same things as real arguments
+// and never parses it — so one written there goes out as visible text to
+// everyone in the session, while the caller believes it directed the
+// message and confirmed a cursor. Seen live: a message whose directive
+// line was read by every peer, and asked about by one.
+func TestHubSendRefusesADirectiveLineRatherThanRelayingIt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		text    string
+		refused bool
+	}{
+		{"a directive line", "#hub conn=relay confirm=123.45\nthe actual message", true},
+		{"leading whitespace does not smuggle it past", "  #hub conn=relay\nbody", true},
+		{"prose that merely mentions it is prose", "the #hub line is only for replies", false},
+		{"a hash that is not the prefix", "#hubbub is not a directive", false},
+		{"a later line is not the first line", "hello\n#hub conn=relay", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := RefuseDirectiveLine(tc.text)
+			if tc.refused && err == nil {
+				t.Fatalf("hub_send would have relayed %q as visible text while the caller believed "+
+					"its directives took effect", tc.text)
+			}
+			if !tc.refused && err != nil {
+				t.Fatalf("ordinary text was refused: %v", err)
+			}
+			if tc.refused && !strings.Contains(err.Error(), "Nothing was sent") {
+				t.Errorf("the refusal does not say whether anything was sent: %v", err)
+			}
+		})
+	}
+}

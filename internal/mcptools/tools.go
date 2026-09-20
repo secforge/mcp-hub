@@ -3512,6 +3512,9 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if err := RefuseDirectiveLine(text); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	to := req.GetString("to", "")
 	if to != "" && !wire.IsValidID(to) {
 		return mcp.NewToolResultError("to must be a UUID"), nil

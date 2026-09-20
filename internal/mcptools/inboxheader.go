@@ -91,3 +91,29 @@ func (h inboxHeader) Summary() string {
 	}
 	return strings.Join(h.Directives, " ")
 }
+
+// RefuseDirectiveLine reports an error when text begins with the "#hub "
+// line that ONLY the relayed-reply path understands.
+//
+// That line is how a SendMessage reply carries what SendMessage cannot:
+// which connection, whom to direct it to, a cursor to confirm. hub_send
+// takes all of those as real arguments and never parses it, so a caller
+// that puts one there has its directives relayed verbatim, as prose, to
+// everyone in the session — and believes the opposite, because nothing
+// says otherwise.
+//
+// Refused rather than stripped. Stripping would send a message the caller
+// did not write, and silently drop a confirm it believes it made; the
+// caller has the arguments available and needs to be told to use them.
+// Same principle the reply path already applies to a mistyped directive:
+// refuse, rather than relay something that looks like an instruction.
+func RefuseDirectiveLine(text string) error {
+	first, _, _ := strings.Cut(text, "\n")
+	if !strings.HasPrefix(strings.TrimSpace(first), strings.TrimSpace(inboxHeaderPrefix)+" ") {
+		return nil
+	}
+	return fmt.Errorf("this message starts with a %q line, which only a relayed SendMessage reply "+
+		"understands — hub_send does not parse it and would send it as visible text. Its "+
+		"directives are arguments here: connection, to, replyTo, confirmCursor, format. Nothing "+
+		"was sent", strings.TrimSpace(inboxHeaderPrefix))
+}
