@@ -823,3 +823,44 @@ identical to one that failed to echo it, and an id-less error from a
 correlating server is the ordinary case (an unsolicited notice, or
 `bad_correlation`, which cannot echo the value it is bounding). The code
 distinguishes them, never the absence.
+
+## A green assertion between two stacked defects
+
+2026-09-20, on the correlation id, and the only entry here that is about
+a test passing rather than failing.
+
+Two defects sat on the same path. `decodeEvent` never carried the echoed
+correlation id onto a `msg`, so `ev.CorrelationID` was empty for every
+history answer. The divert then matched a history claim on the anchor
+instead of the id, so a late answer went to whoever retried the same
+question.
+
+A reproduction was written for the second. A fix was proposed for the
+second. The reproduction passed against the proposed fix — and it passed
+for a reason that had nothing to do with the fix: with the id dropped at
+decode, a "match by id" rule refused EVERY history answer, and the test
+read that blanket refusal as the misattribution being cured.
+
+The proposed fix would have hung every history walk against a
+correlating server. The test that was supposed to establish it was what
+concealed it.
+
+**What makes this its own entry.** The usual advice — write a
+reproduction, watch it fail, apply the fix, watch it pass — was followed
+exactly and produced a wrong conclusion. Red-then-green establishes that
+behaviour changed, never that it changed for the stated reason. Where two
+defects lie on one path, the first can make the second's test pass by
+disabling the path altogether, and nothing in the transition says so.
+
+**What would have caught it**, and did, on the second attempt: asserting
+BOTH directions. A rule that believes an id must be tested by an answer
+that carries the right one AND by an answer that carries none — the
+first alone passes a client that ignores ids, the second alone passes a
+client that refuses everything. Two of today's fixes now carry that pair,
+and the terminator test exists only because the negative case was asked
+for.
+
+Related in shape and not in cause: chat-relay's reflection test proved
+its records COULD carry the id and said nothing about whether any call
+site set one; four of seven acks did not. The capability was present, the
+wiring absent, and a green suite spanned the gap.
