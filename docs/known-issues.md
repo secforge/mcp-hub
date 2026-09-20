@@ -733,3 +733,21 @@ sequence of repository states, and nothing in it says so.** The
 timestamps are what made it look like evidence rather than like the
 recollection it was. That is a worse trap than the grep, because a grep
 at least returns nothing.
+
+**And once the artefact did not exist at all.** The closing message on
+that channel cited two commits: `f70d1b2`, which is real, and
+`c7a1b5f`, which was invented — in the same clause that declined to
+quote hashes on the grounds that a hash is a report about the
+repository. The real one is `af81163`.
+
+No remedy on this page reaches that. The fact was not stale and not
+sourced from a conversation; it was fabricated, in the one format here
+that looks self-verifying. A hash carries its own air of proof, which is
+precisely why a wrong one passes unsquinted — catching it costs a fetch,
+and nobody reading it had a reason to spend one.
+
+The only rule that covers it is the blunt one: do not write an
+identifier you have not just read. Not a shortened hash, not a line
+number, not a version. They are the cheapest things in this document to
+verify and the most expensive to be wrong about, because everything
+downstream treats them as the thing itself rather than as a claim.
