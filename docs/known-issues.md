@@ -725,3 +725,11 @@ to a remote.
 What settled every one of these was the same act: reading `main`. A
 commit hash quoted on a channel is a report about the repository exactly
 as a grep is a report about a file, and both were true when sent.
+
+One of the two sent an urgent correction built from the cursor timeline
+on the channel — every message in order, with timestamps — and named
+afterwards why it felt like proof: **a sequence of message times is not a
+sequence of repository states, and nothing in it says so.** The
+timestamps are what made it look like evidence rather than like the
+recollection it was. That is a worse trap than the grep, because a grep
+at least returns nothing.
