@@ -254,3 +254,79 @@ func TestTheServersDeclaredAttachmentLimitsAreConsultedBeforeEncoding(t *testing
 		})
 	}
 }
+
+// MCP_HUB_PROJECT_DIR outranks the MCP client's advertised roots.
+//
+// It did not, and the arrangement that broke is the one no test here
+// could reach: roots was consulted first, a client that answers roots
+// always answers, and the fallback that reads the variable was therefore
+// unreachable in an MCP session. Setting it did nothing in the only place
+// anyone would set it, and the store recorded connections under the
+// client's root instead. Observed live: a process with
+// MCP_HUB_PROJECT_DIR=/source/mcp-hub/x+test wrote under
+// /source/mcp-hub/x.
+//
+// The ordering is asserted here rather than the outcome alone: a winner
+// that is merely returned first is indistinguishable from one that won
+// after asking, and asking is what made the variable useless.
+func TestAnExplicitProjectOverrideOutranksTheClientsRoots(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		override  string
+		root      string
+		cwd       string
+		want      string
+		wantAsked bool
+	}{
+		{
+			name:     "the override wins and roots is never consulted",
+			override: "/source/mcp-hub/x+test", root: "/source/mcp-hub/x", cwd: "/source/mcp-hub/x",
+			want: "/source/mcp-hub/x+test", wantAsked: false,
+		},
+		{
+			name: "without it, roots still beats the working directory",
+			root: "/source/mcp-hub/x", cwd: "/somewhere/else",
+			want: "/source/mcp-hub/x", wantAsked: true,
+		},
+		{
+			name: "and the working directory is the last resort",
+			cwd:  "/somewhere/else",
+			want: "/somewhere/else", wantAsked: true,
+		},
+		{
+			name: "everything absent degrades to the unnamed scope, not a crash",
+			want: "", wantAsked: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asked := false
+			got := resolveProject(tc.override,
+				func() string { asked = true; return tc.root },
+				func() string { return tc.cwd })
+			if got != tc.want {
+				t.Errorf("resolved %q, want %q", got, tc.want)
+			}
+			if asked != tc.wantAsked {
+				if asked {
+					t.Errorf("the client was asked for its roots although an explicit override was " +
+						"set — an override that is consulted after an inference is an override that " +
+						"does nothing wherever the inference succeeds")
+				} else {
+					t.Errorf("the client was never asked for its roots")
+				}
+			}
+		})
+	}
+}
+
+// And the override reaches that decision from the environment at all.
+func TestTheProjectOverrideIsReadFromTheEnvironment(t *testing.T) {
+	t.Setenv("MCP_HUB_PROJECT_DIR", "/source/mcp-hub/x+test")
+	if got := connstore.ProjectOverride(); got != "/source/mcp-hub/x+test" {
+		t.Fatalf("ProjectOverride() = %q, want the value of MCP_HUB_PROJECT_DIR", got)
+	}
+	t.Setenv("MCP_HUB_PROJECT_DIR", "")
+	if got := connstore.ProjectOverride(); got != "" {
+		t.Fatalf("ProjectOverride() = %q with the variable unset, want empty", got)
+	}
+}

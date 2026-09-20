@@ -229,6 +229,16 @@ type ListedEntry struct {
 // which is already unique and already the thing a human recognises.
 type state map[string]map[string]Entry
 
+// ProjectOverride is MCP_HUB_PROJECT_DIR, or "" when it is unset.
+//
+// It is an EXPLICIT override and outranks everything a caller can infer,
+// including an MCP client's advertised roots. Roots is the better guess
+// at which project a client has open, but a guess is what it is, and a
+// variable someone set by hand is a statement. A caller that consults
+// roots must consult this first, or the variable silently does nothing in
+// the one place it is most likely to be used.
+func ProjectOverride() string { return os.Getenv("MCP_HUB_PROJECT_DIR") }
+
 // CurrentProject identifies "this working directory" for Target.Project —
 // MCP_HUB_PROJECT_DIR if set (an explicit override, and how tests get
 // isolation without touching the real cwd), else the process's actual
@@ -240,7 +250,7 @@ type state map[string]map[string]Entry
 // means every such invocation shares one "unknown project" scope — a
 // degraded-but-safe fallback, not a crash.
 func CurrentProject() string {
-	if p := os.Getenv("MCP_HUB_PROJECT_DIR"); p != "" {
+	if p := ProjectOverride(); p != "" {
 		return p
 	}
 	wd, err := os.Getwd()

@@ -234,30 +234,65 @@ func startupConnectionsNote() string {
 var rootsRequestTimeout = 2 * time.Second
 
 // projectForConnect resolves the project scope for a connstore.Target,
-// preferring the MCP client's own advertised roots (see mcp-go's
-// server.MCPServer.RequestRoots) over connstore.CurrentProject's
-// $PWD-based fallback — roots is the actual spec mechanism for "what
-// project(s) does the client have open," whereas $PWD is merely what this
-// process happened to inherit at launch, which is usually but not
-// necessarily the same thing. Falls back silently (no error surfaced) if
-// the client has no ClientSession in ctx, doesn't support roots, times
-// out, or reports none — connstore.CurrentProject's own fallback already
-// degrades safely to "" in the worst case.
+// in three steps, most explicit first.
+//
+// MCP_HUB_PROJECT_DIR wins outright. It is a statement rather than an
+// inference, and it is consulted BEFORE roots: asking the client first
+// meant the variable had no effect in an MCP session at all, since a
+// client that answers roots always answers, so the fallback that reads it
+// was unreachable exactly where someone would set it.
+//
+// Otherwise the MCP client's advertised roots (see mcp-go's
+// server.MCPServer.RequestRoots), which is the spec mechanism for "what
+// project(s) does the client have open" and a better answer than $PWD.
+//
+// Otherwise connstore.CurrentProject's $PWD, which is merely what this
+// process inherited at launch — usually the same thing, not necessarily.
+// Reached silently (no error surfaced) when the client has no
+// ClientSession in ctx, does not support roots, times out, or reports
+// none, and it degrades safely to "" in the worst case.
 func projectForConnect(ctx context.Context) string {
-	mcpServer := server.ServerFromContext(ctx)
-	if mcpServer != nil {
-		rootsCtx, cancel := context.WithTimeout(ctx, rootsRequestTimeout)
-		result, err := mcpServer.RequestRoots(rootsCtx, mcp.ListRootsRequest{
-			Request: mcp.Request{Method: string(mcp.MethodListRoots)},
-		})
-		cancel()
-		if err == nil && len(result.Roots) > 0 {
-			if p := strings.TrimPrefix(result.Roots[0].URI, "file://"); p != "" {
-				return p
-			}
-		}
+	return resolveProject(connstore.ProjectOverride(), func() string { return rootFromClient(ctx) },
+		connstore.CurrentProject)
+}
+
+// resolveProject is the precedence itself, separated from the plumbing
+// that supplies each answer so the ordering can be tested without an MCP
+// client on the other end. That separation is not incidental: the
+// ordering was wrong, and it was wrong in the one arrangement no test in
+// this package could reach, because a test context has no client session
+// and so never consults roots at all.
+//
+// askRoots is a func rather than a value so the ordering is observable —
+// a caller that wins outright must not have asked.
+func resolveProject(override string, askRoots func() string, cwd func() string) string {
+	if override != "" {
+		return override
 	}
-	return connstore.CurrentProject()
+	if p := askRoots(); p != "" {
+		return p
+	}
+	return cwd()
+}
+
+// rootFromClient is the first root the MCP client advertises, or "" for
+// any reason at all: no ClientSession in ctx, no support for roots, a
+// timeout, or none reported. Every one of those means the same thing here
+// and none is worth surfacing, since the caller has a further fallback.
+func rootFromClient(ctx context.Context) string {
+	mcpServer := server.ServerFromContext(ctx)
+	if mcpServer == nil {
+		return ""
+	}
+	rootsCtx, cancel := context.WithTimeout(ctx, rootsRequestTimeout)
+	defer cancel()
+	result, err := mcpServer.RequestRoots(rootsCtx, mcp.ListRootsRequest{
+		Request: mcp.Request{Method: string(mcp.MethodListRoots)},
+	})
+	if err != nil || len(result.Roots) == 0 {
+		return ""
+	}
+	return strings.TrimPrefix(result.Roots[0].URI, "file://")
 }
 
 // catchUpIDForRelay derives connstore's persistence identity for a
@@ -265,8 +300,8 @@ func projectForConnect(ctx context.Context) string {
 // connTarget's comment: teams-session identity/reconnectSecret has
 // never been connstore's to track), so this uses connstore.TeamsID
 // targetForLink identifies a connection in connstore: the WHOLE link,
-// credential included, scoped to one project (see
-// connstore.CurrentProject) so two agents on the same machine connected to
+// credential included, scoped to one project (see projectForConnect, which
+// resolves it) so two agents on the same machine connected to
 // different conversations — or to the same conversation from two different
 // project directories — never collide.
 //
