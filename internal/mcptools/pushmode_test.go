@@ -619,7 +619,7 @@ func TestABacklogIsReturnedWhenThereIsNothingToPushInto(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -680,7 +680,7 @@ func TestAnAbsentBacklogIsNotReportedAsCaughtUp(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,7 +64,7 @@ func startRelayTestServer(t *testing.T) (link string, gotHeaders func() http.Hea
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	return link, func() http.Header { return captured }
 }
 
@@ -88,7 +89,7 @@ func startRelayTestServerWithJoined(t *testing.T, joined wire.Joined) (link stri
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 }
 
 func TestTeamsRelayConnectSendsHeadersAndReturnsGuidance(t *testing.T) {
@@ -163,7 +164,7 @@ func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T)
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -225,7 +226,7 @@ func startRelayTestServerCapturingClientMessages(t *testing.T) (link string, got
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	return link, gotRaw
 }
 
@@ -279,7 +280,7 @@ func startRelayTestServerEchoingAcks(t *testing.T) (link string) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 }
 
 func TestHubReactSendsReactionRequest(t *testing.T) {
@@ -628,7 +629,7 @@ func TestHubConfirmSurfacesBehindFromServerReply(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -1190,7 +1191,7 @@ func TestCatchUpWithPriorPositionSendsMessageAfterWithCursor(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -1262,7 +1263,7 @@ func TestCatchUpReportsCaughtUpOnNoMoreMessages(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -1327,7 +1328,7 @@ func TestCatchUpSeeksWhenNoPriorCursorButBehindReported(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -1437,7 +1438,7 @@ func TestCatchUpPersistsCursorAcrossHubInstances(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	first := NewHub()
@@ -1538,7 +1539,7 @@ func TestCatchUpSkipsMessageAlreadyHandedOverViaHubReceive(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -1641,7 +1642,7 @@ func TestHandedOverAheadPersistsAcrossHubInstances(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	first := NewHub()
@@ -1725,7 +1726,7 @@ func TestCatchUpSeekRecordsGapAndSurfacesItOnLaterCalls(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -1792,7 +1793,7 @@ func TestBehindNoteSurfacesRecordedGapAtConnect(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#secret-1"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#secret-1"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -1897,7 +1898,7 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -2006,7 +2007,7 @@ func TestCatchUpGapRetrievesPeerlessSystemMsg(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -2076,7 +2077,7 @@ func TestCatchUpGapDedupBranchPrunesHandedOverAhead(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -2156,7 +2157,7 @@ func TestCatchUpSeeksPastALargeBacklogEvenWithAKnownCursorAndOnlyOnce(t *testing
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -2250,7 +2251,7 @@ func TestCatchUpWalksALargeBacklogWhenTheSkipCouldNotBeRecorded(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -2429,7 +2430,7 @@ func TestLiveDeliveryConfirmsItselfOnceKnownCaughtUp(t *testing.T) {
 		<-make(chan struct{})
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -2536,7 +2537,7 @@ func TestReadRecordsTheDeliveryWithoutConsumingTheBacklog(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -2692,7 +2693,7 @@ func startPinServer(t *testing.T, features map[string]json.RawMessage, pinnedAtC
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 }
 
 func connectForPins(t *testing.T, link string) (*Hub, context.Context, *mcp.CallToolResult) {
@@ -2878,7 +2879,7 @@ func startFilterServer(t *testing.T, features map[string]json.RawMessage,
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link = "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	return link, func() []wire.MessageAfter {
 		mu.Lock()
 		defer mu.Unlock()
@@ -3195,7 +3196,7 @@ func TestGracefulServerRestartReadsAsDeliberateWithWaitAdvice(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
@@ -3251,7 +3252,7 @@ func TestUnannouncedDropSaysNothingAboutIntent(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
@@ -3302,7 +3303,7 @@ func TestGracefulCloseWithoutAnAnnouncementStillReadsAsDeliberate(t *testing.T) 
 	}))
 	t.Cleanup(srv.Close)
 
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
@@ -3379,7 +3380,7 @@ func restartOnceServer(t *testing.T, graceful bool, announce int) (link string, 
 		conn.NetConn().Close()
 	}))
 	t.Cleanup(srv.Close)
-	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret",
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret",
 		func() int { mu.Lock(); defer mu.Unlock(); return n }
 }
 
@@ -3882,7 +3883,7 @@ func TestFailedReconnectRetriesAndSaysHowToStop(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 	hub := NewHub()
 	req := mcp.CallToolRequest{}
@@ -3959,7 +3960,7 @@ func TestDisconnectStopsTheRetryLoop(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 	hub := NewHub()
 	req := mcp.CallToolRequest{}
@@ -4037,7 +4038,7 @@ func TestCatchUpMeasuresFromItsOwnCursorWhenTheServerStatedNoBacklog(t *testing.
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#measured-backlog"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#measured-backlog"
 
 	ctx := context.Background()
 	hub := NewHub()
@@ -4156,7 +4157,7 @@ func TestASeekDoesNotClaimSilenceFromAServerThatSpoke(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#spoke-and-measured"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#spoke-and-measured"
 
 	ctx := context.Background()
 	hub := NewHub()
@@ -4231,7 +4232,7 @@ func TestReadResolvesAnAttachmentOnTheMessageItReturns(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -4292,7 +4293,7 @@ func TestAGapThatStartsAtACursorIsRetrievedByCursor(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -4364,7 +4365,7 @@ func TestCatchUpAndConfirmDoNotRaceOnTheReadingPosition(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -4436,7 +4437,7 @@ func TestAPushedAttachmentIsFetchedWhileTheReaderIsInItsCallback(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -4489,7 +4490,7 @@ func TestAPermanentRefusalEndsTheConnectionInsteadOfRetrying(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -4552,7 +4553,7 @@ func TestReadReturnsUpToTheLimitInOneCall(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -4627,7 +4628,7 @@ func TestReadStopsOnSizeAndSaysSo(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -4705,7 +4706,7 @@ func TestAGapIsRetrievedInABatchWhenALimitIsGiven(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -4778,7 +4779,7 @@ func TestAGapWithoutALimitStillComesOneAtATime(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -4847,7 +4848,7 @@ func TestAReadThatCoversTheGapSettlesIt(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -4914,7 +4915,7 @@ func TestAReadStartingElsewhereLeavesTheGapAlone(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -5206,7 +5207,7 @@ func TestAFilteredReadDoesNotClaimToBeAllHistory(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#the-link-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
 	ctx := context.Background()
 
 	hub := NewHub()
@@ -5345,3 +5346,22 @@ func TestALiveOwnersDirectoryIsNeverSweptForAge(t *testing.T) {
 		t.Fatalf("a proven-live owner's directory was swept for being old: %v", err)
 	}
 }
+
+// uniqueConvID makes every test link distinct.
+//
+// A connstore Target is {link, project}, and a test link embeds an
+// httptest server's address. Those ports are recycled: once a server is
+// closed, a later test can be handed the same one and compute a Target
+// byte-for-byte identical to an earlier test's — inheriting whatever that
+// test persisted under it, most damagingly a stored cursor. The failures
+// looked like load, because load is what makes reuse likely, but no load
+// is required and the port is doing the work.
+//
+// Appending this to the conversation id makes the Target unique whatever
+// the port does. It goes in the query rather than the fragment because
+// the fragment is the link's secret and one test asserts its exact value.
+func uniqueConvID() string {
+	return strconv.FormatUint(convIDSeq.Add(1), 10)
+}
+
+var convIDSeq atomic.Uint64

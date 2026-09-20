@@ -62,7 +62,7 @@ func TestGapRetrievalDoesNotMoveTheWireReceipt(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#gap-receipt-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#gap-receipt-secret"
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
@@ -129,7 +129,7 @@ func TestPushCatchUpReportsAServerRefusalRatherThanACursorlessMessage(t *testing
 		}
 	}))
 	t.Cleanup(srv.Close)
-	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc#push-refusal-secret"
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#push-refusal-secret"
 	ctx := context.Background()
 
 	hub := NewHub()

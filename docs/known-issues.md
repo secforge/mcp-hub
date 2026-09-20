@@ -21,11 +21,43 @@ test alone and 3 full runs of the package, all clean. Earlier in the same
 session the same test failed once and 8 subsequent runs (4 on the working
 tree, 4 at HEAD) were clean.
 
-**What that narrows it to.** The failure is a timeout, and it appears only
-when the whole package runs — so the likely cause is the test's own
-server-response deadline being missed under the load of the rest of the
-suite, not a defect in catch-up itself. That is a hypothesis; nothing here
-has been instrumented to confirm it.
+**What that narrowed it to, and why that was wrong.** The failure is a
+timeout, it appears only when the whole package runs, and the hypothesis
+recorded here for four days was the test's own server-response deadline
+being missed under the load of the rest of the suite. It said plainly
+that nothing had been instrumented to confirm it. Nothing ever was, and
+it was at best half right.
+
+**The mechanism, found by reading rather than by timing.** A connstore
+Target is {link, project}, and a test link embeds an httptest server's
+address. Those ports are RECYCLED. Once a server closes, a later test can
+be handed the same port and compute a Target byte-for-byte identical to
+an earlier test's, inheriting whatever that test persisted under it —
+most damagingly a stored cursor, which several of these tests write as
+"cursor-confirmed". No load is required for that. Load only changes the
+timing that makes reuse likely, which is why the family looked like a
+load problem and why every isolated re-run passed.
+
+The file already knew the hazard in one place:
+`TestCatchUpGapWalksThenClearsOnReachingTo` calls `clearCatchUpGap` first
+and says why. The defence had been applied to gaps and not to the cursor.
+
+Found by the external reviewer on 2026-09-20, from two consecutive full
+runs failing on different tests, both complaining that a stored position
+existed where none should.
+
+**The fix**, and what it is not. Every test link now carries a unique
+conversation id (`uniqueConvID`), so the Target is unique whatever the
+port does; it goes in the query rather than the fragment because the
+fragment is the link's secret and a test asserts its exact value. Four
+consecutive full-module runs afterwards were clean, against the
+reviewer's two failures in four immediately before.
+
+Four clean runs is evidence and not proof, and the reviewer was explicit
+that several members of this family failed as bare timeouts with no
+cursor involved — those are not explained by port reuse and may still be
+the load hypothesis, or may be something else again. The entry stays
+open.
 
 **Why it matters anyway.** A test that fails only under load and passes on
 every retry trains a reader to re-run rather than to look, which is exactly
