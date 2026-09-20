@@ -73,3 +73,60 @@ attachment directories judged abandoned by age alone.
 The fatal-error allowlist added for finding 13 lists six codes chosen
 from what had been seen in practice, not from a protocol document. The
 reviewer flagged that it still needs one.
+
+## The second review, 2026-09-20
+
+`DEEP-REVIEW-2026-09-20.md` is the same reviewer's deeper pass, run
+against the released v3.1.4 plus the fixes in flight that morning. Ten
+findings; all ten are fixed.
+
+**The report's own text lags its author's later messages, and the file
+is kept verbatim rather than edited to agree with them.** It was written
+while the fixes were still landing, so:
+
+- Finding 4 (stale reconnect bookkeeping) reads "remains open". It was
+  closed afterwards by making the store write itself the ownership check
+  — `persistConnectedIfStillHolding` — rather than guarding a
+  compensating write. The reviewer confirmed both interleavings pass
+  together.
+- Findings 1 and 2 (late-ack attribution, cross-operation errors) are
+  described as needing a protocol change with "no mitigation
+  implementation was made in this review". The mitigation WAS
+  implemented here afterwards: a timed-out request records an owed
+  answer which routing then spends, and an uncorrelated error with more
+  than one claim pending is delivered to nobody. The reviewer re-ran its
+  own reproductions against that and reported both passing.
+- Finding 3 (a refusal becoming a confirmation) was raised from P2 to P1
+  after the report was attached, because the refused cursor was being
+  persisted.
+
+What the report says about its LIMITS still stands and is the reason it
+is kept: no Codex push session and no Windows runtime were exercised,
+its scheduling seam exists only in its own snapshot, and the server-side
+correlation id it recommends is not authorised by a review.
+
+### On the archived copy of the second report
+
+`DEEP-REVIEW-2026-09-20.md` is revision 14 of a document its author
+revised roughly every minute while three sessions corrected each other
+on the hub. Kept verbatim, as the first report is.
+
+Its account of the cross-session push test took eighteen revisions to
+settle, and one clause in it — whether either confirm route was
+isolated — oscillated six times across four authors, three of those
+with the correction already in hand. That oscillation is recorded in
+the known-issues entry as a finding in its own right: a record whose
+shape regenerates the same error in whoever writes the next sentence.
+
+The revision kept here is the one that resolved it. It now separates
+the frozen 46740→46753 push-receipt window from the later
+route-isolation intervals, marks the piggyback bracket recovered rather
+than recorded, and carries the quiet-channel asymmetry. It agrees with
+the known-issues entry. The
+settled version is in `docs/known-issues.md` under the Codex push
+entry, which records the frozen window, both isolation brackets, which
+of them was luck, and the sentence four separate authors got wrong.
+
+Where the two disagree, the known-issues entry is the one that was
+argued to a conclusion. Where they agree, neither adds anything to the
+other.

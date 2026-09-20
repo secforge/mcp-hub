@@ -46,6 +46,13 @@ here only after those six, and with the same caveat as the rest — the
 shape (a timeout under load, never reproducible) is what puts it here,
 not a diagnosis.
 
+`TestCatchUpGapRetrievesPeerlessSystemMsg` failed once on 2026-09-20 in a
+full `-race` run and never again in ten further runs (six of the package
+in isolation, four of the whole package). Its failure text was NOT
+captured before it stopped reproducing, so this entry records a failure
+without a reason — which is the weakest kind of entry here and is said
+plainly rather than dressed up as a diagnosis.
+
 `TestAnnouncedRestartKeepsTheFollowerAlive` was filed here too and did not
 belong: it was failing for a stated reason (it took the first pending
 note, which had become the new drop notice rather than the reconnect
@@ -111,8 +118,163 @@ is the failure this exists to prevent rather than cause. Where a Codex
 caller appears with no reachable harness, the blocking loop and its
 instructions stay exactly as they were.
 
-**What has not happened.** None of it has been exercised against a real
-Codex session. The thread-id latching from `_meta.threadId`, the receipt
+**The CLAUDE half is now measured, end to end.** On 2026-09-20 a
+push-mode Claude Code peer on chat-relay's hub stated its confirmed
+position and its predictions in advance, took six pushed messages
+without confirming, reconnected, and caught up. It resumed from
+639254998744309000.46740 — its last CONFIRMED cursor, below the last
+pushed one (…46746) — and re-walked ten messages, including all six of
+the unconfirmed set. chat-relay's server-side ACKED_CURSOR read the
+same 46740, and its log shows the successive messageAfter requests
+doing the walk.
+
+THE MEASURED WINDOW, frozen before the outcome was known, is two
+readings and nothing else:
+
+	46740  unmoved, after six unconfirmed pushes and a process restart
+	46753  moved, on a confirm carried as confirmCursor on a send,
+	       naming exactly that cursor
+
+Everything after 46753 on that peer is housekeeping and is not part of
+the result. Quoting a later value would undo the freezing, which is the
+thing that made this a measurement rather than a story about one.
+
+BOTH DIRECTIONS were witnessed on the same peer inside twenty minutes,
+which is what makes it a measurement: six unconfirmed pushes and a
+process restart left the column at 46740, and one confirm then moved it
+to 639254999518371000.46753. A position that never advances is
+indistinguishable from one that CANNOT, so the second half is not a
+formality.
+
+BOTH ROUTES to that column are attested. The peer's confirm history, as
+it posted it: one standalone hub_confirm to 46738, then four sends
+carrying confirmCursor — the second of which set the 46740 this test was
+measured against — then two further standalones after the test closed.
+So the tool's own "or piggyback it on your next send" is a witnessed
+claim rather than an assumption, and the standalone path is not untested
+either.
+
+ISOLATION, which is a stronger claim than attestation and was argued
+over:
+
+	standalone  ISOLATED. Read 46781 at 11:23:07Z, standalone confirms
+	            and nothing else from that peer, read 46787 at
+	            11:24:15Z — exactly the cursor named.
+	piggyback   ISOLATED, on a bracket recovered rather than recorded.
+	            Reading at 11:19:21.6604 showing 46740; one send carrying
+	            confirmCursor 46753; reading POSTED at 11:20:06 showing
+	            46753, with no other confirm from that peer until after
+	            that post. The right edge's actual moment is unrecorded
+	            and no claim is made about it.
+
+	            What closes that bracket is not its narrowness but that
+	            nothing else touched the column inside it — ordinary
+	            traffic does not write this column, only an ack frame
+	            does, so only another CONFIRM would have spoiled it.
+	            Established by enumerating what was ABSENT rather than by
+	            timing what was present.
+
+ONE OF THOSE TWO BRACKETS WAS LUCK, and that is the point worth keeping.
+The standalone one is clean because the server's author had by then
+started stating the moment each reading was taken. The piggyback one had
+to be reconstructed afterwards, and only worked because the traffic was
+sparse enough to enumerate — on a busy connection it would not have been
+recoverable at all. That is the argument for a receipt log carrying the
+cursor AND the moment, made against this morning's own posts rather than
+against a hypothetical.
+
+An earlier version of this entry wrote that bracket's right edge as
+11:19:39.4272. That figure is a LAST_SEEN value — an activity timestamp
+— not the moment of the read, and using it as one is the same
+column-confusion the same people had diagnosed hours earlier. Corrected
+here, and recorded, because it happened to the person who had diagnosed
+it.
+
+THE FROZEN WINDOW ISOLATES NOTHING ABOUT CONFIRM ROUTES. Both routes had
+been used before it opened; its job was the push receipt. It does
+exclude one thing the brackets cannot: a spontaneous ack writer. If a
+push emitted a receipt, the 46740 reading could not exist.
+
+The recurring error worth recording is not any of those: it is that
+"no standalone confirm occurred" was written independently by four
+authors — the server's author, this file, and the reviewer — and
+corrected from the same source each time. None had the history in front
+of them; each had a summary of it. One mistake that the summary form
+keeps producing, because "no standalone" is what the measured window
+looks like from outside, and the window was never where the standalone
+lived.
+
+THE FOURTH INSTANCE IS THE INSTRUCTIVE ONE and it is this file. Having
+watched the other three be corrected, and while actively correcting one
+of them, this entry stated that the standalone established 46740 — right
+about the standalone existing, wrong about what it did, and wrong in a
+way nobody reading the channel could have caught, because only that
+peer's own tool history distinguishes 46738 from 46740. The summary form
+places the standalone and the 46740 adjacent, and adjacency reads as
+causation once the interval between them is gone.
+
+IT WENT ON. The clause reappeared six times in all, from four authors,
+the last three with the correction in hand and paste-ready wording
+already offered. Not stale summaries — the corrections were held at the
+time of writing. The summary form does not merely transmit this error,
+it regenerates it in whoever writes the next sentence.
+
+The server's author stopped correcting it at the fourth attempt, on the
+grounds that the oscillation had become more interesting than the
+sentence, and that "attested but not isolated" is at least wrong in the
+safe direction: it understates the evidence rather than inventing any.
+
+So the finding is not that five people were careless. It is that the
+record's SHAPE produced the same error in whoever handled the summary,
+including the one whose job at that moment was to remove it. The fix is
+the same as the logging item: a line carrying the cursor AND the moment,
+so the interval cannot be lost in the first place. A record that cannot
+be read against the order things happened in gets written up as whatever
+the tidiest available sentence says.
+
+It was nearly filed as a defect: a server read taken moments BEFORE the
+confirm landed showed the old position while the client had already
+reported success, and for one message the two were indistinguishable
+from a client reporting a success the column never took. The runner
+asked instead of assuming. Worth recording as the cheaper of the two
+mistakes available.
+
+THAT HAPPENED THREE TIMES and each reading was both correct and behind.
+A read of a server column and a write to it from another process are not
+ordered by the conversation discussing them, and none of the messages
+carried a timestamp that would let anyone order them afterwards. It was
+benign three times, which is the reason it will eventually be believed
+once too often: anything comparing a client's stated position against a
+server's column has to establish which came first, or it is comparing
+two facts from different moments.
+
+A detail the runner insisted on recording rather than letting stand:
+chat-relay posted that column as a baseline "taken before anything is
+pushed", and it was not — by then six messages had been pushed and the
+reconnect had happened. That makes it better evidence than claimed
+(an after-the-fact reading showing no advance, taken by someone who did
+not yet know it would be used that way), and it is noted here because a
+mislabelled measurement quietly corrected later is worth less than an
+accurate one. So a Claude push receipt really is ObservedNothing
+across the process boundary, not only at the gate this repository's own
+tests drive.
+
+Two limits stated by the people who ran it. It says nothing about the
+CODEX receipt, which is this entry's subject. And chat-relay noted that
+its log records the walk line by line and the receipt not at all — had
+the column moved, it could have reported THAT it moved with nothing
+saying why, which is a gap in the instrument rather than a finding about
+the client.
+
+**What has not happened.** None of the CODEX path has been exercised
+against a real Codex session. One connected to this hub on 2026-09-20
+and was in PULL mode: hub_wait and hub_receive were still in its tool
+list, because the switch is gated on the harness being reachable and
+that session had no harness messaging socket. That is the guard working
+— unregistering the pull tools for a caller this process cannot push to
+would leave it unable to receive at all — and it is why watching a Codex
+peer receive messages proves nothing here: its harness relays the
+conversation whether or not this client pushes anything. The thread-id latching from `_meta.threadId`, the receipt
 handling that distinguishes `ObservedStored`/`ObservedAccepted` from
 `ObservedNothing`, and the mode switch are verified only by this
 repository's own tests and the library's contract.
@@ -198,6 +360,43 @@ no reproduction: HTTP peer and session read under separate locks, and
 `broadcastRoster` publishing outside the lock it built the snapshot
 under — the second is a real hazard for state-not-deltas, since two
 publications can reorder and leave the older one winning.
+
+## Late acks and uncorrelated errors: mitigated, id deferred
+
+A timed-out request's answer used to be handed to whoever asked next —
+send A times out, send B asks, and A's late ack tells B it succeeded,
+with A's externalId. An uncorrelated error with several claims pending
+went to whichever the map yielded first, so a send's refusal could be
+reported as a history read's failure.
+
+MITIGATED, 2026-09-20, without touching the wire: a timed-out request
+records one owed answer of its kind, and routing spends the late answer
+against that record rather than the next caller; an error arriving while
+more than one claim is pending is delivered to nobody and falls through
+to the buffer. Unattributed rather than misattributed, which is the
+honest half of a trade the protocol cannot currently settle: an ack
+carries externalId and ok, an error carries a code, and neither echoes
+anything the request chose.
+
+NOT FIXED, and deliberately so. chat-relay's owner deferred the
+correlation id with a named trigger rather than refusing it: build it
+the first time a send or a refusal is actually seen reported as a
+timeout in real use, or the next time the wire is touched for another
+reason. Both findings came from constructed tests with scheduling hooks
+and neither has been observed in traffic, and everything else in this
+protocol was built after something was measured.
+
+The shape, agreed and recorded on both sides: optional, client-chosen,
+opaque, echoed verbatim on ack AND error, declared in `features` —
+because a server that does not echo it looks exactly like one that does
+not implement it. externalId is explicitly not a substitute: it names a
+stored message and is absent precisely when a send failed.
+
+WHAT TO WATCH FOR, since it is the trigger: with two operations pending,
+a real send_refused now reaches nobody, so a tenant-lock or allowlist
+refusal reads to a model as silence and its next move is a retry that
+will be refused identically. Seeing that in real traffic is the signal
+to build the id.
 
 ## The fatal-error allowlist (settled 2026-09-19)
 
