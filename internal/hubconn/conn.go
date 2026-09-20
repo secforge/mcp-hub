@@ -977,7 +977,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapAckIdl
 		clientRelease:           joined.ClientRelease,
 		features:                joined.Features,
 		featuresDeclared:        joined.Features != nil,
-		correlates:              joined.HasFeature(wire.FeatureCorrelation),
+		correlates:              correlationUsable(joined),
 		lastFrameKind:           "joined",
 		lastFrameAt:             time.Now(),
 		ackIdleInterval:         snapAckIdleInterval,
@@ -1255,6 +1255,45 @@ func (c *Conn) claimNextAckCorrelated(ackKind, token string) (corrID string, res
 	}
 	return corrID, result, cancel, nil
 }
+
+// correlationUsable reports whether this connection should correlate: the
+// server declares the feature AND the cap it declares can hold the id
+// this client mints.
+//
+// The cap is READ, not assumed. A server declaring a maxLength shorter
+// than the id would refuse every correlated request with
+// bad_correlation, so sending one anyway would turn a working connection
+// into one where every request is refused — worse than not correlating at
+// all. Declining the feature instead falls back to the late-answer debt,
+// which is exactly what it is for.
+//
+// A declaration with no maxLength is taken at its word: the field is
+// optional and its absence says the server states no limit, not that the
+// limit is zero.
+func correlationUsable(joined wire.Joined) bool {
+	if !joined.HasFeature(wire.FeatureCorrelation) {
+		return false
+	}
+	var decl struct {
+		MaxLength *int `json:"maxLength"`
+	}
+	if raw, ok := joined.Features[wire.FeatureCorrelation]; ok && len(raw) > 0 {
+		// A payload this client cannot parse is not a refusal: the
+		// feature was declared, and an unrecognised shape is a later
+		// protocol extension rather than a smaller cap.
+		_ = json.Unmarshal(raw, &decl)
+	}
+	if decl.MaxLength != nil && *decl.MaxLength < correlationIDLen {
+		debugf("correlationUsable: server declares correlation maxLength=%d, shorter than the %d-byte "+
+			"id this client mints — not correlating", *decl.MaxLength, correlationIDLen)
+		return false
+	}
+	return true
+}
+
+// correlationIDLen is the length of what newCorrelationID mints: a uuid in
+// its canonical text form.
+const correlationIDLen = 36
 
 // newCorrelationID mints one. A uuid is well inside
 // wire.MaxCorrelationIDLen and carries nothing about this peer — the id

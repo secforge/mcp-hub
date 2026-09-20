@@ -368,3 +368,76 @@ func TestTheIdThisClientChoseIsWhatComesBack(t *testing.T) {
 		t.Fatalf("the ack came back with id %q, want the %q this client sent", ev.CorrelationID, id)
 	}
 }
+
+// The declared cap is read, not assumed. A server that says it accepts
+// less than this client's id would refuse every correlated request, so
+// the feature is declined and the late-answer debt covers the connection
+// instead — a working connection rather than one where every request
+// comes back bad_correlation.
+func TestACapTooSmallForTheIdMeansNotCorrelating(t *testing.T) {
+	shortAckTimeout(t)
+
+	frames := make(chan map[string]any, 4)
+	base := startCorrelatingServer(t, map[string]json.RawMessage{
+		"actionAcks":            json.RawMessage(`{}`),
+		wire.FeatureCorrelation: json.RawMessage(`{"maxLength":8}`),
+	}, func(w *serialWriter, frame map[string]any) {
+		if frame["type"] != string(wire.TypeMsg) {
+			return
+		}
+		frames <- frame
+		w.write(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "x", OK: true})
+	})
+
+	c, err := dialTest(base, "corr-small-cap", DialOptions{})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if c.correlates {
+		t.Fatal("a maxLength of 8 cannot hold a uuid, so every correlated request would be refused " +
+			"with bad_correlation — this connection must fall back rather than send one")
+	}
+	if _, _, err := c.SendAwaitingAck("plain", "", nil, "", "", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case frame := <-frames:
+		if _, present := frame["id"]; present {
+			t.Fatalf("an id was sent to a server whose declared cap is too small for it: %+v", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the server never saw the send")
+	}
+}
+
+// A cap large enough, and a declaration with no cap at all, both
+// correlate. The second matters on its own: an absent maxLength says the
+// server states no limit, and reading it as zero would decline a feature
+// that was offered.
+func TestADeclaredCapThatFitsOrIsAbsentStillCorrelates(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"the agreed cap", `{"maxLength":128}`},
+		{"no cap stated", `{}`},
+		{"a later extension this client does not know", `{"somethingElse":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := startCorrelatingServer(t, map[string]json.RawMessage{
+				"actionAcks":            json.RawMessage(`{}`),
+				wire.FeatureCorrelation: json.RawMessage(tc.payload),
+			}, func(w *serialWriter, frame map[string]any) {})
+			c, err := dialTest(base, "corr-cap-"+tc.name, DialOptions{})
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer c.Close()
+			if !c.correlates {
+				t.Fatalf("features payload %s declined the feature; it should be taken at its word",
+					tc.payload)
+			}
+		})
+	}
+}
