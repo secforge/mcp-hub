@@ -697,3 +697,31 @@ not in the original code — two paths added while repairing a defect that
 reintroduced its exact shape. That is an argument for the second pass
 over the first, and for reviewing repairs at least as closely as the
 code they repair.
+
+### A relay is not a repository
+
+The same afternoon, one level up, and the reason the entry above ends
+where it does.
+
+Between 15:42:54 and 15:43:28 the connecting paragraph was proposed,
+refuted, withdrawn by its author, committed here as the entry, corrected
+here, and then flagged as uncorrected by two separate parties — each of
+whom was accurate about a commit and stale about the repository. Four
+messages crossed a push in ten minutes.
+
+Nothing in a commit can show that. `267e2bf` recorded a channel message
+as a fact about the code's history; it was true when sent and false
+ninety seconds later, and the commit looks identical either way. This is
+the same error as `fd9b201`'s two comments, which recorded another
+party's description of its own server as fact — once about a server's
+behaviour, once about the conversation itself.
+
+The remedy is not "read the file", because the file was fine both times.
+It is that **a fact sourced from a conversation should not be written
+into the tree in the minute it arrives.** A commit is durable, a relay is
+not, and there is no ordering between a message on a channel and a push
+to a remote.
+
+What settled every one of these was the same act: reading `main`. A
+commit hash quoted on a channel is a report about the repository exactly
+as a grep is a report about a file, and both were true when sent.
