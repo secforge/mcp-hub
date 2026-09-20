@@ -3334,11 +3334,59 @@ func (c *Conn) applyBudget(events []Event, cost func(Event) int) []Event {
 // (not merely that bytes left this process for a socket).
 func (c *Conn) DrainEvents() (events []Event, connected bool) {
 	c.mu.Lock()
-	events = c.buffer
+	events = c.freshenRemindersLocked(c.buffer)
 	c.buffer = nil
 	connected = !c.closed
 	c.mu.Unlock()
 	return events, connected
+}
+
+// freshenRemindersLocked brings buffered confirm reminders up to date
+// with the position as it stands NOW, and drops any whose premise has
+// been answered since.
+//
+// confirmReminderLoop composes a reminder on a ticker and appends it to
+// the buffer; the model sees it whenever it next drains. Everything in
+// it — the cursor to confirm, how many are outstanding, how long the run
+// has been going — is a snapshot of the moment it was composed. Between
+// that moment and the drain, the reader can confirm, and then the
+// reminder arrives telling it to confirm a position it has already
+// confirmed, quoting a count that is no longer true.
+//
+// Seen live, four times: a reader piggybacked a confirm on its reply, and
+// the reminder that followed named the cursor it had just confirmed, once
+// with a count of 2 and once with an age that had advanced five minutes
+// while nothing arrived. Reported by the peer receiving it, who could see
+// the text; the cause is only visible from here.
+//
+// A reminder that survives is rewritten rather than passed through, since
+// a stale count is the same defect one size smaller. Only the last one
+// survives: several ticks can pass before a drain, and repeating one
+// instruction four times says nothing the first did not.
+func (c *Conn) freshenRemindersLocked(evs []Event) []Event {
+	out := evs[:0]
+	var pending *Event
+	for _, e := range evs {
+		if e.Kind != "confirmReminder" {
+			out = append(out, e)
+			continue
+		}
+		// Resolved since it was composed: there is nothing to remind
+		// about, and saying so anyway teaches a reader that this
+		// instruction can be ignored.
+		if !c.liveUnconfirmed || c.lastSeenCursor == "" {
+			continue
+		}
+		fresh := e
+		fresh.Text = c.lastSeenCursor
+		fresh.UnconfirmedCount = c.unconfirmedCount
+		fresh.UnconfirmedSince = c.unconfirmedSince
+		pending = &fresh
+	}
+	if pending != nil {
+		out = append(out, *pending)
+	}
+	return out
 }
 
 // MarkConsumed records the given events' cursors as delivered to the

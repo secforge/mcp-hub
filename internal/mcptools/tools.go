@@ -1006,12 +1006,31 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	}
 
 	// The target the successful connect resolved, not one recomputed
-	// here — see session.redialTarget.
+	// here — see session.redialTarget. It is held for the life of this
+	// process, so a reconnect never has to work it out again.
 	s.mu.Lock()
 	target := s.redialTarget
 	s.mu.Unlock()
 	if target.Link == "" {
-		target = targetForLink(context.Background(), link)
+		// RECOMPUTING IT HERE WOULD GUESS, AND GUESS WRONG. The project
+		// half of the key comes from the MCP client's advertised roots
+		// when a request context is available, and there is no request
+		// here — so a recomputed target resolves from the override or
+		// $PWD instead and can name a different bucket than the connect
+		// used. A different bucket holds no identity for this link,
+		// which does not fail: it mints a fresh secret and a new peer
+		// id, strands the old row under the old key, and loses the read
+		// position, all silently.
+		//
+		// The same reasoning as the unreadable-store case below, and it
+		// gets the same answer: not knowing which identity to resume is
+		// a reason to stop, not to take a new one.
+		s.abandonReconnect("Automatic reconnect was not attempted after the server's restart: " +
+			"this client no longer knows which stored identity belongs to that link, and working " +
+			"it out again here could name a different one — which would take a NEW identity and " +
+			"leave the old one stranded with its read position. Call hub_connect yourself when " +
+			"ready; that resolves it properly.")
+		return reconnectFatal
 	}
 	stored, _, storeErr := connstore.Get(target)
 	if storeErr != nil {

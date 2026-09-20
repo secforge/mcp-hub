@@ -633,3 +633,89 @@ func TestTheIdSurvivesDecodingOnEveryFrameThatEchoesIt(t *testing.T) {
 		})
 	}
 }
+
+// A confirm reminder is composed on a ticker and appended to the buffer;
+// the model sees it whenever it next drains. Everything in it is a
+// snapshot of the compose moment, so a reader that confirms in between is
+// then told to confirm what it has already confirmed.
+//
+// Reported four times by a peer who could see the text and not the cause:
+// the reminder named the cursor just piggybacked, once with a count of 2
+// and once with an age that had advanced five minutes while nothing
+// arrived.
+func TestAConfirmReminderIsNotDeliveredAfterItsPremiseIsAnswered(t *testing.T) {
+	c := &Conn{}
+
+	c.mu.Lock()
+	c.lastSeenCursor = "cursor-1"
+	c.liveUnconfirmed = true
+	c.unconfirmedCount = 2
+	c.unconfirmedSince = time.Now().Add(-8 * time.Minute)
+	c.buffer = []Event{
+		{Kind: "msg", Text: "something", Cursor: "cursor-1"},
+		{Kind: "confirmReminder", Text: "cursor-1", UnconfirmedCount: 2},
+	}
+	c.mu.Unlock()
+
+	// The reader confirms before draining, which is exactly what a
+	// piggybacked confirm on a reply does.
+	c.MarkConsumed([]Event{{Cursor: "cursor-1"}})
+
+	events, _ := c.DrainEvents()
+	for _, e := range events {
+		if e.Kind == "confirmReminder" {
+			t.Fatalf("a reminder composed before the confirm was delivered after it, telling the "+
+				"reader to confirm %q — which it had already confirmed: %+v", e.Text, e)
+		}
+	}
+	if len(events) != 1 || events[0].Kind != "msg" {
+		t.Fatalf("dropping the stale reminder disturbed the rest of the buffer: %+v", events)
+	}
+}
+
+// A reminder whose premise still holds is delivered, and rewritten with
+// the position as it stands at the drain rather than at the tick — a
+// stale COUNT is the same defect one size smaller.
+func TestASurvivingConfirmReminderCarriesTheCurrentPosition(t *testing.T) {
+	c := &Conn{}
+	since := time.Now().Add(-3 * time.Minute)
+
+	c.mu.Lock()
+	c.lastSeenCursor = "cursor-9"
+	c.liveUnconfirmed = true
+	c.unconfirmedCount = 4
+	c.unconfirmedSince = since
+	// Two ticks passed before anything drained, and the older one names a
+	// position that has since been overtaken.
+	c.buffer = []Event{
+		{Kind: "confirmReminder", Text: "cursor-3", UnconfirmedCount: 1},
+		{Kind: "msg", Cursor: "cursor-9"},
+		{Kind: "confirmReminder", Text: "cursor-7", UnconfirmedCount: 3},
+	}
+	c.mu.Unlock()
+
+	events, _ := c.DrainEvents()
+	var reminders []Event
+	for _, e := range events {
+		if e.Kind == "confirmReminder" {
+			reminders = append(reminders, e)
+		}
+	}
+	if len(reminders) != 1 {
+		t.Fatalf("got %d reminders, want exactly one — repeating one instruction per missed tick "+
+			"says nothing the first did not: %+v", len(reminders), reminders)
+	}
+	r := reminders[0]
+	if r.Text != "cursor-9" {
+		t.Errorf("the reminder names %q, want the position as it stands at the drain", r.Text)
+	}
+	if r.UnconfirmedCount != 4 {
+		t.Errorf("the reminder says %d outstanding, want 4 — the count at the drain", r.UnconfirmedCount)
+	}
+	if !r.UnconfirmedSince.Equal(since) {
+		t.Errorf("the reminder's age was not refreshed from the connection's own state")
+	}
+	if len(events) != 2 {
+		t.Fatalf("the rest of the buffer was disturbed: %+v", events)
+	}
+}
