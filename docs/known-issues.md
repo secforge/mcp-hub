@@ -623,3 +623,53 @@ not being made under the heading of a bug fix.
 Until then: a reader following the reminder on a monotonic server gets a
 refusal. `ConfirmReceived` reports it truthfully and rolls back, so
 nothing is corrupted — the confirm simply does not take.
+
+## A correction that deletes the evidence
+
+2026-09-20. Drafted by the external reviewer, who owns half of it, and
+kept here because the other half is this repository's.
+
+Twice in one afternoon, in opposite directions, around one fact.
+
+**An absence read as a zero.** chat-relay grepped its own code for
+`receipt|recorded an ack|ack from`, found nothing, and reported receipt
+logging as missing. The log line says "confirmed". The feature had
+shipped on 2026-09-16 and had been agreed with both other parties at the
+time. No matches was read as not there; the result cannot distinguish
+that from not matched, and nothing in it says which. Three of us built on
+the report for three hours, and it was first on this project's list of
+what chat-relay still owed.
+
+**A correction that overshoots.** chat-relay then retracted a second
+claim — that its acked cursor was last-write-wins. The column is
+monotonic and always was. Two comments in this tree had cited the
+retracted claim to justify a client rule, and the reviewer who had relied
+on it proposed replacements removing the server sentence entirely. That
+deletes the sharpest fact in the whole exchange: against a monotonic
+server a regressed receipt is dropped WITHOUT A WORD, so this client
+believes a position acknowledged that never was and nothing on the wire
+ever says otherwise. A reader who meets only "do not offer a position you
+cannot justify" files it as hygiene. A reader who meets the silence
+understands why it is mandatory.
+
+**Why they are one entry.** One reads an absence as a zero; the other
+answers a bad inference by removing what it was drawn from. Both end with
+a reader holding less than the code contains. The second is not a milder
+form of the first and is not caught by being careful about the first —
+the reviewer who wrote the replacement had today's false-absence lesson
+fully in hand, and it is what made the deletion feel like rigour.
+
+**The rule.** Do not argue a client invariant FROM a server's behaviour;
+it holds whatever any server does. Do not pretend not to know that
+behaviour either. A corrected fact, attributed and subordinate, is not
+the error. An uncorrected one, load-bearing at the top of the paragraph,
+was. `fd9b201` is what that looks like in this tree, and the test comment
+it touches keeps both the wrong reason and the correction for the same
+reason this entry exists.
+
+**One more thing the day argued for.** Of twenty-four findings across two
+review rounds, the two that mattered most on the last day were in a FIX,
+not in the original code — two paths added while repairing a defect that
+reintroduced its exact shape. That is an argument for the second pass
+over the first, and for reviewing repairs at least as closely as the
+code they repair.
