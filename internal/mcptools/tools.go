@@ -3289,6 +3289,16 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 			failed++
 		}
 	}
+	if n := conn.TakeStaleAnswerNotice(); n > 0 {
+		// Said rather than dropped silently, which is the failure this
+		// codebase keeps relearning — but said ONCE, because the reader
+		// already has these: they are answers to a query that had
+		// already returned them.
+		s.note(fmt.Sprintf("%d late answer(s) to a history read arrived after that read had "+
+			"finished, and were NOT delivered again — you already have them from the read "+
+			"itself, and re-delivering would hand you messages older than your own confirmed "+
+			"position. They remain on the server if you want them again.", n))
+	}
 	if failed > 0 {
 		s.note(fmt.Sprintf("%d message(s) could not be delivered to you live — the "+
 			"push into this session failed. Nothing is lost: your catch-up position only moves "+

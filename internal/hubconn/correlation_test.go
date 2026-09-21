@@ -1083,3 +1083,40 @@ func TestThePushWindowHoldsLongBeforeAnInboxCouldOverflow(t *testing.T) {
 			"silent drop, just on this side of the wire")
 	}
 }
+
+// A history answer is not live traffic. The server marks a message
+// historical when answering a query, and such an answer reaches the
+// buffer only when it missed the claim that asked for it — the query had
+// already returned. Pushing it hands the reader something it already has,
+// from BEHIND its own position, moments after being told it is caught up.
+//
+// Seen live on 2026-09-21 against v3.1.9.
+func TestAHistoryAnswerIsNotPushedAsLiveTraffic(t *testing.T) {
+	c := &Conn{budget: newBudget()}
+	c.buffer = []Event{
+		{Kind: "msg", PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text: "live one", Cursor: "c-live"},
+		{Kind: "msg", PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text: "a late answer to a read", Cursor: "c-old", Historical: true},
+	}
+
+	items, _ := c.DrainForPush()
+	for _, it := range items {
+		if it.Event.Historical {
+			t.Fatalf("a history answer was pushed as live traffic: %s", it.Text)
+		}
+	}
+	if len(items) != 1 || items[0].Cursor != "c-live" {
+		t.Fatalf("live traffic was disturbed by the filtering: %+v", items)
+	}
+
+	// Not silently: the reader is told once, and the count resets so it
+	// is not repeated.
+	if n := c.TakeStaleAnswerNotice(); n != 1 {
+		t.Fatalf("stale answers counted %d, want 1 — dropping without saying so is the failure "+
+			"this codebase keeps relearning", n)
+	}
+	if n := c.TakeStaleAnswerNotice(); n != 0 {
+		t.Fatalf("the notice repeats: %d", n)
+	}
+}

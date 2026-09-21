@@ -510,6 +510,9 @@ type Conn struct {
 	// must NOT be diverted here, unlike pendingAcks' blind kind match;
 	// see tryDivertToClaimLocked.
 	pendingMessageAfter *ackClaim
+	// staleAnswers counts history answers that reached the buffer after
+	// the query they answered had finished — see DrainForPush.
+	staleAnswers int
 	// pushSeq counts pushes made on this connection, so each carries a
 	// position a reader can check for gaps — see Event.PushSeq.
 	pushSeq int
@@ -3295,6 +3298,17 @@ func (c *Conn) DrainBatch() (chunks []string, connected bool) {
 // flag. Read once rather than left set, because it describes an event
 // that happened, not a state that persists: repeating it after the reader
 // has been told would make a resolved gap look like an unresolved one.
+// TakeStaleAnswerNotice reports how many history answers arrived after
+// the query they answered had finished, and were therefore not pushed as
+// live traffic. Resets on read, so a caller says it once.
+func (c *Conn) TakeStaleAnswerNotice() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := c.staleAnswers
+	c.staleAnswers = 0
+	return n
+}
+
 func (c *Conn) TakeSkippedHeldNotice() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -3390,6 +3404,31 @@ type PushItem struct {
 func (c *Conn) DrainForPush() (items []PushItem, connected bool) {
 	events, connected := c.DrainEvents()
 	for _, e := range c.applyBudget(events, pushDeliveredCost) {
+		// A HISTORY ANSWER IS NOT LIVE TRAFFIC. The server marks a
+		// message historical when it is answering a query — hub_read or
+		// a catch-up walk — and such an answer reaches this buffer only
+		// when it missed the claim that asked for it: the query had
+		// already returned, so nothing was waiting.
+		//
+		// Pushing it then is wrong twice over. The reader already has
+		// it, because the query it answers returned. And it arrives
+		// BEHIND the reader's position, so a reader that has just been
+		// told it is fully caught up is handed something older, with
+		// nothing to explain it. Seen live on 2026-09-21: a message
+		// re-delivered as "history" moments after a confirm reported
+		// fully caught up, having already been returned by the read
+		// that asked for it.
+		//
+		// Nothing is lost by not pushing it. It is on the server, it is
+		// reachable by the same read again, and the catch-up walk
+		// delivers its own history by its own path rather than through
+		// this buffer.
+		if e.Kind == "msg" && e.Historical {
+			c.mu.Lock()
+			c.staleAnswers++
+			c.mu.Unlock()
+			continue
+		}
 		// Numbered before formatting and only for what will actually be
 		// pushed: a number that skips because this client declined to
 		// render something would report a gap that never existed, which
