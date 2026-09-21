@@ -61,7 +61,7 @@ func release() (string, bool) {
 // scripts/release.sh when a release is cut; a stale value costs a
 // misleading prefix on dev builds only, never on a release, which gets
 // its number from Release above.
-const LastRelease = "v3.1.11"
+const LastRelease = "v3.1.12"
 
 // devStamp is when the running binary's file was written, as
 // yyyymmddhhmmss, or "" when that cannot be read.

@@ -3342,6 +3342,20 @@ func (c *Conn) writeJSON(v any) error {
 // ASKED for, and the run that drives it has a budget of its own. Charging
 // twice would close the live window on the strength of a pull.
 func (c *Conn) ShapeForPush(e Event) string {
+	// NUMBERED FROM THE SAME SEQUENCE AS A LIVE PUSH, because a reader
+	// receives one stream and the number is only useful if it covers all
+	// of it. A catch-up walk pushes into the same session queue and can
+	// be dropped by it exactly as live traffic can — and it is the path
+	// used to RECOVER from a drop, so leaving it unnumbered would blind
+	// the reader precisely where it is looking hardest.
+	//
+	// Two counters would be worse than none: a reader seeing 1, then two
+	// unnumbered arrivals, then 2, cannot tell whether the sequence
+	// stalled or something went missing.
+	c.mu.Lock()
+	c.pushSeq++
+	e.PushSeq = c.pushSeq
+	c.mu.Unlock()
 	if c.budget == nil {
 		return NameNotice(c.budgetOwner, FormatEventForPush(e))
 	}

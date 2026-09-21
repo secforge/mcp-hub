@@ -1120,3 +1120,36 @@ func TestAHistoryAnswerIsNotPushedAsLiveTraffic(t *testing.T) {
 		t.Fatalf("the notice repeats: %d", n)
 	}
 }
+
+// A reader receives ONE stream, so the sequence has to cover all of it.
+// A catch-up walk pushes into the same session queue as live traffic and
+// can be dropped by it the same way — and it is the path used to recover
+// from a drop, so leaving it unnumbered would blind the reader exactly
+// where it is looking hardest.
+//
+// Two counters would be worse than none: 1, two unnumbered arrivals,
+// then 2 cannot be told from 1, a gap, then 2.
+func TestCatchUpPushesShareTheLivePushSequence(t *testing.T) {
+	c := &Conn{budget: newBudget()}
+	peer := "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+	c.buffer = []Event{{Kind: "msg", PeerID: peer, Text: "live", Cursor: "c1"}}
+	items, _ := c.DrainForPush()
+	if len(items) != 1 || !strings.HasPrefix(items[0].Text, "[#1]") {
+		t.Fatalf("first live push is not #1: %+v", items)
+	}
+
+	// A catch-up walk pushes next, and must continue the same count.
+	got := c.ShapeForPush(Event{Kind: "msg", PeerID: peer, Text: "from the walk", Cursor: "c2"})
+	if !strings.HasPrefix(got, "[#2]") {
+		t.Fatalf("a catch-up push did not continue the sequence — a reader cannot tell a stall "+
+			"from a gap:\n%s", got)
+	}
+
+	// And live traffic afterwards continues past it.
+	c.buffer = []Event{{Kind: "msg", PeerID: peer, Text: "live again", Cursor: "c3"}}
+	items, _ = c.DrainForPush()
+	if len(items) != 1 || !strings.HasPrefix(items[0].Text, "[#3]") {
+		t.Fatalf("live traffic did not continue past the catch-up push: %+v", items)
+	}
+}
