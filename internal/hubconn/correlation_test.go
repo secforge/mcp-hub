@@ -2,6 +2,7 @@ package hubconn
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -997,5 +998,83 @@ func TestResumablePeersSurvivesDecodingJoined(t *testing.T) {
 				t.Fatalf("got %d, want %d", *back.ResumablePeers, *tc.in)
 			}
 		})
+	}
+}
+
+// A PUSH CANNOT BE CONFIRMED: the transport returns ObservedNothing on
+// success, meaning written and unverified. So a harness that accepts a
+// message and then discards it — inbox full, session busy — reports
+// nothing, and this client cannot tell delivery from loss. The number is
+// what lets the READER tell, because cursors are opaque and unordered
+// and two arrivals say nothing about a third between them.
+//
+// Seen live on 2026-09-21: 28 pushes dropped by a busy session, neither
+// the client nor the reader aware, and no catch-up afterwards.
+func TestEveryPushCarriesItsPositionSoAGapIsVisible(t *testing.T) {
+	c := &Conn{budget: newBudget()}
+	c.buffer = []Event{
+		{Kind: "msg", PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "one", Cursor: "c1"},
+		{Kind: "msg", PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "two", Cursor: "c2"},
+		{Kind: "msg", PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "three", Cursor: "c3"},
+	}
+
+	items, _ := c.DrainForPush()
+	if len(items) != 3 {
+		t.Fatalf("got %d items, want 3", len(items))
+	}
+	for i, it := range items {
+		want := fmt.Sprintf("[#%d]", i+1)
+		if !strings.HasPrefix(it.Text, want) {
+			t.Fatalf("push %d does not open with %s — a reader has no way to see a hole:\n%s",
+				i+1, want, it.Text)
+		}
+	}
+
+	// The count CONTINUES across drains. A counter that restarted per
+	// batch would make every batch look complete, which is the failure
+	// it exists to reveal.
+	c.buffer = []Event{{Kind: "msg", PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		Text: "four", Cursor: "c4"}}
+	more, _ := c.DrainForPush()
+	if len(more) != 1 || !strings.HasPrefix(more[0].Text, "[#4]") {
+		t.Fatalf("the sequence restarted between drains: %+v", more)
+	}
+}
+
+// The push window bounds the RECEIVER'S INBOX, which the transport says
+// nothing about, rather than the reader's context. It was 200 — chosen
+// against context — and a session dropped 28 pushes long before reaching
+// it.
+func TestThePushWindowHoldsLongBeforeAnInboxCouldOverflow(t *testing.T) {
+	if pushWindowCount > 50 {
+		t.Fatalf("pushWindowCount is %d; it bounds a harness inbox whose capacity this client "+
+			"cannot discover, and the two errors are not symmetric — too low pauses delivery and "+
+			"says so, too high loses messages silently", pushWindowCount)
+	}
+
+	c := &Conn{budget: newBudget()}
+	for i := 0; i < pushWindowCount+10; i++ {
+		c.buffer = append(c.buffer, Event{Kind: "msg",
+			PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+			Text:   "m", Cursor: fmt.Sprintf("c%d", i)})
+	}
+	items, _ := c.DrainForPush()
+
+	var held, msgs int
+	for _, it := range items {
+		switch it.Event.Kind {
+		case "deliveryHeld":
+			held++
+		case "msg":
+			msgs++
+		}
+	}
+	if msgs > pushWindowCount {
+		t.Fatalf("pushed %d messages with a window of %d — the window did not close",
+			msgs, pushWindowCount)
+	}
+	if held == 0 {
+		t.Fatal("delivery was capped and nothing said so — a silent cap is the same failure as a " +
+			"silent drop, just on this side of the wire")
 	}
 }

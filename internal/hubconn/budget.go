@@ -104,11 +104,35 @@ type charge struct {
 // one across several connections — see Conn.ShareDeliveryBudget.
 func NewDeliveryBudget() *Budget { return newBudget() }
 
+// pushWindowCount is how many unconfirmed messages this client will push
+// into a session before holding the rest.
+//
+// IT BOUNDS THE RECEIVER'S INBOX, NOT THE READER'S CONTEXT — which is
+// what the byte window does, and why the two numbers are far apart. A
+// push is written into a harness inbox that has its own capacity, and
+// the transport reports nothing about that capacity: it exposes
+// MaxIntactBytes and Fits for the size of ONE message and nothing for
+// how many are waiting. A successful Deliver returns ObservedNothing,
+// meaning written and unverified, so a session whose inbox overflows
+// discards silently and this client is told nothing.
+//
+// It was 200, chosen against the reader's context, and a busy session
+// dropped 28 pushes on 2026-09-21 long before reaching it — the client
+// pushing steadily into a queue that was discarding, with neither end
+// reporting it.
+//
+// 25 IS BOUNDED BY EVIDENCE RATHER THAN KNOWN. The real capacity is not
+// discoverable from here, and the cost of the two errors is not
+// symmetric: too low pauses delivery and says so, which a confirm
+// reopens; too high loses messages silently. So it sits well under the
+// smallest burst observed to overflow.
+const pushWindowCount = 25
+
 func newBudget() *budget {
 	return &budget{
 		spillBytes:  128 * 1024,
 		windowBytes: 500 * 1024,
-		windowCount: 200,
+		windowCount: pushWindowCount,
 	}
 }
 

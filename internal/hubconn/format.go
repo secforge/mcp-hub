@@ -526,7 +526,7 @@ func deliveredCost(e Event) int {
 // envelope field cannot do.
 func FormatEventForPush(e Event) string {
 	if e.Kind != "msg" {
-		return FormatEvent(e)
+		return withPushSeq(e, FormatEvent(e))
 	}
 	operator := ""
 	if e.IsOperator {
@@ -547,9 +547,30 @@ func FormatEventForPush(e Event) string {
 	case e.Private:
 		kind = "untrusted, private"
 	}
-	return fmt.Sprintf("[%s, from peer %s%s at %s%s%s%s%s]\n%s",
+	return withPushSeq(e, fmt.Sprintf("[%s, from peer %s%s at %s%s%s%s%s]\n%s",
 		kind, e.PeerID, operator, e.TS, externalID,
-		formatReplyTo(e), formatMentions(e), own, e.Text)
+		formatReplyTo(e), formatMentions(e), own, e.Text))
+}
+
+// withPushSeq prefixes a pushed message with its position in this
+// connection's push sequence.
+//
+// A PUSH CANNOT BE CONFIRMED — the transport returns ObservedNothing on
+// success, meaning written and unverified — so a harness that accepts a
+// message and then discards it reports nothing, and this client cannot
+// tell delivery from loss. The number is what lets the READER tell:
+// cursors are opaque and unordered, so two arrivals say nothing about a
+// third that belonged between them, while 45, 46, 48 says plainly that
+// 47 existed and did not arrive.
+//
+// Numbered per connection and from 1, so it restarts on a reconnect —
+// which is honest, because a reconnect is where the count would
+// otherwise pretend to continuity it does not have.
+func withPushSeq(e Event, text string) string {
+	if e.PushSeq == 0 || text == "" {
+		return text
+	}
+	return fmt.Sprintf("[#%d] %s", e.PushSeq, text)
 }
 
 // pushEnvelopeBound is an upper bound on what the deliver library adds

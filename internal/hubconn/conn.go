@@ -148,6 +148,23 @@ type Event struct {
 	// this connection's own display name. Set only on a "roster" event,
 	// and only where this connection has a name of its own to collide.
 	RosterNameTaken bool
+	// PushSeq numbers this event within the sequence of pushes this
+	// connection has made, from 1, and is set only on the push path.
+	//
+	// It exists because a PUSH CANNOT BE CONFIRMED. The transport says so
+	// outright: a successful Deliver returns ObservedNothing, meaning the
+	// bytes were written and arrival is unverified. A harness that accepts
+	// a message and then discards it because its inbox is full reports
+	// nothing back, so this client cannot tell a delivery from a loss.
+	//
+	// Nothing else in a pushed message can reveal a hole. Cursors are
+	// opaque and unordered by contract, so two consecutive arrivals say
+	// nothing about whether a third belonged between them. A number does:
+	// a reader that sees 45, 46, 48 knows 47 existed and did not arrive,
+	// and can ask for it. Seen live on 2026-09-21, when 28 pushes were
+	// dropped by a busy session's inbox and neither the client nor the
+	// reader ever knew.
+	PushSeq int
 
 	// Mirrored says the connection this event arrived on is a mirror of
 	// some other conversation (a teams link), where a message we send is
@@ -493,6 +510,9 @@ type Conn struct {
 	// must NOT be diverted here, unlike pendingAcks' blind kind match;
 	// see tryDivertToClaimLocked.
 	pendingMessageAfter *ackClaim
+	// pushSeq counts pushes made on this connection, so each carries a
+	// position a reader can check for gaps — see Event.PushSeq.
+	pushSeq int
 	// resumablePeers is joined.ResumablePeers as the server sent it: how
 	// many peers in this conversation still hold a reconnect secret,
 	// present only when the server MINTED a fresh identity for this
@@ -3370,10 +3390,18 @@ type PushItem struct {
 func (c *Conn) DrainForPush() (items []PushItem, connected bool) {
 	events, connected := c.DrainEvents()
 	for _, e := range c.applyBudget(events, pushDeliveredCost) {
-		text := NameNotice(c.budgetOwner, FormatEventForPush(e))
-		if text == "" {
+		// Numbered before formatting and only for what will actually be
+		// pushed: a number that skips because this client declined to
+		// render something would report a gap that never existed, which
+		// is worse than no number at all.
+		if text := FormatEventForPush(e); text == "" {
 			continue
 		}
+		c.mu.Lock()
+		c.pushSeq++
+		e.PushSeq = c.pushSeq
+		c.mu.Unlock()
+		text := NameNotice(c.budgetOwner, FormatEventForPush(e))
 		items = append(items, PushItem{Cursor: e.Cursor, Text: text, Event: e})
 	}
 	return items, connected
