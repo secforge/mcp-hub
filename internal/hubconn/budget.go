@@ -108,24 +108,25 @@ func NewDeliveryBudget() *Budget { return newBudget() }
 // into a session before holding the rest.
 //
 // IT BOUNDS THE RECEIVER'S INBOX, NOT THE READER'S CONTEXT — which is
-// what the byte window does, and why the two numbers are far apart. A
-// push is written into a harness inbox that has its own capacity, and
-// the transport reports nothing about that capacity: it exposes
-// MaxIntactBytes and Fits for the size of ONE message and nothing for
-// how many are waiting. A successful Deliver returns ObservedNothing,
-// meaning written and unverified, so a session whose inbox overflows
-// discards silently and this client is told nothing.
+// what the byte window does, and why the two numbers are far apart.
+//
+// The receiving session queues at most 50 accepted messages for its
+// model to read, per Claude Code's own documentation, and also
+// rate-limits per sender and drops identical repeats arriving close
+// together. That queue is per SESSION and shared by every sender
+// reaching it, so a single connection may not spend all of it.
 //
 // It was 200, chosen against the reader's context, and a busy session
-// dropped 28 pushes on 2026-09-21 long before reaching it — the client
-// pushing steadily into a queue that was discarding, with neither end
-// reporting it.
+// dropped 28 pushes on 2026-09-21 long before reaching it — this client
+// pushing steadily into a queue that was discarding. Nothing came back:
+// a successful Deliver returns ObservedNothing, written and unverified,
+// so the drop is invisible to the sender. The RECEIVING session is told
+// which sender dropped it; the sender is not.
 //
-// 25 IS BOUNDED BY EVIDENCE RATHER THAN KNOWN. The real capacity is not
-// discoverable from here, and the cost of the two errors is not
-// symmetric: too low pauses delivery and says so, which a confirm
-// reopens; too high loses messages silently. So it sits well under the
-// smallest burst observed to overflow.
+// 25 is half the documented cap, which leaves the other half for
+// everything else reaching that session. Not a tuning choice: the two
+// errors are not symmetric, since too low pauses delivery and says so
+// and a confirm reopens it, while too high loses messages silently.
 const pushWindowCount = 25
 
 func newBudget() *budget {

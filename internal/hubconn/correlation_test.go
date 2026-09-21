@@ -1046,10 +1046,15 @@ func TestEveryPushCarriesItsPositionSoAGapIsVisible(t *testing.T) {
 // against context — and a session dropped 28 pushes long before reaching
 // it.
 func TestThePushWindowHoldsLongBeforeAnInboxCouldOverflow(t *testing.T) {
-	if pushWindowCount > 50 {
-		t.Fatalf("pushWindowCount is %d; it bounds a harness inbox whose capacity this client "+
-			"cannot discover, and the two errors are not symmetric — too low pauses delivery and "+
-			"says so, too high loses messages silently", pushWindowCount)
+	// The receiving session queues at most 50 accepted messages, per
+	// Claude Code's documentation, and that queue is shared by every
+	// sender reaching it — so one connection must not plan to spend all
+	// of it.
+	const documentedSessionQueue = 50
+	if pushWindowCount > documentedSessionQueue/2 {
+		t.Fatalf("pushWindowCount is %d against a documented session queue of %d shared by all "+
+			"senders; the two errors are not symmetric — too low pauses delivery and says so, "+
+			"too high loses messages silently", pushWindowCount, documentedSessionQueue)
 	}
 
 	c := &Conn{budget: newBudget()}
