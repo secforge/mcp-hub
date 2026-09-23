@@ -687,10 +687,18 @@ func TestASecondHistoryRequestIsRefusedNotSilentlySwapped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c.Close()
 
+	// The first request is JOINED before this test returns. Left running,
+	// it reads AckWaitTimeout concurrently with whichever later test sets
+	// it, which the race detector reports against that test.
 	started := make(chan struct{})
+	firstDone := make(chan struct{})
+	defer func() {
+		c.Close()
+		<-firstDone
+	}()
 	go func() {
+		defer close(firstDone)
 		close(started)
 		c.RequestMessageAfterAwaiting(wire.Anchor{Cursor: "first"})
 	}()
