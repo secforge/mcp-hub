@@ -710,8 +710,12 @@ func discardCatchUpGap(id connstore.Target) (connstore.GapState, bool) {
 // the message's own opaque Cursor for precision, the same
 // walk-forward-by-cursor logic the ordinary (non-gap) walk already uses.
 func loadCatchUpGap(id connstore.Target) (connstore.GapState, bool) {
-	cs, ok := connstore.GetCatchUp(id)
-	if !ok || cs.Gap == nil || !cs.Gap.Started() {
+	// An unreadable store reports no gap, which is the same answer as
+	// "no gap recorded" and is reported by the caller of this function's
+	// sibling — see setCatchUpKey, which says so once per connection.
+	// Repeating it per gap check would say it on every catch-up.
+	cs, ok, err := connstore.GetCatchUp(id)
+	if err != nil || !ok || cs.Gap == nil || !cs.Gap.Started() {
 		return connstore.GapState{}, false
 	}
 	return *cs.Gap, true
@@ -799,8 +803,8 @@ func saveHandedOverAhead(id connstore.Target, ahead map[string]bool) {
 // one (a fresh id, or one whose set has emptied out entirely — see
 // saveHandedOverAhead).
 func loadHandedOverAhead(id connstore.Target) map[string]bool {
-	cs, ok := connstore.GetCatchUp(id)
-	if !ok || len(cs.Ahead) == 0 {
+	cs, ok, err := connstore.GetCatchUp(id)
+	if err != nil || !ok || len(cs.Ahead) == 0 {
 		return nil
 	}
 	ahead := make(map[string]bool, len(cs.Ahead))

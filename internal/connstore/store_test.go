@@ -176,7 +176,7 @@ func TestUpsertPreservesExistingCatchUpState(t *testing.T) {
 		t.Fatalf("second upsert: %v", err)
 	}
 
-	cs, ok := GetCatchUp(target)
+	cs, ok, _ := GetCatchUp(target)
 	if !ok || cs.Cursor != "cursor-1" {
 		t.Fatalf("expected the catch-up cursor to survive a reconnect's Upsert, got %+v (ok=%v)", cs, ok)
 	}
@@ -376,7 +376,7 @@ func TestSetTopicPreservesCatchUpAndViceVersa(t *testing.T) {
 		t.Fatalf("SetTopic: %v", err)
 	}
 
-	cs, ok := GetCatchUp(target)
+	cs, ok, _ := GetCatchUp(target)
 	if !ok || cs.Cursor != "cursor-1" {
 		t.Fatalf("expected the catch-up cursor to survive SetTopic, got %+v (ok=%v)", cs, ok)
 	}
@@ -404,7 +404,7 @@ func TestSetCatchUpGapAndAheadRoundTrip(t *testing.T) {
 		t.Fatalf("SetCatchUp: %v", err)
 	}
 
-	got, ok := GetCatchUp(target)
+	got, ok, _ := GetCatchUp(target)
 	if !ok {
 		t.Fatal("expected catch-up state to be found")
 	}
@@ -424,10 +424,10 @@ func TestCatchUpForDifferentLinksIsIndependent(t *testing.T) {
 		t.Fatalf("SetCatchUp one: %v", err)
 	}
 
-	if _, ok := GetCatchUp(two); ok {
+	if _, ok, _ := GetCatchUp(two); ok {
 		t.Fatal("expected no catch-up state for a link nothing was stored under")
 	}
-	cs, ok := GetCatchUp(one)
+	cs, ok, _ := GetCatchUp(one)
 	if !ok || cs.Cursor != "cursor-one" {
 		t.Fatalf("got %+v (ok=%v)", cs, ok)
 	}
@@ -586,5 +586,46 @@ func TestTheModeContractIsEnforcedNotRequested(t *testing.T) {
 	if got := fi.Mode().Perm(); got != 0o600 {
 		t.Errorf("state file is %04o, want 0600 — it inherited the mode of a temp file left behind "+
 			"by an earlier crash, and it holds every reconnect secret this client has", got)
+	}
+}
+
+// A READ FAILURE IS NOT "NOTHING STORED". An unreadable store must
+// return an error rather than ok=false, or it looks exactly like a
+// first-ever connection — and the caller then starts from no position,
+// which re-walks a backlog at best and skips one wherever something else
+// moves the position.
+func TestGetCatchUpDistinguishesAnUnreadableStoreFromAnEmptyOne(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", dir)
+	target := Target{Link: "wss://example.test/hub/join#s", Project: "/proj"}
+
+	// Nothing stored: no error, and no state.
+	cs, ok, err := GetCatchUp(target)
+	if err != nil || ok || cs.Cursor != "" {
+		t.Fatalf("an empty store reported cs=%+v ok=%v err=%v; want no state and no error",
+			cs, ok, err)
+	}
+
+	// Something stored: no error, and the state.
+	if err := SetCatchUp(target, CatchUpState{Cursor: "cursor-1"}); err != nil {
+		t.Fatalf("SetCatchUp: %v", err)
+	}
+	if cs, ok, err = GetCatchUp(target); err != nil || !ok || cs.Cursor != "cursor-1" {
+		t.Fatalf("stored state came back cs=%+v ok=%v err=%v", cs, ok, err)
+	}
+
+	// Unreadable: an ERROR, not an empty answer. A caller that cannot
+	// tell these apart resumes from the beginning of a conversation it
+	// has already read.
+	if err := os.WriteFile(path(), []byte("{ this is not json"), 0o600); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	cs, ok, err = GetCatchUp(target)
+	if err == nil {
+		t.Fatalf("an unreadable store returned cs=%+v ok=%v and NO error — indistinguishable "+
+			"from a first connection, which is the one thing it must not look like", cs, ok)
+	}
+	if ok || cs.Cursor != "" {
+		t.Errorf("a failed read also returned state: cs=%+v ok=%v", cs, ok)
 	}
 }

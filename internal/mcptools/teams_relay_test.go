@@ -553,7 +553,7 @@ func TestHubConfirmSendsAckAndPersistsCursor(t *testing.T) {
 	if got != "cursor-confirmed" {
 		t.Fatalf("expected lastHandedOverCursor cursor-confirmed, got %q", got)
 	}
-	if cs, ok := connstore.GetCatchUp(id); !ok || cs.Cursor != "cursor-confirmed" {
+	if cs, ok, _ := connstore.GetCatchUp(id); !ok || cs.Cursor != "cursor-confirmed" {
 		t.Fatalf("expected persisted catch-up cursor cursor-confirmed, got (%+v, %v)", cs, ok)
 	}
 }
@@ -2326,7 +2326,7 @@ func TestDiscardGapWritesItOffAndRecordsTheDecision(t *testing.T) {
 	if _, _, ok := getCatchUpGap(id); ok {
 		t.Fatal("expected the open gap to be gone after a discard")
 	}
-	cs, _ := connstore.GetCatchUp(id)
+	cs, _, _ := connstore.GetCatchUp(id)
 	if len(cs.Discarded) != 1 {
 		t.Fatalf("expected the decision recorded, got %+v", cs.Discarded)
 	}
@@ -2371,7 +2371,7 @@ func TestDiscardGapWithNoGapChangesNothing(t *testing.T) {
 	sess.mu.Lock()
 	id := sess.catchUpID
 	sess.mu.Unlock()
-	if cs, _ := connstore.GetCatchUp(id); len(cs.Discarded) != 0 {
+	if cs, _, _ := connstore.GetCatchUp(id); len(cs.Discarded) != 0 {
 		t.Fatalf("expected nothing recorded when there was nothing to discard, got %+v", cs.Discarded)
 	}
 }
@@ -2453,7 +2453,7 @@ func TestLiveDeliveryConfirmsItselfOnceKnownCaughtUp(t *testing.T) {
 	if _, err := hub.handleReceive(ctx, connReqFor(testConn)); err != nil {
 		t.Fatalf("hub_receive: %v", err)
 	}
-	if cs, _ := connstore.GetCatchUp(id); cs.Cursor != "" {
+	if cs, _, _ := connstore.GetCatchUp(id); cs.Cursor != "" {
 		t.Fatalf("expected no position advance before being told it is contiguous, got %q", cs.Cursor)
 	}
 
@@ -2474,7 +2474,7 @@ func TestLiveDeliveryConfirmsItselfOnceKnownCaughtUp(t *testing.T) {
 	if _, err := hub.handleReceive(ctx, connReqFor(testConn)); err != nil {
 		t.Fatalf("hub_receive: %v", err)
 	}
-	cs, _ := connstore.GetCatchUp(id)
+	cs, _, _ := connstore.GetCatchUp(id)
 	if cs.Cursor != "cursor-after-catchup" {
 		t.Fatalf("expected the live delivery to confirm itself, got cursor %q", cs.Cursor)
 	}
@@ -2555,7 +2555,7 @@ func TestReadRecordsTheDeliveryWithoutConsumingTheBacklog(t *testing.T) {
 	sess.knownContiguous = true
 	sess.mu.Unlock()
 	setCatchUpGapFromAt(id, "2026-09-10T18:00:00Z", "2026-09-10T20:00:00Z")
-	before, _ := connstore.GetCatchUp(id)
+	before, _, _ := connstore.GetCatchUp(id)
 
 	readReq := mcp.CallToolRequest{}
 	readReq.Params.Arguments = map[string]any{"connection": testConn, "at": "2026-09-10T18:30:00Z"}
@@ -2582,7 +2582,7 @@ func TestReadRecordsTheDeliveryWithoutConsumingTheBacklog(t *testing.T) {
 
 	// Nothing may have moved: not the position, not the seen-ahead set,
 	// not the recorded gap.
-	after, _ := connstore.GetCatchUp(id)
+	after, _, _ := connstore.GetCatchUp(id)
 	if after.Cursor != before.Cursor {
 		t.Fatalf("expected the position untouched, %q -> %q", before.Cursor, after.Cursor)
 	}

@@ -1820,7 +1820,17 @@ func TestSetCatchUpKeyPersistsAcrossHubInstances(t *testing.T) {
 	got := sess.lastHandedOverCursor
 	sess.mu.Unlock()
 	if got != "cursor-1" {
-		t.Fatalf("expected the second Hub to recover cursor-1 for the same identity, got %q", got)
+		// SAY WHICH FAILURE THIS IS. "got \"\"" is the same message
+		// whether the store was unreadable, the write never landed, or
+		// the read went to a different key — three different defects,
+		// which this message tells apart.
+		cs, ok, err := connstore.GetCatchUp(target)
+		t.Fatalf("expected the second Hub to recover cursor-1 for the same identity, got %q\n"+
+			"  store now says: cursor=%q ok=%v err=%v\n"+
+			"  target: link=%q project=%q\n"+
+			"  store dir: %q",
+			got, cs.Cursor, ok, err, target.Link, target.Project,
+			os.Getenv("MCP_HUB_CONNSTORE_DIR"))
 	}
 }
 

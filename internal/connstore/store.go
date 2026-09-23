@@ -238,7 +238,6 @@ type state map[string]map[string]Entry
 // roots must consult this first, or the variable silently does nothing in
 // the one place it is most likely to be used.
 func ProjectOverride() string { return os.Getenv("MCP_HUB_PROJECT_DIR") }
-
 // CurrentProject identifies "this working directory" for Target.Project —
 // MCP_HUB_PROJECT_DIR if set (an explicit override, and how tests get
 // isolation without touching the real cwd), else the process's actual
@@ -649,20 +648,27 @@ func ListForProject(project string) ([]ListedEntry, error) {
 }
 
 // GetCatchUp returns target's persisted hub_catch_up state, if any.
-func GetCatchUp(target Target) (CatchUpState, bool) {
-	var cs CatchUpState
-	var ok bool
-	_ = withLock(false, func() error {
-		var e Entry
-		st, err := load()
-		if err != nil {
-			return err
+// A READ FAILURE IS NOT "NOTHING STORED". ok=false with a nil error
+// means nothing is stored for target; a non-nil error means the store
+// could not be read or locked, and says nothing about what it holds.
+// Treating the second as the first starts a connection from no position,
+// which re-walks a backlog at best and, where something else moves the
+// position, skips one — so the error is returned and callers decide.
+func GetCatchUp(target Target) (cs CatchUpState, ok bool, err error) {
+	err = withLock(false, func() error {
+		st, lerr := load()
+		if lerr != nil {
+			return lerr
 		}
+		var e Entry
 		e, ok = getEntry(st, target.Project, target.Link)
 		cs = e.CatchUp
 		return nil
 	})
-	return cs, ok
+	if err != nil {
+		return CatchUpState{}, false, err
+	}
+	return cs, ok, nil
 }
 
 // UpdateCatchUp mutates target's catch-up state inside ONE exclusive lock,

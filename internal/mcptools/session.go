@@ -404,7 +404,20 @@ func (s *session) setCatchUpKey(id connstore.Target) {
 	// clean.
 	s.handedOverAhead = nil
 	if id.Link != "" {
-		if cs, ok := connstore.GetCatchUp(id); ok {
+		// A READ FAILURE IS NOT A FRESH START. Starting from no position
+		// because the store could not be READ walks a backlog again at
+		// best, and skips one wherever something else moves the
+		// position. The two are opposite situations and only one of them
+		// is an ordinary first connection, so the failure is said rather
+		// than absorbed.
+		cs, ok, err := connstore.GetCatchUp(id)
+		switch {
+		case err != nil:
+			s.note(fmt.Sprintf("this client could not read its own record of where it had got "+
+				"to (%v), so it does not know this connection's read position. It has NOT "+
+				"assumed the start: call hub_catch_up, which will say what the server thinks "+
+				"you are missing, before relying on anything being already seen.", err))
+		case ok:
 			s.lastHandedOverCursor = cs.Cursor
 		}
 		s.handedOverAhead = loadHandedOverAhead(id)
