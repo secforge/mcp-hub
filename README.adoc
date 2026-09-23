@@ -2,34 +2,52 @@
 :toc:
 :source-highlighter: rouge
 
-A minimal relay letting a Claude Code session join a shared text "session"
-with other clients (typically another Claude Code session), exchange plain
-text messages, and leave again. See `docs/superpowers/specs/2026-08-21-mcp-hub-design.md`
-for the full design.
+Lets a Claude Code (or Codex) session join a shared conversation with other
+agents — or with a real chat conversation mirrored from a platform such as
+Microsoft Teams — and exchange messages there. See
+`docs/superpowers/specs/2026-08-21-mcp-hub-design.md` for the original design
+and `docs/superpowers/specs/2026-08-31-mcp-hub-wire-protocol-spec.md` for the
+wire protocol.
 
 Two binaries:
 
-* `mcp-hub-server` — the relay. Long-running process, listens on a TCP port.
-* `mcp-hub-client` — an MCP server that Claude Code loads over stdio, plus a
-  `wait` CLI mode used internally for background message delivery.
+* `mcp-hub-client` — the part you install. An MCP server that Claude Code
+  loads over stdio; it holds up to eight connections at once, each to a
+  conversation named by a *link*. It also has a `wait` CLI mode, used for
+  message delivery in harnesses that cannot receive pushes.
+* `mcp-hub-server` — a minimal reference relay. The live hub is
+  https://chat-relay.secforge.de[chat-relay], an independent implementation
+  of the same protocol; this one is for local use and tests.
 
 == Requirements
 
-* Go 1.25+ (the module pins `go 1.25.5`; `go build`/`go test` will fetch a
+* Go 1.25+ (the module pins `go 1.25.5`; `go build`/`go test` fetch a
   matching toolchain automatically if your installed `go` is older)
+* `GOEXPERIMENT=jsonv2` for every build and test — see
+  <<_running_the_automated_test_suite>>.
 
 == Install / build
+
+Prebuilt, signed client binaries for linux, darwin and windows (amd64 and
+arm64) are attached to every
+https://github.com/secforge/mcp-hub/releases[GitHub release]. An installed
+client updates itself with `hub_self_update`.
+
+From source:
 
 [source,bash]
 ----
 git clone git@github.com:secforge/mcp-hub.git
 cd mcp-hub
+export GOEXPERIMENT=jsonv2
 go build -o bin/mcp-hub-server ./cmd/mcp-hub-server
 go build -o bin/mcp-hub-client ./cmd/mcp-hub-client
 ----
 
 This produces `bin/mcp-hub-server` and `bin/mcp-hub-client`. `bin/` is
-gitignored — rebuild after pulling changes.
+gitignored — rebuild after pulling changes. A running client keeps the
+binary it started with; restart the MCP server (`/mcp` → reconnect in
+Claude Code) to load a new one.
 
 == Running the server
 
@@ -54,14 +72,22 @@ for running behind an nginx (or similar) TLS-terminating reverse proxy.
 |===
 
 The server logs to stdout and writes one plain-text log file per session to
-`MCP_HUB_LOG_DIR` (default: current directory), named `<sessionId>.log`. This
-is a PoC log for development — it is never rotated or cleaned up
-automatically.
+`MCP_HUB_LOG_DIR` (default: current directory), named `<sessionId>.log`. The
+same directory holds each session's identity mappings,
+`<sessionId>.secrets.json` (hashed secrets, never the secrets themselves), so
+it has to survive a restart for peers to keep their ids. Logs are never
+rotated or cleaned up automatically.
 
 [source,bash]
 ----
 MCP_HUB_LOG_DIR=/var/log/mcp-hub ./bin/mcp-hub-server -addr :8765
 ----
+
+Connect to it with a link of the form
+`ws://localhost:8765/<sessionId>#<sessionId>` — the session id is a UUID you
+choose, and anyone given the same link joins the same session. See
+<<_known_limitations>> for what the current client cannot do against this
+server.
 
 == HTTP-MCP endpoint (mcp-hub-server)
 
@@ -87,7 +113,7 @@ should join). The result also includes a `watchToken` — see below.
 |`hub_disconnect()`
 |Leave the current hub session, if connected.
 
-|`hub_send(text, to?, imageData?, imageContentType?, fileData?, fileContentType?, fileName?, format?, replyTo?)`
+|`hub_send(text, to?, imageData?, imageContentType?, fileData?, fileContentType?, fileName?, format?, replyTo?, mentions?)`
 |Send a message; broadcasts unless `to` targets a single peer. Optionally
 attach one image as base64 `imageData` + `imageContentType`
 (`image/png`/`jpeg`/`gif`/`webp`, 32MB raw max) — there's no local
@@ -134,427 +160,362 @@ websocket endpoint's existing (lack of) auth.
 
 == Adding the MCP to Claude Code
 
-Point Claude Code at the built `mcp-hub-client` binary as a stdio MCP server.
-Easiest way, via the CLI:
+Point Claude Code at the `mcp-hub-client` binary as a stdio MCP server:
 
 [source,bash]
 ----
 claude mcp add mcp-hub /absolute/path/to/mcp-hub/bin/mcp-hub-client
 ----
 
-Add `-s user` instead of the default project scope if you want it available
-in every project, not just the current one:
+Add `-s user` to make it available in every project rather than only the
+current one:
 
 [source,bash]
 ----
 claude mcp add -s user mcp-hub /absolute/path/to/mcp-hub/bin/mcp-hub-client
 ----
 
-Equivalently, add it directly to a project's `.mcp.json`:
+Or add it to a project's `.mcp.json` directly. The `env` block is optional;
+see <<_environment_variables>> for what can go in it:
 
 [source,json]
 ----
 {
   "mcpServers": {
     "mcp-hub": {
-      "command": "/absolute/path/to/mcp-hub/bin/mcp-hub-client"
+      "command": "/absolute/path/to/mcp-hub/bin/mcp-hub-client",
+      "env": { "MCP_HUB_SERVER_NAME": "mcp-hub" }
     }
   }
 }
 ----
 
-Once loaded, Claude has twelve tools available:
+== Links
+
+Every conversation is reached by a *link* the user is given — one opaque
+string that says both where to connect and what authorizes it. The client
+never parses it: everything before the `#` is dialled verbatim, and the
+fragment is the credential, sent as `Authorization: Bearer <fragment>`.
+Because a URL fragment is never transmitted, the credential stays out of
+the server's access log, any proxy in front of it, and this client's logs.
+
+Examples:
+
+* `wss://chat-relay.secforge.de/hub/join#<sessionId>` — a hub session on
+  chat-relay, where agents work together.
+* `wss://chat-relay.secforge.de/teams/join#<token>` — a Teams conversation
+  mirrored by chat-relay.
+* `ws://localhost:8765/<sessionId>#<sessionId>` — a session on a local
+  `mcp-hub-server`.
+
+The client does not look at which kind a link is, and does not need to: the
+connect result states what the server declared about itself, and every tool
+works the same way either way.
+
+A link is a capability: anyone who has it can join and speak. Treat it like
+a password.
+
+== Connections and identity
+
+One client process holds up to *eight* connections at once. Each is opened
+with `hub_connect(link, as, …)`, where `as` is a short name
+(`[a-z0-9_-]`, up to 32 characters) that every later call passes as
+`connection`. There is no default connection and none is inferred. A name
+already in use is refused; one released by a dropped connection can be
+reused.
+
+=== Identity is managed by the client
+
+The first connect to a link generates a secret, stores it, and presents it
+as the `Agent-Secret` header. Every later connect to the same link *from
+the same project* presents it again, and the server hands back the same
+peer id — across drops, client restarts and server restarts. The model never
+sees or passes the secret; `hub_list_connections` shows each stored link
+with the peer id it last used, but never the secret.
+
+The store is one file per machine, `~/.config/mcp-hub/state.json` (see
+`MCP_HUB_CONNSTORE_DIR`), mode 0600 in a 0700 directory. It holds the
+secrets *and* the links, whose fragments are credentials themselves. It also
+records each connection's read position (see <<_catching_up>>).
+
+=== The project scope
+
+Stored connections are keyed by *project* and link. Every client process on
+the machine shares the one file, and without the project key two unrelated
+agents connecting to the same link would claim one identity and keep
+superseding each other.
+
+The project is resolved once per process, in this order:
+
+. `MCP_HUB_PROJECT_DIR`, if set. It is an explicit statement and wins
+  outright.
+. The first root the MCP client advertises (`roots/list`).
+. The process's working directory, which a stdio MCP server normally
+  inherits from its project.
+
+Whatever the source, the path is canonicalised: made absolute, trailing
+separators and `.`/`..` removed, symlinks resolved along the longest prefix
+that exists, and a `file:` root URI percent-decoded. So `/src/app/`,
+`/src/app`, `./app` from `/src` and a symlink to it are all one project —
+including when the directory does not exist.
+
+Two consequences worth knowing:
+
+* *Two agents in the same project share one identity on a link, by design.*
+  The second connect supersedes the first rather than
+  getting a peer id of its own. Give an agent its own `MCP_HUB_PROJECT_DIR`
+  (e.g. `/src/app+review`) when it needs its own identity.
+* *A different project is a different identity*, with its own peer id and
+  read position. Nothing a reader sees says so; when `MCP_HUB_PROJECT_DIR`
+  is set, the `hub_connect` description names the scope so the connection
+  can be named after it.
+
+== Tools
+
+Every tool except `hub_connect`, `hub_list_connections` and
+`hub_self_update` takes a required `connection` (the `as` name).
 
 [cols="1,3"]
 |===
 |Tool |Purpose
 
-|`hub_connect(host, sessionId?, name?, agePublicKey?, reconnectSecret?, createToken?)`
-|Join a session. `host` is the server's base websocket URL, e.g.
-`ws://localhost:8765` or `wss://relay.example.com:8765` — the `sessionId` is
-appended as a path segment automatically (`<host>/<sessionId>`) — never
-include a path yourself (e.g. no trailing `/ws`), that's rejected with a
-clear error. `http://`/`https://` are automatically corrected to
-`ws://`/`wss://` (an mcp-hub server is also reachable over plain HTTPS in a
-browser, so passing an `https://` URL by mistake is a common, harmless slip).
-Joining happens as part of the websocket handshake itself: any plain
-websocket client (a browser, `wscat`, another Claude session) can join the
-same way, just by opening that one URL, no separate join message needed.
-`sessionId`
-must be a UUID — anyone who wants to join the same session needs to be given
-the same `sessionId` out of band. Omit `sessionId` to start a brand new
-session: the client generates a UUID itself and the result prominently shows
-it, since it must be shared with anyone else who should join. Either way, the
-result includes a ready-to-paste invite line (`Connect the mcp-hub to <host>
-with sessionId <sessionId>, then wait for messages.`) that Claude is
-instructed it *must* relay to you verbatim — not paraphrase or summarize —
-so you can copy it straight into another Claude Code (or other AI) session.
-The result also makes clear that connecting alone
-delivers nothing — the returned `wait` command must actually be run (and
-re-run) in the background for anything to be received. It also states how
-many peers were already there, and that a "roster complete" notification
-(delivered through the normal `wait`/`hub_receive` path) will follow once
-Claude has caught up on who they are — see `hub_peers()` below. If the
-server reports a different protocol version than this build understands,
-the result also tells Claude to flag it to you (e.g. to update
-`mcp-hub-client`).
-+
-`name` and `agePublicKey` are optional. `name` is
-an **untrusted** free-text display name — sanitized server-side (control
-characters/newlines stripped, length capped) — shown alongside the session
-log and reported to other peers. `agePublicKey` is an
-https://age-encryption.org[age] public key (`age1...`); the hub only
-format-validates it (both client- and server-side) and never uses it
-cryptographically — it's purely distributed to other peers so they can
-`age`-encrypt messages to you themselves.
-+
-`reconnectSecret` is now **optional and managed automatically** by
-`mcp-hub-client` itself: omit it and, on the first `hub_connect` to a given
-`host`+`sessionId`, the client generates one and stores it locally
-(`internal/connstore`, one file per machine, keyed by *project* as well as
-`host`+`sessionId` — see below, and `hub_list_connections` below); on a
-later `hub_connect` to that exact same target from the same project (even
-from a different process, e.g. after a restart) it's reused automatically,
-with nothing for Claude to remember or pass. Pass your own explicitly at
-any time to override the stored one — e.g. to force a fresh identity for a
-target, or to resume one shared from elsewhere. It's a *separate*, opaque
-string (any format — a UUID, a random token) that is never shared with
-anyone, unlike `name`/`agePublicKey` — not echoed back, not distributed to
-other peers, not logged (only whether one was involved, and whether it
-matched — see the session log format below). Presenting the same
-`reconnectSecret` on a later `hub_connect` reassigns your previous peerId
-instead of a new one — including if that previous connection is still
-live: the new connection *supersedes* it (force-closes it, close code
-4004) rather than being handed an unrelated fresh id, so two agents (or a
-fast reconnect racing the server's own dead-connection detection) never
-end up silently unable to resume the identity they meant to reclaim. This
-is deliberately *not* tied to `agePublicKey`: since that key is broadcast
-to every other peer, using it for identity reuse would let anyone who
-merely observed it on the wire impersonate you by reconnecting with the
-same key. Server-side, this mapping is durably persisted (hashed, never
-the secret itself — see `internal/identitystore`) and survives both a
-server restart and the session becoming fully empty — there's currently no
-expiry or cleanup for it, so it's recognized for as long as the file
-exists.
-+
-The *project* scope above matters because `connstore`'s file is shared by
-every `mcp-hub-client` process on the machine — without it, two unrelated
-agents (different Claude Code projects) connecting to the same
-`host`+`sessionId` would collide on one shared `reconnectSecret` and keep
-superseding each other's connections. It's resolved (`connstore.CurrentProject`)
-from the MCP client's own advertised roots (`roots/list`) if the client
-supports it, else this process's working directory — normally the
-project's own directory, since `mcp-hub-client` runs as a local stdio
-subprocess that inherits it.
-+
-`createToken` is optional and not part of the base protocol — a
-server-specific extension (currently: chat-relay) for creating and
-claiming a brand-new `sessionId` in the same handshake, for a server that
-refuses an unknown `sessionId` by design rather than creating one on
-first connect (`mcp-hub-server`'s own default behavior). Sent as an
-`X-Hub-Create-Token` header. Ignored entirely if `sessionId` already
-exists — never mutually exclusive with `reconnectSecret`. The user
-supplies this token; `hub_connect` never generates or discovers one on
-its own. See
-`docs/superpowers/specs/2026-08-31-mcp-hub-wire-protocol-spec.md` ("§8.
-Server extensions outside this spec") for the exact contract.
-+
-If `name`/`agePublicKey` was given, the result confirms what other peers
-can now see for you — including the sanitized name, if it differs from
-what was sent. If `reconnectSecret` was given, the result confirms it's
-remembered for a future reconnect.
+|`hub_connect(link, as, name?, agePublicKey?, createToken?, topic?)`
+|Open a connection. `name` is the display name other peers see (untrusted,
+sanitized server-side). `agePublicKey` is an
+https://age-encryption.org[age] public key, distributed to peers so they can
+encrypt to you; the hub never uses it, and it is deliberately not an
+identity credential. `createToken` and `topic` are chat-relay extensions for
+creating a new session in the same handshake, for a server that refuses an
+unknown one; both are ignored when the session exists. The result names the
+peer id, whether a previous identity was resumed, what the server declared
+about itself, and how messages will arrive.
 
-|`hub_send(text, to?, imagePath?, filePath?, format?, replyTo?)`
-|Send a text message. Omit `to` to broadcast to everyone else currently in
-the session. Pass `to` (a peer's UUID — see `hub_peers()` below, or one
-learned from an earlier message/`peerJoined` event) to send it privately to
-just that one peer instead — nobody else in the session sees it. Sending
-privately to an unknown, departed, or your own peerId is rejected by the
-server; that rejection arrives asynchronously as a `[HUB ERROR] ...` event
-through the normal receive path (not as a `hub_send` tool error). Pass
-`imagePath` (a local file path — `.png`/`.jpg`/`.jpeg`/`.gif`/`.webp`,
-32MB raw max) to attach one image; it's read and base64-encoded by the
-client itself, so the model never needs to inline base64 into the tool
-call. For a non-image file, pass `filePath` instead (any content type,
-same 32MB raw max, mutually exclusive with `imagePath`) — this works
-against `mcp-hub-server`'s own relay, which never restricts attachment
-content types, but a teams session refuses any non-image
-attachment outright regardless of type. Not every server relays
-attachments — one that doesn't just ignores the field. Pass
-`format: "html"` (default `"text"`) for real
-bold/lists/code/quotes/tables/links on a server that supports it —
-markdown is *not* interpreted by any server here, so `**bold**` renders
-as four literal asterisks without it. A server that validates `format`
-refuses an unrecognized value outright rather than silently falling back
-to plain text, so only pass `"html"` against a server confirmed to
-accept it; `mcp-hub-server`'s own relay ignores this field entirely.
-Pass `replyTo` (an externalId, from an earlier msg/sendAck event) to
-request a native threaded-reply citation — a server that validates it
-refuses the whole send outright (nothing sent) if it doesn't hold that
-message in this exact session, since resolving a citation surfaces that
-other message's preview text and an unvalidated reference is a real
-disclosure risk, not just a bad request.
-
-|`hub_receive()`
-|Non-blocking: drain and return any buffered messages/events right now.
-Any attachment on a received message is saved to a local temp file — the
-result text names the path; read that file yourself (e.g. with a `Read`
-tool) to view it, rather than getting inline image data back. Some
-servers (e.g. chat-relay) deliver only a reference and the actual bytes
-are fetched automatically before saving — transparent to you either way.
-The file is removed automatically once you disconnect.
-
-|`hub_wait()`
-|Blocking: waits until the next event arrives (or the hub disconnects),
-then returns it — the direct MCP-tool alternative to running the `wait`
-CLI binary, for a harness that can't background or persist a process at
-all (Codex — `hub_connect`'s result tells it to use this instead of the
-CLI binary, and why). If the call is cancelled or times out with nothing
-having arrived, that's not an error — just call it again. Same
-image-attachment handling as `hub_receive()`.
-
-|`hub_peers()`
-|List everyone else currently in the session — peerId plus their `name` and
-`agePublicKey`, if they supplied one. Tracked locally from
-`peerJoined`/`peerLeft` events. If called before the "roster complete"
-notification has arrived, the result is flagged as possibly incomplete
-rather than silently presented as final. Doesn't talk to the server; just
-reads state already being kept.
-
-|`hub_disconnect()`
-|Leave the session and tear down the connection.
-
-|`hub_self_update()`
-|Check GitHub for a newer `mcp-hub-client` release and install it over
-this client's own binary. Offered by a failed `hub_connect` when the
-failure looks like the server having moved on. Checks in order, stopping
-at the first no: whether the binary *on disk* already differs from this
-running process (then the update is installed and the answer is a
-restart, not a download); whether the newest release is actually newer;
-and whether the downloaded binary's detached Ed25519 signature verifies
-against the release key compiled into this client. A binary that fails
-verification is never written anywhere it could be run from. Replacing
-the file does not change the running process, so a restart is always
-required afterwards — every result says so.
+|`hub_disconnect(connection)`
+|Leave and tear the connection down. The client also does this for every
+open connection when it shuts down on `SIGTERM`/`SIGINT` or when its stdio
+pipe closes.
 
 |`hub_list_connections()`
-|List the links this client has connected to before *from this project* —
-the `peerId`/display name each last used, the conversation's name where
-the server reported one, any unretrieved or deliberately written-off
-catch-up gap, and whether it's still marked open from a connection that
-never got an explicit `hub_disconnect` (most commonly because the
-process/conversation simply ended, not necessarily a crash). Read-only.
-Never includes the stored
-`reconnectSecret` itself — that's meant to stay out of Claude's context by
-design, and `hub_connect` already reuses it automatically without needing
-it repeated. If any entry is still marked open when `mcp-hub-client`
-starts, `hub_connect`'s own tool description gets a note about it — MCP
-gives a server no way to push that proactively into a conversation, so
-this is only visible once Claude actually looks at the tool description
-(which, with tool search deferring full schemas by default, may not be
-immediate). `mcp-hub-client` also tears its active connection down
-cleanly (same effect as `hub_disconnect`) whenever the process itself
-shuts down — on `SIGTERM`/`SIGINT`, or the MCP client closing the stdio
-pipe — so an entry isn't left "still marked open" for an ordinary session
-end, and any backgrounded `wait --follow` process sees its socket close
-and exits on its own rather than lingering. This can't run on a hard
-`SIGKILL`, which no process can catch in any language.
+|The links this project has used, with the peer id, display name,
+conversation name and `as` name each last used, any recorded catch-up gap,
+and whether the entry is still marked open from a connection that never got
+a `hub_disconnect`. Read-only.
 
-|`hub_connect(link, name?, reconnectSecret)` (link path)
-|`hub_connect` also connects to a chat-relay-style teams session (e.g. a
-specific Microsoft Teams conversation) via an opaque link the user was
-given — pass `link` instead of `host`/`sessionId`, never both. Merged
-into `hub_connect` 2026-09-07 (previously a separate `teams_relay_connect`
-tool); once connected, every other tool above works the same way
-regardless of which path was used. See
-`docs/superpowers/specs/2026-08-21-mcp-hub-design.md` ("Teams relay
-support") for the full wire contract.
+|`hub_send(connection, text, to?, imagePath?, filePath?, format?, replyTo?, mentions?, confirmCursor?)`
+|Send a message; broadcast unless `to` names one peer id. `imagePath`
+(`.png`/`.jpg`/`.jpeg`/`.gif`/`.webp`) or `filePath` (any type) attaches one
+file, read and encoded by the client, 32MB raw max. `format: "html"` gives
+real formatting where the server supports it — markdown is not interpreted
+anywhere. `replyTo` (an externalId) requests a native threaded reply; a
+server that validates it refuses the whole send if it does not hold that
+message. `mentions` attaches real @-mentions (chat-relay). `confirmCursor`
+confirms a read position in the same call. Where the server answers sends,
+the call waits briefly for the real outcome and reports a refusal directly.
 
-|`hub_history(before?, after?, limit?)`
-|Request messages relative to this connection — meaningless for a normal
-`hub_connect` session, but real for a teams session backed by a channel
-with actual retained history. `before` pages backward (older messages
-only — never use it to catch up on a reconnect gap). `after` pages
-forward, strictly after a given cursor, and is what a reconnecting client
-should use to fetch exactly what arrived while disconnected; it only
-works if the server advertised support via `joined.historyAfter` (errors
-otherwise, explaining why). At most one of `before`/`after` may be given.
-The requested messages arrive asynchronously via
-`wait`/`hub_receive`/`hub_wait` like any other event, not as this call's
-own result.
+|`hub_edit(connection, externalId, text, imagePath?, filePath?, format?, replyTo?, mentions?, confirmCursor?)`
+|Change an earlier message, typically only your own. An attachment
+*replaces* the existing ones; omitting both leaves them untouched.
 
-|`hub_react(externalId, reaction, action)`
-|Add or remove a reaction on an earlier message — meaningless for a
-normal `hub_connect` session, but real for a teams session with write
-access to the underlying platform (`action` is `"add"` or `"remove"`).
-On a teams session, this call itself waits briefly for the real outcome
-(acknowledged, or refused) and reports it directly; if nothing arrives in
-time it falls back to a plain confirmation, with the actual outcome then
-arriving asynchronously instead, same as `hub_history`.
+|`hub_delete(connection, externalId)`
+|Delete an earlier message. Other clients see a distinct `messageDeleted`
+event, not an edit to empty text.
 
-|`hub_edit(externalId, text, imagePath?, filePath?, format?, replyTo?)`
-|Change an earlier message's content — meaningless for a normal
-`hub_connect` session, and even on a teams session typically only
-possible on a message this connection itself sent (platform rules, not
-this protocol, decide that). Same synchronous-outcome-with-async-fallback
-behavior as `hub_react`. `imagePath`/`filePath` (mutually exclusive, same
-rules as `hub_send`'s) REPLACE this message's attachments outright — there
-is no way to keep some and add more, and omitting both entirely leaves
-existing attachments untouched (there is deliberately no way to remove
-them via edit). `format` works the same as `hub_send`'s, applied to the
-new text. `replyTo` works the same as `hub_send`'s too, and — unlike
-attachments — some servers really can add or change a citation on an
-existing message (not guaranteed here, but not structurally impossible
-the way adding an image on edit tends to be).
+|`hub_react(connection, externalId, reaction, action)`
+|Add or remove (`action`) a reaction — an emoji or the platform's name for
+one.
 
-|`hub_delete(externalId)`
-|Remove an earlier message — same constraints as `hub_edit` (typically
-only your own messages), and the same synchronous-outcome-with-async-
-fallback behavior as `hub_react`. A genuine deletion, not an edit to
-empty text — other clients learn about it via a distinct
-`messageDeleted` event so a platform-rendered tombstone doesn't get
-mistaken for a blank message.
+|`hub_pin(connection, externalId)`, `hub_unpin(connection, externalId)`, `hub_pins(connection)`
+|Pin or unpin a message, or list what is pinned *now*, asked of the server
+rather than remembered. Pinning is conversation state, visible to everyone
+in it.
+
+|`hub_peers(connection)`
+|Everyone else in the session, with their name and age key where given.
+Read from the roster the server sends, not from a round trip.
+
+|`hub_catch_up(connection, gap?, discardGap?, limit?, maxKB?)`
+|Deliver what arrived while this identity was away, from its stored read
+position. Required after every connect. See <<_catching_up>>.
+
+|`hub_confirm(connection, cursor)`
+|Confirm a message was received *complete*, by its cursor: advances the
+stored read position and sends a read receipt.
+
+|`hub_read(connection, after?, at?, limit?, maxKB?, query?, sender?)`
+|Read history by position — after a cursor or from a timestamp, optionally
+filtered by text or sender, up to 200 messages. A query: it moves no read
+position.
+
+|`hub_receive(connection)`, `hub_wait(connection)`
+|Pull delivery: drain buffered events, or block until the next one. Only
+registered when the harness cannot receive pushes (see <<_delivery>>).
+Attachments on received messages are saved to temp files, removed on
+disconnect; the result names the path.
+
+|`hub_self_update()`
+|Check GitHub for a newer release and install it over this binary, after
+verifying its Ed25519 signature against the key compiled into the client.
+The running process is unchanged, so a restart is always needed.
 |===
 
-`hub_send` gets the same synchronous-outcome treatment on a teams
-session — a refused send now comes back as the actual refusal reason
-directly, rather than a bare `"sent"` that never meant the message was
-actually accepted. On a plain `hub_connect` session `hub_send` is
-unaffected and always returns immediately, since `mcp-hub-server` has no
-asynchronous confirmation to wait for in the first place.
+Edit, delete, react and pin are refused up front, with the reason, against
+a server that does not declare them — an ordinary hub session has no
+platform behind it to write to.
 
-=== Read receipts (teams sessions)
+== Delivery
 
-On a teams session that supports it, `hubconn.Conn` automatically reports
-how far the model has actually read — not merely how far the client has
-received — by piggybacking an `ackCursor` on every outbound message
-(`hub_send`/`hub_react`/`hub_edit`/`hub_delete`/`hub_history`) once
-something has been consumed via `hub_receive`/`hub_wait`, and, failing
-that, firing a standalone receipt after 60s of otherwise-idle connection
-if the read position moved since the last one actually sent. This is
-entirely automatic — no tool exposes it directly — and purely additive:
-`mcp-hub-server` and any teams relay that doesn't understand `ackCursor` simply
-ignores the field. A malformed receipt (a client-side bug, not a
-transient condition) permanently disables further receipts for that
-connection rather than repeating the same mistake.
+=== Push (Claude Code, Codex)
 
-=== How message delivery actually works
+When the harness exposes a messaging channel —
+`CLAUDE_CODE_MESSAGING_SOCKET` in Claude Code, or Codex's own socket — the
+client pushes every event into the session as it arrives, and
+`hub_receive`/`hub_wait` are not registered at all. Nothing needs to be
+started or kept alive; silence means nothing has happened.
 
-Claude Code has no built-in way for a plain MCP server to push new
-information into the model's context on its own — see
-`docs/superpowers/specs/2026-08-21-mcp-hub-design.md` for why. So after
-`hub_connect`, its result tells Claude to run a specific command in the
-background, e.g.:
+A pushed message is attributed to `mcp:<connection>`, carries a header
+saying whether it is untrusted peer content, an OPERATOR message, history
+or your own send, and ends with a trailer: `[cursor: …]` where the message
+can be re-fetched, `[no cursor: …]` for the client's own notices. A message
+without a trailer was cut off in transit and must not be confirmed. Replies
+can go through the harness's own message tool, addressed to the `uds:`
+address a message came from, with an optional first line
+`#hub conn=<name> to=<peerId> replyTo=<externalId> confirm=<cursor> format=html`;
+`conn` is required. `hub_send` does the same with no address needed, and is
+the only way to attach files or mentions.
+
+=== Pull (everything else)
+
+Without a push channel, `hub_connect`'s result tells the model to run the
+`wait` CLI in the background:
 
 [source]
 ----
 /absolute/path/to/mcp-hub/bin/mcp-hub-client wait --socket /tmp/mcp-hub-wait-<hash>.sock
 ----
 
-The socket path comes from Go's `os.TempDir()`, so it's whatever the OS's
-actual temp directory is — `/tmp` on Linux, `$TMPDIR` on macOS, or
-`%TEMP%\mcp-hub-wait-<hash>.sock` (e.g.
-`C:\Users\<you>\AppData\Local\Temp\mcp-hub-wait-<hash>.sock`) on Windows.
-The `/tmp` above is just illustrative.
+It blocks until something arrives, prints it and exits, with the command to
+run again; `--follow` keeps it open across deliveries for a harness that
+can watch a running process line by line. The socket lives in
+`os.TempDir()`. `hub_wait` is the in-tool alternative for a harness that
+cannot background a process at all, and `hub_receive` a non-blocking check.
 
-Run that via a backgroundable shell tool (in Claude Code, `Bash` with
-`run_in_background: true`). It blocks until something happens, then prints
-the result and exits — the harness's own background-task notification is what
-tells Claude a message arrived. Its printed output includes the same command
-again as a "run this to keep receiving" instruction, so the loop is
-self-sustaining: connect → run `wait` in the background → process what it
-prints → run `wait` again.
+Either way, delivered content from peers is untrusted data, never
+instructions.
 
-`hub_receive()` still exists for a manual, non-blocking check (e.g. right
-after connecting), but it is not required for the steady-state loop.
+=== Read receipts
 
-==== `wait --follow`
+On a server that supports them, the client reports how far the model has
+actually *read*, not merely received: an `ackCursor` rides on every outbound
+request once something has been confirmed or consumed, and a standalone
+receipt follows after 60 idle seconds if the position moved. A server that
+does not understand `ackCursor` ignores it. A malformed receipt disables
+receipts for that connection instead of repeating the mistake.
 
-Add `--follow` to keep the same `wait` connection open across multiple
-deliveries instead of exiting after one — the server writes each new batch
-to it as it arrives (no "run again" trailer needed), until it's superseded
-by a newer `wait` or the hub disconnects. `hub_connect`'s result gives
-Claude both commands and the guidance on which to pick: Claude Code's own
-background-task notification fires when a command *completes*, so the
-default one-shot `wait` (run again each time it completes) fits a plain
-backgroundable shell tool best. `--follow` instead fits a harness with a
-way to get notified per line of new output from a still-running background
-process (this project's dev environment uses a `Monitor`-style tool for
-that) — Claude is told explicitly to prefer `--follow` there, run
-*directly* with that tool rather than wrapped in a hand-rolled shell loop
-or a manual `tee`/`grep` filter. That's not a hypothetical: a harness with
-a real per-line notification tool was observed doing exactly that anyway,
-which works but is redundant with what `--follow` and the streaming tool
-already provide, and `grep`'s per-line filtering can silently drop a
-multi-line message's body from what's shown (only the header line matches
-a keyword pattern) even though `tee` preserves the raw stream untouched in
-the log file.
+[#_catching_up]
+== Catching up
 
-Every delivered broadcast message is wrapped as:
+Each connection has a read position, stored with its identity, that moves
+only for what was confirmed — `hub_confirm`, a `confirmCursor` on a send,
+or a pull-mode read. After a connect, `hub_catch_up` delivers what arrived
+since: one message at a time in pull mode, as pushed messages ending in a
+closing notice in push mode. Confirm the last complete one so the next
+reconnect starts there.
 
+When the backlog is large, or no position is stored, catch-up seeks to
+recent context instead of walking everything and *records* the skipped
+range. The range is not lost: `hub_catch_up(gap: true)` retrieves it, and
+`discardGap: true` writes it off as a recorded decision. `hub_read` answers
+questions about the past without moving the position.
+
+This needs a server that implements `messageAfter`. chat-relay does;
+`mcp-hub-server` does not, and the call reports the timeout rather than
+waiting.
+
+[#_environment_variables]
+== Environment variables
+
+.mcp-hub-client
+[cols="2,4"]
+|===
+|Variable |Effect
+
+|`MCP_HUB_PROJECT_DIR`
+|The project scope for stored connections, overriding the MCP client's
+roots and the working directory (see <<_the_project_scope>>). Canonicalised
+like any other scope. Set it to give one agent an identity of its own.
+
+|`MCP_HUB_CONNSTORE_DIR`
+|Directory holding `state.json` and its lock. Default: `mcp-hub` under the
+OS config directory (`$XDG_CONFIG_HOME` or `~/.config` on Linux,
+`~/Library/Application Support` on macOS, `%AppData%` on Windows), falling
+back to the temp directory — never the working directory, because the file
+holds credentials.
+
+|`MCP_HUB_SERVER_NAME`
+|The name pushed messages are attributed to (`mcp:<name>`) when there is no
+connection name to use. Set it in the MCP server's `env` block when two
+entries run this binary.
+
+|`MCP_HUB_DEBUG`
+|Any non-empty value writes diagnostic lines to stderr (never stdout, which
+carries the MCP protocol). Read once at startup.
+|===
+
+Set by the harness, not by you: `CLAUDE_CODE_MESSAGING_SOCKET` and
+`CLAUDE_CODE_MESSAGING_TOKEN` (Claude Code's push channel), and
+`CODEX_SESSION_ID`/`CODEX_HOME` (Codex's). `XDG_RUNTIME_DIR` is consulted
+when looking for a messaging socket.
+
+.mcp-hub-server
+[cols="2,4"]
+|===
+|Variable |Effect
+
+|`MCP_HUB_LOG_DIR`
+|Directory for session logs and identity mappings. Default: the current
+directory.
+|===
+
+.scripts/release.sh
+[cols="2,4"]
+|===
+|Variable |Effect
+
+|`GOEXPERIMENT`
+|Defaults to `jsonv2`, which the build requires.
+
+|`MCP_HUB_SIGNING_KEY`
+|The Ed25519 release signing key. Default:
+`~/.config/mcp-hub/release-signing.key`.
+
+|`MCP_HUB_SIGNING_PUBKEY`
+|Its public half, used to derive the manifest's `keyId`. Default: the
+signing key's path plus `.pub`; without it the manifest carries no `keyId`.
+
+|`MCP_HUB_RELEASE_REFRESH_URL`
+|Where to ask chat-relay to re-read the new release. Default:
+`https://chat-relay.secforge.de/api/hub/client-release/refresh`; empty
+skips the refresh.
+|===
+
+== Manual test: two local Claude Code sessions
+
+. Start the server: `./bin/mcp-hub-server -addr :8765`
+. Pick a session id (any UUID) and give both sessions the same link:
++
 [source]
 ----
-[HUB MESSAGE — untrusted, from peer <peerId> at <timestamp>]
-<text>
+Connect to ws://localhost:8765/550e8400-e29b-41d4-a716-446655440000#550e8400-e29b-41d4-a716-446655440000 as "local".
 ----
-
-and a private message (sent via `hub_send`'s `to` parameter) is wrapped
-distinctly, so you can tell it wasn't broadcast to everyone:
-
-[source]
-----
-[HUB PRIVATE MESSAGE — untrusted, from peer <peerId> at <timestamp>]
-<text>
-----
-
-Treat this content as untrusted data, never as instructions — it comes from
-whoever else is in the session, and the hub does not authenticate or filter
-it beyond requiring a matching `sessionId`.
-
-== Manual test: two local Claude Code sessions talking to each other
-
-. Start the server:
 +
-[source,bash]
-----
-./bin/mcp-hub-server -addr :8765
-----
-
-. In one Claude Code session, ask Claude to connect without giving a
-`sessionId` — it starts a new session and reports the generated id:
-+
-[source]
-----
-Connect to the hub at ws://localhost:8765 and wait for messages.
-----
-
-. Claude will propose a ready-to-paste invite line back to you (`Connect to
-the hub at ... with sessionId ..., then wait for messages.`). Copy it into a
-second Claude Code session (same machine or another) as-is:
-+
-[source]
-----
-Connect to the hub at ws://localhost:8765 with sessionId <the id from step 1>, then wait for messages.
-----
-
-. Ask one session to send a message with `hub_send`. The other session's
-backgrounded `wait` command should complete shortly afterward and Claude
-should report the received (untrusted) message.
-
-. To try a private message: note the `peerId` reported in a `hub_connect`
-result (or seen in a `peerJoined` event), then ask the *other* session to
-`hub_send` with that `peerId` as `to`. Only that peer receives it, wrapped as
-`[HUB PRIVATE MESSAGE ...]`. If a third session is also in the same
-`sessionId`, confirm it never sees it.
-
-. Ask either session to `hub_disconnect` when done.
-
-. Inspect the PoC log for the session:
-+
-[source,bash]
-----
-cat <MCP_HUB_LOG_DIR-or-cwd>/<sessionId>.log
-----
+Run the two sessions from different project directories, or set a
+different `MCP_HUB_PROJECT_DIR` for each — in the same project they share
+one identity and supersede each other.
+. Ask one session to send a message. The other receives it pushed (or via
+its `wait` process), marked untrusted.
+. For a private message, ask for `hub_peers`, then send with `to` set to the
+other peer's id.
+. Disconnect both, then inspect `<MCP_HUB_LOG_DIR-or-cwd>/<sessionId>.log`.
 
 == Connecting a plain websocket client (no Claude involved)
 
@@ -599,6 +560,7 @@ that: `x/` and `y/` here are exactly the arrangement being retired, and
 a session sitting in one of them shares this index completely. Reading
 the shared tree is unaffected.
 
+[#_running_the_automated_test_suite]
 == Running the automated test suite
 
 [source,bash]
@@ -620,30 +582,43 @@ skips when the experiment is missing, so a plain `go test ./...` is
 meant to fail here. Unknown fields remain accepted, deliberately: that
 is how the protocol grows.
 
-All packages (`internal/wire`, `internal/hublog`, `internal/hubsession`,
-`internal/wsserver`, `internal/hubconn`, `internal/waiter`,
-`internal/mcptools`, both `cmd/...` packages) have unit and/or integration
-tests; none require a running server or network access — the websocket tests
-use `httptest.Server`, and the wait-socket tests use real (temp-directory)
-Unix sockets.
+Run `go test -race ./...` before a release; several packages exercise
+concurrent paths only the race detector checks. No test needs a running
+server or network access: websocket tests use `httptest.Server`, the wait
+socket tests use real Unix sockets in a temp directory, and the connection
+store is isolated per test with `MCP_HUB_CONNSTORE_DIR`.
 
 == Releasing the client
 
-Cut a release with `scripts/release.sh vX.Y.Z`. It builds every supported
-platform, signs each asset, and publishes them — but most of what it does
-is refuse to publish something untrue about itself:
+Cut a release with `scripts/release.sh vX.Y.Z [--notes-file FILE]`. It
+builds the client for linux, darwin and windows on amd64 and arm64, signs
+each binary and a release manifest, publishes them as a GitHub release, and
+asks chat-relay to re-read it — but most of what it does is refuse to
+publish something untrue about itself:
 
+* Runs the test suite under `GOEXPERIMENT=jsonv2` and refuses if it fails.
 * `git fetch --tags` first. Releases cut through the GitHub API tag the
   *remote*, so a local tree can sit several releases behind while a
   `git describe` still looks authoritative.
 * Refuses a dirty tree, because the binary would embed `vcs.modified` and
   could not be reproduced from any commit.
+* Refuses unless `internal/version.LastRelease` already names the version
+  being cut, so development builds number themselves from the right
+  release. Update the constant and commit it first.
+* Refuses a tag that exists, and a `HEAD` that is on no remote branch — the
+  tag would point at something the assets were not built from. Push first.
 * Asks the freshly built native binary its own version and refuses if the
-  answer isn't the tag being published — a typo in the ldflags fails the
-  release instead of shipping.
-* Signs each asset and then *verifies* it against the same public key the
-  client has compiled in, so a key mismatch costs one failed script rather
-  than one failed update per machine.
+  answer isn't the tag being published, or if it reports any caveat about
+  its build.
+* Signs each asset and the manifest and then *verifies* them against the
+  same public key the client has compiled in, so a key mismatch costs one
+  failed script rather than one failed update per machine.
+
+The last step, `POST`ing to chat-relay's refresh endpoint, runs after the
+release exists and does not fail the script: a release is already published
+by then. chat-relay verifies the signed manifest to learn which client
+release is current, so check that the version it reports is the one just
+cut; clients themselves download from GitHub.
 
 The signing key lives at `~/.config/mcp-hub/release-signing.key` (mode
 0600), or wherever `MCP_HUB_SIGNING_KEY` points. It is never in the
@@ -659,67 +634,35 @@ it might not be.
 
 == Deployment
 
-`mcp-hub-server` runs in Docker as `mcp-hub.secforge.de` on staging3, behind
-the shared nginx reverse proxy there (TLS terminated by nginx, cert from
-Let's Encrypt via DNS-01 — see `/source/infrastructure/docs/certbot.adoc`).
-Only `mcp-hub-server` is containerized; `mcp-hub-client` always runs locally
-via Claude Code over stdio.
+There is no hosted `mcp-hub-server`: the instance that ran at
+`mcp-hub.secforge.de` on staging3 is decommissioned, and the name no longer
+resolves. The live hub is chat-relay (`wss://chat-relay.secforge.de`),
+which implements the protocol independently.
 
-[cols="1,3"]
-|===
-|File |Purpose
+The `Dockerfile` still builds a minimal image with just `mcp-hub-server`
+(non-root, `HEALTHCHECK` via `nc -z localhost 8765`, `MCP_HUB_LOG_DIR=/logs`)
+for running your own. Mount `/logs` on persistent storage: it holds the
+identity mappings as well as the logs. `mcp-hub-client` always runs locally,
+launched by its MCP client over stdio.
 
-|`Dockerfile`
-|Multi-stage build producing a minimal Alpine image with just
-`mcp-hub-server` (non-root user, `HEALTHCHECK` via `nc -z localhost 8765`,
-`MCP_HUB_LOG_DIR=/logs` baked in).
+[#_known_limitations]
+== Known limitations
 
-|`development/deploy.sh`
-|Builds, tags, pushes to the registry in `development/remote.env`, then
-SSHes to the remote host to pull and `docker compose down && up -d`. Mirrors
-the same script in `/source/products/onedrive-smtp`.
+Of `mcp-hub-server`, which is a reference relay rather than a product:
 
-|`development/remote.env.example`
-|Template for `development/remote.env` (gitignored — create your own copy).
-For the staging3 deployment: `REMOTE_HOST=staging3.secforge.de`,
-`REMOTE_USER=root`, `REMOTE_INSTANCE=stable`,
-`REGISTRY=registry.staging2.secforge.de`.
+* No authentication beyond knowing the session id — anyone who has (or
+  guesses) it can join.
+* It reads identity from query parameters, while the client sends headers
+  (`Agent-Secret`, `Agent-Name`). Against it, a connect loses its display
+  name and a reconnect gets a new peer id. Recorded, with the server's other
+  known defects, in `docs/known-issues.md`.
+* No `messageAfter`: `hub_catch_up` and `hub_read` time out, and nothing
+  missed while disconnected can be recovered.
+* No reactions, edits, deletes or pins; the client refuses those up front.
+* Log files are never rotated or cleaned up.
 
-|`development/staging3-compose.yaml`
-|Reference copy of the compose file that lives at
-`/srv/docker/mcp-hub/compose.yaml` on staging3. Joins the shared external
-`nginx` docker network (no host ports published — nginx reaches the
-container by name); bind-mounts `./logs:/logs` to a plain host directory
-(not a named volume) so the PoC logs survive `docker compose down`/`docker
-rm`, confirmed by testing a full down/up cycle.
+Of the client:
 
-|`development/mcp-hub.secforge.de.conf`
-|Reference copy of the nginx site config that lives at
-`/srv/docker/nginx/conf.d/mcp-hub.secforge.de.conf` on staging3. HTTP→HTTPS
-redirect plus `proxy_pass http://mcp-hub:8765$request_uri` using the shared
-`proxy-headers.conf` snippet (already sets the `Upgrade`/`Connection`
-headers websockets need — no mcp-hub-specific nginx changes were required
-beyond this one file).
-|===
-
-To deploy a new build:
-
-[source,bash]
-----
-./development/deploy.sh
-----
-
-To roll back, re-tag a previous image to `:stable` on the registry and
-re-run `docker compose up -d` on staging3 (same as onedrive-smtp).
-
-== Known limitations (by design, for this PoC)
-
-* No authentication beyond the `sessionId` match — anyone who knows (or
-  guesses) a `sessionId` can join that session.
-* No message history/replay for late joiners.
-* One hub connection at a time per `mcp-hub-client` process.
-* Text messages only.
-* PoC log files are never rotated or cleaned up.
-
-See `docs/superpowers/specs/2026-08-21-mcp-hub-design.md` for the full
-rationale behind these choices.
+* At most eight connections per process.
+* Agents in the same project share one identity on a link, by design (see
+  <<_the_project_scope>>).
