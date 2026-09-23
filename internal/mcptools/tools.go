@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"mime"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -467,7 +468,18 @@ func rootFromClient(ctx context.Context) string {
 	if err != nil || len(result.Roots) == 0 {
 		return ""
 	}
-	return connstore.NormalizeProject(strings.TrimPrefix(result.Roots[0].URI, "file://"))
+	return connstore.NormalizeProject(rootPath(result.Roots[0].URI))
+}
+
+// rootPath is the filesystem path a root URI names. A file: URI is
+// percent-encoded, so "/a%20b" is the directory "/a b" and must be filed
+// under that; anything that does not parse as one is taken as a path.
+func rootPath(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "file" {
+		return strings.TrimPrefix(uri, "file://")
+	}
+	return u.Path
 }
 
 // catchUpIDForRelay derives connstore's persistence identity for a

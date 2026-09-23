@@ -240,16 +240,38 @@ type state map[string]map[string]Entry
 func ProjectOverride() string { return NormalizeProject(os.Getenv("MCP_HUB_PROJECT_DIR")) }
 
 // NormalizeProject is the one spelling a project scope is filed and
-// looked up under. "/source/x/" and "/source/x" name the same directory,
-// and as two map keys they are two scopes: the second finds nothing,
-// mints a new identity, and strands the first. Trailing separators and
-// other redundant path elements are dropped; "" stays "" (filepath.Clean
-// would make it ".", which is a different scope).
+// looked up under. "/source/x/", "/source/x", a relative path to it and a
+// symlink to it all name the same directory, and as separate map keys
+// they are separate scopes: the second finds nothing, mints a new
+// identity, and strands the first.
+//
+// The path is made absolute and cleaned, then symlinks are resolved along
+// the longest prefix that exists, with the rest appended as written. A
+// project directory need not exist — a scope can name one that was moved,
+// or never was — and it still gets the spelling it would have if it did.
+// "" stays "": it is the "unknown project" scope, not the working
+// directory.
 func NormalizeProject(p string) string {
 	if p == "" {
 		return ""
 	}
-	return filepath.Clean(p)
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	} else {
+		p = filepath.Clean(p)
+	}
+	var rest []string
+	for cur := p; ; {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(append([]string{resolved}, rest...)...)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		rest = append([]string{filepath.Base(cur)}, rest...)
+		cur = parent
+	}
 }
 
 // CurrentProject identifies "this working directory" for Target.Project —
@@ -270,7 +292,7 @@ func CurrentProject() string {
 	if err != nil {
 		return ""
 	}
-	return wd
+	return NormalizeProject(wd)
 }
 
 func dir() string {

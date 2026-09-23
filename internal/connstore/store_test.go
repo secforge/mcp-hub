@@ -55,8 +55,12 @@ func TestCurrentProjectFallsBackToWorkingDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Getwd: %v", err)
 	}
-	if got := CurrentProject(); got != wd {
-		t.Fatalf("expected the working directory %q, got %q", wd, got)
+	want, err := filepath.EvalSymlinks(wd)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if got := CurrentProject(); got != want {
+		t.Fatalf("expected the working directory %q, got %q", want, got)
 	}
 }
 
@@ -658,5 +662,39 @@ func TestProjectSpellingsOfOneDirectoryShareOneScope(t *testing.T) {
 	}
 	if got := NormalizeProject(""); got != "" {
 		t.Errorf(`NormalizeProject("") = %q; want "" — "." would be a scope of its own`, got)
+	}
+}
+
+// A SYMLINK, A RELATIVE PATH AND A DIRECTORY THAT DOES NOT EXIST are
+// canonicalised too. The last matters as much as the others: a scope can
+// name a directory that was moved or never created, and one spelled
+// through a symlink must still land where its real spelling would.
+func TestNormalizeProjectCanonicalisesExistingAndMissingPaths(t *testing.T) {
+	real, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(real, "proj"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	link := filepath.Join(real, "link")
+	if err := os.Symlink(filepath.Join(real, "proj"), link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	t.Chdir(real)
+
+	for _, tc := range []struct{ in, want string }{
+		{filepath.Join(real, "proj"), filepath.Join(real, "proj")},
+		{link, filepath.Join(real, "proj")},
+		{link + "/", filepath.Join(real, "proj")},
+		{"proj", filepath.Join(real, "proj")},
+		{"./link/", filepath.Join(real, "proj")},
+		{filepath.Join(link, "missing", "deeper"), filepath.Join(real, "proj", "missing", "deeper")},
+		{filepath.Join(real, "missing") + "/", filepath.Join(real, "missing")},
+		{"/does-not-exist/at/all/", "/does-not-exist/at/all"},
+	} {
+		if got := NormalizeProject(tc.in); got != tc.want {
+			t.Errorf("NormalizeProject(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

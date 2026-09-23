@@ -668,3 +668,19 @@ func TestConnectReportsAMintWhenPeersCouldHaveBeenResumed(t *testing.T) {
 		})
 	}
 }
+
+// A root is a file: URI, and a URI is percent-encoded: "file:///a%20b"
+// names the directory "/a b". Filed under the encoded spelling, it is a
+// different scope from the same directory reached by path.
+func TestARootURIIsDecodedToThePathItNames(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"file:///source/a%20b", "/source/a b"},
+		{"file:///source/mcp-hub/", "/source/mcp-hub/"},
+		{"file://localhost/source/x", "/source/x"},
+		{"/already/a/path", "/already/a/path"},
+	} {
+		if got := rootPath(tc.in); got != tc.want {
+			t.Errorf("rootPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
