@@ -237,7 +237,21 @@ type state map[string]map[string]Entry
 // variable someone set by hand is a statement. A caller that consults
 // roots must consult this first, or the variable silently does nothing in
 // the one place it is most likely to be used.
-func ProjectOverride() string { return os.Getenv("MCP_HUB_PROJECT_DIR") }
+func ProjectOverride() string { return NormalizeProject(os.Getenv("MCP_HUB_PROJECT_DIR")) }
+
+// NormalizeProject is the one spelling a project scope is filed and
+// looked up under. "/source/x/" and "/source/x" name the same directory,
+// and as two map keys they are two scopes: the second finds nothing,
+// mints a new identity, and strands the first. Trailing separators and
+// other redundant path elements are dropped; "" stays "" (filepath.Clean
+// would make it ".", which is a different scope).
+func NormalizeProject(p string) string {
+	if p == "" {
+		return ""
+	}
+	return filepath.Clean(p)
+}
+
 // CurrentProject identifies "this working directory" for Target.Project —
 // MCP_HUB_PROJECT_DIR if set (an explicit override, and how tests get
 // isolation without touching the real cwd), else the process's actual
@@ -462,7 +476,7 @@ func syncDir(d string) {
 }
 
 func getEntry(s state, project, key string) (Entry, bool) {
-	byKey, ok := s[project]
+	byKey, ok := s[NormalizeProject(project)]
 	if !ok {
 		return Entry{}, false
 	}
@@ -475,6 +489,7 @@ func getEntry(s state, project, key string) (Entry, bool) {
 // instead of leaving a pointless empty entry behind, pruning the
 // project map too once it's the last one there.
 func setEntry(s *state, project, key string, e Entry) {
+	project = NormalizeProject(project)
 	if e.empty() {
 		if byKey, ok := (*s)[project]; ok {
 			delete(byKey, key)
@@ -630,6 +645,7 @@ func SetTopic(target Target, topic string) error {
 // single-key lookup rather than a scan, since project is the outermost
 // key on disk.
 func ListForProject(project string) ([]ListedEntry, error) {
+	project = NormalizeProject(project)
 	var out []ListedEntry
 	err := withLock(false, func() error {
 		st, err := load()

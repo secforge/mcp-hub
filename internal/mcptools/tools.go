@@ -467,7 +467,7 @@ func rootFromClient(ctx context.Context) string {
 	if err != nil || len(result.Roots) == 0 {
 		return ""
 	}
-	return strings.TrimPrefix(result.Roots[0].URI, "file://")
+	return connstore.NormalizeProject(strings.TrimPrefix(result.Roots[0].URI, "file://"))
 }
 
 // catchUpIDForRelay derives connstore's persistence identity for a

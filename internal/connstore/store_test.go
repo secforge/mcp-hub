@@ -629,3 +629,34 @@ func TestGetCatchUpDistinguishesAnUnreadableStoreFromAnEmptyOne(t *testing.T) {
 		t.Errorf("a failed read also returned state: cs=%+v ok=%v", cs, ok)
 	}
 }
+
+// A TRAILING SEPARATOR IS THE SAME PROJECT. "/proj/" and "/proj" name one
+// directory; filed as two keys, a session started with one spelling finds
+// nothing the other stored, mints a new identity and strands the old one.
+func TestProjectSpellingsOfOneDirectoryShareOneScope(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link := "wss://example.test/hub/join#s"
+
+	if err := Upsert(Target{Link: link, Project: "/proj"}, Entry{PeerID: "peer-1"}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	for _, spelling := range []string{"/proj/", "/proj//", "/proj/."} {
+		got, ok, err := Get(Target{Link: link, Project: spelling})
+		if err != nil || !ok || got.PeerID != "peer-1" {
+			t.Errorf("Project %q: got %+v ok=%v err=%v; want the identity stored under /proj",
+				spelling, got, ok, err)
+		}
+		listed, err := ListForProject(spelling)
+		if err != nil || len(listed) != 1 || listed[0].Target.Project != "/proj" {
+			t.Errorf("ListForProject(%q) = %+v, %v; want the one entry under /proj", spelling, listed, err)
+		}
+	}
+
+	t.Setenv("MCP_HUB_PROJECT_DIR", "/proj/")
+	if got := ProjectOverride(); got != "/proj" {
+		t.Errorf("ProjectOverride() = %q with MCP_HUB_PROJECT_DIR=/proj/; want /proj", got)
+	}
+	if got := NormalizeProject(""); got != "" {
+		t.Errorf(`NormalizeProject("") = %q; want "" — "." would be a scope of its own`, got)
+	}
+}
