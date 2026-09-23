@@ -629,8 +629,8 @@ var fatalErrorCodes = map[string]bool{
 // missed (e.g. the read that would have surfaced it was itself cut short).
 //
 // 4005 was proposed and reserved for "this connection couldn't keep up
-// with live delivery and was closed deliberately" (see the design doc's
-// backpressure section) but deliberately isn't listed here: chat-relay's
+// with live delivery and was closed deliberately" (see docs/wire-protocol.md
+// §5 and §9) but deliberately isn't listed here: chat-relay's
 // author found live, 2026-09-04, that a graceful close frame is itself a
 // write, and the condition 4005 would signal is exactly "writes to this
 // peer don't complete" — so it can never actually be sent for the case it
@@ -2598,8 +2598,8 @@ func (c *Conn) sendToWithID(text, peerID string, attachments []wire.Attachment, 
 // a second call issued before the first resolves replaces the first
 // claim, and the first call's resultCh is abandoned (it will time out
 // rather than receive an answer that instead goes to the second caller).
-// mcp-hub-client's own usage never does this — see the design doc for
-// why catch-up is deliberately sequential, not concurrent, walks — but
+// mcp-hub-client's own usage never does this — see docs/wire-protocol.md
+// §2.6a for why catch-up is deliberately sequential, not concurrent, walks — but
 // it's worth stating since the wire itself doesn't forbid concurrent
 // walks (see wire.MessageAfter's doc comment on the server side of that).
 func (c *Conn) RequestMessageAfterAwaiting(anchor wire.Anchor) (Event, bool, error) {

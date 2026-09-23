@@ -4,10 +4,9 @@
 
 Lets a Claude Code (or Codex) session join a shared conversation with other
 agents — or with a real chat conversation mirrored from a platform such as
-Microsoft Teams — and exchange messages there. See
-`docs/superpowers/specs/2026-08-21-mcp-hub-design.md` for the original design
-and `docs/superpowers/specs/2026-08-31-mcp-hub-wire-protocol-spec.md` for the
-wire protocol.
+Microsoft Teams — and exchange messages there. The wire protocol is
+specified in `docs/wire-protocol.md`; known defects are in
+`docs/known-issues.md`.
 
 Two binaries:
 
@@ -228,8 +227,11 @@ reused.
 
 The first connect to a link generates a secret, stores it, and presents it
 as the `Agent-Secret` header. Every later connect to the same link *from
-the same project* presents it again, and the server hands back the same
-peer id — across drops, client restarts and server restarts. The model never
+the same project* presents it again together with `Agent-Id`, the peer id
+it was last assigned, and the server — having verified the secret — hands
+that peer id back, across drops, client restarts and server restarts. The
+secret alone reclaims nothing: without `Agent-Id` a server mints a fresh
+identity. The model never
 sees or passes the secret; `hub_list_connections` shows each stored link
 with the peer id it last used, but never the secret.
 
@@ -528,10 +530,11 @@ example with https://github.com/vi/websocat[websocat]:
 websocat ws://localhost:8765/550e8400-e29b-41d4-a716-446655440000
 ----
 
-The first line received is `{"type":"joined","peerId":"..."}` (and one
-`{"type":"peerJoined",...}` per peer already present); after that, type a
-JSON line like `{"type":"msg","text":"hello"}` and press enter to broadcast
-it.
+The first line received is `{"type":"joined","peerId":"...",…}`, followed
+by one `{"type":"roster","members":[…]}` listing everyone in the session,
+you included — re-sent in full whenever membership changes. After that,
+type a JSON line like `{"type":"msg","text":"hello"}` and press enter to
+broadcast it, or add `"to":"<peerId>"` to send privately.
 
 == Committing from this checkout
 
@@ -587,6 +590,11 @@ concurrent paths only the race detector checks. No test needs a running
 server or network access: websocket tests use `httptest.Server`, the wait
 socket tests use real Unix sockets in a temp directory, and the connection
 store is isolated per test with `MCP_HUB_CONNSTORE_DIR`.
+
+Reproductions of defects recorded in `docs/known-issues.md` and not yet
+fixed live beside the other tests and skip by default, so a red suite
+always means something new. `MCP_HUB_KNOWN_ISSUES=1 go test ./...` runs
+them; each fails until its defect is fixed, and the fix removes its skip.
 
 == Releasing the client
 

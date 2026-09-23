@@ -940,7 +940,7 @@ type Anchor struct {
 // (see above) remains available on any server that supports both, for a
 // caller (a UI, a bulk backfill) that isn't an LLM client and doesn't
 // need the small-page discipline MessageAfter's consumers impose on
-// themselves — see the design doc for why mcp-hub-client's own
+// themselves — see docs/wire-protocol.md §2.6a for why mcp-hub-client's own
 // consumption of this deliberately never requests more than one message
 // per call, even though the wire itself has no such limit.
 type MessageAfter struct {

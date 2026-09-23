@@ -19,11 +19,12 @@ handshake.
 What actually varies by server is **which requests get a real answer**:
 
 - `mcp-hub-server`'s own relay (`internal/wsserver`) implements only
-  `msg` (broadcast and directed). Every other inbound request type —
-  `messageAfter`, `reaction`, `edit`, `delete`, `ack` — is silently
-  dropped (`internal/wsserver/server.go`'s read loop discards anything
-  whose `type` isn't `"msg"`). This is a *deployment's* limited feature
-  set, not a protocol restriction.
+  `msg` (broadcast and directed), and sends `joined` and `roster`. Every
+  other inbound request type — `messageAfter`, `reaction`, `edit`,
+  `delete`, `pin`, `ack` — is silently dropped (`internal/wsserver/server.go`'s
+  read loop discards anything whose `type` isn't `"msg"`), and it declares
+  no `features`. This is a *deployment's* limited feature set, not a
+  protocol restriction.
 - A teams relay (chat-relay) implements the rest because it has real
   history, write access, and a reason to track read position.
 
@@ -51,9 +52,7 @@ it. A server ignores what it does not use.
 **URL:** `{scheme}://{host}/{path}`, with the credential in the fragment
 (see `Authorization` below).
 
-- `scheme`: `ws`/`wss` only. (The client also accepts `http`/`https` on
-  the *host* it's given and rewrites them to `ws`/`wss` — that's a
-  client-side convenience, not part of the wire contract.)
+- `scheme`: `ws`/`wss` only.
 - `path`: whatever the server issued. A client never parses it, and a
   server must not require it to. `mcp-hub-server` currently addresses a
   session by a UUID path segment matching
@@ -97,7 +96,7 @@ it. A server ignores what it does not use.
   it, so granting identity reuse on it would let anyone who saw it
   impersonate its owner.
 - `Hub-Protocol-Version` (optional): the client's `ProtocolVersion`
-  (currently `3`). A server may log a mismatch; it must not refuse the
+  (currently `4`). A server may log a mismatch; it must not refuse the
   connection over it (see §6).
 - `Hub-Create-Token` (optional): a capability for creating and claiming a
   session in this same handshake, for a server that refuses an unknown
@@ -116,12 +115,9 @@ message and parses it as `Joined`; if that read errors or
 `Joined.peerId` isn't a valid UUID, the client closes the connection and
 reports a dial failure — no retry.
 
-**Known gap:** the client's first read has **no read deadline** — if a
-server upgrades the connection and then sends nothing at all, the client
-hangs indefinitely rather than timing out. A conformant server should
-send `Joined` promptly regardless; don't rely on the client's patience
-here, and treat this as something the client should probably fix (it's
-being tracked, not something the spec asks a server to work around).
+The client waits at most 10s (or its `pongWait`, if shorter) for that
+first message, then reports the connect as failed. Send `Joined`
+immediately after the upgrade.
 
 **Known laxity, not a requirement to match:** the client's first-message
 parser does not check that the frame's `type` field is literally
@@ -143,7 +139,6 @@ bump — see §6.
 |---|---|---|---|
 | `type` | `"joined"` | yes | |
 | `peerId` | string (UUID) | yes | This connection's assigned identity — see §4. |
-| `peerCount` | int | yes | How many *other* peers were already present. Informational only — see §3. |
 | `serverVersion` | int | yes | This server's protocol version — see §6. |
 | `name` | string | no | Echoed back, post-sanitization. |
 | `agePublicKey` | string | no | Echoed back verbatim. |
@@ -153,6 +148,9 @@ bump — see §6.
 | `features` | object | no | This server's declared capabilities — see §2.1a. |
 | `behind` | int | no | How many messages this peer's own last-acked position trails the newest message in this conversation, computed once at connect. `0` states "caught up" as a fact, distinct from omitted (no such concept — including every mcp-hub-server, and a first-ever connection with no prior position to compare). See §2.6a. |
 | `behindSince` | string (RFC 3339, explicit UTC offset) | no, but required alongside `behind` when `behind` is set to a positive value | The timestamp of this peer's last-acked position — what a `messageAfter{at:...}` seek is computed from when the gap is too large to walk. Omitted under the same conditions as `behind`. |
+| `pinned` | array of `externalId` | whenever `pins` is declared | The conversation's pinned messages. **Always present** when `pins` is declared — `[]` when nothing is pinned — so that absence means only "unsupported". See §2.8a. |
+| `resumablePeers` | int | whenever `mintNotice` is declared and this connection was given a **fresh** identity | How many peers in this conversation still hold a reconnect secret. `0` is sent, not omitted. Absent when an identity was reclaimed. Lets a client that stored nothing for this link tell a first-ever connect from one made under a different scope — see §4. |
+| `clientRelease` | object `{version, readAt?}` | no | What the *server* has verified the current client release to be, from the signed release manifest — never what a peer reported. Present only with the `clientRelease` feature and something verified. The comparison against the client's own build is the client's to make. |
 
 ### 2.1a `features` — capability declaration
 
@@ -181,13 +179,19 @@ client, and a server must not send one to request client behaviour.
 | `messageAfter` | — | Answers `messageAfter` requests (§2.6a). Without it, a client cannot catch up and must say so rather than wait. |
 | `ackReplies` | — | Replies to a *standalone* `ack` (§2.7) with its own `ack` carrying `behind`. |
 | `actionAcks` | — | Answers a write action with its own ack — `sendAck` for `msg`, and `reactionAck`/`editAck`/`deleteAck` for whichever of `reactions`/`edit`/`delete` are also declared. Which acks exist follows from those features; this one says only that waiting for an ack is worthwhile at all. |
-| `rosterReadAt` | — | Reports per-peer read positions in the roster. |
+| `roster` | — | Membership arrives as `roster` frames (§2.3). `roster.readAt` is set where the server knows when the conversation was last read. |
 | `mentions` | — | Accepts `mentions` on `msg`/`edit` and resolves them to platform-native @-mentions. |
 | `attachments` | `maxRawBytes`, `maxFrameBytes` int; `imagesOnly` bool | Accepts attachments, within those limits. `imagesOnly` refuses anything but an image. |
 | `reactions` | — | Accepts `reaction` requests. |
 | `edit` | — | Accepts `edit` requests. |
 | `delete` | — | Accepts `delete` requests. |
 | `replyTo` | — | Accepts `replyTo` on `msg`/`edit` and renders a native threaded citation. |
+| `pins` | — | Mirrors the conversation's pinned set (`joined.pinned`, `pinned`/`unpinned` events) and accepts `pin`/`unpin`/`pins` (§2.8a). |
+| `correlation` | — | Echoes a request's `id` verbatim on the frame that answers it and on an `error` refusing it (§2.2, §2.5). |
+| `mintNotice` | — | Sends `joined.resumablePeers` whenever it mints a fresh identity (§2.1, §4). |
+| `piggybackAckRefusals` | — | Refuses a piggybacked `ackCursor` it cannot record with `error{code:"bad_piggyback_ack"}` instead of dropping it silently (§2.7). |
+| `serverStopping` | — | Sends `serverStopping` before a deliberate shutdown (§2.10). |
+| `clientRelease` | — | Sends `joined.clientRelease` when it has verified a release. |
 
 Adding a feature needs no version bump — a client at protocol 3 or above
 already knows to look. A feature name is removed in the same change that
@@ -198,6 +202,7 @@ removes the capability it names, never left describing something gone.
 | Field | Type | Required | Direction | Notes |
 |---|---|---|---|---|
 | `type` | `"msg"` | yes | both | |
+| `id` | string | no | client→server, echoed server→client | The client's own correlation id for this request, opaque to the server, at most 128 bytes. Echoed verbatim on the frame that answers it (`sendAck`, a `messageAfter` answer) where `correlation` is declared. |
 | `peerId` | string | client←server only | server | Sender's peerId. Absent on the client→server request (the connection *is* the sender). |
 | `text` | string | yes | both | |
 | `ts` | string | server→client | server | Timestamp, server-defined format (RFC3339 in `mcp-hub-server`'s case). |
@@ -208,6 +213,7 @@ removes the capability it names, never left describing something gone.
 | `own` | bool | no | server→client | True if *this exact connection* sent it. A receiving client's own policy decision whether to treat this as wake-worthy — see §3 for what the reference client does. |
 | `cursor` | string | no | server→client | This message's own opaque position — pass back as a `messageAfter` anchor (§2.6a). |
 | `answers` | Anchor (see §2.6a) | no | server→client | Present only when this `msg` is the direct answer to a `messageAfter` request — the exact anchor that request was sent with, echoed back verbatim. |
+| `matching` | Filter (see §2.6a) | no | server→client | On an answer to a filtered `messageAfter`: the filter that was *applied*. |
 | `ackCursor` | string | no | client→server | Piggybacked read receipt — see §2.7. |
 | `attachments` | array of Attachment (see below) | no | both | Binary content, inline or by reference. |
 | `format` | string | no | both | How `text` should be interpreted — see below. |
@@ -284,19 +290,18 @@ never sets either. `messageEdited` (§2.8) carries the same two fields,
 reflecting the edited text — an edit can change who's mentioned, unlike
 `replyTo`/`replyPreview` which never change on edit.
 
-`systemPeerId` (§2.1, `joined`) names a `peerId` a server itself
-originates operator/system messages from on this session. Since every
-`peerId` is necessarily server-assigned — no inbound client frame ever
-supplies one — a client can treat a `msg`/`peerJoined`/`peerLeft` whose
-`peerId` equals `systemPeerId` as reliably from the server's own operator
-channel, not from a peer that typed the same claim into ordinary message
-text. That guarantee covers the *sender's identity* only, not the
-*content* of what they said: a client surfacing this to a model should
-frame an operator message as outranking another **agent's** instructions
-on this hub, while never outranking the model's own user, who isn't a
-party to the hub session at all. `mcp-hub-server` never sets
-`systemPeerId` — there is no operator concept on a plain hub session,
-every peer is an ordinary participant.
+Two reserved `peerId`s mark messages the server itself originates:
+`00000000-0000-0000-0000-000000000000` is the **operator** — the human
+running the server — and `ffffffff-ffff-ffff-ffff-ffffffffffff` is an
+automated **system** message. They are constants a client checks directly;
+nothing in `joined` advertises them. Since every `peerId` is server-assigned
+— no inbound client frame supplies one — a client can trust that a `msg`
+carrying one came from the server's operator channel, not from a peer that
+typed the same claim into ordinary text. That covers the *sender's
+identity* only, not what they said: a client surfacing it to a model
+should frame an operator message as outranking other **agents'**
+instructions on this hub, never the model's own user, who is not a party
+to the session. `mcp-hub-server` never sends either.
 
 An **Attachment** is one of two shapes sharing the same object, distinguished
 by which fields are present — a client attaching its own content (client→server,
@@ -381,28 +386,30 @@ your server does the same, don't expect the sender to see its own `msg`
 come back; `sendAck` (§2.8) exists for exactly this gap on a teams relay that
 *can't* deliver synchronously.
 
-### 2.3 `peerJoined` / `peerLeft` (server → client)
+### 2.3 `roster` (server → client)
 
 ```json
-{"type": "peerJoined", "peerId": "...", "name": "...", "agePublicKey": "..."}
-{"type": "peerLeft", "peerId": "..."}
+{"type": "roster", "members": [{"peerId": "...", "name": "...", "agePublicKey": "..."}], "readAt": "..."}
 ```
 
-`name`/`agePublicKey` are omitted if that peer didn't supply them.
+The session's **whole** membership, including the receiving peer itself —
+so a list of one means you are alone, and an empty list never occurs. Sent
+once right after `joined`, and again, in full, whenever membership
+changes. There are no deltas and no count: every frame is the complete
+truth, so a client that misses one is repaired by the next rather than
+drifting. `name`/`agePublicKey` are omitted for a member that supplied
+none; `readAt`, where present, is when the conversation behind a teams
+link was last read (absent means no answer, not "never").
 
-### 2.4 `rosterComplete` (server → client)
-
-```json
-{"type": "rosterComplete"}
-```
-
-Terminates the initial roster burst — see §3.
+Build it under the same lock that owns membership, so a roster can never
+interleave with a join or leave.
 
 ### 2.5 `error` (server → client)
 
 | Field | Type | Required |
 |---|---|---|
 | `type` | `"error"` | yes |
+| `id` | string | no — the refused request's correlation id, where `correlation` is declared |
 | `message` | string | yes |
 | `code` | string | no |
 | `retryable` | bool | no, meaningless without `code` |
@@ -418,17 +425,24 @@ closed set — treat `code` as an open string):
   mandate retryability per code).
 - `invalid_credential` — relay auth failure (teams-specific, not part
   of the plain-session handshake in §1).
-- `bad_ack` / `bad_ack_cursor` — ack-subsystem-specific: a standalone
-  `ack` with no cursor, or a cursor that won't decode/parse.
-  **Deliberately distinct from any generic `bad_request`/`bad_cursor`
-  you might use for other malformed requests** — `error` carries no
-  correlation id, so a client watching for ack-specific failures
-  (to permanently stop sending receipts on a persistent bug — see §2.7)
-  cannot tell a generic error apart from an ack one. If you emit a
-  generic `bad_cursor`/`bad_request` for other request kinds too, use
-  different codes for the ack case, not the same ones, or every client
-  built against this spec will misattribute your unrelated errors to
-  their ack subsystem.
+- `bad_ack` / `bad_ack_cursor` — a *standalone* `ack` with no cursor,
+  or a cursor that won't decode/parse. Keep these distinct from any
+  generic `bad_request`/`bad_cursor`: a client reads them as "my receipt
+  bookkeeping is broken" and permanently stops sending receipts on that
+  connection (§2.7), which is wrong for an unrelated malformed request.
+- `bad_piggyback_ack` — a *piggybacked* `ackCursor` (§2.7) that cannot be
+  recorded: a cursor this server never minted, or one from another
+  conversation. A stale but valid cursor is not an error. It answers no
+  request, so it carries no `id`; that is why it has its own code, and
+  why it is declared (`piggybackAckRefusals`) rather than inferred.
+- `bad_correlation` — a request's `id` was malformed or over 128 bytes.
+  Refuses that one request only, and is the one error that carries no
+  `id` (it cannot echo the value it is bounding). Recognise it by code,
+  never by the missing id.
+- `bad_filter` — a `messageAfter` filter was invalid (e.g. a `query`
+  under two characters). Distinct from `bad_anchor`: the anchor was fine.
+- `unsupported` — a request for something this connection does not do
+  (e.g. `pin` on a hub session).
 - `bad_reply_to`, `retryable:false` — a `msg`/`edit`'s `replyTo` (§2.2)
   named a message the server won't cite: unknown, held in a different
   conversation, or malformed/empty. Nothing is sent when this fires — not
@@ -518,8 +532,20 @@ independent implementations agree on the malformed case too.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `type` | `"messageAfter"` | yes | |
+| `id` | string | no | Correlation id, echoed on the answer (§2.2). |
 | `cursor` | string | exactly one of `cursor`/`at` | An opaque handle, verbatim from a `msg.cursor` this client already holds. Never parsed, compared, or constructed by the client — see "Why the anchor is a position, not a message identity" below. |
 | `at` | string (RFC 3339, explicit UTC offset — a naive/zoneless timestamp must be refused, not assumed) | exactly one of `cursor`/`at` | A client-chosen instant. "The first message at or after this instant" — inclusive, unlike `cursor`'s exclusive "strictly after." |
+| `sender` | string | no | Filter: only messages from this sender — the identity id this session's own `msg` frames carry (the directory id on a teams session, the `peerId` on a hub one). |
+| `query` | string | no | Filter: only messages whose text contains this. Two characters minimum, else `bad_filter`. |
+
+**Filters** change which message is "next", never the shape of the
+answer: still exactly one message, oldest first — the first one strictly
+after the anchor *that matches*. Both fields AND, an empty field is no
+constraint. The answer echoes the filter that was *applied* as `matching`,
+on the `msg` and on `noMoreMessages`; a server that ignored the filter
+sends no `matching`. A filtered `noMoreMessages` means "nothing further
+matches", not "no more messages" — a client must not end an unfiltered
+walk on it.
 
 Answer — exactly one of three, and *only* one of the three:
 
@@ -599,15 +625,15 @@ bytes on the client's own reading surface, all present) and was *still*
 misread: one message was skimmed inside the page, its position then
 recorded as "seen" by a cursor that advances over a whole returned page,
 and it would never be re-delivered. Nothing was lost in transit — the
-existing truncation-detection machinery (§2.6, and the client-side
-per-event markers described in the design doc) had nothing to detect,
+existing truncation-detection machinery (§2.6, and the client's own
+per-event markers) had nothing to detect,
 because there was no cut. The failure was **attention**, not delivery: a
 reader given a large batch of mostly-already-seen text does not reliably
 read every line. `messageAfter` fixes this at the root by removing the
 batch: a client that only ever asks for and receives one message at a
 time has nothing to skim *inside*, because there is no "inside" — the
 page is exactly the thing it asked for. This is why a well-behaved
-client (see the design doc's `hub_catch_up`) deliberately never requests
+client (the reference client's `hub_catch_up`) deliberately never requests
 more than one message per call even though this protocol places no such
 limit on the wire itself.
 
@@ -628,16 +654,16 @@ at all.
 ### 2.7 `ack` (both directions) — read receipts
 
 This is the read-cursor / read-receipt mechanism. It answers "has the
-model/client actually consumed this event, not just received it" — see
-the design rationale in `docs/superpowers/specs/2026-08-21-mcp-hub-design.md`'s
-"Read receipts" section if you want the full history of why this
-exists.
+model/client actually consumed this event, not just received it".
 
 **Piggybacked form** (preferred): any client→server request
-(`msg`/`reaction`/`edit`/`delete`) may carry an `ackCursor`
-field — "this is the cursor of the last event I've actually consumed."
-Fire-and-forget: **no reply** to a piggybacked receipt, ever. A server
-should just record the position.
+(`msg`/`reaction`/`edit`/`delete`/`pin`/`unpin`/`pins`) may carry an
+`ackCursor` field — "this is the cursor of the last event I've actually
+consumed." It is never *acknowledged*: a server records the position and
+the frame's own answer is about the frame. A server declaring
+`piggybackAckRefusals` refuses one it cannot record with
+`error{code:"bad_piggyback_ack"}` (§2.5); a stale but valid cursor is
+simply not recorded, and is not an error.
 
 **Standalone form**, when nothing else is about to go out anyway:
 
@@ -648,8 +674,11 @@ should just record the position.
 Reply — success:
 
 ```json
-{"type": "ack", "ackCursor": "<cursor you sent>", "ok": true}
+{"type": "ack", "id": "...", "ackCursor": "<cursor you sent>", "ok": true, "behind": 0}
 ```
+
+`behind`, where the server sends it, is how many messages remain after
+the position named in this same frame — `0` stated as a fact.
 
 Reply — stale (the given cursor is behind what you already hold):
 
@@ -718,9 +747,9 @@ Acks (server → client, sent once the action is actually carried out —
 false`**; `ok` is expected true whenever one of these is sent at all):
 
 ```json
-{"type": "reactionAck", "externalId": "...", "reaction": "...", "action": "...", "ok": true}
-{"type": "editAck", "externalId": "...", "ok": true}
-{"type": "deleteAck", "externalId": "...", "ok": true}
+{"type": "reactionAck", "id": "...", "externalId": "...", "reaction": "...", "action": "...", "ok": true}
+{"type": "editAck", "id": "...", "externalId": "...", "ok": true}
+{"type": "deleteAck", "id": "...", "externalId": "...", "ok": true}
 ```
 
 Fan-out to *other* connections (server → client, not something a
@@ -751,10 +780,41 @@ Notes:
 - `own` on all three is true only when *this exact connection* performed
   the action.
 
+### 2.8a Pins (both directions)
+
+Declared as `pins`. Pinning is conversation state, visible to everyone in
+it — including the people on the other side of a mirrored conversation.
+
+```json
+{"type": "pin", "id": "...", "externalId": "...", "ackCursor": "..."}
+{"type": "unpin", "id": "...", "externalId": "...", "ackCursor": "..."}
+{"type": "pins", "id": "...", "ackCursor": "..."}
+```
+
+`pin`/`unpin` are answered by `pinAck`/`unpinAck` (`{id, externalId, ok}`)
+where `actionAcks` is declared, and refused with an `error` otherwise.
+`pins` asks for the current set and is answered by
+`{"type": "pins", "id": "...", "list": ["<externalId>", ...], "at": "..."}`
+— `list` is `[]`, never null, when nothing is pinned. Answer it from the
+same stored set `joined.pinned` carries, not from a fresh upstream read,
+or the two disagree under exactly the conditions the pull exists for.
+
+Changes from anyone arrive as events:
+
+```json
+{"type": "pinned", "externalId": "...", "by": {"id": "...", "name": "..."}, "at": "..."}
+{"type": "unpinned", "externalId": "...", "by": {"id": "...", "name": "..."}, "at": "..."}
+```
+
+`by` names a platform identity, never a `peerId`, and there is no `own`
+flag: an agent pins *as the account*, so the platform shows the account
+as the pinner. A client recognises its own pin by the ack answering its
+request.
+
 ### 2.9 `sendAck` (server → client)
 
 ```json
-{"type": "sendAck", "externalId": "...", "ok": true}
+{"type": "sendAck", "id": "...", "externalId": "...", "ok": true}
 ```
 
 Sent immediately on a send, **before** the canonical `msg` comes back
@@ -766,77 +826,81 @@ later, as an ordinary `msg` with a real `cursor` — `sendAck` never
 substitutes for it. `mcp-hub-server` never sends this (a plain
 `hub_send` already completes synchronously with no such gap).
 
+### 2.10 `serverStopping` (server → client)
+
+```json
+{"type": "serverStopping", "reconnectAfter": 30}
+```
+
+Declared as `serverStopping`. Sent immediately before a deliberate
+shutdown, which then closes with 1001 (Going Away). `reconnectAfter` is
+the server's own estimate in seconds — a floor, not an instruction:
+clients should spread their retries across it rather than all arrive at
+once. The close code is what says "graceful"; this frame only adds the
+estimate, and a client must never require it. Its absence says nothing:
+a killed process sends no frame at all, so a bare 1006 stays exactly as
+ambiguous as before.
+
 ## 3. Ordering and atomicity
 
-- **`joined` → N × `peerJoined` → `rosterComplete`**: the sentinel event
-  (`rosterComplete`) is what the client actually waits for. **`peerCount`
-  is purely informational** — the reference client never compares it
-  against the number of `peerJoined` events actually received, and never
-  blocks on it. Sending a `peerCount` that doesn't match reality changes
-  nothing structurally on the client side, though obviously your own
-  correctness (and human/model-facing text) depends on it being right.
-- The whole join sequence must be computed **atomically** with respect
-  to concurrent joins/leaves — a joining peer's roster snapshot must be
-  exactly the set of peers present at that moment, with no gap where a
-  peer from the snapshot could vanish (a phantom `peerJoined` with no
-  matching `peerLeft` reachable) or a concurrent joiner could be missed
-  entirely from everyone's view.
-- Beyond the roster burst, this protocol makes no ordering guarantee
+- **`joined` → `roster`**: `joined` is always first; the first `roster`
+  follows it. Each `roster` is a complete snapshot built atomically with
+  respect to joins and leaves, and later ones replace earlier ones
+  wholesale.
+- Beyond that, this protocol makes no ordering guarantee
   across unrelated message kinds and no coalescing guarantee — don't
   assume, e.g., that a `sendAck` always arrives strictly before the
   canonical `msg` in wall-clock terms on the wire, only that it's
   *sent* first by a well-behaved server.
 
-## 4. Identity: peerId and reconnectSecret
+## 4. Identity: peerId, Agent-Secret and Agent-Id
 
-- `peerId` is a UUID the server assigns, either freshly generated or
-  reclaimed — never chosen by the client.
-- A client **should always send a `reconnectSecret`**, even on a brand
-  new connection with nothing to resume (the reference client's own
-  tool contract requires this, as a guardrail against a client ending
-  up unable to resume its own identity later — the wire protocol itself
-  doesn't require it, but treat it as a MUST for interop with that
-  client).
-- Presenting the **exact same** `reconnectSecret` on a later connect
-  reassigns the same `peerId` as before. If the previous connection
-  holding that secret is not currently live, this is an ordinary
-  reconnect. If it *is* still connected, the new connection **supersedes**
-  it — the old connection is force-closed (with close code 4004, §5) and
-  the new one takes over the identity, rather than the new connection
-  being handed a fresh, unrelated `peerId`. This was a deliberate
-  correction from an earlier revision of this contract (which assigned a
-  fresh id on live collision): that behavior silently defeated
-  `reconnectSecret`'s entire purpose for exactly the case that needs it
-  most — a fast reconnect racing the server's own detection that the old
-  socket died, where "live" from the server's point of view can simply
-  mean "hasn't noticed yet." Never collide two live connections onto one
-  identity; always resolve to exactly one.
-  No `peerLeft`/`peerJoined` is broadcast to other peers for a
-  supersede — from their perspective this identity never left, it just
-  changed which connection holds it.
-- The secret is never distributed to any other peer — it's a private
-  channel between one client and the server, unlike `agePublicKey`
-  (which is broadcast) or `peerId` (which is public within the session).
-  Do not use anything publicly visible (like `agePublicKey`) to grant
-  identity reuse — that would let anyone who observed it impersonate
-  the original holder.
-- The mapping should survive a server restart and even the session
-  becoming fully empty — a reconnect months later with the same secret
-  should still reclaim the same `peerId`, unless you deliberately expire
-  it (teams-specific link/session lifetimes are your own policy, not
-  part of this identity contract).
+- `peerId` is a UUID the server assigns — freshly generated or reclaimed,
+  never chosen by the client.
+- Every connect carries `Agent-Secret` (§1), and a server refuses one
+  without it. The reference client mints the secret on the first connect
+  to a link, stores it, and presents the same one every time.
+- Reclaiming an identity takes **both**: `Agent-Id` names the `peerId`
+  the client was last assigned, and `Agent-Secret` authorises it.
+  Verified → that `peerId`. Present but unverifiable → the join is
+  refused before the upgrade. Absent → a **fresh** identity. A secret
+  alone never reclaims anything: there is no search of a session's peers
+  for a matching secret (see `Agent-Id` in §1 for why).
+- If the identity being reclaimed is still held by a live connection, the
+  new connection **supersedes** it: the old one is closed with 4004 (§5)
+  and the new one takes over, rather than being handed an unrelated
+  `peerId`. Never collide two live connections onto one identity. Other
+  peers see a roster that did not change.
+- A server declaring `mintNotice` reports `joined.resumablePeers` whenever
+  it mints a fresh identity. The reference client stores identities per
+  *project* and link, so a client that stored nothing for this link
+  cannot tell on its own whether this is a first-ever connect or one from
+  a different project; a non-zero count says other identities could have
+  been resumed.
+- On a teams link the `peerId` is derived from the link itself, so
+  nothing is minted and `Agent-Id` has nothing to reclaim; the secret
+  there authorises resuming the link.
+- The secret is never distributed to any other peer, unlike
+  `agePublicKey` (broadcast) or `peerId` (public within the session).
+  Never grant identity reuse on anything publicly visible.
+- The mapping should survive a server restart and the session becoming
+  empty, unless you deliberately expire it.
+
+**Known gap:** `mcp-hub-server` does not implement this section: it reads
+the secret from a query parameter the client does not send, so against it
+every connect gets a fresh identity. See §1.
 
 ## 5. Close codes
 
 | Code | Meaning | Client behavior |
 |---|---|---|
 | 1000 (NormalClosure) | Deliberate, clean disconnect by either side | No note surfaced — this is the expected, unremarkable case. The reference client sends this with description `"client disconnect"` on every intentional close (e.g. `hub_disconnect`). |
-| 1001 (GoingAway) | Also treated as an ordinary, expected close | Same as 1000 — no note. |
+| 1001 (GoingAway) | A deliberate server shutdown, usually preceded by `serverStopping` (§2.10) | No failure note; the client reports the restart and the server's `reconnectAfter` estimate where it had one. |
 | 1006 (AbnormalClosure) | No close frame received at all — network death, crash, or (historically, now fixed client-side) a close frame written but not flushed before the underlying connection was torn down | Surfaced to the model/caller as "connection assumed dead" plus (if a read timeout, not a close frame, triggered it) how long since the last frame seen. |
 | 4001 | Teams-specific: credential revoked | Client surfaces "(revoked — do not reconnect)". |
 | 4002 | Teams-specific: credential/link expired | Client surfaces "(expired — do not reconnect)". |
 | 4003 | Teams-specific: the underlying conversation became unavailable | Client surfaces "(conversation unavailable — do not reconnect)". |
-| 4004 | A new connection presented the same `reconnectSecret` while this one was still live, and took over (superseded) rather than being assigned a fresh, unrelated peerId | Client surfaces "(connection closed, code N)" (no specific-case guidance yet — this is new) — **do not treat this as a signal to avoid reconnecting**, unlike 4001–4003: the identity is alive and well on the connection that superseded this one, this is simply not that connection anymore. |
+| 4004 | Superseded: another connection reclaimed this identity (§4) while this one was live | Client surfaces "(superseded — another connection holds this identity now…)" and does **not** reconnect automatically: reconnecting would present the same secret and take the identity straight back, and two holders doing that take turns forever. The identity itself is fine. |
 | any other non-1000/1001 code | Generic | Client surfaces "(connection closed, code N)" — no specific guidance. |
 
 4001–4003 are an existing convention for "this credential is dead, don't
@@ -878,26 +942,27 @@ abort acceptable rather than a loss.
 
 ## 6. Versioning
 
-`ProtocolVersion` is currently `2`. The policy: bump it only for a
+`ProtocolVersion` is currently `4`. The policy: bump it only for a
 genuinely breaking change. New optional fields and new event kinds are
 additive and don't need it — `encoding/json` ignores unknown fields on
 decode, and an unrecognized `type` is silently dropped rather than
 erroring. A server should follow the same policy: don't require a
-specific `v` to accept a connection.
+specific version to accept a connection.
 
-`1` → `2` (2026-09-04) is exactly such a breaking change: `history`/
-`historyBegin`/`historyComplete` (§2.6, removed) had no replacement
-fallback left once `messageAfter` (§2.6a) became the only read-catch-up
-path — a client that only knows `history` can no longer be served by a
-server that only knows `messageAfter`, and vice versa. That's the bar for
-a version bump: not "does this add something new" (that's additive, no
-bump) but "does an old peer's request now go unanswered where it used to
-work."
+- `1` → `2` (2026-09-04): `history`/`historyBegin`/`historyComplete`
+  (§2.6) removed, `messageAfter` (§2.6a) the only catch-up path — an old
+  peer's request would now go unanswered. That is the bar for a bump.
+- `2` → `3` (2026-09-08): `joined.features` (§2.1a). Not breaking by
+  itself, but a floor meaning "this server declares its features", so a
+  client knows to look; no individual feature needs a bump after it.
+- `3` → `4`: the membership burst (`peerCount`, one `peerJoined` per peer,
+  `peerLeft`, `rosterComplete`) replaced by the `roster` frame (§2.3). A
+  client waiting for `rosterComplete` would wait forever.
 
 If `Joined.serverVersion` differs from the client's own `ProtocolVersion`,
 the reference client does **not** refuse the connection or alter its own
 behavior beyond this — it's surfaced as an explicit note in
-`hub_connect`'s/`teams_relay_connect`'s result text: "tell the user to
+`hub_connect`'s result text: "tell the user to
 update mcp-hub-client" if the server is newer, "the server may need
 updating" if the server is older. This is the mechanism an incompatible
 peer is expected to be caught by — at connect time, as a clear
@@ -942,23 +1007,19 @@ the "unknown fields ignored" rule §6 already establishes for message
 bodies, extended to the handshake). One such extension exists today,
 documented here for reference, not as something every server needs:
 
-**`X-Hub-Create-Token` (chat-relay).** A capability token, transport
-`{prefix}.{secret}` (both base64url), sent as a request header on the
-handshake (preferred — a query-string equivalent, `?create=...`, exists
-as a fallback for a client that can't set headers, but ends up in
-plaintext in a reverse proxy's access log, so header is strictly
-better when available). Lets a client create and claim a brand-new
-`sessionId` in the same handshake that joins it — meaningful only for a
-server that refuses an unknown `sessionId` by design (chat-relay 404s
-one rather than creating it, unlike `mcp-hub-server`'s create-on-first-
-connect behavior). If `sessionId` already exists, the token is ignored
-entirely and the join proceeds normally — never mutually exclusive with
-`reconnectSecret`/`name`/`agePublicKey`. The reference client
-(`hubconn.DialOptions.CreateToken`, surfaced as `hub_connect`'s
-`createToken` parameter) sends it as the header form only; it never
-generates or discovers a token on its own — the user supplies one,
-issued out of band (chat-relay: `POST /api/conversations/hub/create-
-tokens`, shown once, only its hash is later stored).
+**Creating a session on connect (chat-relay).** For a server that
+refuses an unknown session by design (chat-relay answers `404` rather
+than creating one, unlike `mcp-hub-server`'s create-on-first-connect),
+`Hub-Create-Token` (§1) carries a capability to create and claim a new
+session in the same handshake, with `Hub-Topic` optionally naming it. The
+link names the new session id in its fragment as usual. A header only —
+there is no query form, because a create token in a URL lands in access
+logs and creates conversations. If the session already exists, the token
+is ignored and the join proceeds normally. The reference client sends it
+from `hub_connect`'s `createToken`/`topic` and never generates or
+discovers a token itself; chat-relay issues them to a person
+(`POST /api/conversations/hub/create-tokens`), shows them once and stores
+only a hash.
 
 **Outbound `mentions` on `msg`/`edit` (chat-relay).** A client may set
 `mentions` (an array of `Mention`, §2.2's table — same field a client

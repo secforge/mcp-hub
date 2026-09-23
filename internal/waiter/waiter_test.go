@@ -346,8 +346,7 @@ func TestFollowDeliversMultipleEventsOverSameConnection(t *testing.T) {
 // emission pacing: two chunks delivered in the same burst must be
 // separated by at least liveEmissionSpacing, so a downstream layer
 // coalescing anything within its own window cannot merge them — see
-// deliver's own doc comment and the design doc's live-emission-pacing
-// section.
+// deliver's own doc comment.
 func TestFollowSpacesWritesWithinABurst(t *testing.T) {
 	orig := liveEmissionSpacing
 	liveEmissionSpacing = 100 * time.Millisecond

@@ -364,11 +364,13 @@ in the new client rather than in the old one.
 
 ## Four bundled-server defects, left unfixed by scope
 
-Found by an external Codex review, 2026-09-19 (`docs/review-2026-09-19/`,
-which keeps the report and the reviewer's own failing tests). The project
-owner stated the same day that `/source/chat-relay` is the only supported
-server and the bundled one is out of scope, so these are recorded rather
-than fixed. They are real: each has a test that fails against this code.
+Found by an external Codex review, 2026-09-19. The project owner stated
+the same day that `/source/chat-relay` is the only supported server and
+the bundled one is out of scope, so these are recorded rather than fixed.
+They are real: each has a reproduction in the package's
+`review_regressions_test.go` that fails against this code. They skip by
+default so the suite stays green; `MCP_HUB_KNOWN_ISSUES=1` runs them, and
+a fix removes that test's skip.
 
 - **An unreadable identity file is silently overwritten.**
   `identitystore.Load` treats malformed JSON and read errors alike as an
