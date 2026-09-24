@@ -1146,3 +1146,41 @@ found it here was another party reading a release note against a
 document they had helped write. That is not a process anyone can
 guarantee; it is a reason to say what a fix changes, out loud, to
 somebody who has the old version in their head.
+
+## Intermittent: `TestSetCatchUpKeyPersistsAcrossHubInstances`
+
+**Observed** 2026-09-24, once in about ten full `go test -race` runs of
+`internal/mcptools`, never when the test runs alone (20 isolated runs
+passed). The test's own diagnostic said the store was readable, no error,
+and held nothing for the target — `cursor="" ok=false err=<nil>` — right
+after `SetCatchUp` had written it.
+
+**Cause, from source:** `connstore` resolves its directory from
+`MCP_HUB_CONNSTORE_DIR` anew in `lockPath()`, `load()`'s `path()` and
+`save()`'s `path()`/`dir()` — three times within one `withLock` operation.
+Tests switch that variable per test with `t.Setenv`. A goroutine left
+running by an earlier test that is inside an operation when the next test
+switches it can lock and load in one directory and save in the other,
+writing a stale whole-file snapshot over the new test's file and erasing
+the entry it just wrote. Production never changes the variable, so only
+tests are exposed.
+
+**Fix, not yet made:** resolve the directory once per operation and pass
+it to the lock, the load and the save.
+
+## `hub_connect` waits forever on a client that does not answer roots
+
+**Observed** 2026-09-24 with an MCP client that declared no `roots`
+capability (the tool-reference generator's own probe): with
+`MCP_HUB_PROJECT_DIR` unset, `hub_connect` never returned.
+
+**Cause, from source:** with no override, `projectForConnect` asks the MCP
+client for its roots (`rootFromClient`) and deliberately waits on the
+request's own context with no timeout of its own, so that a slow answer
+cannot change the scope. A client that never answers — including one that
+declared no roots support at all — blocks the connect for as long as the
+call lives. Claude Code answers, so this has not been seen there.
+
+**Fix, not yet made:** skip the request when the client's `initialize`
+declared no `roots` capability, and fall through to the working directory
+as for any other "no roots".
