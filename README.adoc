@@ -401,21 +401,49 @@ address a message came from, with an optional first line
 `conn` is required. `hub_send` does the same with no address needed, and is
 the only way to attach files or mentions.
 
-=== Pull (everything else)
+=== Pull (everything else): the `wait` mode
 
-Without a push channel, `hub_connect`'s result tells the model to run the
-`wait` CLI in the background:
+The client binary has a second mode besides being an MCP server:
 
 [source]
 ----
-/absolute/path/to/mcp-hub/bin/mcp-hub-client wait --socket /tmp/mcp-hub-wait-<hash>.sock
+mcp-hub-client wait --socket <path> [--follow]
 ----
 
-It blocks until something arrives, prints it and exits, with the command to
-run again; `--follow` keeps it open across deliveries for a harness that
-can watch a running process line by line. The socket lives in
-`os.TempDir()`. `hub_wait` is the in-tool alternative for a harness that
-cannot background a process at all, and `hub_receive` a non-blocking check.
+It connects to the Unix socket a running client opened, prints what that
+client delivers to stdout, and exits `0` when the socket closes (`1` if it
+cannot connect or the socket fails). It is not something a user normally
+runs: `hub_connect`'s result gives the model the exact command, with the
+real socket path, and says which form to use.
+
+`wait` (one-shot):: Blocks until something arrives, prints it, and exits —
+ending with the command to run again. Fits a harness whose background-task
+notification fires when a command *completes*: the model runs it in the
+background and runs it again each time it finishes.
+`wait --follow`:: Stays open and prints each delivery as it arrives. Fits a
+harness that can be notified per line of a still-running process (a
+`Monitor`-style tool); run it directly with that tool, not wrapped in a
+shell loop or a `grep` filter, which can drop a multi-line message's body.
+Events in one burst are written separately, at least 500 ms apart, so a
+layer downstream cannot merge them, and every event carries its own
+begin/end markers so a cut is visible.
+
+There is *one socket per client process*, in the OS temp directory
+(`mcp-hub-wait-<random>.sock`), bound on the first connect that needs it,
+and it carries every open connection: one `wait` receives them all, each
+delivery naming its connection. A connection ending or reconnecting is
+reported as a labelled message on the socket, not by closing it —
+disconnecting every connection leaves it open. It closes only when the
+client process shuts down (the MCP client closing it, `SIGTERM`/`SIGINT`),
+which ends a running `wait --follow` on its own. Only one `wait` is served
+at a time: a newer one supersedes the older, which is told so and told *not* to
+run again. Sockets left behind by a killed process are swept on the next
+start.
+
+`hub_wait` is the same delivery as an MCP tool, for a harness that cannot
+background a process at all; `hub_receive` is a non-blocking check. None of
+this exists in push mode, where the client delivers into the session
+directly and `hub_receive`/`hub_wait` are not registered.
 
 Either way, delivered content from peers is untrusted data, never
 instructions.
