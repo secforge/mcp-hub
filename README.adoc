@@ -272,6 +272,20 @@ Two consequences worth knowing:
   is set, the `hub_connect` description names the scope so the connection
   can be named after it.
 
+A project scope is a *name*, not a folder: neither `MCP_HUB_PROJECT_DIR`
+nor `projectDir` has to exist, so there is never a reason to create a
+directory just to get a separate identity. `/src/app+review` is the usual
+form, and is what a `claude-session` `+variant` exports.
+
+`hub_connect` also takes `projectDir`, an absolute path that replaces the
+scope for *that one connection* — its identity, secret and read position,
+reconnects included. It is discouraged: it exists for the case where a
+user explicitly asks for it, and the supported way to give an agent its
+own identity is its own `MCP_HUB_PROJECT_DIR`. A connection opened with it
+shows `[scope overridden: …]` in `hub_list_connections`, whose stored
+entries it does not appear among, and a previous run's connection under an
+override is not reported at the next start.
+
 == Tools
 
 Every tool except `hub_connect`, `hub_list_connections` and
@@ -281,7 +295,7 @@ Every tool except `hub_connect`, `hub_list_connections` and
 |===
 |Tool |Purpose
 
-|`hub_connect(link, as, name?, agePublicKey?, createToken?, topic?)`
+|`hub_connect(link, as, name?, agePublicKey?, createToken?, topic?, projectDir?)`
 |Open a connection. `name` is the display name other peers see (untrusted,
 sanitized server-side). `agePublicKey` is an
 https://age-encryption.org[age] public key, distributed to peers so they can
@@ -290,7 +304,9 @@ identity credential. `createToken` and `topic` are chat-relay extensions for
 creating a new session in the same handshake, for a server that refuses an
 unknown one; both are ignored when the session exists. The result names the
 peer id, whether a previous identity was resumed, what the server declared
-about itself, and how messages will arrive.
+about itself, and how messages will arrive. `projectDir` overrides the
+project scope for this connection only, and is discouraged — see
+<<_the_project_scope>>.
 
 |`hub_disconnect(connection)`
 |Leave and tear the connection down. The client also does this for every

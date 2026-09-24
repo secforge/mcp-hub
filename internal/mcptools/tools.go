@@ -1738,6 +1738,19 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"Optional, server-specific: a display name for a session being CREATED (see "+
 					"createToken). Meaningless when joining one that already exists — a "+
 					"conversation's name is the server's to report, not a client's to set")),
+			mcp.WithString("projectDir", mcp.Description(
+				"DISCOURAGED — leave this out. Only for when the user explicitly tells you to "+
+					"use a different project scope for this one connection, and never on your "+
+					"own initiative. An absolute path — it need not exist, it is a name, not a "+
+					"folder to create — that replaces this client's project scope "+
+					"(MCP_HUB_PROJECT_DIR, else the client's project root) for THIS connection "+
+					"only: its stored identity, secret and read position are looked up and "+
+					"written under that scope for its whole life, reconnects included. A "+
+					"different scope is a different identity — a new peer id and a fresh read "+
+					"position unless that scope already holds one for this link — and "+
+					"hub_list_connections does not list its stored entry. To give an agent its "+
+					"own identity, the supported way is a separate MCP_HUB_PROJECT_DIR (e.g. a "+
+					"claude-session +variant), not this")),
 		),
 		h.handleConnect,
 	)
@@ -2443,6 +2456,23 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	}
 
 	target := targetForLink(ctx, link)
+	// AN EXPLICIT SCOPE FOR THIS ONE CONNECTION. It replaces the project
+	// half of the target here, once, and everything later reads the
+	// target this call stores on the session — reconnects, catch-up
+	// position, gap records, the connected mark — so the override holds
+	// for the connection's whole life without being consulted again.
+	// Nothing else resolves a scope for an open connection.
+	defaultProject := target.Project
+	if dir := req.GetString("projectDir", ""); dir != "" {
+		if !filepath.IsAbs(dir) {
+			return mcp.NewToolResultError(fmt.Sprintf("projectDir must be an absolute path, got "+
+				"%q: a relative one would be resolved against this process's working directory, "+
+				"which is not something a caller can see. It need not exist. Better still, leave "+
+				"projectDir out — it is only for when the user explicitly asks for a different "+
+				"scope.", dir)), nil
+		}
+		target.Project = connstore.NormalizeProject(dir)
+	}
 	stored, _, storeErr := connstore.Get(target)
 	// AN OMITTED NAME KEEPS THE ONE THIS LINK LAST USED. The whole entry
 	// is rewritten after a successful connect, so taking "" literally
@@ -2785,6 +2815,14 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				"the server's side, which messages count as your own — does not carry over. "+
 				"The new one has been recorded and will be asked for next time.",
 			stored.PeerID, conn.PeerID())
+	}
+
+	if target.Project != defaultProject {
+		identityNote += fmt.Sprintf("\nSCOPE OVERRIDDEN: this connection is scoped to %q "+
+			"instead of this client's %q, for its stored identity, secret and read position — "+
+			"reconnects included. It is a separate identity from one opened under the default "+
+			"scope, and hub_list_connections does not list its stored entry.",
+			target.Project, defaultProject)
 	}
 
 	notes := ""
@@ -4337,8 +4375,13 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 			state = "reconnecting automatically"
 		}
 		link := s.redialLink
+		scope := s.redialTarget.Project
 		s.mu.Unlock()
-		openLines = append(openLines, fmt.Sprintf("%s — %s (link=%s)", s.name, state, link))
+		line := fmt.Sprintf("%s — %s (link=%s)", s.name, state, link)
+		if scope != "" && scope != projectForConnect(ctx) {
+			line += fmt.Sprintf(" [scope overridden: %s]", scope)
+		}
+		openLines = append(openLines, line)
 	}
 	openBlock := "No connection is open. hub_connect opens one and gives it a name.\n\n"
 	if len(openLines) > 0 {
