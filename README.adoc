@@ -382,6 +382,25 @@ platform behind it to write to.
 
 == Delivery
 
+The client delivers in one of five ways, preferred in this order — each
+is used only where the ones above it are not available:
+
+. *Unix domain socket push (Claude Code)* — the harness's own messaging
+  socket (`CLAUDE_CODE_MESSAGING_SOCKET`); messages arrive in the session
+  as they happen.
+. *Local server socket push (Codex)* — Codex's own socket, found under
+  `CODEX_HOME`; the same, for Codex.
+. *`wait --follow`* — for any other harness that can watch a running
+  background process line by line (a `Monitor`-style tool).
+. *`wait`* (one-shot) — for a harness that can run a command in the
+  background but only learns when it completes; run again after each one.
+. *`hub_wait`* — the MCP tool, for everything else, including a harness
+  that cannot run a background process at all.
+
+The two push modes need nothing started or kept alive, and in them
+`hub_receive`/`hub_wait` are not registered. `hub_connect`'s result says
+which mode applies and gives the exact command where one is needed.
+
 === Push (Claude Code, Codex)
 
 When the harness exposes a messaging channel —
