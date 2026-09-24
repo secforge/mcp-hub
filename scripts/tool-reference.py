@@ -11,11 +11,13 @@ to appear.
 
     scripts/tool-reference.py                    # print the fragment
     scripts/tool-reference.py --update FILE.adoc # replace it between markers
+    scripts/tool-reference.py --client bin/mcp-hub-client ...  # describe a given build
 
 The markers are the lines `// BEGIN generated: mcp-hub tool reference` and
 `// END generated: mcp-hub tool reference`.
 """
 import argparse
+import html
 import json
 import os
 import re
@@ -107,10 +109,14 @@ def free_port():
 
 
 def literal(text):
-    # A literal block shows the text exactly as the model receives it. A
-    # line of four dots inside it would end the block, so one is escaped.
-    body = "\n".join(("​" + l) if l.strip() == "...." else l for l in text.split("\n"))
-    return "....\n" + body + "\n....\n"
+    # The text exactly as the model receives it, in the look of a literal
+    # block but WRAPPED: the site's theme sets `white-space: pre` on
+    # literal blocks, which puts a whole description on one scrolling line.
+    # Passed through as HTML, escaped, so nothing in it is read as markup.
+    body = html.escape(text, quote=False)
+    return ('++++\n<div class="literalblock"><div class="content">'
+            '<pre style="white-space: pre-wrap; overflow-wrap: anywhere">' + body +
+            '</pre></div></div>\n++++\n')
 
 
 def param_type(schema):
@@ -172,9 +178,11 @@ def startup_notices():
     return texts
 
 
-def generate():
+def generate(client=None):
     tmp = tempfile.mkdtemp(prefix="mcp-hub-toolref-")
     bins = build(tmp)
+    if client:
+        bins["mcp-hub-client"] = os.path.abspath(client)
     push = probe(bins["mcp-hub-client"], tmp, push=True)
     pull = probe(bins["mcp-hub-client"], tmp, push=False)
     scoped = probe(bins["mcp-hub-client"], tmp, push=True, project="/source/example")
@@ -249,8 +257,11 @@ def generate():
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--update", metavar="FILE", help="replace the fragment between the markers in FILE")
+    ap.add_argument("--client", metavar="BINARY",
+                    help="describe this mcp-hub-client instead of one built from the working tree, "
+                         "e.g. a release build")
     args = ap.parse_args()
-    frag = generate()
+    frag = generate(args.client)
     if not args.update:
         sys.stdout.write(frag)
         return
