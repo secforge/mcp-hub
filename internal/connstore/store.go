@@ -598,6 +598,26 @@ func MarkDisconnected(target Target) error {
 	})
 }
 
+// Delete removes target's entry entirely — the reconnect secret, the peer
+// id it reclaims, the read position and any recorded gap. Irreversible:
+// the next connect to that link is a first-ever one, with a new identity.
+// Reports whether there was an entry to remove.
+func Delete(target Target) (bool, error) {
+	var existed bool
+	err := withLock(true, func() error {
+		s, err := load()
+		if err != nil {
+			return err
+		}
+		if _, existed = getEntry(s, target.Project, target.Link); !existed {
+			return nil
+		}
+		setEntry(&s, target.Project, target.Link, Entry{})
+		return save(s)
+	})
+	return existed, err
+}
+
 // SetPeerID records the identity a server assigned, so a later connect can
 // ask for it back (see hubconn.DialOptions.AgentID).
 func SetPeerID(target Target, peerID string) error {

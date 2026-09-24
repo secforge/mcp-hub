@@ -308,10 +308,24 @@ about itself, and how messages will arrive. `projectDir` overrides the
 project scope for this connection only, and is discouraged — see
 <<_the_project_scope>>.
 
-|`hub_disconnect(connection)`
-|Leave and tear the connection down. The client also does this for every
-open connection when it shuts down on `SIGTERM`/`SIGINT` or when its stdio
-pipe closes.
+|`hub_disconnect(connection, remove?)`
+|Leave and tear the connection down. The stored entry stays, so the next
+connect to that link resumes the same identity; `remove: true` deletes it
+as well (see `hub_remove`). The client also disconnects every open
+connection when it shuts down on `SIGTERM`/`SIGINT` or when its stdio pipe
+closes — without removing anything.
+
+|`hub_remove(connection? \| link?)`
+|Delete a stored entry — its secret, peer id and read position. A
+`connection` name that is open means that connection, as it does for every
+tool: it is disconnected and its entry removed from the scope it was opened
+under, exactly as `hub_disconnect(remove: true)` would. A name that is not
+open, or a `link`, is looked up among this project's stored entries (a name
+by what it was last opened as, refused if more than one entry matches); an
+entry an open connection holds is disconnected and removed the same way.
+*Irreversible*: the next connect to that link gets a new identity, which the
+other peers see as a new participant, and nothing to catch up from. Both
+tools tell the model to do this only when the user asks.
 
 |`hub_list_connections()`
 |The links this project has used, with the peer id, display name,

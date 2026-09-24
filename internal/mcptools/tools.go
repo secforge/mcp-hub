@@ -1821,8 +1821,35 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool(
 		mcp.NewTool("hub_disconnect",
 			connectionParam(),
-			mcp.WithDescription("Disconnect from the current hub session")),
+			mcp.WithDescription("Disconnect from the current hub session"),
+			mcp.WithBoolean("remove", mcp.Description(
+				"Optional, default false: also delete this connection's stored entry — its "+
+					"reconnect secret, peer id and read position — so it no longer appears in "+
+					"hub_list_connections. "+"IRREVERSIBLE: the stored identity is gone — the next hub_connect to this link is a "+
+					"first-ever one, with a NEW peer id that the other peers see as a new participant, "+
+					"and no read position to catch up from. Only when the user explicitly asks to forget "+
+					"this connection, never to tidy up on your own initiative"))),
 		h.handleDisconnect,
+	)
+	addTool(
+		mcp.NewTool("hub_remove",
+			mcp.WithDescription("Delete a stored connection — its reconnect secret, peer id and "+
+				"read position — so it no longer appears in hub_list_connections. A connection "+
+				"that is OPEN is disconnected first, exactly as hub_disconnect(remove: true) does, "+
+				"and its entry removed from whatever scope it was opened under. "+"IRREVERSIBLE: the stored identity is gone — the next hub_connect to this link is a "+
+				"first-ever one, with a NEW peer id that the other peers see as a new participant, "+
+				"and no read position to catch up from. Only when the user explicitly asks to forget "+
+				"this connection, never to tidy up on your own initiative"),
+			mcp.WithString("connection", mcp.Description(
+				"A connection name. If a connection is OPEN under it, that is the connection "+
+					"meant, as with every other tool. Otherwise the stored entry of this project last "+
+					"opened under it (hub_list_connections' lastOpenedAs) — refused if more than one "+
+					"was; pass link then. Exactly one of connection and link")),
+			mcp.WithString("link", mcp.Description(
+				"The entry's link, exactly as hub_list_connections shows it, among this "+
+					"project's stored entries. Exactly one of connection and link")),
+		),
+		h.handleRemove,
 	)
 	addTool(
 		mcp.NewTool("hub_list_connections",
@@ -3756,6 +3783,17 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	// The stored target, taken before anything below clears it: a
+	// connection mid-reconnect has no live one, and the redial target is
+	// the next thing reset. It is the target the connect resolved, so a
+	// projectDir override is honoured here too.
+	remove := req.GetBool("remove", false)
+	s.mu.Lock()
+	removeTarget := s.redialTarget
+	if removeTarget == (connstore.Target{}) {
+		removeTarget = s.connTarget
+	}
+	s.mu.Unlock()
 	// Leaving on purpose ends the standing permission to come back. A
 	// server restart arriving moments later must not drag a caller into a
 	// session it chose to leave, and "I disconnected but it reconnected"
@@ -3787,7 +3825,11 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 		// disconnect.
 		if w != nil {
 			return mcp.NewToolResultText("not connected — a reconnect was pending and has been " +
-				"cancelled, and the channel has been told this connection is gone"), nil
+				"cancelled, and the channel has been told this connection is gone" +
+				removeStored(remove, removeTarget)), nil
+		}
+		if remove {
+			return mcp.NewToolResultText("not connected" + removeStored(remove, removeTarget)), nil
 		}
 		return s.notConnected(), nil
 	}
@@ -3798,7 +3840,101 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 		// nag about a connection its caller chose to leave.
 		_ = connstore.MarkDisconnected(target)
 	}
-	return mcp.NewToolResultText("disconnected"), nil
+	return mcp.NewToolResultText("disconnected" + removeStored(remove, removeTarget)), nil
+}
+
+// removeStored deletes target's stored entry when asked, and says what
+// happened in a form appended to a disconnect result. Last, after the
+// connection is closed, so nothing of this connection writes it back.
+func removeStored(remove bool, target connstore.Target) string {
+	if !remove {
+		return ""
+	}
+	if target == (connstore.Target{}) {
+		return "; nothing was removed — this connection never had a stored entry"
+	}
+	existed, err := connstore.Delete(target)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("; its stored entry could NOT be removed (%v) and is still listed", err)
+	case !existed:
+		return "; there was no stored entry to remove"
+	}
+	return "; its stored entry is removed — secret, peer id and read position. The next " +
+		"connect to this link is a first-ever one, with a new identity"
+}
+
+// handleRemove deletes a stored entry. A name that is open means that
+// connection, as it does for every tool, and so does a link whose entry an
+// open connection holds: either is disconnected and removed through
+// handleDisconnect, which deletes the target the connection was opened
+// under — an override scope included — and does it after closing, so
+// nothing of the connection writes the entry back. Otherwise a name or a
+// link is looked up among this project's stored entries.
+func (h *Hub) handleRemove(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name, link := req.GetString("connection", ""), req.GetString("link", "")
+	if (name == "") == (link == "") {
+		return mcp.NewToolResultError("hub_remove takes exactly one of connection and link"), nil
+	}
+	if name != "" {
+		if _, err := h.session(name); err == nil {
+			return h.disconnectAndRemove(ctx, name)
+		}
+	}
+	entries, err := connstore.ListForProject(projectForConnect(ctx))
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("could not read the stored connections: %v", err)), nil
+	}
+	var matches []connstore.ListedEntry
+	for _, le := range entries {
+		if (link != "" && le.Target.Link == link) || (name != "" && le.Entry.LocalName == name) {
+			matches = append(matches, le)
+		}
+	}
+	switch {
+	case len(matches) == 0:
+		return mcp.NewToolResultError("no open connection by that name, and no stored connection " +
+			"of this project matches — hub_list_connections shows both"), nil
+	case len(matches) > 1:
+		return mcp.NewToolResultError(fmt.Sprintf("%d stored connections were last opened as %q; "+
+			"pass link instead to say which", len(matches), name)), nil
+	}
+	target := matches[0].Target
+	for _, s := range h.allSessions() {
+		s.mu.Lock()
+		held := s.redialTarget == target || s.connTarget == target
+		s.mu.Unlock()
+		if held {
+			return h.disconnectAndRemove(ctx, s.name)
+		}
+	}
+	existed, err := connstore.Delete(target)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("could not remove it: %v", err)), nil
+	}
+	if !existed {
+		return mcp.NewToolResultText("it was already gone"), nil
+	}
+	return mcp.NewToolResultText("removed — its secret, peer id and read position are gone. The " +
+		"next connect to this link is a first-ever one, with a new identity"), nil
+}
+
+// disconnectAndRemove is hub_disconnect(connection: name, remove: true),
+// said as what it did to an open connection.
+func (h *Hub) disconnectAndRemove(ctx context.Context, name string) (*mcp.CallToolResult, error) {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"connection": name, "remove": true}
+	res, err := h.handleDisconnect(ctx, req)
+	if err != nil || res.IsError {
+		return res, err
+	}
+	for i, c := range res.Content {
+		if t, ok := c.(mcp.TextContent); ok {
+			t.Text = fmt.Sprintf("%q was open, so it was disconnected first: %s", name, t.Text)
+			res.Content[i] = t
+		}
+	}
+	return res, nil
 }
 
 // Shutdown tears down the active connection exactly as handleDisconnect

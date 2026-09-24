@@ -698,3 +698,36 @@ func TestNormalizeProjectCanonicalisesExistingAndMissingPaths(t *testing.T) {
 		}
 	}
 }
+
+// Delete removes everything stored for a target — identity and read
+// position — and nothing belonging to another target.
+func TestDeleteRemovesOneEntryCompletely(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	one := Target{Link: "wss://example.test/hub/join#one", Project: "/proj"}
+	two := Target{Link: "wss://example.test/hub/join#two", Project: "/proj"}
+	for _, tg := range []Target{one, two} {
+		if err := Upsert(tg, Entry{PeerID: "peer", ReconnectSecret: "secret"}); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+		if err := SetCatchUp(tg, CatchUpState{Cursor: "cursor"}); err != nil {
+			t.Fatalf("SetCatchUp: %v", err)
+		}
+	}
+
+	existed, err := Delete(one)
+	if err != nil || !existed {
+		t.Fatalf("Delete = %v, %v; want true, nil", existed, err)
+	}
+	if e, ok, _ := Get(one); ok {
+		t.Fatalf("the deleted entry is still there: %+v", e)
+	}
+	if cs, ok, _ := GetCatchUp(one); ok {
+		t.Fatalf("the deleted entry's read position is still there: %+v", cs)
+	}
+	if e, ok, _ := Get(two); !ok || e.ReconnectSecret != "secret" {
+		t.Fatalf("Delete touched another entry: %+v ok=%v", e, ok)
+	}
+	if existed, err := Delete(one); err != nil || existed {
+		t.Fatalf("deleting again = %v, %v; want false, nil", existed, err)
+	}
+}
