@@ -553,6 +553,9 @@ type Conn struct {
 	// decodes this shape existed and had no client caller at all.
 	attachments     wire.AttachmentsFeature
 	attachmentsSaid bool
+	// formats is the "formats" feature's accepted list, nil when the
+	// server did not declare it — see RequireFormat.
+	formats []string
 }
 
 // ackClaim is a one-shot subscription for the next event matching a
@@ -1037,6 +1040,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfir
 		resumablePeers:          joined.ResumablePeers,
 		mintNoticeDeclared:      joined.HasFeature(wire.FeatureMintNotice),
 		attachmentsSaid:         attachmentsStated(joined),
+		formats:                 formatsDeclared(joined),
 		lastFrameKind:           "joined",
 		lastFrameAt:             time.Now(),
 		confirmReminderInterval: snapConfirmReminderInterval,
@@ -1076,6 +1080,17 @@ func (c *Conn) ServerVersion() int { return c.serverVersion }
 func attachmentsDeclared(joined wire.Joined) wire.AttachmentsFeature {
 	af, _ := joined.AttachmentsFeature()
 	return af
+}
+
+func formatsDeclared(joined wire.Joined) []string {
+	ff, ok := joined.FormatsFeature()
+	if !ok {
+		return nil
+	}
+	if ff.Accepted == nil {
+		return []string{}
+	}
+	return ff.Accepted
 }
 
 func attachmentsStated(joined wire.Joined) bool {
@@ -2555,6 +2570,12 @@ func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo 
 }
 
 func (c *Conn) sendWithID(text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention, corrID string) error {
+	if err := c.RequireContent(len(attachments) > 0, replyTo != "", len(mentions) > 0); err != nil {
+		return err
+	}
+	if err := c.RequireFormat(format); err != nil {
+		return err
+	}
 	m := wire.NewOutgoingMsg(text)
 	m.ID = corrID
 	m.AckCursor = c.ackCursorForOutbound()
@@ -2574,6 +2595,12 @@ func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format
 }
 
 func (c *Conn) sendToWithID(text, peerID string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention, corrID string) error {
+	if err := c.RequireContent(len(attachments) > 0, replyTo != "", len(mentions) > 0); err != nil {
+		return err
+	}
+	if err := c.RequireFormat(format); err != nil {
+		return err
+	}
 	m := wire.NewOutgoingDirectedMsg(text, peerID)
 	m.ID = corrID
 	m.AckCursor = c.ackCursorForOutbound()
@@ -2721,6 +2748,58 @@ func (c *Conn) requireAction(feature string) error {
 	return fmt.Errorf("this server does not support %s on this session (it declares no %q feature), so the request would be dropped without an answer", feature, feature)
 }
 
+// RequireContent refuses message content the server has said nothing
+// about supporting, before anything is read or written: an attachment
+// without "attachments", a threaded reply without "replyTo", @-mentions
+// without "mentions". Such a frame is refused on arrival, and for an
+// attachment only after the whole file has been read, encoded and pushed.
+// A server that declares no features at all has said nothing either way,
+// so the content goes out, as with requireAction.
+func (c *Conn) RequireContent(attachments bool, replyTo bool, mentions bool) error {
+	if !c.featuresDeclared {
+		return nil
+	}
+	for _, want := range []struct {
+		used    bool
+		feature string
+		what    string
+	}{
+		{attachments, "attachments", "attachments"},
+		{replyTo, "replyTo", "threaded replies (replyTo)"},
+		{mentions, "mentions", "@-mentions"},
+	} {
+		if want.used && !c.HasFeature(want.feature) {
+			return fmt.Errorf("this server does not support %s on this session (it declares no %q "+
+				"feature), so the message would be refused on arrival — nothing was sent; send it "+
+				"without them", want.what, want.feature)
+		}
+	}
+	return nil
+}
+
+// RequireFormat refuses a format value the server does not accept on this
+// conversation, before anything is written. Where "formats" is declared,
+// only a listed value goes out; where it is not, the server has said
+// nothing and the value is sent as given. An empty format asks for the
+// default and is never refused here.
+func (c *Conn) RequireFormat(format string) error {
+	if format == "" || c.formats == nil {
+		return nil
+	}
+	for _, v := range c.formats {
+		if v == format {
+			return nil
+		}
+	}
+	return fmt.Errorf("this conversation does not accept format %q — it declares formats.accepted = "+
+		"[%s]; nothing was sent. Send it in one of those, or omit format for plain text",
+		format, strings.Join(c.formats, ", "))
+}
+
+// AcceptedFormats is the "formats" feature's list, or nil when the server
+// did not declare one.
+func (c *Conn) AcceptedFormats() []string { return c.formats }
+
 func (c *Conn) React(externalID, reaction, action string) error {
 	return c.reactWithID(externalID, reaction, action, "")
 }
@@ -2747,6 +2826,12 @@ func (c *Conn) EditMessage(externalID, text string, attachments []wire.Attachmen
 
 func (c *Conn) editMessageWithID(externalID, text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention, corrID string) error {
 	if err := c.requireAction("edit"); err != nil {
+		return err
+	}
+	if err := c.RequireContent(len(attachments) > 0, replyTo != "", len(mentions) > 0); err != nil {
+		return err
+	}
+	if err := c.RequireFormat(format); err != nil {
 		return err
 	}
 	e := wire.NewEditRequest(externalID, text, attachments, format, replyTo, mentions)

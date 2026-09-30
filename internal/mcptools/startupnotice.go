@@ -2,6 +2,7 @@ package mcptools
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -64,6 +65,15 @@ func (h *Hub) reportAbandonedConnections() {
 		// decision. A process simply ending does NOT, because that is
 		// the case nothing else can report.
 		if !le.Entry.Connected {
+			continue
+		}
+		// HELD BY A LIVE PROCESS is not abandoned. Another client in the
+		// same project — a second session, or a process started from
+		// inside one — shares this store, and reporting its connection as
+		// a previous run's, then clearing the mark, would erase live state
+		// on the word of a process that never held it. An unknown answer
+		// counts as live, for the same reason.
+		if h := le.Entry.Holder; h != nil && h.PID != os.Getpid() && holderLive(h) {
 			continue
 		}
 		name := le.Entry.LocalName

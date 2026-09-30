@@ -186,6 +186,7 @@ client, and a server must not send one to request client behaviour.
 | `edit` | — | Accepts `edit` requests. |
 | `delete` | — | Accepts `delete` requests. |
 | `replyTo` | — | Accepts `replyTo` on `msg`/`edit` and renders a native threaded citation. |
+| `formats` | `accepted` array of strings | The `format` values this conversation accepts on `msg`/`edit` — e.g. `["text","html"]`. A value not listed is refused; a client refuses it locally. Declared per conversation, since what a path can render differs. |
 | `pins` | — | Mirrors the conversation's pinned set (`joined.pinned`, `pinned`/`unpinned` events) and accepts `pin`/`unpin`/`pins` (§2.8a). |
 | `correlation` | — | Echoes a request's `id` verbatim on the frame that answers it and on an `error` refusing it (§2.2, §2.5). |
 | `mintNotice` | — | Sends `joined.resumablePeers` whenever it mints a fresh identity (§2.1, §4). |
@@ -262,10 +263,14 @@ a client never sets
 this on send — the server derives it once it has resolved `replyTo`.
 
 `format`, when present, is `"text"` (the default if omitted — plain,
-escaped verbatim) or `"html"` (bold/lists/code/quotes/tables/links,
+escaped verbatim), `"html"` (bold/lists/code/quotes/tables/links,
 sanitized server-side through the same allowlist used to render it:
 scripts, event handlers, styles, iframes, and off-host images are
-stripped). A server that validates this field should refuse an
+stripped) or `"markdown"` (CommonMark with GFM tables, strikethrough and
+autolinks — one meaning on every path; a server renders it into its own
+native form, and raw HTML inside it is escaped rather than passed
+through). There are no aliases. Which values a conversation accepts is
+declared as `formats` (§2.1a). A server that validates this field should refuse an
 unrecognized value outright (e.g. as an `error`, §2.5) rather than
 silently downgrading it to `"text"` — a client should never guess a
 value the target server wasn't confirmed to accept, since that failure

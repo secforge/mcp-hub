@@ -7,6 +7,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/secforge/mcp-hub/internal/harness"
 	"github.com/secforge/mcp-hub/internal/mcptools"
 	"github.com/secforge/mcp-hub/internal/version"
 )
@@ -28,6 +29,10 @@ func main() {
 		os.Exit(runWait(*socket, *follow, os.Stdout, os.Stderr))
 	}
 
+	// Before anything looks for a harness: a socket this process inherited
+	// from a session it does not serve is dropped here, so nothing below
+	// can push into that session.
+	harness.ReleaseInheritedSession()
 	s := server.NewMCPServer("mcp-hub-client", version.Short(), server.WithToolCapabilities(false), server.WithRoots())
 	hub := mcptools.NewHub()
 	hub.Register(s)

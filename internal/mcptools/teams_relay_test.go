@@ -38,6 +38,11 @@ func teamsTestFeatures() map[string]json.RawMessage {
 		"reactions":  json.RawMessage("{}"),
 		"edit":       json.RawMessage("{}"),
 		"delete":     json.RawMessage("{}"),
+		// Content a real Teams link declares, so tests that send it are not
+		// refused locally for a feature the server they model does have.
+		"attachments": json.RawMessage("{}"),
+		"mentions":    json.RawMessage("{}"),
+		"replyTo":     json.RawMessage("{}"),
 	}
 }
 

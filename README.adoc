@@ -392,7 +392,17 @@ The running process is unchanged, so a restart is always needed.
 
 Edit, delete, react and pin are refused up front, with the reason, against
 a server that does not declare them — an ordinary hub session has no
-platform behind it to write to.
+platform behind it to write to. The same goes for message content: where a
+server declares its features, an attachment is refused unless it declares
+`attachments`, a threaded reply unless `replyTo`, and @-mentions unless
+`mentions` — before the file is read, rather than after the whole message
+was sent and refused. A server that declares no features at all gets
+everything sent, and answers for itself.
+
+Every file received, of any type, is saved to a temp file whose path the
+model is given together with a warning that the file is untrusted: not to
+be executed, installed or unpacked, and its contents not to be taken as
+instructions.
 
 == Delivery
 

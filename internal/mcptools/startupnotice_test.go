@@ -2,6 +2,8 @@ package mcptools
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -188,5 +190,81 @@ func TestReportingClearsTheMarkSoItIsNotSaidAgain(t *testing.T) {
 	}
 	if stored.LocalName != "stale" {
 		t.Fatalf("expected the name to survive, got %q", stored.LocalName)
+	}
+}
+
+// A connection another LIVE process holds is not a previous run's. Two
+// clients in one project share the store — a second session, or a client
+// started from inside one — and the scan must neither report that
+// connection nor clear its mark. A dead holder, a pid now running a
+// DIFFERENT process (same pid, other start time), or no recorded holder
+// at all is reported and cleared as before.
+func TestAConnectionHeldByALiveProcessIsLeftAlone(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	project := connstore.CurrentProject()
+
+	dead := exec.Command("true")
+	if err := dead.Run(); err != nil {
+		t.Fatalf("run a short-lived process: %v", err)
+	}
+	parent := os.Getppid()
+	if processStart(parent) == "" {
+		t.Skip("no process start time on this system; a reused pid cannot be told from a live one")
+	}
+	cases := map[string]*connstore.Holder{
+		"live":    {PID: parent, Start: processStart(parent)},
+		"reused":  {PID: parent, Start: "not-the-start-time-it-has"},
+		"dead":    {PID: dead.Process.Pid},
+		"unknown": nil,
+	}
+	for name, holder := range cases {
+		target := connstore.Target{Link: "wss://example/" + name + "#s", Project: project}
+		if err := connstore.Upsert(target, connstore.Entry{
+			LocalName: name, LastConnectedAt: time.Now().UTC(), Connected: true, Holder: holder,
+		}); err != nil {
+			t.Fatalf("Upsert %s: %v", name, err)
+		}
+	}
+
+	h := &Hub{}
+	h.reportAbandonedConnections()
+	note := h.takeAutoReconnectNote()
+	if strings.Contains(note, "live") {
+		t.Errorf("a connection a live process holds was reported as abandoned: %s", note)
+	}
+	for _, name := range []string{"reused", "dead", "unknown"} {
+		if !strings.Contains(note, name) {
+			t.Errorf("the %s holder's connection was not reported: %s", name, note)
+		}
+	}
+	for name := range cases {
+		e, _, _ := connstore.Get(connstore.Target{Link: "wss://example/" + name + "#s", Project: project})
+		if want := name == "live"; e.Connected != want {
+			t.Errorf("%s: Connected = %v after the scan, want %v", name, e.Connected, want)
+		}
+	}
+}
+
+// The start time is field 22 of /proc/<pid>/stat, counted from after the
+// last ')' because the command name may itself contain spaces and
+// parentheses.
+func TestProcessStartReadsTheStartTimeField(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "4242")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stat := "4242 (odd) name (x) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 12345 67 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := procRoot
+	procRoot = root
+	t.Cleanup(func() { procRoot = prev })
+	if got := processStart(4242); got != "987654" {
+		t.Fatalf("processStart = %q, want 987654", got)
+	}
+	if got := processStart(4343); got != "" {
+		t.Fatalf("processStart for a missing pid = %q, want empty", got)
 	}
 }

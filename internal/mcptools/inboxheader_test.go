@@ -64,7 +64,7 @@ func TestAMistypedDirectiveIsRefusedRatherThanRelayed(t *testing.T) {
 		"#hub too=peer-1\nbody",         // typo
 		"#hub mentions=alice\nbody",     // needs hub_send
 		"#hub attach=/etc/passwd\nbody", // needs hub_send
-		"#hub format=markdown\nbody",    // not a format
+		"#hub format=md\nbody",          // not a format: no aliases
 		"#hub to\nbody",                 // not key=value
 		"#hub to=\nbody",                // empty value
 		"#hub \nbody",                   // no directives

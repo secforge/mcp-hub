@@ -193,6 +193,10 @@ type Entry struct {
 	// that set it never got a chance to clear it — most commonly the
 	// session simply ending mid-conversation, not necessarily a crash.
 	Connected bool `json:"connected,omitempty"`
+	// Holder is the process that set Connected, so a later process can tell
+	// a connection a live client still holds from one a finished run left
+	// marked. Nil when unknown. Cleared with Connected.
+	Holder *Holder `json:"holder,omitempty"`
 	// Topic is the CONVERSATION's own display name when the server sets
 	// one (wire.Joined.Topic, e.g. a Teams chat's title) — distinct from
 	// Name above, which is this connection's OWN peer display name rather
@@ -212,6 +216,16 @@ func (e Entry) empty() bool {
 	return e.PeerID == "" && e.Name == "" && e.ReconnectSecret == "" &&
 		e.Topic == "" && e.LocalName == "" && !e.Connected &&
 		e.LastConnectedAt.IsZero() && e.CatchUp.empty()
+}
+
+// Holder identifies one process for as long as it runs. A pid alone does
+// not: the operating system hands it to a new process once the old one
+// ends. Start is that process's start time as the OS reports it (on Linux
+// the starttime field of /proc/<pid>/stat), which a reused pid does not
+// share; empty where it cannot be read, leaving the pid to answer alone.
+type Holder struct {
+	PID   int    `json:"pid"`
+	Start string `json:"start,omitempty"`
 }
 
 // ListedEntry pairs a stored entry with the identity it is stored under,
@@ -593,6 +607,7 @@ func MarkDisconnected(target Target) error {
 			return nil
 		}
 		e.Connected = false
+		e.Holder = nil
 		setEntry(&s, target.Project, target.Link, e)
 		return save(s)
 	})

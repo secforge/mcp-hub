@@ -65,8 +65,8 @@ func parseInboxHeader(text string) (inboxHeader, string, error) {
 		case "confirm":
 			h.Confirm = value
 		case "format":
-			if value != "text" && value != "html" {
-				return h, "", fmt.Errorf("format=%q — only text or html", value)
+			if value != "text" && value != "html" && value != "markdown" {
+				return h, "", fmt.Errorf("format=%q — only text, html or markdown", value)
 			}
 			h.Format = value
 		default:

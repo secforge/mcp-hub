@@ -266,6 +266,26 @@ type AttachmentsFeature struct {
 	ImagesOnly bool `json:"imagesOnly,omitempty,case:strict"`
 }
 
+// FormatsFeature is Features["formats"]'s parameter shape: the format
+// values this conversation accepts on msg/edit ("text", "html",
+// "markdown"). One list per path, because what a path can render differs.
+type FormatsFeature struct {
+	Accepted []string `json:"accepted,case:strict"`
+}
+
+// FormatsFeature decodes Features["formats"], if the server declared it.
+func (j Joined) FormatsFeature() (FormatsFeature, bool) {
+	raw, ok := j.Features["formats"]
+	if !ok {
+		return FormatsFeature{}, false
+	}
+	var ff FormatsFeature
+	if err := json.Unmarshal(raw, &ff); err != nil {
+		return FormatsFeature{}, false
+	}
+	return ff, true
+}
+
 // HasFeature reports whether j declares support for the named feature —
 // see Features's doc comment for why absence means unsupported, and why
 // that's different from j.Features being nil entirely (a pre-v3 server,
@@ -1059,10 +1079,10 @@ type ServerStopping struct {
 // position, not an echo of what was sent — the client should adopt it
 // rather than retry. A malformed or missing cursor is refused as a plain
 // Error (code "bad_ack_cursor"/"bad_ack" — ack-subsystem-specific, not the
-// generic "bad_cursor"/"bad_request" other request kinds may also use,
-// since error events carry no correlation id and a generic code couldn't
-// be attributed to the ack that caused it) instead of an Ack reply, since
-// that's a protocol violation rather than a stale-but-valid receipt.
+// generic "bad_cursor"/"bad_request" other request kinds may also use:
+// a client reading them stops sending receipts altogether, which is wrong
+// for an unrelated malformed request) instead of an Ack reply, since that's
+// a protocol violation rather than a stale-but-valid receipt.
 type Ack struct {
 	Type Type `json:"type,case:strict"`
 	// ID echoes the request's correlation id — see Msg.ID.
