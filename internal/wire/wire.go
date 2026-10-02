@@ -271,6 +271,9 @@ type AttachmentsFeature struct {
 // "markdown"). One list per path, because what a path can render differs.
 type FormatsFeature struct {
 	Accepted []string `json:"accepted,case:strict"`
+	// Default is what an omitted format means on this conversation. Empty
+	// when the server does not say, which is not the same as "text".
+	Default string `json:"default,omitempty,case:strict"`
 }
 
 // FormatsFeature decodes Features["formats"], if the server declared it.

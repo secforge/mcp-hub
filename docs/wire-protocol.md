@@ -186,7 +186,7 @@ client, and a server must not send one to request client behaviour.
 | `edit` | — | Accepts `edit` requests. |
 | `delete` | — | Accepts `delete` requests. |
 | `replyTo` | — | Accepts `replyTo` on `msg`/`edit` and renders a native threaded citation. |
-| `formats` | `accepted` array of strings | The `format` values this conversation accepts on `msg`/`edit` — e.g. `["text","html"]`. A value not listed is refused; a client refuses it locally. Declared per conversation, since what a path can render differs. |
+| `formats` | `accepted` array of strings; `default` string | The `format` values this conversation accepts on `msg`/`edit` — e.g. `["text","html"]` — and what an omitted `format` means there (e.g. `"markdown"` on a hub session, `"text"` elsewhere). A value not listed is refused; a client refuses it locally. Absent `default` says nothing about the default; it does not mean `"text"`. Declared per conversation, since what a path can render differs. |
 | `pins` | — | Mirrors the conversation's pinned set (`joined.pinned`, `pinned`/`unpinned` events) and accepts `pin`/`unpin`/`pins` (§2.8a). |
 | `correlation` | — | Echoes a request's `id` verbatim on the frame that answers it and on an `error` refusing it (§2.2, §2.5). |
 | `mintNotice` | — | Sends `joined.resumablePeers` whenever it mints a fresh identity (§2.1, §4). |

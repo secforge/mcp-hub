@@ -2,6 +2,7 @@ package hubconn
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -554,8 +555,10 @@ type Conn struct {
 	attachments     wire.AttachmentsFeature
 	attachmentsSaid bool
 	// formats is the "formats" feature's accepted list, nil when the
-	// server did not declare it — see RequireFormat.
-	formats []string
+	// server did not declare it — see RequireFormat. formatDefault is what
+	// an omitted format means there, "" when the server does not say.
+	formats       []string
+	formatDefault string
 }
 
 // ackClaim is a one-shot subscription for the next event matching a
@@ -1041,6 +1044,7 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfir
 		mintNoticeDeclared:      joined.HasFeature(wire.FeatureMintNotice),
 		attachmentsSaid:         attachmentsStated(joined),
 		formats:                 formatsDeclared(joined),
+		formatDefault:           formatDefaultDeclared(joined),
 		lastFrameKind:           "joined",
 		lastFrameAt:             time.Now(),
 		confirmReminderInterval: snapConfirmReminderInterval,
@@ -1091,6 +1095,11 @@ func formatsDeclared(joined wire.Joined) []string {
 		return []string{}
 	}
 	return ff.Accepted
+}
+
+func formatDefaultDeclared(joined wire.Joined) string {
+	ff, _ := joined.FormatsFeature()
+	return ff.Default
 }
 
 func attachmentsStated(joined wire.Joined) bool {
@@ -2032,22 +2041,33 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		// The answer may still be coming. Marked so it is spent rather
 		// than handed to whoever confirms next — see expectLateAnswer.
 		c.expectLateAnswer("ack")
-		// THE POSITION IS KEPT on an unknown outcome, and the two
-		// records then disagree by design: the receipt was written, so
-		// this client believes it, while the server's own column moves
-		// only when a receipt actually arrives and is accepted. If it
-		// did not, that column sits behind this one and the next
-		// joined.behind counts from THEIRS — over-reporting, and a
-		// re-walk of things already seen rather than a skip. Confirmed
-		// from the server side by chat-relay's author, 2026-09-20. The
-		// safe direction of a disagreement that is invisible until a
-		// reconnect, and the reason this line says so.
+		// A SERVER THAT PROMISED AN ANSWER AND GAVE NONE has not accepted
+		// this position. It declared ackReplies, so silence is not its
+		// normal behaviour, and the likeliest cause is a refusal that did
+		// not reach this claim. Keeping the cursor would make a refused
+		// position the place the next catch-up starts from — past unread
+		// messages, or nowhere at all. So nothing moves, and the caller
+		// is told to confirm again: the cost is a re-walk, never a skip.
+		if c.featuresDeclared {
+			restore()
+			return nil, ErrConfirmUnanswered
+		}
+		// A server that declares nothing has said nothing about replies,
+		// so no answer is ordinary there and the receipt was written: the
+		// position is kept. If the server did not take it, its own record
+		// sits behind this one and a reconnect re-walks rather than skips.
 		c.mu.Lock()
 		c.lastConfirmed = cursor
 		c.mu.Unlock()
 		return nil, nil
 	}
 }
+
+// ErrConfirmUnanswered reports a confirm the server promised to answer
+// and did not, within AckWaitTimeout. The read position has not moved.
+var ErrConfirmUnanswered = errors.New("the server did not answer this confirm in time, though it " +
+	"declares that it answers every one — your read position has NOT moved. Confirm the same " +
+	"cursor again; if this repeats, the cursor is probably not one this conversation delivered")
 
 // THE IDLE RECEIPT LOOP IS GONE, and this is where it was.
 //
@@ -2799,6 +2819,10 @@ func (c *Conn) RequireFormat(format string) error {
 // AcceptedFormats is the "formats" feature's list, or nil when the server
 // did not declare one.
 func (c *Conn) AcceptedFormats() []string { return c.formats }
+
+// DefaultFormat is what an omitted format means on this conversation, or
+// "" when the server does not say.
+func (c *Conn) DefaultFormat() string { return c.formatDefault }
 
 func (c *Conn) React(externalID, reaction, action string) error {
 	return c.reactWithID(externalID, reaction, action, "")

@@ -124,11 +124,38 @@ func TestFormatsNoteRecommendsMarkdown(t *testing.T) {
 		{[]string{"text", "html"}, "markdown is not rendered here"},
 		{[]string{"text"}, "Plain text only"},
 	} {
-		if got := formatsNote(tc.accepted); !strings.Contains(got, tc.want) || !strings.Contains(got, strings.Join(tc.accepted, ", ")) {
+		if got := formatsNote(tc.accepted, ""); !strings.Contains(got, tc.want) || !strings.Contains(got, strings.Join(tc.accepted, ", ")) {
 			t.Errorf("formats %v: note %q does not list them or lacks %q", tc.accepted, got, tc.want)
 		}
 	}
-	if got := formatsNote(nil); got != "" {
+	if got := formatsNote(nil, "markdown"); got != "" {
 		t.Errorf("no declared formats should say nothing, got %q", got)
+	}
+}
+
+// What an omitted format means is said when the server declares it, and
+// only then — on a markdown-default conversation with the warning that
+// literal content needs format="text".
+func TestFormatsNoteStatesTheDeclaredDefault(t *testing.T) {
+	if got := formatsNote([]string{"markdown", "text"}, "markdown"); !strings.Contains(got, "rendered as MARKDOWN") ||
+		!strings.Contains(got, `format="text"`) {
+		t.Errorf("markdown default: %q", got)
+	}
+	if got := formatsNote([]string{"text", "markdown"}, "text"); !strings.Contains(got, "shown as plain text") {
+		t.Errorf("text default: %q", got)
+	}
+	if got := formatsNote([]string{"text", "markdown"}, ""); strings.Contains(got, "no format") {
+		t.Errorf("an undeclared default must not be described: %q", got)
+	}
+}
+
+func TestTheDeclaredDefaultIsReadFromJoined(t *testing.T) {
+	hub := connectWithFeatures(t, map[string]json.RawMessage{
+		"formats": json.RawMessage(`{"accepted":["markdown","text"],"default":"markdown"}`),
+	})
+	s := sole(t, hub)
+	conn, _ := s.activeConn()
+	if got := conn.DefaultFormat(); got != "markdown" {
+		t.Fatalf("DefaultFormat = %q, want markdown", got)
 	}
 }

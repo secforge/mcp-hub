@@ -1766,14 +1766,13 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool(
 		mcp.NewTool("hub_send",
 			connectionParam(),
-			mcp.WithDescription("Send a text message to the current hub session. On a teams "+
-				"session (e.g. via hub_connect's link form), this call itself waits briefly for the "+
-				"real outcome — the send actually being accepted, or refused — and reports it "+
-				"directly rather than a bare confirmation that doesn't mean the send succeeded; if "+
-				"nothing arrives in time it falls back to a plain confirmation, with the actual "+
-				"outcome then arriving later via "+deliveryChannels()+" instead. On a plain "+
-				"hub_connect session this always returns immediately, since mcp-hub-server has no "+
-				"equivalent asynchronous confirmation to wait for"+messageStyleNote),
+			mcp.WithDescription("Send a text message to the current hub session. Where the server "+
+				"answers sends, this call waits briefly for the real outcome — the send actually "+
+				"being accepted, or refused — and reports it directly rather than a bare "+
+				"confirmation that doesn't mean the send succeeded; if nothing arrives in time it "+
+				"falls back to a plain confirmation, with the actual outcome then arriving later via "+
+				deliveryChannels()+" instead. Where the server does not answer sends, this returns "+
+				"immediately"+messageStyleNote),
 			mcp.WithString("text", mcp.Required(), mcp.Description("Message text")),
 			mcp.WithString("to", mcp.Description(
 				"Optional peerId to send this privately to a single peer instead of "+
@@ -1794,8 +1793,8 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"\"attachments\" takes none; both are refused here, before sending."+uploadNote+
 					" Mutually exclusive with imagePath — pass at most one")),
 			mcp.WithString("format", mcp.Description(
-				"Optional, server-specific: how the server should render text — \"text\" (the "+
-					"default: shown literally, so \"**bold**\" is four asterisks), \"markdown\" "+
+				"Optional, server-specific: how the server should render text — \"text\" (shown "+
+					"literally, so \"**bold**\" is four asterisks), \"markdown\" "+
 					"(CommonMark with GitHub tables, strikethrough and autolinks — the same dialect "+
 					"on every kind of conversation; the server converts it to what the platform "+
 					"shows, and a platform's own syntax typed into it, such as <@U123>, stays plain "+
@@ -1803,10 +1802,13 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"\"markdown\" wherever the conversation accepts it, and use \"html\" only "+
 					"where markdown cannot express the formatting and the conversation accepts "+
 					"html. Which of these a conversation takes is the server's to declare "+
-					"(formats.accepted, which the connect result names): where it declares them, a value not on the list is "+
+					"(formats.accepted, which the connect result names, together with what an "+
+					"omitted format means there): "+
+					"where it declares them, a value not on the list is "+
 					"refused here with the list in the reason, before sending; where it declares "+
-					"nothing, the value is sent and the server refuses one it does not take. Omit "+
-					"it for plain text. mcp-hub-server's own relay ignores this field")),
+					"nothing, the value is sent and the server refuses one it does not take. Pass "+
+					"\"text\" explicitly whenever content must stay literal, since omitting format "+
+					"does not mean text everywhere. mcp-hub-server's own relay ignores this field")),
 			mcp.WithString("replyTo", mcp.Description(
 				"Optional, server-specific: the externalId of a message this send should be a "+
 					"threaded reply/citation to (from an earlier msg/sendAck event) — gets native "+
@@ -2157,7 +2159,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"reason rather than sent into silence. Typically only possible on a message this "+
 				"connection itself sent — platform rules usually restrict editing to your own "+
 				"messages, and that's enforced by the platform, not pre-judged here. Errors if not "+
-				"connected. On a teams session this call itself waits briefly for the real outcome "+
+				"connected. Where the server answers this action, the call waits briefly for the real outcome "+
 				"and reports it directly, falling back to an async confirmation (see hub_react) if "+
 				"nothing arrives in time"+messageStyleNote),
 			mcp.WithString("externalId", mcp.Required(), mcp.Description(
@@ -2214,8 +2216,8 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"connection itself sent, same as hub_edit; enforced by the platform, not pre-judged "+
 				"here. This is a genuine deletion, not an edit to empty text — the platform renders "+
 				"a tombstone rather than a blank message, and other clients learn about it via a "+
-				"distinct messageDeleted event, not an edited one. Errors if not connected. On a "+
-				"teams session this call itself waits briefly for the real outcome and reports it "+
+				"distinct messageDeleted event, not an edited one. Errors if not connected. Where "+
+				"the server answers this action, the call waits briefly for the real outcome and reports it "+
 				"directly, falling back to an async confirmation (see hub_react) if nothing arrives "+
 				"in time"),
 			mcp.WithString("externalId", mcp.Required(), mcp.Description(
@@ -2428,7 +2430,7 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 // takes and which to reach for: markdown where it is accepted, html only
 // where markdown cannot say it. Empty when the server declares no formats,
 // since nothing is known then and guessing a list would be worse.
-func formatsNote(accepted []string) string {
+func formatsNote(accepted []string, def string) string {
 	if accepted == nil {
 		return ""
 	}
@@ -2437,6 +2439,16 @@ func formatsNote(accepted []string) string {
 		has[v] = true
 	}
 	note := "\nFormats this conversation accepts (hub_send/hub_edit format): " + strings.Join(accepted, ", ") + "."
+	switch def {
+	case "markdown":
+		note += " A message with no format is rendered as MARKDOWN here — send format=\"text\" for " +
+			"anything that must stay literal, such as a log or a diff full of * and _."
+	case "text":
+		note += " A message with no format is shown as plain text here."
+	case "":
+	default:
+		note += fmt.Sprintf(" A message with no format is sent as %q here.", def)
+	}
 	switch {
 	case has["markdown"] && has["html"]:
 		note += " Use format=\"markdown\" whenever a message needs formatting; use \"html\" only " +
@@ -2895,7 +2907,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			target.Project, defaultProject)
 	}
 
-	notes := formatsNote(conn.AcceptedFormats())
+	notes := formatsNote(conn.AcceptedFormats(), conn.DefaultFormat())
 	if mirrored {
 		notes = "\nThis mirrors a real chat conversation, not an ordinary hub session — some " +
 			"things behave differently: a directed hub_send (`to`) has no meaning here and " +

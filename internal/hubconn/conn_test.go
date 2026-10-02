@@ -2,6 +2,7 @@ package hubconn
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -906,12 +907,12 @@ func TestConfirmReceivedReturnsBehindWhenAckRepliesDeclared(t *testing.T) {
 	}
 }
 
-// TestConfirmReceivedOnTeamsSessionReturnsNilWhenServerDoesNotReply proves the
-// graceful-fallback half: a teams relay that never answers a
-// standalone ack at all (predating chat-relay's extension, or simply not
-// implementing it) still resolves ConfirmReceived — after AckWaitTimeout
-// — with behind=nil, not an error or a hang.
-func TestConfirmReceivedOnTeamsSessionReturnsNilWhenServerDoesNotReply(t *testing.T) {
+// A server that DECLARES ackReplies and then gives no answer has not
+// accepted the position — the likeliest cause is a refusal that never
+// reached the claim, which is how a mistyped cursor from another
+// conversation was once kept and became the next catch-up's start. So the
+// confirm fails, says nothing moved, and nothing has.
+func TestAnUnansweredConfirmOnADeclaringServerMovesNothing(t *testing.T) {
 	orig := AckWaitTimeout
 	AckWaitTimeout = 100 * time.Millisecond
 	defer func() { AckWaitTimeout = orig }()
@@ -925,12 +926,47 @@ func TestConfirmReceivedOnTeamsSessionReturnsNilWhenServerDoesNotReply(t *testin
 	}
 	defer c.Close()
 
+	before := c.ConfirmedCursor()
 	behind, err := c.ConfirmReceived("cursor-1")
-	if err != nil {
-		t.Fatalf("ConfirmReceived: %v", err)
+	if !errors.Is(err, ErrConfirmUnanswered) {
+		t.Fatalf("ConfirmReceived = (%v, %v), want ErrConfirmUnanswered", behind, err)
 	}
-	if behind != nil {
-		t.Fatalf("expected behind=nil when the server never replies, got %v", *behind)
+	if got := c.ConfirmedCursor(); got != before {
+		t.Fatalf("an unanswered confirm moved the confirmed position %q -> %q", before, got)
+	}
+}
+
+// A server that declares NOTHING has said nothing about replying, so no
+// answer is ordinary there: the confirm resolves after AckWaitTimeout with
+// behind=nil, not an error or a hang, and the receipt stands.
+func TestAnUnansweredConfirmOnAnUndeclaringServerResolves(t *testing.T) {
+	orig := AckWaitTimeout
+	AckWaitTimeout = 100 * time.Millisecond
+	defer func() { AckWaitTimeout = orig }()
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", ""))
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+	c, err := Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"#secret", DialOptions{ReconnectSecret: "resume-me"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	behind, err := c.ConfirmReceived("cursor-1")
+	if err != nil || behind != nil {
+		t.Fatalf("ConfirmReceived = (%v, %v), want (nil, nil)", behind, err)
+	}
+	if got := c.ConfirmedCursor(); got != "cursor-1" {
+		t.Fatalf("the confirmed position is %q, want cursor-1", got)
 	}
 }
 
