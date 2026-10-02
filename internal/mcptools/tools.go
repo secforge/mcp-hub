@@ -36,6 +36,10 @@ type Hub struct {
 	// mu guards the session map and nothing else. Each session guards its
 	// own state — see session.mu for the lock order.
 	mu sync.Mutex
+	// abandonedPending is set when startup could not report a previous
+	// run's connections, because the scope was not yet known; the first
+	// tool call reports them instead. See reportAbandonedConnections.
+	abandonedPending atomic.Bool
 	// sessions is every open connection, keyed by the name its caller
 	// gave it at connect. That name is the address: every tool that acts
 	// on a connection names one, and an unknown name is an error rather
@@ -1031,7 +1035,7 @@ func reconnectBackoff(attempt int) time.Duration {
 // after a host was hibernated for several hours.
 func (s *session) scheduleReconnect(conn *hubconn.Conn) {
 	if reason, permanent := conn.PermanentFailure(); permanent {
-		s.note(fmt.Sprintf("Connection %q ENDED and will NOT be reconnected: %s. Retrying "+
+		s.alert(fmt.Sprintf("Connection %q ENDED and will NOT be reconnected: %s. Retrying "+
 			"cannot fix that. The name is free again if you want to open something else "+
 			"under it.", s.name, reason))
 		return
@@ -1060,7 +1064,7 @@ func (s *session) scheduleReconnect(conn *hubconn.Conn) {
 	if scheduled {
 		why = "The server announced a restart"
 	}
-	s.note(fmt.Sprintf("Connection %q is DOWN. %s. Reconnecting automatically, first attempt in "+
+	s.alert(fmt.Sprintf("Connection %q is DOWN. %s. Reconnecting automatically, first attempt in "+
 		"about %s, and retrying until it succeeds — you will be told when it does. Nothing is "+
 		"lost: your reading position only moves on a confirm, so the server still holds "+
 		"anything sent meanwhile. hub_disconnect stops the retrying.",
@@ -1202,7 +1206,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		w, err = s.hub.ensureWaiter()
 		if err != nil {
 			conn.Close()
-			s.note(fmt.Sprintf("Automatic reconnect dialled successfully but could "+
+			s.alert(fmt.Sprintf("Automatic reconnect dialled successfully but could "+
 				"not start its wait socket (%v), so it was abandoned and you are still "+
 				"disconnected — call hub_connect to retry.", err))
 			return reconnectFatal
@@ -1339,7 +1343,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	if scheduled {
 		because = "after the server's announced restart"
 	}
-	s.note(fmt.Sprintf("RECONNECTED AUTOMATICALLY %s, having waited %s. You are connected again "+
+	s.alert(fmt.Sprintf("RECONNECTED AUTOMATICALLY %s, having waited %s. You are connected again "+
 		"as peer %s. Messages may have arrived while you were away and while this client was "+
 		"waiting — call hub_catch_up() now, the same as after any reconnect. %s",
 		because, waited.Round(time.Second), conn.PeerID(), followerNote))
@@ -1358,7 +1362,7 @@ func (s *session) reportFailedAttempt(attempt int, interval time.Duration, err e
 		"WAIT — you will be told when it succeeds — or call hub_disconnect to stop trying, which "+
 		"also releases the follower being held open for it.",
 		attempt, err, interval.Round(time.Second))
-	s.note(msg)
+	s.alert(msg)
 	if w := s.hub.currentWaiter(); w != nil {
 		w.Announce("[connection: " + s.name + "]\n[hub: " + msg + "]")
 	}
@@ -1455,6 +1459,14 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 					"the harness (%v) — messages will not be pushed to you until that is "+
 					"resolved; use hub_catch_up() to read.", err))
 			}
+		}
+		// THE STARTUP REPORT, deferred to here when startup could not know
+		// the scope — a client with no MCP_HUB_PROJECT_DIR and no roots
+		// answered yet. Resolved by the same function hub_connect uses, so
+		// the report and every connect agree on whose connections these
+		// are. Once per process.
+		if h.abandonedPending.CompareAndSwap(true, false) {
+			h.reportAbandonedConnectionsFor(projectForConnect(ctx))
 		}
 		res, err := handler(ctx, req)
 		// A wire fact the inbox observed — whether a reply asserted a
@@ -1554,7 +1566,7 @@ func (s *session) abandonReconnect(note string) {
 	if w := s.hub.currentWaiter(); w != nil {
 		w.Detach(s.name, "its automatic reconnect did not succeed; hub_connect when ready")
 	}
-	s.note(note)
+	s.alert(note)
 }
 
 // noteAutoReconnect stores something the model has not been told yet. It
@@ -1662,8 +1674,10 @@ func (h *Hub) Register(s *server.MCPServer) {
 	h.srv = s
 	h.mu.Unlock()
 	sweepStaleAttachmentDirs()
-	// Said on the first tool call, whichever it is: the connections a
-	// previous run held are gone, and nothing else would ever mention it.
+	// Said at startup when the scope is already known; otherwise on the
+	// first tool call, which is where the scope becomes known. The
+	// connections a previous run held are gone, and nothing else would
+	// ever mention it.
 	h.reportAbandonedConnections()
 	h.registerTools(s)
 }

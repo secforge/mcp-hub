@@ -40,8 +40,15 @@ func (h *Hub) reportAbandonedConnections() {
 	// to stop.
 	project, known := scopeIfKnown()
 	if !known {
+		h.abandonedPending.Store(true)
 		return
 	}
+	h.reportAbandonedConnectionsFor(project)
+}
+
+// reportAbandonedConnectionsFor reports, once, the connections a previous
+// run in project was holding when it ended.
+func (h *Hub) reportAbandonedConnectionsFor(project string) {
 	entries, err := connstore.ListForProject(project)
 	if err != nil {
 		// Nothing to report FROM is different from nothing to report, and

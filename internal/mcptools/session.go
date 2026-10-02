@@ -446,6 +446,24 @@ func (s *session) note(text string) {
 	s.hub.noteAutoReconnect("on " + s.name + ": " + text)
 }
 
+// alert says something that happened OUTSIDE any tool call — a drop, an
+// automatic reconnect, a reconnect giving up. Queued, such a notice waits
+// for the reader's next tool call, which may be an hour away or never, so
+// a connection could be down without anybody knowing. Pushed instead
+// wherever this connection's harness takes deliveries, and queued only
+// when that push does not happen. Never called with s.mu held: a push is
+// a socket write.
+func (s *session) alert(text string) {
+	if s.pusher != nil {
+		if ok, _ := s.pusher.Available(); ok {
+			if _, err := s.pusher.Push("", "[hub: on "+s.name+": "+text+"]", false); err == nil {
+				return
+			}
+		}
+	}
+	s.note(text)
+}
+
 // forRequest resolves the connection a tool call names, and answers for
 // it when there is nothing to act on.
 //
