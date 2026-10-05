@@ -283,6 +283,12 @@ func SetCodexReachableForTesting(reachable bool) func() {
 	return func() { codexReachable = prev }
 }
 
+// PusherForTesting returns a Pusher that delivers into d, so a test can
+// see exactly what was pushed and with which trailer.
+func PusherForTesting(d deliver.Deliverer) *Pusher {
+	return &Pusher{d: d}
+}
+
 // ClearEnvForTesting removes the inherited harness messaging environment
 // and returns a function restoring it. A test binary inherits the
 // launching session's socket and token, which makes it indistinguishable

@@ -96,15 +96,15 @@ func (h *Handler) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid sessionId", http.StatusBadRequest)
 		return
 	}
-	// clientVersion is currently only logged (reserved for future
-	// server-side compatibility decisions); a missing or unparseable "v" is
-	// treated as version 1 — the permanent backward-compatible default for
-	// any client (including plain websocket clients) that doesn't send one
-	// at all.
+	// clientVersion is only logged. It is read from the Hub-Protocol-Version
+	// header, which is where mcp-hub-client sends it, then from the "v"
+	// query parameter; a client that sends neither, or nothing parseable,
+	// counts as version 1.
 	clientVersion := 1
-	if v := r.URL.Query().Get("v"); v != "" {
+	for _, v := range []string{r.Header.Get("Hub-Protocol-Version"), r.URL.Query().Get("v")} {
 		if parsed, err := strconv.Atoi(v); err == nil {
 			clientVersion = parsed
+			break
 		}
 	}
 	if clientVersion != wire.ProtocolVersion {

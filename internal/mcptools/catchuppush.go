@@ -105,7 +105,33 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 	var res catchUpResult
 	maxMessages, maxBytes := want.limits()
 
-	for res.Delivered < maxMessages && res.Bytes < maxBytes {
+	// ONE MESSAGE IS HELD BACK until the next fetch answers, because only
+	// that answer says whether anything follows it: each delivery's trailer
+	// states "more is waiting" only when another message really is, and the
+	// last one before "caught up" says nothing of the kind.
+	var held *hubconn.Event
+	heldText := ""
+	release := func(more bool) {
+		ev := *held
+		held = nil
+		if err := s.pushCatchUpMessage(conn, id, ev, heldText, more); err != nil {
+			if res.Err == nil {
+				res.Err = err
+			}
+			return
+		}
+		res.Delivered++
+		res.Bytes += len(heldText)
+	}
+
+	for {
+		count, bytes := res.Delivered, res.Bytes
+		if held != nil {
+			count, bytes = count+1, bytes+len(heldText)
+		}
+		if count >= maxMessages || bytes >= maxBytes {
+			break
+		}
 		ev, ok, err := conn.RequestMessageAfterAwaiting(anchor)
 		if err != nil {
 			res.Err = err
@@ -120,15 +146,11 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			break
 		}
 		// A REFUSAL, BEFORE THE CURSOR TEST. An error frame carries no
-		// cursor, so testing for a missing cursor first reported every
-		// refusal as "a message arrived with no cursor" and told the
-		// reader to call again — which fails identically, with the same
-		// wrong sentence, and never shows the reason. bad_anchor is the
-		// live case: chat-relay answers it when a stored cursor no
-		// longer resolves, which is exactly when a reader most needs to
-		// be told. The pull walk has always reported this correctly;
-		// this is the path push-mode readers actually use. Found by an
-		// external reviewer, 2026-09-20.
+		// cursor, so testing for a missing cursor first would report every
+		// refusal as "a message arrived with no cursor" and never show the
+		// reason. bad_anchor is the live case: chat-relay answers it when a
+		// stored cursor no longer resolves, which is exactly when a reader
+		// most needs to be told.
 		if ev.Kind == "error" {
 			code := ev.Code
 			if code == "" {
@@ -145,45 +167,18 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			break
 		}
 
+		if held != nil {
+			if release(true); res.Err != nil {
+				break
+			}
+		}
 		text := conn.ShapeForPush(ev)
 		text += s.saveReceivedAttachments(conn, []hubconn.Event{ev})
-		receipt, err := s.pusher.Push(ev.Cursor, text, true)
-		if err != nil {
-			// The message is still on the server and the position has not
-			// moved, so this is recoverable — but only if it is said.
-			res.Err = err
-			break
-		}
-
-		// A PUSH IS NOT A HAND-OVER unless the transport says more than
-		// "the bytes left". Its own contract is explicit: a nil error
-		// with ObservedNothing means the write succeeded and arrival is
-		// unverified — which is the case for every push into Claude. So
-		// a nil error alone must not move the persisted position: a
-		// harness that accepts the socket write and then fails to present
-		// the message would leave the position past content nobody read,
-		// and the reconnect that should re-walk it would skip it instead,
-		// while the closing summary promised the opposite.
-		//
-		// The walk's own fetch position is the local anchor below and
-		// moves regardless, so this costs no progress here. What the
-		// cursor gets instead is the "delivered, not confirmed" set,
-		// which an explicit hub_confirm turns into position — the same
-		// route every other unverified delivery takes.
-		conn.NoteHandedOver([]hubconn.Event{ev})
-		if receipt.Observation > deliver.ObservedNothing {
-			s.mu.Lock()
-			s.lastHandedOverCursor = ev.Cursor
-			s.mu.Unlock()
-			setCatchUpCursor(id, ev.Cursor)
-			s.noteDelivered(ev.Cursor)
-		} else {
-			s.recordHandedOver([]hubconn.Event{ev})
-		}
-
+		held, heldText = &ev, text
 		anchor = wire.Anchor{Cursor: ev.Cursor}
-		res.Delivered++
-		res.Bytes += len(text)
+	}
+	if held != nil {
+		release(false)
 	}
 
 	if res.StoppedBy == "" && !res.CaughtUp && res.Err == nil {
@@ -191,6 +186,35 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			maxMessages, maxBytes/1024)
 	}
 	return res
+}
+
+// pushCatchUpMessage pushes one walked message and records what the
+// transport observed.
+//
+// A PUSH IS NOT A HAND-OVER unless the transport says more than "the bytes
+// left": a nil error with ObservedNothing means the write succeeded and
+// arrival is unverified, which is the case for every push into Claude. So
+// a nil error alone does not move the persisted position; the message goes
+// into the "delivered, not confirmed" set instead, which an explicit
+// hub_confirm turns into position. A failed push leaves the message on the
+// server with the position unmoved.
+func (s *session) pushCatchUpMessage(conn *hubconn.Conn, id connstore.Target, ev hubconn.Event,
+	text string, more bool) error {
+	receipt, err := s.pusher.Push(ev.Cursor, text, more)
+	if err != nil {
+		return err
+	}
+	conn.NoteHandedOver([]hubconn.Event{ev})
+	if receipt.Observation > deliver.ObservedNothing {
+		s.mu.Lock()
+		s.lastHandedOverCursor = ev.Cursor
+		s.mu.Unlock()
+		setCatchUpCursor(id, ev.Cursor)
+		s.noteDelivered(ev.Cursor)
+	} else {
+		s.recordHandedOver([]hubconn.Event{ev})
+	}
+	return nil
 }
 
 // pushCatchUpSummary is the last thing a run delivers: what happened and
