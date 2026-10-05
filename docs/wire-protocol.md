@@ -601,13 +601,28 @@ for the opacity rule — no way for a client-fabricated `cursor` to name
 "the wrong message," only "some position," because a `cursor` must never
 be fabricated in the first place (see below).
 
-**One ordering rule, not two.** The answer is always "the message at the
-first position **strictly after** the given one" — for a `cursor` this is
-an ordinary exclusive walk; for a bare `at` timestamp T, treat T as the
-position `(T, <before any tiebreak>)`, so "strictly after" naturally
-returns a message *at* T if one exists. One rule produces both the
-exclusive-walk and the inclusive-seek behavior a client needs, with
-nothing to remember about which anchor form gets which rule.
+**Positions are in arrival order.** A conversation's positions are the
+order in which the server received its messages, not the timestamps the
+messages carry. The two differ where a platform reports a message late
+with an earlier timestamp (a Teams post, for one): that message takes
+the next position, after everything already received, so a reader whose
+position is already past its timestamp still walks to it and counts it.
+`behind`, a confirm's monotonicity check and `messageAfter` all use this
+one order.
+
+**`cursor` and `at` answer differently.** For a `cursor`, the answer is
+the message at the first position **strictly after** it: an ordinary
+exclusive walk. For a bare `at` timestamp T, the answer is the **first
+message in arrival order whose timestamp is at or after T**, inclusive;
+a walk continues by cursor from there. So every message before that
+answer in arrival order carries a timestamp earlier than T, which makes
+a skipped range exact: walking by cursor from an earlier position and
+stopping at the first message timestamped at or after T covers
+precisely what the `at` seek jumped over, late arrivals included.
+`behindSince` is the timestamp of the message at the peer's held
+position, so a seek with `at = behindSince` lands at or before that
+position: it may re-deliver messages the peer already has, never skip
+one it has not.
 
 **Opacity, and why it's a *safety* property, not just a style
 preference.** `cursor` is entirely the server's format and precision to
@@ -695,6 +710,13 @@ Reply — stale (the given cursor is behind what you already hold):
 the client should adopt as its own bookkeeping rather than retry
 (monotonicity means nothing is lost: you only reject a position older
 than one you already have).
+
+`ok:false` is sent for exactly that case and no other: the cursor is at
+or before the position you hold. A cursor that is not this
+conversation's gets an `error` frame (`bad_ack_cursor`), never an ack.
+So the client reports `ok:false` as already covered — nothing to do,
+not a failure. Typical cause: a message delivered after a later one
+was confirmed.
 
 Malformed input never gets an `ack` reply — see §2.5's `bad_ack`/
 `bad_ack_cursor`.

@@ -1996,28 +1996,27 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 			// persisted — otherwise the refused cursor rides out on the
 			// next send's piggybacked receipt.
 			restore()
-			return nil, fmt.Errorf("the server REFUSED this confirm (%s): %s — your read "+
-				"position has not moved", code, ev.Text)
+			return nil, fmt.Errorf("the server REFUSED this confirm (%s): %s", code, ev.Text)
 		}
 		// An ack that states ok:false is a refusal too, and its cursor
 		// is the position the server actually holds rather than an echo
 		// of what was sent (see wire.Ack). Absent ok is not a refusal:
 		// it is a server that said nothing either way, which every
 		// older server does.
+		// An ack that states ok:false means the cursor is at or behind the
+		// position the server already holds — the only case a server
+		// answers that way; a cursor it does not know gets an error frame.
+		// Its cursor is that held position rather than an echo (see
+		// wire.Ack). Absent ok is not a refusal: it is a server that said
+		// nothing either way, which every older server does.
 		if ev.ActionOKStated && !ev.ActionOK {
-			where := ""
-			if ev.Cursor != "" {
-				where = fmt.Sprintf(" It holds %q for this peer.", ev.Cursor)
-			}
-			// Same reasoning as the error branch — except that the ack
-			// plumbing has already adopted the server's OWN reported
-			// position into lastAckSent, which is the right value to
-			// keep, so only the consumed mark goes back.
+			// The ack plumbing has already adopted the server's own
+			// position into lastAckSent, which is the right value to keep,
+			// so only the consumed mark goes back.
 			c.mu.Lock()
 			c.lastConsumed = prevConsumed
 			c.mu.Unlock()
-			return nil, fmt.Errorf("the server did not accept this confirm.%s Your read "+
-				"position has not moved", where)
+			return nil, ConfirmCoveredError{Held: ev.Cursor}
 		}
 		c.mu.Lock()
 		c.lastConfirmed = cursor
@@ -2032,8 +2031,7 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 		// for, and leaving two instances of it here would be worse than
 		// the bug.
 		restore()
-		return nil, fmt.Errorf("the connection dropped before the server answered this confirm — " +
-			"your read position has not moved")
+		return nil, errors.New("the connection dropped before the server answered this confirm")
 	case <-time.After(AckWaitTimeout):
 		c.mu.Lock()
 		c.ackReplyMisses++
@@ -2063,10 +2061,22 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	}
 }
 
+// ConfirmCoveredError reports a confirm the server did not need: the
+// cursor is at or before the position it already holds for this peer,
+// typically a message delivered after a later one was confirmed.
+type ConfirmCoveredError struct {
+	Held string
+}
+
+func (e ConfirmCoveredError) Error() string {
+	return fmt.Sprintf("already covered: the server holds %q for this peer, at or after this cursor", e.Held)
+}
+
 // ErrConfirmUnanswered reports a confirm the server promised to answer
-// and did not, within AckWaitTimeout. The read position has not moved.
+// and did not, within AckWaitTimeout. The read position has not moved;
+// the caller says so.
 var ErrConfirmUnanswered = errors.New("the server did not answer this confirm in time, though it " +
-	"declares that it answers every one — your read position has NOT moved. Confirm the same " +
+	"declares that it answers every one. Confirm the same " +
 	"cursor again; if this repeats, the cursor is probably not one this conversation delivered")
 
 // THE IDLE RECEIPT LOOP IS GONE, and this is where it was.

@@ -3464,7 +3464,7 @@ func (s *session) sendFromInbox(text string) {
 		return
 	}
 	if header.Confirm != "" {
-		if _, err := s.confirmCursor(conn, header.Confirm); err != nil {
+		if _, err := s.confirmCursor(conn, header.Confirm); err != nil && !confirmCovered(err) {
 			s.note(fmt.Sprintf("a reply asked to confirm %s and that failed (%v); "+
 				"the message itself is still being sent.", header.Confirm, err))
 		}
@@ -3985,7 +3985,7 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	behindNote := ""
 	if confirmCursor := req.GetString("confirmCursor", ""); confirmCursor != "" {
 		behind, err := s.confirmCursor(conn, confirmCursor)
-		if err != nil {
+		if err != nil && !confirmCovered(err) {
 			return mcp.NewToolResultError(fmt.Sprintf("confirmCursor failed: %v", err)), nil
 		}
 		behindNote = formatBehindNote(behind)
@@ -5627,7 +5627,14 @@ func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest
 	}
 	behind, err := s.confirmCursor(conn, cursor)
 	var notPersisted errNotPersisted
+	var covered hubconn.ConfirmCoveredError
 	switch {
+	case errors.As(err, &covered):
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"nothing to confirm: %q is already covered — the server holds %q for this peer, "+
+				"which is at or after it, so this message counts as read already. This happens "+
+				"when a message is delivered after a later one was confirmed. Your read position "+
+				"stays where it was; there is nothing to retry", cursor, covered.Held)), nil
 	case errors.As(err, &notPersisted):
 		// The ONLY case where the server accepted it. What failed is the
 		// part that has to survive a restart, and "persisted" is the one
@@ -5699,6 +5706,13 @@ type errNotPersisted struct{ err error }
 
 func (e errNotPersisted) Error() string { return e.err.Error() }
 func (e errNotPersisted) Unwrap() error { return e.err }
+
+// confirmCovered reports a confirm the server did not need because its
+// position already covers the cursor — nothing failed, nothing to retry.
+func confirmCovered(err error) bool {
+	var covered hubconn.ConfirmCoveredError
+	return errors.As(err, &covered)
+}
 
 func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error) {
 	// Refused only on proof: another open connection delivered this exact
@@ -5828,7 +5842,7 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	behindNote := ""
 	if confirmCursor := req.GetString("confirmCursor", ""); confirmCursor != "" {
 		behind, err := s.confirmCursor(conn, confirmCursor)
-		if err != nil {
+		if err != nil && !confirmCovered(err) {
 			return mcp.NewToolResultError(fmt.Sprintf("confirmCursor failed: %v", err)), nil
 		}
 		behindNote = formatBehindNote(behind)

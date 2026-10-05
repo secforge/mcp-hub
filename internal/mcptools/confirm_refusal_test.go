@@ -73,11 +73,69 @@ func TestARefusalThatMissesTheConfirmDoesNotMoveTheStoredPosition(t *testing.T) 
 	confirm := mcp.CallToolRequest{}
 	confirm.Params.Arguments = map[string]any{"connection": testConn, "cursor": "a-cursor-from-elsewhere"}
 	res, _ := hub.handleConfirmReceived(ctx, confirm)
-	if res == nil || !res.IsError || !strings.Contains(textOf(res), "NOT moved") {
+	if res == nil || !res.IsError || strings.Count(strings.ToLower(textOf(res)), "has not moved") != 1 {
 		t.Fatalf("hub_confirm reported %+v; want a failure saying the position did not move", res)
 	}
 	after, _, _ := connstore.GetCatchUp(id)
 	if after.Cursor != before.Cursor {
 		t.Fatalf("the stored position moved %q -> %q on a confirm nothing accepted", before.Cursor, after.Cursor)
+	}
+}
+
+// A confirm the server answers with ok:false is one whose cursor the held
+// position already covers — a message delivered after a later one was
+// confirmed. That is nothing to do, not a failure, and the result names
+// the position the server holds.
+func TestAnOkFalseConfirmIsAlreadyCovered(t *testing.T) {
+	const held = "639267938090700000.57879"
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
+		joined.Features = map[string]json.RawMessage{
+			"ackReplies":            json.RawMessage(`{}`),
+			"messageAfter":          json.RawMessage(`{}`),
+			wire.FeatureCorrelation: json.RawMessage(`{}`),
+		}
+		conn.WriteJSON(joined)
+		for {
+			var req struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+			}
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			if req.Type == string(wire.TypeAck) {
+				no := false
+				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, ID: req.ID, AckCursor: held, OK: &no})
+			}
+		}
+	}))
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/hub/join#ok-false-covered"
+
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, req); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	confirm := mcp.CallToolRequest{}
+	confirm.Params.Arguments = map[string]any{"connection": testConn, "cursor": "639267938033310000.57882"}
+	res, _ := hub.handleConfirmReceived(ctx, confirm)
+	hub.handleDisconnect(ctx, connReqFor(testConn))
+	srv.Close()
+
+	text := textOf(res)
+	if res == nil || res.IsError || !strings.Contains(text, "already covered") {
+		t.Fatalf("an ok:false confirm was not reported as already covered: %+v", res)
+	}
+	if !strings.Contains(text, held) || strings.Contains(text, "..") {
+		t.Errorf("the held position is missing or the sentence is mangled: %s", text)
 	}
 }
