@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1414,6 +1415,102 @@ func (h *Hub) adoptCodexMode(ctx context.Context) {
 	}
 }
 
+// refuseUnknownArguments refuses a call that names a parameter the tool
+// does not have, before the tool runs. Such an argument is otherwise
+// dropped without a word: a file passed as "attachments" to hub_send went
+// out as text only, and the sender believed the file had been sent. The
+// refusal names the closest real parameter, which is almost always what
+// was meant.
+func refuseUnknownArguments(tool mcp.Tool, handler server.ToolHandlerFunc) server.ToolHandlerFunc {
+	known := make([]string, 0, len(tool.InputSchema.Properties))
+	for name := range tool.InputSchema.Properties {
+		known = append(known, name)
+	}
+	sort.Strings(known)
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var unknown []string
+		for name := range req.GetArguments() {
+			if _, ok := tool.InputSchema.Properties[name]; !ok {
+				unknown = append(unknown, name)
+			}
+		}
+		if len(unknown) == 0 {
+			return handler(ctx, req)
+		}
+		sort.Strings(unknown)
+		var parts []string
+		for _, name := range unknown {
+			part := fmt.Sprintf("%q", name)
+			if guess := closestParameter(name, known); guess != "" {
+				part += fmt.Sprintf(" (did you mean %q?)", guess)
+			}
+			parts = append(parts, part)
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("%s has no parameter %s, so nothing was done — an "+
+			"unknown argument would otherwise be ignored without a word. Its parameters are: %s.",
+			tool.Name, strings.Join(parts, ", "), strings.Join(known, ", "))), nil
+	}
+}
+
+// parameterAliases maps names a caller plausibly reaches for onto the
+// parameter that means it, where the spelling alone would not find it.
+var parameterAliases = map[string][]string{
+	"attachments": {"filePath", "imagePath"},
+	"attachment":  {"filePath", "imagePath"},
+	"file":        {"filePath"},
+	"files":       {"filePath"},
+	"path":        {"filePath"},
+	"image":       {"imagePath"},
+	"message":     {"text"},
+	"body":        {"text"},
+	"content":     {"text"},
+	"conn":        {"connection"},
+	"name":        {"connection"},
+	"id":          {"externalId"},
+	"messageId":   {"externalId"},
+}
+
+// closestParameter is the known parameter a mistyped one most likely
+// meant: an alias first, else the nearest by edit distance, if near at all.
+func closestParameter(name string, known []string) string {
+	has := map[string]bool{}
+	for _, k := range known {
+		has[k] = true
+	}
+	for _, alias := range parameterAliases[name] {
+		if has[alias] {
+			return alias
+		}
+	}
+	best, bestDist := "", 4
+	for _, k := range known {
+		if d := editDistance(strings.ToLower(name), strings.ToLower(k)); d < bestDist {
+			best, bestDist = k, d
+		}
+	}
+	return best
+}
+
+func editDistance(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur := make([]int, len(b)+1)
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min(min(prev[j]+1, cur[j-1]+1), prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(b)]
+}
+
 func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		h.adoptCodexMode(ctx)
@@ -1699,7 +1796,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	// would be delivered reliably by none, since which tool a caller
 	// reaches for next is not something this code gets to choose.
 	addTool := func(tool mcp.Tool, handler server.ToolHandlerFunc) {
-		s.AddTool(tool, h.withReconnectNote(handler))
+		s.AddTool(tool, h.withReconnectNote(refuseUnknownArguments(tool, handler)))
 	}
 	addTool(
 		mcp.NewTool("hub_connect",
@@ -1853,7 +1950,8 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 			connectionParam(),
 			mcp.WithDescription("Disconnect from the current hub session"),
 			mcp.WithBoolean("remove", mcp.Description(
-				"Optional, default false: also delete this connection's stored entry — its "+
+				"Optional, default false. NOT for messages — to withdraw a message, use hub_delete. "+
+					"Also deletes this connection's stored entry — its "+
 					"reconnect secret, peer id and read position — so it no longer appears in "+
 					"hub_list_connections. "+"IRREVERSIBLE: the stored identity is gone — the next hub_connect to this link is a "+
 					"first-ever one, with a NEW peer id that the other peers see as a new participant, "+
@@ -1862,8 +1960,9 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		h.handleDisconnect,
 	)
 	addTool(
-		mcp.NewTool("hub_remove",
-			mcp.WithDescription("Delete a stored connection — its reconnect secret, peer id and "+
+		mcp.NewTool("hub_forget_connection",
+			mcp.WithDescription("NOT for messages — to withdraw a message, use hub_delete. This "+
+				"forgets a stored CONNECTION: its reconnect secret, peer id and "+
 				"read position — so it no longer appears in hub_list_connections. A connection "+
 				"that is OPEN is disconnected first, exactly as hub_disconnect(remove: true) does, "+
 				"and its entry removed from whatever scope it was opened under. "+"IRREVERSIBLE: the stored identity is gone — the next hub_connect to this link is a "+
@@ -4014,7 +4113,7 @@ func removeStored(remove bool, target connstore.Target) string {
 func (h *Hub) handleRemove(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	name, link := req.GetString("connection", ""), req.GetString("link", "")
 	if (name == "") == (link == "") {
-		return mcp.NewToolResultError("hub_remove takes exactly one of connection and link"), nil
+		return mcp.NewToolResultError("hub_forget_connection takes exactly one of connection and link"), nil
 	}
 	if name != "" {
 		if _, err := h.session(name); err == nil {

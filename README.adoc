@@ -311,11 +311,11 @@ project scope for this connection only, and is discouraged — see
 |`hub_disconnect(connection, remove?)`
 |Leave and tear the connection down. The stored entry stays, so the next
 connect to that link resumes the same identity; `remove: true` deletes it
-as well (see `hub_remove`). The client also disconnects every open
+as well (see `hub_forget_connection`). The client also disconnects every open
 connection when it shuts down on `SIGTERM`/`SIGINT` or when its stdio pipe
 closes — without removing anything.
 
-|`hub_remove(connection? \| link?)`
+|`hub_forget_connection(connection? \| link?)`
 |Delete a stored entry — its secret, peer id and read position. A
 `connection` name that is open means that connection, as it does for every
 tool: it is disconnected and its entry removed from the scope it was opened

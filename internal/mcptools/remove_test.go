@@ -127,10 +127,10 @@ func TestHubRemoveRefusesAnAmbiguousNameAndBadArguments(t *testing.T) {
 		t.Fatalf("an ambiguous name was not refused: %s", textOf(res))
 	}
 	if res := callRemove(hub, map[string]any{}); !res.IsError {
-		t.Fatal("hub_remove with neither argument was not refused")
+		t.Fatal("hub_forget_connection with neither argument was not refused")
 	}
 	if res := callRemove(hub, map[string]any{"connection": "same", "link": linkA}); !res.IsError {
-		t.Fatal("hub_remove with both arguments was not refused")
+		t.Fatal("hub_forget_connection with both arguments was not refused")
 	}
 }
 
