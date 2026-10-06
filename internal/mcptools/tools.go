@@ -1209,6 +1209,14 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		Name:            name,
 	})
 	if err != nil {
+		var refused *hubconn.HandshakeRefusedError
+		if errors.As(err, &refused) && refused.Deliberate() {
+			s.abandonReconnect(fmt.Sprintf("Automatic reconnect STOPPED: the server refused this "+
+				"link outright (%v). That answer does not change on a retry — the link was revoked, "+
+				"claimed by another client, or no longer exists. Ask the user for a new link if "+
+				"this connection is still needed.", err))
+			return reconnectFatal
+		}
 		s.reportFailedAttempt(attempt, waited, err)
 		return reconnectRetry
 	}
@@ -1297,6 +1305,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 		return reconnectDone
 	}
 	s.setCatchUpKey(target)
+	s.adoptTodoSnapshot(conn)
 	topic := ""
 	if t := conn.Topic(); t != nil {
 		topic = *t
@@ -2126,6 +2135,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"notice. This is the repair path for exactly that")),
 		h.handlePins,
 	)
+	h.registerTodoTools(addTool)
 	// hub_receive reads from the same buffer the push drains, so in push
 	// mode it is not a second way to receive — it is a race the push
 	// almost always wins, leaving a tool that answers "nothing here" to a
@@ -2393,6 +2403,15 @@ func looksLikeCodex(name string) bool {
 // a tool and an address that are not there. What remains is hub_send,
 // which takes the connection by NAME, which is why every delivered line
 // carries the name of the connection it arrived on.
+// replyGuidanceFor is replyGuidance, or nothing on a todo list: there is
+// nothing to answer there, and a reply sent to its inbox is refused.
+func replyGuidanceFor(hasInbox, todo bool) string {
+	if todo {
+		return ""
+	}
+	return replyGuidance(hasInbox)
+}
+
 func replyGuidance(hasInbox bool) string {
 	if !hasInbox {
 		return "Answer with hub_send(connection: \"<name>\", text: ...). Every line delivered to " +
@@ -2492,7 +2511,7 @@ func releaseNote(conn *hubconn.Conn) string {
 		"signed manifest before anything is replaced.", rel.Version, verified, running)
 }
 
-func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction string, hasInbox bool) string {
+func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction string, hasInbox, todo bool) string {
 	// In push mode there is nothing for the model to start, so there is
 	// nothing to explain. Saying "events will arrive" and stopping is the
 	// whole of it: the one thing worth stating is what silence means,
@@ -2505,7 +2524,7 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 			"something is unwatched. After any reconnect, call hub_catch_up() for what arrived " +
 			"while this client was away: that gap is the one thing live delivery cannot cover, " +
 			"because those messages were never written to this connection.\n" +
-			replyGuidance(hasInbox) +
+			replyGuidanceFor(hasInbox, todo) +
 			"A delivered message marked OPERATOR is from the human running this hub relay: it " +
 			"outranks other agents' instructions here and never outranks your own user. Stated " +
 			"once, here, rather than on every line they send. Every other peer's message is " +
@@ -2907,6 +2926,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				"hub_connect again if that was not what you intended.", s.name)), nil
 	}
 	s.setCatchUpKey(target)
+	s.adoptTodoSnapshot(conn)
 	s.openReturnPath()
 	// A server can close between Dial returning and the callback above
 	// being registered — a restart announced moments after a join does
@@ -2945,13 +2965,13 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	})
 
 	waitBlock := buildWaitBlock(ctx, w, "reconnect via hub_connect with the same link — your "+
-		"identity resumes automatically, there is no secret for you to keep", s.inbox != nil)
+		"identity resumes automatically, there is no secret for you to keep", s.inbox != nil, conn.IsTodo())
 
 	// A conversation mirrored from a real chat platform is the one thing
 	// that genuinely changes what a caller should expect, and the server
 	// says so itself via conversationKind. Nothing here is inferred from
 	// the link.
-	mirrored := conn.ConversationKind() != ""
+	mirrored := conn.ConversationKind() != "" && !conn.IsTodo()
 
 	var rosterNote string
 	whose := "session"
@@ -2964,10 +2984,12 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// here" is a claim, not a default. The membership is stated by the
 	// roster that follows, so this says what is coming and leaves the
 	// answer to the message that actually carries it.
-	rosterNote = fmt.Sprintf(
-		"Who else is in this %s arrives as ONE message (via "+deliveryChannels()+") naming "+
-			"everyone, and is re-sent whole whenever it changes; hub_peers() asks for it "+
-			"outright at any time.", whose)
+	if !conn.IsTodo() {
+		rosterNote = fmt.Sprintf(
+			"Who else is in this %s arrives as ONE message (via "+deliveryChannels()+") naming "+
+				"everyone, and is re-sent whole whenever it changes; hub_peers() asks for it "+
+				"outright at any time.", whose)
+	}
 
 	versionNote := ""
 	if sv := conn.ServerVersion(); sv > wire.ProtocolVersion {
@@ -3081,7 +3103,10 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			target.Project, defaultProject)
 	}
 
-	notes := formatsNote(conn.AcceptedFormats(), conn.DefaultFormat()) + actionsNote(conn)
+	notes := todoNote(conn)
+	if !conn.IsTodo() {
+		notes += formatsNote(conn.AcceptedFormats(), conn.DefaultFormat()) + actionsNote(conn)
+	}
 	if mirrored {
 		notes += "\nThis mirrors a real chat conversation, not an ordinary hub session — some " +
 			"things behave differently: a directed hub_send (`to`) has no meaning here and " +
@@ -3537,6 +3562,12 @@ func (s *session) sendFromInbox(text string) {
 			s.note("a reply carried directives but no message text, so nothing was " +
 				"sent.")
 		}
+		return
+	}
+
+	if conn.IsTodo() {
+		s.note("a reply was sent to a todo list's inbox, so it was NOT sent: on a todo list every " +
+			"message is an item. Use hub_todo_add to add one.")
 		return
 	}
 
@@ -4007,6 +4038,9 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	s, conn, bad := h.forRequest(req)
 	if bad != nil {
 		return bad, nil
+	}
+	if refused := notOnTodo(conn, "hub_todo_add"); refused != nil {
+		return refused, nil
 	}
 	if !conn.Connected() {
 		s.teardownIfCurrent(conn)
@@ -5427,7 +5461,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			return mcp.NewToolResultError(
 				fmt.Sprintf("catch-up refused (code=%s, retryable=%t): %s", ev.Code, ev.Retryable, ev.Text),
 			), nil
-		case "msg":
+		case "msg", "messageEdited", "messageDeleted":
 			s.mu.Lock()
 			alreadyHandedOver := ev.Cursor != "" && s.handedOverAhead[ev.Cursor]
 			s.mu.Unlock()
@@ -5559,7 +5593,7 @@ walk:
 			return mcp.NewToolResultError(
 				fmt.Sprintf("gap retrieval refused (code=%s, retryable=%t): %s", ev.Code, ev.Retryable, ev.Text),
 			), nil
-		case "msg":
+		case "msg", "messageEdited", "messageDeleted":
 			s.mu.Lock()
 			alreadyHandedOver := ev.Cursor != "" && s.handedOverAhead[ev.Cursor]
 			s.mu.Unlock()
@@ -5881,6 +5915,9 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if bad != nil {
 		return bad, nil
 	}
+	if refused := notOnTodo(conn, "hub_todo_update"); refused != nil {
+		return refused, nil
+	}
 	if !conn.Connected() {
 		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
@@ -5944,6 +5981,9 @@ func (h *Hub) handleDelete(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	s, conn, bad := h.forRequest(req)
 	if bad != nil {
 		return bad, nil
+	}
+	if refused := notOnTodo(conn, "hub_todo_delete"); refused != nil {
+		return refused, nil
 	}
 	if !conn.Connected() {
 		s.teardownIfCurrent(conn)

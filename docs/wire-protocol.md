@@ -150,6 +150,8 @@ bump — see §6.
 | `behindSince` | string (RFC 3339, explicit UTC offset) | no, but required alongside `behind` when `behind` is set to a positive value | The timestamp of this peer's last-acked position — what a `messageAfter{at:...}` seek is computed from when the gap is too large to walk. Omitted under the same conditions as `behind`. |
 | `pinned` | array of `externalId` | whenever `pins` is declared | The conversation's pinned messages. **Always present** when `pins` is declared — `[]` when nothing is pinned — so that absence means only "unsupported". See §2.8a. |
 | `resumablePeers` | int | whenever `mintNotice` is declared and this connection was given a **fresh** identity | How many peers in this conversation still hold a reconnect secret. `0` is sent, not omitted. Absent when an identity was reclaimed. Lets a client that stored nothing for this link tell a first-ever connect from one made under a different scope — see §4. |
+| `items` | array of item | whenever `todo` is declared | The list's current items, each in the item shape of §2.8b with its `externalId`: open items first, by `position`, then done items by `doneAt`. **Always present** when `todo` is declared — `[]` for an empty list. |
+| `itemsCursor` | string | whenever `todo` is declared and the list has a change | The cursor of the newest change `items` reflects. A reader with no stored position catches up from here, so every later change arrives exactly once. |
 | `clientRelease` | object `{version, readAt?}` | no | What the *server* has verified the current client release to be, from the signed release manifest — never what a peer reported. Present only with the `clientRelease` feature and something verified. The comparison against the client's own build is the client's to make. |
 
 ### 2.1a `features` — capability declaration
@@ -188,6 +190,7 @@ client, and a server must not send one to request client behaviour.
 | `replyTo` | — | Accepts `replyTo` on `msg`/`edit` and renders a native threaded citation. |
 | `formats` | `accepted` array of strings; `default` string | The `format` values this conversation accepts on `msg`/`edit` — e.g. `["text","html"]` — and what an omitted `format` means there (e.g. `"markdown"` on a hub session, `"text"` elsewhere). A value not listed is refused; a client refuses it locally. Absent `default` says nothing about the default; it does not mean `"text"`. Declared per conversation, since what a path can render differs. |
 | `pins` | — | Mirrors the conversation's pinned set (`joined.pinned`, `pinned`/`unpinned` events) and accepts `pin`/`unpin`/`pins` (§2.8a). |
+| `todo` | `maxText`, `maxNotes` int | The conversation is a todo list: a message is an item, and `msg`/`edit`/`delete` add, change and remove items with the fields of §2.8b. `joined.items` carries the current list. |
 | `correlation` | — | Echoes a request's `id` verbatim on the frame that answers it and on an `error` refusing it (§2.2, §2.5). |
 | `mintNotice` | — | Sends `joined.resumablePeers` whenever it mints a fresh identity (§2.1, §4). |
 | `piggybackAckRefusals` | — | Refuses a piggybacked `ackCursor` it cannot record with `error{code:"bad_piggyback_ack"}` instead of dropping it silently (§2.7). |
@@ -552,7 +555,8 @@ sends no `matching`. A filtered `noMoreMessages` means "nothing further
 matches", not "no more messages" — a client must not end an unfiltered
 walk on it.
 
-Answer — exactly one of three, and *only* one of the three:
+Answer — exactly one of three, and *only* one of the three (a todo
+list widens the first, see below):
 
 ```json
 {"type": "msg", ..., "historical": true, "answers": {"cursor": "..."}}
@@ -563,6 +567,10 @@ Answer — exactly one of three, and *only* one of the three:
 - The `msg` form is the answer, formatted exactly like any other `msg`
   (§2.2) — same `attachments`/`format`/`replyTo`/`mentions` fields, same
   rules — with `historical: true` and `answers` added.
+- Where the server declares `todo`, the answer can also be a
+  `messageEdited` or `messageDeleted` from the list's change log, with
+  `historical: true`, `answers` and its own `cursor` (§2.8b). It counts
+  as the one message of the answer.
 - `noMoreMessages` means "there is no message at a later position than
   the one given" — **not an error**, this is the normal, expected way a
   walk or a seek terminates. `answers` is set here too.
@@ -837,6 +845,88 @@ Changes from anyone arrive as events:
 flag: an agent pins *as the account*, so the platform shows the account
 as the pinner. A client recognises its own pin by the ack answering its
 request.
+
+### 2.8b Todo lists (feature `todo`)
+
+A server declaring `todo` serves a todo list as a conversation: each item
+is a message whose `externalId` is the item's id, and the frames of §2.2
+and §2.8 carry the item fields below. Nothing else changes — acks,
+correlation, `messageAfter`, read positions and close codes work as for
+any conversation.
+
+**Links.** A todo link is one client's access to one list, not the list:
+the list issues a new link per client, and the list's own id is never a
+hub credential. The first connect claims the link for the `Agent-Secret`
+it presents; a later connect with the same secret resumes that client's
+identity (superseding a live connection with 4004, §4), and one with any
+other secret is refused before the upgrade with 401. An unknown link is
+refused with 404. The `peerId` is fixed by the link, so `Agent-Id` has
+nothing to reclaim and is ignored. Revoking a link closes its live
+connection with 4001 and refuses every later join. A client treats a
+refusal at the upgrade like 4001: it does not reconnect on its own.
+
+**Item fields** (on `msg` and `edit` from the client, on `msg` and
+`messageEdited` from the server, and in `joined.items`):
+
+| Field | Type | Notes |
+|---|---|---|
+| `text` | string | The item's text, at most `maxText` characters. |
+| `notes` | string | Free-text notes, at most `maxNotes` characters. The server always sends it, `""` when there are none; absent never means "none". |
+| `done` | bool | Whether the item is completed. |
+| `doneAt` | string (RFC 3339) | Server → client only, on a done item: when it was completed. Done items sort by it. |
+| `position` | number | Server → client only: an opaque sort key. Open items sort by it ascending; a client never computes with it or sends one. |
+| `afterId` | string\|null | Client → server only: place the item directly after this item's `externalId`; `null` places it first. On `msg`, absent places it last; on `edit`, absent leaves it where it is. |
+
+**Adding** is a `msg` with `text` and optionally `notes`, `done`,
+`afterId`. **Changing** is an `edit` naming the item by `externalId` and
+carrying only the fields that change: an absent field stays as it was,
+so `text` is optional on `edit` here. **Removing** is a `delete`; its `messageDeleted` echo carries no item
+fields. Each is answered with its ack as declared by `actionAcks`.
+
+An `afterId` naming an unknown item, a done item or the item itself, or
+any move of a done item, is refused with
+`error{code:"bad_after_id", retryable:false}`, and nothing changes.
+
+**Server rules** a client must expect rather than reproduce: un-completing
+an item may move it (the reference server puts it first), and positions
+may be renumbered — a renumbering arrives as a `messageEdited` for each
+item whose `position` changed, so no position changes without an event.
+An event always carries the item's full state after the change,
+`position` included, so a reader never derives one.
+
+**Who changed it.** A change the reading connection made is answered with
+its ack (`sendAck`/`editAck`/`deleteAck`) and then echoed to it as the
+canonical event with `own: true` and a `cursor`, so the sender learns the
+`position` and `doneAt` the server assigned. Every `msg`,
+`messageEdited` and `messageDeleted` on a todo list carries the `peerId`
+of whoever made the change. A change made outside the hub — in the list's own web UI —
+arrives from peer id
+`ffffffff-ffff-ffff-ffff-ffffffffffff`, never the all-zeros operator id:
+anyone holding the list's link can edit it, so such a change is
+untrusted content like any peer's message.
+
+**Reading the whole list.** `{"type": "items", "id": "..."}` asks for the
+current state at any time and is answered by
+`{"type": "items", "id": "...", "list": [...], "itemsCursor": "..."}` —
+every item in the order and shape of `joined.items`, read from the same
+state, with the cursor of the newest change it reflects. A reader whose
+earlier view is gone or stale asks for this instead of reconstructing the
+list from events.
+
+**Catch-up.** Every add, change and removal is one entry in the list's
+change log, in arrival order, with its own cursor; `messageAfter` walks
+those entries, each delivered as `msg`, `messageEdited` or `messageDeleted`
+with the item's state after it, `historical: true`, `answers` and its
+own `cursor` — `messageEdited` carries a `cursor` here, which it does
+not elsewhere. `joined.items` and `joined.itemsCursor` give the state to
+start from.
+
+**Limits.** Text or notes over the declared maximum is refused with
+`error{code:"too_long"}`; a client refuses it locally first.
+
+**A deleted list** is answered with
+`error{code:"conversation_unavailable", retryable:false}` and closed with
+4003, so a client stops reconnecting.
 
 ### 2.9 `sendAck` (server → client)
 

@@ -56,6 +56,7 @@ const (
 	TypePins            Type = "pins"
 	TypeNoMoreMessages  Type = "noMoreMessages"
 	TypeServerStopping  Type = "serverStopping"
+	TypeItems           Type = "items"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -241,6 +242,10 @@ type Joined struct {
 	// from a server that does not say. Declared as FeatureMintNotice, so
 	// its absence means one thing.
 	ResumablePeers *int `json:"resumablePeers,omitempty,case:strict"`
+	// Items is a todo list's current state, present whenever "todo" is
+	// declared (§2.8b); ItemsCursor is the newest change it reflects.
+	Items       *[]TodoItem `json:"items,omitempty,case:strict"`
+	ItemsCursor string      `json:"itemsCursor,omitempty,case:strict"`
 }
 
 // ClientRelease is a server's verified statement of the current client
@@ -521,6 +526,8 @@ type Msg struct {
 	// target server wasn't confirmed to accept. mcp-hub-server's own relay
 	// has no opinion on this field at all, same as Attachments.
 	Format string `json:"format,omitempty,case:strict"`
+	// TodoFields are set on a todo list's items (§2.8b).
+	TodoFields
 }
 
 // Attachment is binary content attached to a Msg/Edit — a server
@@ -1204,6 +1211,16 @@ type MessageEdited struct {
 	// the original.
 	Mentions    []Mention `json:"mentions,omitempty,case:strict"`
 	MentionedMe bool      `json:"mentionedMe,omitempty,case:strict"`
+	// On a todo list (§2.8b) an edit is also a change-log entry, so it
+	// carries a cursor and, as a messageAfter answer, historical/answers.
+	Cursor     string  `json:"cursor,omitempty,case:strict"`
+	Historical bool    `json:"historical,omitempty,case:strict"`
+	Answers    *Anchor `json:"answers,omitempty,case:strict"`
+	ID         string  `json:"id,omitempty,case:strict"`
+	TodoFields
+	// PeerID names who made the change, where the server says — a todo
+	// list does (§2.8b).
+	PeerID string `json:"peerId,omitempty,case:strict"`
 }
 
 // Reaction is a client request to add or remove a reaction on an earlier
@@ -1345,6 +1362,14 @@ type MessageDeleted struct {
 	Cursor     string `json:"cursor,omitempty,case:strict"`
 	TS         string `json:"ts,omitempty,case:strict"`
 	Own        bool   `json:"own,omitempty,case:strict"`
+	// Set when a todo list's change log answers a messageAfter with a
+	// removal (§2.8b).
+	Historical bool    `json:"historical,omitempty,case:strict"`
+	Answers    *Anchor `json:"answers,omitempty,case:strict"`
+	ID         string  `json:"id,omitempty,case:strict"`
+	// PeerID names who removed it, where the server says — a todo list
+	// does (§2.8b).
+	PeerID string `json:"peerId,omitempty,case:strict"`
 }
 
 // Identity names a person or account on the platform behind a mirrored
@@ -1459,3 +1484,81 @@ func OK(v bool) *bool { return &v }
 // trails. Nil means the server has no such concept; a stated 0 asserts
 // "caught up" as a fact.
 func BehindCount(n int) *int { return &n }
+
+// FeatureTodo declares a todo list (§2.8b).
+const FeatureTodo = "todo"
+
+// TodoFeature is the "todo" feature's parameters: the longest text and
+// notes the server accepts, 0 when it states none.
+type TodoFeature struct {
+	MaxText  int `json:"maxText,omitempty"`
+	MaxNotes int `json:"maxNotes,omitempty"`
+}
+
+// TodoFeature returns the declared todo parameters, and whether the
+// server declared a todo list at all.
+func (j Joined) TodoFeature() (TodoFeature, bool) {
+	raw, ok := j.Features[FeatureTodo]
+	if !ok {
+		return TodoFeature{}, false
+	}
+	var tf TodoFeature
+	_ = json.Unmarshal(raw, &tf)
+	return tf, true
+}
+
+// TodoFields are an item's fields as a server delivers them on msg and
+// messageEdited (§2.8b). Absent on any other conversation.
+type TodoFields struct {
+	Notes    *string  `json:"notes,omitempty,case:strict"`
+	Done     *bool    `json:"done,omitempty,case:strict"`
+	DoneAt   string   `json:"doneAt,omitempty,case:strict"`
+	Position *float64 `json:"position,omitempty,case:strict"`
+}
+
+// TodoItem is one item of joined.items and of an items answer.
+type TodoItem struct {
+	ExternalID string  `json:"externalId,case:strict"`
+	Text       string  `json:"text,case:strict"`
+	Notes      string  `json:"notes,case:strict"`
+	Done       bool    `json:"done,case:strict"`
+	DoneAt     string  `json:"doneAt,omitempty,case:strict"`
+	Position   float64 `json:"position,case:strict"`
+}
+
+// TodoAdd adds an item: a msg carrying the item fields a client sets.
+// AfterID is raw so that absent (place last), null (place first) and an
+// id are three different things on the wire.
+type TodoAdd struct {
+	Type    Type            `json:"type,case:strict"`
+	ID      string          `json:"id,omitempty,case:strict"`
+	Text    string          `json:"text,case:strict"`
+	Notes   *string         `json:"notes,omitempty,case:strict"`
+	Done    *bool           `json:"done,omitempty,case:strict"`
+	AfterID json.RawMessage `json:"afterId,omitempty,case:strict"`
+}
+
+// TodoEdit changes an item: an edit carrying only the fields that change.
+type TodoEdit struct {
+	Type       Type            `json:"type,case:strict"`
+	ID         string          `json:"id,omitempty,case:strict"`
+	ExternalID string          `json:"externalId,case:strict"`
+	Text       *string         `json:"text,omitempty,case:strict"`
+	Notes      *string         `json:"notes,omitempty,case:strict"`
+	Done       *bool           `json:"done,omitempty,case:strict"`
+	AfterID    json.RawMessage `json:"afterId,omitempty,case:strict"`
+}
+
+// ItemsRequest asks a todo list for its current items.
+type ItemsRequest struct {
+	Type Type   `json:"type,case:strict"`
+	ID   string `json:"id,omitempty,case:strict"`
+}
+
+// ItemsResponse is the answer to ItemsRequest.
+type ItemsResponse struct {
+	Type        Type        `json:"type,case:strict"`
+	ID          string      `json:"id,omitempty,case:strict"`
+	List        *[]TodoItem `json:"list,case:strict"`
+	ItemsCursor string      `json:"itemsCursor,omitempty,case:strict"`
+}

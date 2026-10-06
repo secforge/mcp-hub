@@ -127,6 +127,9 @@ func confirmReminderCost(e Event) string {
 }
 
 func FormatEvent(e Event) string {
+	if text, ok := formatTodoEvent(e, true); ok {
+		return text
+	}
 	switch e.Kind {
 	case "msg":
 		// own/cursor/externalId are appended, not prepended, so a reader
@@ -525,6 +528,9 @@ func deliveredCost(e Event) int {
 // client's own words from a peer's inside the payload, which a static
 // envelope field cannot do.
 func FormatEventForPush(e Event) string {
+	if text, ok := formatTodoEvent(e, false); ok {
+		return withPushSeq(e, text)
+	}
 	if e.Kind != "msg" {
 		return withPushSeq(e, FormatEvent(e))
 	}

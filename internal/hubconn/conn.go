@@ -275,6 +275,12 @@ type Event struct {
 	HeldCount  int
 	SpillPath  string
 	SpillBytes int
+	// Todo carries a todo list item's fields on msg and messageEdited
+	// (§2.8b); nil on any other conversation.
+	Todo *wire.TodoFields
+	// TodoItems and ItemsCursor are an "items" answer's list and cursor.
+	TodoItems   []wire.TodoItem
+	ItemsCursor string
 }
 
 // PeerInfo is what's known about one other peer in the session.
@@ -320,6 +326,11 @@ type Conn struct {
 	pinnedAtConnect  []string
 	features         map[string]json.RawMessage
 	featuresDeclared bool
+	// todo is set when the server declared a todo list; todoItems and
+	// todoCursor are the list as joined.items stated it.
+	todo       *wire.TodoFeature
+	todoItems  []wire.TodoItem
+	todoCursor string
 	// pongWait is snapshotted from the package-level var once, synchronously,
 	// in Dial — never read from the background readLoop goroutine directly.
 	// Reading the mutable package var from that goroutine on every loop
@@ -947,10 +958,39 @@ func dialWS(target string, header http.Header) (*websocket.Conn, error) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	if said := strings.TrimSpace(string(body)); said != "" {
-		return nil, fmt.Errorf("%w — server answered %s: %s", err, resp.Status, said)
+	return nil, &HandshakeRefusedError{Status: resp.StatusCode, StatusText: resp.Status,
+		Said: strings.TrimSpace(string(body)), err: err}
+}
+
+// HandshakeRefusedError is a server's answer to the upgrade that was not
+// an upgrade, with the status it sent.
+type HandshakeRefusedError struct {
+	Status     int
+	StatusText string
+	Said       string
+	err        error
+}
+
+func (e *HandshakeRefusedError) Error() string {
+	if e.Said != "" {
+		return fmt.Sprintf("%v — server answered %s: %s", e.err, e.StatusText, e.Said)
 	}
-	return nil, fmt.Errorf("%w — server answered %s", err, resp.Status)
+	return fmt.Sprintf("%v — server answered %s", e.err, e.StatusText)
+}
+
+func (e *HandshakeRefusedError) Unwrap() error { return e.err }
+
+// Deliberate reports a refusal the server means: the link's credential is
+// not honoured (401, 403), or the server has no such link (404, 410).
+// Dialling again presents the same link and gets the same answer, so it is
+// no reason to retry — unlike a 5xx, which a restarting server or proxy
+// sends while it comes back.
+func (e *HandshakeRefusedError) Deliberate() bool {
+	switch e.Status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+		return true
+	}
+	return false
 }
 
 // maxReadFrameBytes bounds a single incoming websocket frame, matching
@@ -1031,6 +1071,9 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfir
 		gone:                    make(chan struct{}),
 		canSend:                 joined.CanSend,
 		conversationKind:        joined.ConversationKind,
+		todo:                    todoOf(joined),
+		todoItems:               itemsOf(joined.Items),
+		todoCursor:              joined.ItemsCursor,
 		topic:                   joined.Topic,
 		behind:                  joined.Behind,
 		behindSince:             joined.BehindSince,
@@ -1607,7 +1650,7 @@ func (c *Conn) tryDivertToClaimLocked(ev Event) bool {
 	// together with it, not here.
 	if c.pendingMessageAfter != nil {
 		switch {
-		case (ev.Kind == "msg" && ev.Answers != nil || ev.Kind == "noMoreMessages") &&
+		case (isChangeKind(ev.Kind) && ev.Answers != nil || ev.Kind == "noMoreMessages") &&
 			answersHistoryClaim(ev, c.pendingMessageAfter):
 			claim := c.pendingMessageAfter
 			c.pendingMessageAfter = nil
@@ -2392,7 +2435,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,
-			Matching: m.Matching, CorrelationID: m.ID}, true
+			Matching: m.Matching, CorrelationID: m.ID, Todo: todoFields(m.TodoFields)}, true
 	case wire.TypeServerStopping:
 		var st wire.ServerStopping
 		if err := json.Unmarshal(raw, &st); err != nil {
@@ -2450,7 +2493,8 @@ func decodeEvent(raw []byte) (Event, bool) {
 		}
 		return Event{Kind: "messageEdited", ExternalID: m.ExternalID, Text: m.Text, TS: m.TS, Own: m.Own,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
-			Mentions: m.Mentions, MentionedMe: m.MentionedMe}, true
+			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Cursor: m.Cursor, Historical: m.Historical,
+			Answers: m.Answers, CorrelationID: m.ID, Todo: todoFields(m.TodoFields), PeerID: m.PeerID}, true
 	case wire.TypeReactionAck:
 		var a wire.ReactionAck
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -2516,7 +2560,15 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &d); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "messageDeleted", ExternalID: d.ExternalID, Cursor: d.Cursor, TS: d.TS, Own: d.Own}, true
+		return Event{Kind: "messageDeleted", ExternalID: d.ExternalID, Cursor: d.Cursor, TS: d.TS, Own: d.Own,
+			Historical: d.Historical, Answers: d.Answers, CorrelationID: d.ID, PeerID: d.PeerID}, true
+	case wire.TypeItems:
+		var r wire.ItemsResponse
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "items", TodoItems: itemsOf(r.List), ItemsCursor: r.ItemsCursor,
+			CorrelationID: r.ID}, true
 	case wire.TypeAck:
 		var a wire.Ack
 		if err := json.Unmarshal(raw, &a); err != nil {
