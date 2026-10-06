@@ -515,57 +515,43 @@ func targetForLink(ctx context.Context, link string) connstore.Target {
 	return connstore.Target{Link: link, Project: projectForConnect(ctx)}
 }
 
-// setCatchUpGap persists {from, to} as id's current abandoned range,
-// WIDENING rather than replacing any range already recorded. Recorded as
-// ongoing STATE, not a one-time notice: a seek's
-// skipped range doesn't stop existing once the call that performed it
-// returns, so any later "am I caught up" check (a fresh hub_catch_up
-// call, a fresh hub_connect) should keep saying so until something
-// actually walks that range, not just the one time it happened.
+// catchUpGap is a seek's skipped range, recorded as ongoing STATE, not a
+// one-time notice: a skipped range doesn't stop existing once the call
+// that skipped it returns, so every later "am I caught up" check keeps
+// saying so until something walks the range or writes it off.
 //
-// From/To are both timestamps (RFC3339) — From is where the abandoned
-// range starts (Conn.BehindSince() at the time of the seek), To is where
-// it ends (the seek's own landing point, so everything from there
-// onward is already covered by ordinary hub_catch_up).
+// One range per seek, kept apart and retrieved oldest first. A seek can
+// happen while an earlier range is still unwalked — a reconnect while
+// behind does exactly that — and the two ranges are separate stretches
+// of history with read messages between them. Recording them as one
+// range from the oldest start to the newest end would make retrieval
+// re-deliver everything read in between.
 //
-// Widening, not replacing, because a seek can happen while an earlier
-// range is still unwalked — a reconnect while behind does exactly that,
-// and it is the ordinary case rather than an exotic one. Replacing threw
-// the earlier range away: the client had correctly identified it,
-// correctly told the model about it, and then discarded it with nothing
-// recording that it ever existed. Nobody would know to go looking, which
-// is the whole failure this record exists to prevent, reintroduced by
-// the thing meant to prevent it.
-//
-// The old From and AnchorCursor are what carry forward, and the
-// AnchorCursor half is the part worth being careful about: a range can
-// be PARTLY walked, and its progress lives there. Keeping it means
-// retrieval resumes where it stopped instead of restarting, so widening
-// costs nothing already read. Only To moves.
-//
-// The merged range does cover ground the ordinary walk may have covered
-// between the two seeks, so retrieving it can re-deliver a few messages
-// already seen. That is the safe direction and the same trade gap
-// retrieval already makes.
+// To is where the seek landed: from there on, ordinary hub_catch_up
+// covers everything, so a range ends at the first message timestamped at
+// or after it.
 func setCatchUpGapFromAt(id connstore.Target, at, to string) {
-	carryForwardGap(id, connstore.GapState{FromAt: at, To: to})
+	appendCatchUpGap(id, connstore.GapState{FromAt: at, To: to})
 }
 
 // setCatchUpGapFromCursor records a gap whose start is a position this
 // client actually reached. Kept apart from the timestamp form all the
 // way to the wire: a cursor is opaque, and one sent as `at` is refused
-// as a bad anchor, which left the skipped range unreachable through the
-// very call that exists to reach it.
+// as a bad anchor, which would leave the skipped range unreachable
+// through the very call that exists to reach it.
 func setCatchUpGapFromCursor(id connstore.Target, cursor, to string) {
-	carryForwardGap(id, connstore.GapState{FromCursor: cursor, To: to})
+	appendCatchUpGap(id, connstore.GapState{FromCursor: cursor, To: to})
 }
 
-func carryForwardGap(id connstore.Target, g connstore.GapState) {
-	if prev, ok := loadCatchUpGap(id); ok {
-		g.FromCursor, g.FromAt = prev.FromCursor, prev.FromAt
-		g.AnchorCursor = prev.AnchorCursor
+func appendCatchUpGap(id connstore.Target, g connstore.GapState) {
+	if id.Link == "" || !g.Started() {
+		return
 	}
-	saveCatchUpGap(id, g)
+	if err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
+		cs.Gaps = append(cs.Gaps, g)
+	}); err != nil {
+		noteCatchUpWriteFailure(err)
+	}
 }
 
 // decisionNote renders where this catch-up started and what it chose. See
@@ -656,107 +642,119 @@ var codexPushOnly atomic.Bool
 // a Codex one from the moment it says so.
 func pushOnly() bool { return harness.PushOnly() || codexPushOnly.Load() }
 
-// saveCatchUpGap persists g as id's current gap record — an empty g (the
-// zero value) clears it, since loadCatchUpGap already treats a blank
-// From as "no gap recorded."
+// saveCatchUpGap records retrieval progress on a range: g replaces the
+// recorded range it is the Same as. A range no longer on record — another
+// process finished or wrote it off meanwhile — is left gone.
 func saveCatchUpGap(id connstore.Target, g connstore.GapState) {
+	updateCatchUpGap(id, g, func(cs *connstore.CatchUpState, i int) { cs.Gaps[i] = g })
+}
+
+// clearCatchUpGap removes the range g from id's record — called once
+// handleCatchUpGap's walk has retrieved everything in it (a
+// "noMoreMessages" answer, or a message whose own timestamp reaches To).
+// Any later range stays recorded.
+func clearCatchUpGap(id connstore.Target, g connstore.GapState) {
+	updateCatchUpGap(id, g, func(cs *connstore.CatchUpState, i int) {
+		cs.Gaps = append(cs.Gaps[:i], cs.Gaps[i+1:]...)
+	})
+}
+
+// updateCatchUpGap applies change to the recorded range that is the Same
+// as g, under one exclusive lock across read and write, so what another
+// process recorded meanwhile is not erased by a snapshot taken before it.
+func updateCatchUpGap(id connstore.Target, g connstore.GapState, change func(*connstore.CatchUpState, int)) {
 	if id.Link == "" {
 		return
 	}
-	// One exclusive lock across read and write. Done by hand this used to
-	// straddle two lock acquisitions, and what another process recorded in
-	// between was erased by a snapshot taken before it — with the gap
-	// record, which says messages exist that nothing will walk to, as the
-	// thing most worth losing.
 	if err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
-		if !g.Started() {
-			cs.Gap = nil
-		} else {
-			cs.Gap = &g
+		for i := range cs.Gaps {
+			if cs.Gaps[i].Same(g) {
+				change(cs, i)
+				return
+			}
 		}
 	}); err != nil {
 		noteCatchUpWriteFailure(err)
 	}
 }
 
-// clearCatchUpGap removes id's gap record — called once
-// handleCatchUpGap's walk has retrieved everything in the range (a
-// "noMoreMessages" answer, or a message whose own timestamp reaches To).
-func clearCatchUpGap(id connstore.Target) {
-	saveCatchUpGap(id, connstore.GapState{})
-}
-
-// discardCatchUpGap writes off id's recorded gap unread, moving it into
-// CatchUpState.Discarded rather than deleting it. That distinction is the
-// whole point: a range nobody ever read, deliberately, is a different
+// discardCatchUpGaps writes off every recorded range unread, moving each
+// into CatchUpState.Discarded rather than deleting it. That distinction is
+// the whole point: a range nobody ever read, deliberately, is a different
 // fact from a range that was read, and erasing the record would collapse
-// the two into "no gap here" — the same silence the gap mechanism exists
-// to prevent.
+// the two into "no gap here" — the same silence the gap record exists to
+// prevent.
 //
 // Without this the only exit from a recorded gap is walking it to the end,
 // so a large one has no exit a caller can actually take, and a note that
 // cannot be acted on is one that gets scrolled past.
-func discardCatchUpGap(id connstore.Target) (connstore.GapState, bool) {
+func discardCatchUpGaps(id connstore.Target) []connstore.GapState {
 	if id.Link == "" {
-		return connstore.GapState{}, false
+		return nil
 	}
-	// Read and write under one lock: the record being removed here is the
-	// only thing that says a range went unread, and losing the write that
-	// removes it — or having this overwrite someone else's — turns a
-	// deliberate decision back into silence.
-	var discarded connstore.GapState
-	var found bool
+	var discarded []connstore.GapState
 	err := connstore.UpdateCatchUp(id, func(cs *connstore.CatchUpState) {
-		if cs.Gap == nil || !cs.Gap.Started() {
-			return
+		now := time.Now().UTC()
+		for _, g := range cs.Gaps {
+			if !g.Started() {
+				continue
+			}
+			discarded = append(discarded, g)
+			cs.Discarded = append(cs.Discarded, connstore.DiscardedGap{From: g.From(), To: g.To, At: now})
 		}
-		discarded, found = *cs.Gap, true
-		cs.Gap = nil
-		cs.Discarded = append(cs.Discarded, connstore.DiscardedGap{
-			From: discarded.From(), To: discarded.To, At: time.Now().UTC(),
-		})
+		cs.Gaps = nil
 	})
 	if err != nil {
 		// Reported as "not discarded", because it was not: saying it was
 		// while the record survives is the one answer that leaves a
 		// reader believing a decision was taken that was not.
 		noteCatchUpWriteFailure(err)
-		return connstore.GapState{}, false
+		return nil
 	}
-	return discarded, found
+	return discarded
 }
 
-// loadCatchUpGap returns id's full currently-recorded gap record, if
-// any — including retrieval progress (AnchorCursor), unlike
-// getCatchUpGap below which only surfaces the display-facing From/To.
-// AnchorCursor is the actual retrieval progress once
-// hub_catch_up(gap: true) has walked at least one message into the
-// range — see handleCatchUpGap. Empty until then, meaning "resume via
-// At: From" (a coarse, inclusive seek); once set, retrieval switches to
-// the message's own opaque Cursor for precision, the same
-// walk-forward-by-cursor logic the ordinary (non-gap) walk already uses.
+// loadCatchUpGap returns id's oldest recorded range, the one retrieval
+// works on, including its progress: AnchorCursor, once
+// hub_catch_up(gap: true) has walked at least one message into the range.
+// Empty until then, meaning "resume from the range's start".
 func loadCatchUpGap(id connstore.Target) (connstore.GapState, bool) {
-	// An unreadable store reports no gap, which is the same answer as
-	// "no gap recorded" and is reported by the caller of this function's
-	// sibling — see setCatchUpKey, which says so once per connection.
-	// Repeating it per gap check would say it on every catch-up.
-	cs, ok, err := connstore.GetCatchUp(id)
-	if err != nil || !ok || cs.Gap == nil || !cs.Gap.Started() {
+	gaps := getCatchUpGaps(id)
+	if len(gaps) == 0 {
 		return connstore.GapState{}, false
 	}
-	return *cs.Gap, true
+	return gaps[0], true
 }
 
-// getCatchUpGap returns id's currently-recorded abandoned range, if
-// any — the display-facing half of loadCatchUpGap, for callers (the
-// connect/catch-up note text) that only care about From/To, not
-// retrieval progress.
-func getCatchUpGap(id connstore.Target) (from, to string, ok bool) {
-	g, ok := loadCatchUpGap(id)
-	if !ok {
-		return "", "", false
+// getCatchUpGaps returns every range id has on record, oldest first.
+// An unreadable store reports none, which is the same answer as "no gap
+// recorded" and is reported by setCatchUpKey, once per connection.
+func getCatchUpGaps(id connstore.Target) []connstore.GapState {
+	cs, ok, err := connstore.GetCatchUp(id)
+	if err != nil || !ok {
+		return nil
 	}
-	return g.From(), g.To, true
+	var gaps []connstore.GapState
+	for _, g := range cs.Gaps {
+		if g.Started() {
+			gaps = append(gaps, g)
+		}
+	}
+	return gaps
+}
+
+// describeGaps renders recorded ranges for a reader, one per seek, so a
+// reader sees each stretch that was skipped rather than one span covering
+// everything read between them.
+func describeGaps(gaps []connstore.GapState) string {
+	parts := make([]string, len(gaps))
+	for i, g := range gaps {
+		parts[i] = fmt.Sprintf("%s to %s", g.From(), g.To)
+	}
+	if len(parts) == 1 {
+		return "the range " + parts[0]
+	}
+	return fmt.Sprintf("%d separate ranges: %s", len(parts), strings.Join(parts, "; "))
 }
 
 // setCatchUpCursor persists cursor as id's hub_catch_up position,
@@ -3125,10 +3123,10 @@ func (s *session) behindNote(conn *hubconn.Conn) string {
 	s.mu.Lock()
 	id := s.catchUpID
 	s.mu.Unlock()
-	if from, to, ok := getCatchUpGap(id); ok {
-		note += fmt.Sprintf("\nAlso still on record: an earlier catch-up seek skipped the range %s "+
-			"to %s rather than walk it. Not lost — still on the server — call "+
-			"hub_catch_up(gap: true) to retrieve it.", from, to)
+	if gaps := getCatchUpGaps(id); len(gaps) > 0 {
+		note += fmt.Sprintf("\nAlso still on record: earlier catch-up seeks skipped %s rather "+
+			"than walk it. Not lost — still on the server — call hub_catch_up(gap: true) to "+
+			"retrieve it, oldest range first.", describeGaps(gaps))
 	}
 	return note
 }
@@ -4570,7 +4568,7 @@ func (s *session) noteReadCoveredGap(start wire.Anchor, events []hubconn.Event) 
 	}
 	for _, ev := range events {
 		if gap.To != "" && ev.TS != "" && ev.TS >= gap.To {
-			clearCatchUpGap(id)
+			clearCatchUpGap(id, gap)
 			return
 		}
 	}
@@ -4801,8 +4799,10 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 			line += " (still marked open — meaning nothing recorded it closing," +
 				" which a killed process never does; not proof it is live)"
 		}
-		if gap := le.Entry.CatchUp.Gap; gap != nil && gap.Started() {
-			line += fmt.Sprintf("\n    unretrieved gap: %s to %s — hub_catch_up(gap: true) once connected", gap.From(), gap.To)
+		for _, gap := range le.Entry.CatchUp.Gaps {
+			if gap.Started() {
+				line += fmt.Sprintf("\n    unretrieved gap: %s to %s — hub_catch_up(gap: true) once connected", gap.From(), gap.To)
+			}
 		}
 		for _, d := range le.Entry.CatchUp.Discarded {
 			line += fmt.Sprintf("\n    gap written off unread: %s to %s (decided %s)",
@@ -5039,18 +5039,18 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		s.mu.Lock()
 		catchUpIDNow := s.catchUpID
 		s.mu.Unlock()
-		discarded, ok := discardCatchUpGap(catchUpIDNow)
-		if !ok {
+		discarded := discardCatchUpGaps(catchUpIDNow)
+		if len(discarded) == 0 {
 			return mcp.NewToolResultText(
 				"no recorded gap for this session — nothing to discard, and nothing was changed"), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"[hub: gap %s to %s written off UNREAD at your request. Those messages were never "+
+			"[hub: %s written off UNREAD at your request. Those messages were never "+
 				"retrieved and now never will be by this session — they remain on the server, but "+
 				"nothing here will mention them again. The decision is recorded against this "+
 				"connection so it stays visible as a choice rather than looking like there was "+
 				"never a gap. Normal hub_catch_up is unaffected.]",
-			discarded.From(), discarded.To)), nil
+			describeGaps(discarded))), nil
 	}
 
 	if req.GetBool("gap", false) {
@@ -5073,9 +5073,10 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// incomplete as if complete" failure this whole feature exists to
 	// avoid. See setCatchUpGap's doc comment.
 	gapNote := ""
-	if from, to, ok := getCatchUpGap(catchUpIDNow); ok {
-		gapNote = fmt.Sprintf("\n[hub: note — an earlier catch-up seek also skipped %s to %s, "+
-			"still on the server but not yet walked — call hub_catch_up(gap: true) to retrieve it]", from, to)
+	if gaps := getCatchUpGaps(catchUpIDNow); len(gaps) > 0 {
+		gapNote = fmt.Sprintf("\n[hub: note — earlier catch-up seeks also skipped %s, still on the "+
+			"server but not yet walked — call hub_catch_up(gap: true) to retrieve it, oldest range "+
+			"first]", describeGaps(gaps))
 	}
 
 	// MEASURE before deciding, from OUR OWN stored position.
@@ -5485,7 +5486,7 @@ walk:
 		}
 		switch ev.Kind {
 		case "noMoreMessages":
-			clearCatchUpGap(id)
+			clearCatchUpGap(id, gap)
 			finished = true
 			break walk
 		case "error":
@@ -5521,7 +5522,7 @@ walk:
 				saveHandedOverAhead(aheadID, snapshot)
 				skipped++
 				if reachedEnd {
-					clearCatchUpGap(id)
+					clearCatchUpGap(id, gap)
 					finishedAllSeen = true
 					break walk
 				}
@@ -5534,7 +5535,7 @@ walk:
 			spent += len(ev.Text)
 			gap.AnchorCursor = ev.Cursor
 			if reachedEnd {
-				clearCatchUpGap(id)
+				clearCatchUpGap(id, gap)
 				finished = true
 				break walk
 			}
@@ -5557,17 +5558,27 @@ walk:
 		}
 	}
 
+	// A finished range may not be the last one recorded; saying "fully
+	// retrieved" without the rest would read as there being nothing left.
+	rest := ""
+	if finished || finishedAllSeen {
+		if left := getCatchUpGaps(id); len(left) > 0 {
+			rest = fmt.Sprintf(". Still recorded: %s — call hub_catch_up(gap: true) again for it",
+				describeGaps(left))
+		}
+	}
+
 	if len(events) == 0 {
 		switch {
 		case finished:
 			return mcp.NewToolResultText(fmt.Sprintf(
-				"[hub: gap fully retrieved — nothing more between %s and %s. Normal hub_catch_up "+
-					"already covers everything from here onward]", gap.From(), gap.To,
+				"[hub: gap range fully retrieved — nothing more between %s and %s%s]",
+				gap.From(), gap.To, rest,
 			)), nil
 		case finishedAllSeen:
 			return mcp.NewToolResultText(fmt.Sprintf(
-				"[hub: gap fully retrieved (the remainder was already shown to you earlier) — "+
-					"nothing more between %s and %s]", gap.From(), gap.To,
+				"[hub: gap range fully retrieved (the remainder was already shown to you earlier) — "+
+					"nothing more between %s and %s%s]", gap.From(), gap.To, rest,
 			)), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf(
@@ -5579,12 +5590,12 @@ walk:
 	switch {
 	case finished:
 		trailer = fmt.Sprintf(
-			"[hub: gap fully retrieved — that was the last message between %s and %s]",
-			gap.From(), gap.To)
+			"[hub: gap range fully retrieved — that was the last message between %s and %s%s]",
+			gap.From(), gap.To, rest)
 	case finishedAllSeen:
 		trailer = fmt.Sprintf(
-			"[hub: gap fully retrieved (the remainder was already shown to you earlier) — nothing "+
-				"more between %s and %s]", gap.From(), gap.To)
+			"[hub: gap range fully retrieved (the remainder was already shown to you earlier) — "+
+				"nothing more between %s and %s%s]", gap.From(), gap.To, rest)
 	case hitBudget:
 		trailer = fmt.Sprintf(
 			"[hub: stopped at %d KB rather than at the message count, so more of the gap (%s to "+

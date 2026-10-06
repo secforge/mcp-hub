@@ -389,7 +389,7 @@ func TestSetTopicPreservesCatchUpAndViceVersa(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	e := s[target.Project][target.Link]
+	e, _ := getEntry(s, target.Project, target.Link)
 	if e.Topic != "Design Review" {
 		t.Fatalf("expected the topic to survive too, got %+v", e)
 	}
@@ -401,8 +401,11 @@ func TestSetCatchUpGapAndAheadRoundTrip(t *testing.T) {
 	target := Target{Link: "wss://mcp-hub.secforge.de/hub/join"}
 	cs := CatchUpState{
 		Cursor: "cursor-1",
-		Gap:    &GapState{FromAt: "2026-09-01T00:00:00Z", To: "2026-09-01T01:00:00Z"},
-		Ahead:  []string{"cursor-2", "cursor-3"},
+		Gaps: []GapState{
+			{FromAt: "2026-09-01T00:00:00Z", To: "2026-09-01T01:00:00Z"},
+			{FromCursor: "cursor-0", To: "2026-09-02T01:00:00Z"},
+		},
+		Ahead: []string{"cursor-2", "cursor-3"},
 	}
 	if err := SetCatchUp(target, cs); err != nil {
 		t.Fatalf("SetCatchUp: %v", err)
@@ -412,7 +415,8 @@ func TestSetCatchUpGapAndAheadRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("expected catch-up state to be found")
 	}
-	if got.Cursor != "cursor-1" || got.Gap == nil || got.Gap.FromAt != "2026-09-01T00:00:00Z" || len(got.Ahead) != 2 {
+	if got.Cursor != "cursor-1" || len(got.Gaps) != 2 || got.Gaps[0].FromAt != "2026-09-01T00:00:00Z" ||
+		got.Gaps[1].FromCursor != "cursor-0" || len(got.Ahead) != 2 {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -434,40 +438,6 @@ func TestCatchUpForDifferentLinksIsIndependent(t *testing.T) {
 	cs, ok, _ := GetCatchUp(one)
 	if !ok || cs.Cursor != "cursor-one" {
 		t.Fatalf("got %+v (ok=%v)", cs, ok)
-	}
-}
-
-// A gap recorded by an older build carries its start in one field that
-// held either a cursor or a timestamp. Dropping those records on upgrade
-// would lose the one thing they exist to keep: a range nothing has
-// walked to, which nobody would otherwise know to go looking for.
-func TestALegacyGapRecordIsSortedIntoTheRightField(t *testing.T) {
-	t.Setenv("MCP_HUB_LOG_DIR", t.TempDir())
-	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
-
-	for _, tc := range []struct {
-		name       string
-		legacy     string
-		wantCursor string
-		wantAt     string
-	}{
-		{"a timestamp stays a timestamp", "2026-09-01T00:00:00Z", "", "2026-09-01T00:00:00Z"},
-		{"anything else is a cursor", "639251841733942000.45797", "639251841733942000.45797", ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			g := GapState{LegacyFrom: tc.legacy, To: "2026-09-01T01:00:00Z"}
-			g.normalise()
-			if g.FromCursor != tc.wantCursor || g.FromAt != tc.wantAt {
-				t.Fatalf("got cursor=%q at=%q, want cursor=%q at=%q",
-					g.FromCursor, g.FromAt, tc.wantCursor, tc.wantAt)
-			}
-			if g.LegacyFrom != "" {
-				t.Fatalf("expected the legacy field to be cleared once sorted, got %q", g.LegacyFrom)
-			}
-			if !g.Started() {
-				t.Fatal("expected the migrated gap to still count as a recorded gap")
-			}
-		})
 	}
 }
 

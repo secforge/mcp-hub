@@ -1909,10 +1909,12 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 	id := targetForLink(ctx, link)
 	// Cleared first: this package shares one connection store, and a
 	// closed httptest server's port is reused, so an earlier test's
-	// target can be this one's — and a gap widens rather than replaces,
-	// which would carry that test's start into this one's.
-	clearCatchUpGap(id)
+	// target can be this one's — and that test's gap would be retrieved
+	// before this one's.
+	resetCatchUpGaps(id)
 	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
+	// A later seek's range, which finishing the first must leave in place.
+	setCatchUpGapFromAt(id, "2026-09-02T09:00:00Z", "2026-09-02T10:00:00Z")
 
 	hub := NewHub()
 	connReq := mcp.CallToolRequest{}
@@ -1952,11 +1954,14 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 	if !strings.Contains(text, "last gap message") {
 		t.Fatalf("expected the last gap message, got: %s", text)
 	}
-	if !strings.Contains(text, "gap fully retrieved") {
+	if !strings.Contains(text, "gap range fully retrieved") {
 		t.Fatalf("expected a gap-fully-retrieved note, got: %s", text)
 	}
-	if _, ok := loadCatchUpGap(id); ok {
-		t.Fatal("expected the gap to be cleared after reaching its recorded end")
+	if !strings.Contains(text, "Still recorded: the range 2026-09-02T09:00:00Z to 2026-09-02T10:00:00Z") {
+		t.Fatalf("finishing one range did not name the one still recorded: %s", text)
+	}
+	if g, ok := loadCatchUpGap(id); !ok || g.FromAt != "2026-09-02T09:00:00Z" {
+		t.Fatalf("expected only the walked range cleared and the later one next, got %+v (ok=%v)", g, ok)
 	}
 
 	reqMu.Lock()
@@ -2201,7 +2206,7 @@ func TestCatchUpSeeksPastALargeBacklogEvenWithAKnownCursorAndOnlyOnce(t *testing
 	sess.mu.Lock()
 	id := sess.catchUpID
 	sess.mu.Unlock()
-	from, to, ok := getCatchUpGap(id)
+	from, to, ok := oldestGap(id)
 	if !ok || from != "2026-09-01T09:12:00Z" || to == "" {
 		t.Fatalf("expected the skipped range recorded from the server's last-acked position, got from=%q to=%q ok=%v", from, to, ok)
 	}
@@ -2215,7 +2220,7 @@ func TestCatchUpSeeksPastALargeBacklogEvenWithAKnownCursorAndOnlyOnce(t *testing
 	if strings.Contains(textOf(second), "seeking to recent context") {
 		t.Fatalf("expected no second seek, got: %s", textOf(second))
 	}
-	if from2, to2, ok2 := getCatchUpGap(id); !ok2 || from2 != from || to2 != to {
+	if from2, to2, ok2 := oldestGap(id); !ok2 || from2 != from || to2 != to {
 		t.Fatalf("expected the gap record untouched by the second call, got from=%q to=%q ok=%v", from2, to2, ok2)
 	}
 }
@@ -2289,7 +2294,7 @@ func TestCatchUpWalksALargeBacklogWhenTheSkipCouldNotBeRecorded(t *testing.T) {
 	sess.mu.Lock()
 	id := sess.catchUpID
 	sess.mu.Unlock()
-	if _, _, ok := getCatchUpGap(id); ok {
+	if _, _, ok := oldestGap(id); ok {
 		t.Fatal("expected no gap recorded when nothing was skipped")
 	}
 }
@@ -2328,7 +2333,7 @@ func TestDiscardGapWritesItOffAndRecordsTheDecision(t *testing.T) {
 		t.Fatalf("expected the result to state plainly what was written off, got: %s", text)
 	}
 
-	if _, _, ok := getCatchUpGap(id); ok {
+	if _, _, ok := oldestGap(id); ok {
 		t.Fatal("expected the open gap to be gone after a discard")
 	}
 	cs, _, _ := connstore.GetCatchUp(id)
@@ -2611,7 +2616,7 @@ func TestReadRecordsTheDeliveryWithoutConsumingTheBacklog(t *testing.T) {
 	if lc := conn.LastConsumedCursor(); lc == "cursor-old-1" {
 		t.Fatal("expected the read NOT to move the server-side read receipt backwards")
 	}
-	if from, to, ok := getCatchUpGap(id); !ok || from != "2026-09-10T18:00:00Z" || to != "2026-09-10T20:00:00Z" {
+	if from, to, ok := oldestGap(id); !ok || from != "2026-09-10T18:00:00Z" || to != "2026-09-10T20:00:00Z" {
 		t.Fatalf("expected the gap record untouched, got from=%q to=%q ok=%v", from, to, ok)
 	}
 	sess = sole(t, hub)
@@ -3102,59 +3107,73 @@ func TestSingleCharacterQueryIsRefusedLocally(t *testing.T) {
 }
 
 // A seek can happen while an earlier range is still unwalked — a
-// reconnect while behind does exactly that. Replacing the record threw
-// that range away: correctly identified, correctly announced, then
-// discarded with nothing recording it ever existed. Observed live on
-// 2026-09-13, where it cost seven messages that were sitting on the
-// server the whole time.
-func TestSecondSeekWidensTheGapInsteadOfReplacingIt(t *testing.T) {
+// reconnect while behind does exactly that. Each seek keeps its own range:
+// replacing the record would lose the earlier one, and widening it into
+// one span would make retrieval re-deliver everything read between them.
+func TestEachSeekRecordsItsOwnRange(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
 
 	setCatchUpGapFromAt(id, "2026-09-13T14:40:17Z", "2026-09-13T15:51:22Z")
-	from, to, ok := getCatchUpGap(id)
-	if !ok || from != "2026-09-13T14:40:17Z" || to != "2026-09-13T15:51:22Z" {
-		t.Fatalf("expected the first gap recorded, got from=%q to=%q ok=%v", from, to, ok)
-	}
+	setCatchUpGapFromCursor(id, "639249632127954000.44361", "2026-09-14T07:17:34Z")
 
-	// A second seek, before anything walked the first range.
-	setCatchUpGapFromAt(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
-	from, to, ok = getCatchUpGap(id)
-	if !ok {
-		t.Fatal("expected a gap to still be recorded after a second seek")
+	gaps := getCatchUpGaps(id)
+	if len(gaps) != 2 {
+		t.Fatalf("expected two separate ranges, got %+v", gaps)
 	}
-	if from != "2026-09-13T14:40:17Z" {
-		t.Fatalf("expected the earlier start carried forward (the unwalked range), got from=%q", from)
+	if gaps[0].FromAt != "2026-09-13T14:40:17Z" || gaps[0].To != "2026-09-13T15:51:22Z" {
+		t.Fatalf("the first range changed: %+v", gaps[0])
 	}
-	if to != "2026-09-14T07:17:34Z" {
-		t.Fatalf("expected the later end, got to=%q", to)
+	if gaps[1].FromCursor != "639249632127954000.44361" || gaps[1].To != "2026-09-14T07:17:34Z" {
+		t.Fatalf("the second range is not its own: %+v", gaps[1])
+	}
+	if from, _, _ := oldestGap(id); from != "2026-09-13T14:40:17Z" {
+		t.Fatalf("retrieval does not start with the oldest range: %q", from)
+	}
+	if d := describeGaps(gaps); !strings.Contains(d, "2 separate ranges") {
+		t.Fatalf("the ranges are not reported separately: %s", d)
 	}
 }
 
-// And a partly-walked range keeps its progress: widening must not cost
-// what has already been retrieved, or a reconnect mid-walk restarts it
-// one message per call.
-func TestWideningKeepsRetrievalProgress(t *testing.T) {
+// Progress on one range and finishing it leave the other range as it was,
+// and the next range is what retrieval works on afterwards.
+func TestFinishingOneRangeLeavesTheNext(t *testing.T) {
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
 
 	setCatchUpGapFromAt(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
-	// Retrieval gets a third of the way in.
+	setCatchUpGapFromAt(id, "2026-09-14T08:00:00Z", "2026-09-14T09:30:00Z")
+
 	g, _ := loadCatchUpGap(id)
 	g.AnchorCursor = "639249632127954000.44361"
 	saveCatchUpGap(id, g)
+	if got, _ := loadCatchUpGap(id); got.AnchorCursor != g.AnchorCursor {
+		t.Fatalf("progress on the first range was not kept: %+v", got)
+	}
+	if gaps := getCatchUpGaps(id); gaps[1].AnchorCursor != "" {
+		t.Fatalf("progress leaked into the second range: %+v", gaps[1])
+	}
 
-	setCatchUpGapFromAt(id, "2026-09-14T08:00:00Z", "2026-09-14T09:30:00Z")
-
+	clearCatchUpGap(id, g)
 	got, ok := loadCatchUpGap(id)
-	if !ok {
-		t.Fatal("expected a gap after widening")
+	if !ok || got.FromAt != "2026-09-14T08:00:00Z" || got.To != "2026-09-14T09:30:00Z" {
+		t.Fatalf("expected the second range next, got %+v ok=%v", got, ok)
 	}
-	if got.AnchorCursor != "639249632127954000.44361" {
-		t.Fatalf("expected retrieval progress preserved, got anchorCursor=%q", got.AnchorCursor)
+}
+
+// Writing off records every range as its own decision.
+func TestDiscardWritesOffEveryRange(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
+
+	setCatchUpGapFromAt(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
+	setCatchUpGapFromAt(id, "2026-09-14T08:00:00Z", "2026-09-14T09:30:00Z")
+	if got := discardCatchUpGaps(id); len(got) != 2 {
+		t.Fatalf("expected both ranges written off, got %+v", got)
 	}
-	if got.FromAt != "2026-09-14T05:35:55Z" || got.To != "2026-09-14T09:30:00Z" {
-		t.Fatalf("expected the union of both ranges, got from=%q to=%q", got.From(), got.To)
+	cs, _, _ := connstore.GetCatchUp(id)
+	if len(cs.Gaps) != 0 || len(cs.Discarded) != 2 {
+		t.Fatalf("expected no open ranges and two recorded write-offs, got %+v", cs)
 	}
 }
 
@@ -3165,10 +3184,11 @@ func TestSeekAfterAFullyRetrievedGapStartsClean(t *testing.T) {
 	id := connstore.Target{Link: "wss://example.test/hub/join#secret", Project: "/p"}
 
 	setCatchUpGapFromAt(id, "2026-09-13T14:40:17Z", "2026-09-13T15:51:22Z")
-	clearCatchUpGap(id)
+	g, _ := loadCatchUpGap(id)
+	clearCatchUpGap(id, g)
 	setCatchUpGapFromAt(id, "2026-09-14T05:35:55Z", "2026-09-14T07:17:34Z")
 
-	from, to, ok := getCatchUpGap(id)
+	from, to, ok := oldestGap(id)
 	if !ok || from != "2026-09-14T05:35:55Z" || to != "2026-09-14T07:17:34Z" {
 		t.Fatalf("expected only the new range, got from=%q to=%q ok=%v", from, to, ok)
 	}
@@ -4304,7 +4324,7 @@ func TestAGapThatStartsAtACursorIsRetrievedByCursor(t *testing.T) {
 	id := targetForLink(ctx, link)
 	// Recorded the way the seek branch records it: the start is this
 	// client's own stored cursor, the end is the seek's landing time.
-	clearCatchUpGap(id)
+	resetCatchUpGaps(id)
 	setCatchUpGapFromCursor(id, "639251841733942000.45797", "2026-09-16T19:40:00Z")
 
 	hub := NewHub()
@@ -4715,7 +4735,7 @@ func TestAGapIsRetrievedInABatchWhenALimitIsGiven(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	clearCatchUpGap(id)
+	resetCatchUpGaps(id)
 	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()
@@ -4738,7 +4758,7 @@ func TestAGapIsRetrievedInABatchWhenALimitIsGiven(t *testing.T) {
 			t.Fatalf("expected %q in the one batched answer, got: %s", want, text)
 		}
 	}
-	if !strings.Contains(text, "gap fully retrieved") {
+	if !strings.Contains(text, "gap range fully retrieved") {
 		t.Fatalf("expected the batch to report the gap complete, got: %s", text)
 	}
 	if _, ok := loadCatchUpGap(id); ok {
@@ -4788,7 +4808,7 @@ func TestAGapWithoutALimitStillComesOneAtATime(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	clearCatchUpGap(id)
+	resetCatchUpGaps(id)
 	setCatchUpGapFromAt(id, "2026-09-02T09:00:00Z", "2026-09-02T10:00:00Z")
 
 	hub := NewHub()
@@ -4857,7 +4877,7 @@ func TestAReadThatCoversTheGapSettlesIt(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	clearCatchUpGap(id)
+	resetCatchUpGaps(id)
 	setCatchUpGapFromAt(id, "2026-09-03T09:00:00Z", "2026-09-03T10:00:00Z")
 	gap, ok := loadCatchUpGap(id)
 	if !ok {
@@ -4924,7 +4944,7 @@ func TestAReadStartingElsewhereLeavesTheGapAlone(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	clearCatchUpGap(id)
+	resetCatchUpGaps(id)
 	setCatchUpGapFromAt(id, "2026-09-04T09:00:00Z", "2026-09-04T10:00:00Z")
 	gap, ok := loadCatchUpGap(id)
 	if !ok {

@@ -68,7 +68,7 @@ func TestGapRetrievalDoesNotMoveTheWireReceipt(t *testing.T) {
 	ctx := context.Background()
 
 	id := targetForLink(ctx, link)
-	clearCatchUpGap(id)
+	resetCatchUpGaps(id)
 	setCatchUpGapFromAt(id, "2026-09-01T09:00:00Z", "2026-09-01T10:00:00Z")
 
 	hub := NewHub()

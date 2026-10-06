@@ -47,6 +47,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -73,51 +75,23 @@ type Target struct {
 // credentials that must not be written over.
 var ErrUnreadable = errors.New("connection store is unreadable")
 
-// GapState is a persisted record of a hub_catch_up seek's abandoned
+// GapState is a persisted record of one hub_catch_up seek's skipped
 // range — see mcptools' catchUpGap for the full rationale (recorded as
-// ongoing state, not a one-time notice). Nil (not a zero-value struct) on
-// CatchUpState.Gap when there is no open gap, so a caller doesn't need a
-// separate boolean to tell "no gap" from "a gap with blank fields."
+// ongoing state, not a one-time notice).
 type GapState struct {
 	// From is where the skipped range STARTS, and the two fields are
 	// separate because a cursor and a timestamp are not
 	// interchangeable: a cursor is opaque, and a server asked to treat
-	// one as a timestamp refuses the request outright (bad_anchor),
-	// which made the one advertised recovery path for skipped history
-	// fail. Exactly one is set — FromCursor when the seek started from a
+	// one as a timestamp refuses the request outright (bad_anchor).
+	// Exactly one is set — FromCursor when the seek started from a
 	// position this client had actually reached, FromAt when all that is
 	// known is how far back the server said the backlog went.
 	FromCursor string `json:"fromCursor,omitempty"`
 	FromAt     string `json:"fromAt,omitempty"`
 	To         string `json:"to,omitempty"`
-	// AnchorCursor is how far INTO the gap this client has walked, and
+	// AnchorCursor is how far INTO the range this client has walked, and
 	// takes precedence over both fields above once set.
 	AnchorCursor string `json:"anchorCursor,omitempty"`
-	// legacyFrom is the single field these two replaced, which held
-	// either kind of value with nothing to say which. Read on load and
-	// sorted into the right one (see normalise) rather than dropped: a
-	// gap record says messages exist that nothing has walked to, and
-	// discarding it on upgrade would lose exactly the range it was
-	// recorded to keep reachable.
-	LegacyFrom string `json:"from,omitempty"`
-}
-
-// normalise sorts a legacy start value into the field it belongs in. The
-// test is whether it parses as a timestamp — the one property that
-// actually distinguishes the two, rather than a guess about how cursors
-// tend to look.
-func (g *GapState) normalise() {
-	if g.LegacyFrom == "" {
-		return
-	}
-	if _, err := time.Parse(time.RFC3339, g.LegacyFrom); err == nil {
-		if g.FromAt == "" {
-			g.FromAt = g.LegacyFrom
-		}
-	} else if g.FromCursor == "" {
-		g.FromCursor = g.LegacyFrom
-	}
-	g.LegacyFrom = ""
 }
 
 // From renders where the gap starts for a reader. A cursor is shown as
@@ -138,6 +112,12 @@ func (g GapState) From() string {
 // neither is not a gap.
 func (g GapState) Started() bool { return g.FromCursor != "" || g.FromAt != "" }
 
+// Same reports whether g and o record the same range, whatever either
+// has walked of it.
+func (g GapState) Same(o GapState) bool {
+	return g.FromCursor == o.FromCursor && g.FromAt == o.FromAt && g.To == o.To
+}
+
 // DiscardedGap records a skipped range that was deliberately written off
 // instead of retrieved. Kept rather than deleted so the decision stays
 // auditable: "nobody ever read this range, and that was chosen" is a
@@ -157,8 +137,13 @@ type CatchUpState struct {
 	// Cursor is the contiguous high-water mark of positions actually
 	// handed over to the model — mcptools' session.lastHandedOverCursor.
 	Cursor string `json:"cursor,omitempty"`
-	// Gap is the currently-open seek gap, if any — see GapState.
-	Gap *GapState `json:"gap,omitempty"`
+	// Gaps holds one range per seek that skipped messages, oldest first —
+	// see GapState. Each is retrieved, or written off, on its own.
+	Gaps []GapState `json:"gaps,omitempty"`
+	// SingleGap is the one range a client before Gaps recorded. Read into
+	// Gaps when this client reads its own entry (see decodeEntry), so the
+	// entry's next write stores it as Gaps; other entries keep theirs.
+	SingleGap *GapState `json:"gap,omitempty"`
 	// Ahead is the set of cursors confirmed handed over to the model at
 	// a position ahead of Cursor (via live delivery) — mcptools'
 	// session.handedOverAhead. A slice, not a set, in the JSON form (Go maps
@@ -175,7 +160,7 @@ type CatchUpState struct {
 // used to decide whether an Entry is worth keeping once its last
 // non-catch-up-identifying field is cleared.
 func (cs CatchUpState) empty() bool {
-	return cs.Cursor == "" && cs.Gap == nil && len(cs.Ahead) == 0 && len(cs.Discarded) == 0
+	return cs.Cursor == "" && len(cs.Gaps) == 0 && len(cs.Ahead) == 0 && len(cs.Discarded) == 0
 }
 
 // Entry is what's remembered about one connection: the identity to
@@ -241,7 +226,15 @@ type ListedEntry struct {
 // contiguous block rather than scattered across every link the machine has
 // ever seen. Below project, each connection is keyed by its own link,
 // which is already unique and already the thing a human recognises.
-type state map[string]map[string]Entry
+//
+// EACH ENTRY STAYS RAW until something reads or writes that one entry.
+// Several client versions share this file, and one that decoded every
+// entry into its own Entry and wrote them all back would drop whatever it
+// does not know — another version's fields, in entries it never meant to
+// touch. So a write re-encodes the one entry it changes, and within that
+// entry replaces only the fields this version knows (see mergeKnown);
+// every other entry is written back as it was read.
+type state map[string]map[string]json.RawMessage
 
 // ProjectOverride is MCP_HUB_PROJECT_DIR, or "" when it is unset.
 //
@@ -405,16 +398,6 @@ func load() (state, error) {
 			"unavailable until it is repaired, restored from a backup, or moved aside "+
 			"(nothing here will overwrite it)", ErrUnreadable, path(), err)
 	}
-	// A gap written by an older build carries its start in one field
-	// that held either kind of value; sort it out once, here, where
-	// every reader goes through.
-	for _, byLink := range s {
-		for _, e := range byLink {
-			if e.CatchUp.Gap != nil {
-				e.CatchUp.Gap.normalise()
-			}
-		}
-	}
 	return s, nil
 }
 
@@ -516,8 +499,32 @@ func getEntry(s state, project, key string) (Entry, bool) {
 	if !ok {
 		return Entry{}, false
 	}
-	e, ok := byKey[key]
-	return e, ok
+	raw, ok := byKey[key]
+	if !ok {
+		return Entry{}, false
+	}
+	return decodeEntry(raw), true
+}
+
+// decodeEntry reads one stored entry. An entry this version cannot decode
+// reads as empty rather than failing the whole store: it belongs to one
+// connection, and every other connection is still readable.
+//
+// A range recorded in the single-gap form becomes the first of Gaps, so
+// this client works with every range it has; writing the entry back then
+// stores it in the current form.
+func decodeEntry(raw json.RawMessage) Entry {
+	var e Entry
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return Entry{}
+	}
+	if g := e.CatchUp.SingleGap; g != nil {
+		if g.Started() {
+			e.CatchUp.Gaps = append([]GapState{*g}, e.CatchUp.Gaps...)
+		}
+		e.CatchUp.SingleGap = nil
+	}
+	return e
 }
 
 // setEntry writes e at (project, key), creating the intermediate map as
@@ -540,10 +547,78 @@ func setEntry(s *state, project, key string, e Entry) {
 	}
 	byKey, ok := (*s)[project]
 	if !ok {
-		byKey = map[string]Entry{}
+		byKey = map[string]json.RawMessage{}
 		(*s)[project] = byKey
 	}
-	byKey[key] = e
+	byKey[key] = encodeEntry(byKey[key], e)
+}
+
+// encodeEntry writes e over the entry stored as old, keeping every field
+// of old this version does not know — at the entry's top level and inside
+// catchUp, the two places another version's fields live.
+func encodeEntry(old json.RawMessage, e Entry) json.RawMessage {
+	var oldFields map[string]json.RawMessage
+	_ = json.Unmarshal(old, &oldFields)
+	fields := mergeKnown(oldFields, e)
+	if catchUp := mergeKnown(rawObject(oldFields["catchUp"]), e.CatchUp); len(catchUp) > 0 {
+		fields["catchUp"], _ = json.Marshal(catchUp)
+	} else {
+		delete(fields, "catchUp")
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		out, _ = json.Marshal(e)
+	}
+	return out
+}
+
+func rawObject(raw json.RawMessage) map[string]json.RawMessage {
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &fields)
+	return fields
+}
+
+// mergeKnown returns old's fields with every field v's type declares
+// replaced by v's own value, or removed where v leaves it out. Fields of
+// old that v's type does not declare are kept as they are.
+func mergeKnown(old map[string]json.RawMessage, v any) map[string]json.RawMessage {
+	fields := make(map[string]json.RawMessage, len(old))
+	for k, val := range old {
+		fields[k] = val
+	}
+	current, err := json.Marshal(v)
+	if err != nil {
+		return fields
+	}
+	mine := rawObject(current)
+	for _, name := range jsonFieldNames(reflect.TypeOf(v)) {
+		if value, ok := mine[name]; ok && string(value) != "{}" {
+			fields[name] = value
+		} else {
+			delete(fields, name)
+		}
+	}
+	return fields
+}
+
+// jsonFieldNames lists the object keys t's fields are encoded under.
+func jsonFieldNames(t reflect.Type) []string {
+	var names []string
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		switch name {
+		case "-":
+			continue
+		case "":
+			name = f.Name
+		}
+		names = append(names, name)
+	}
+	return names
 }
 
 // Get returns the stored entry for target, if any.
@@ -709,10 +784,10 @@ func ListForProject(project string) ([]ListedEntry, error) {
 		if err != nil {
 			return err
 		}
-		for link, e := range st[project] {
+		for link, raw := range st[project] {
 			out = append(out, ListedEntry{
 				Target: Target{Link: link, Project: project},
-				Entry:  e,
+				Entry:  decodeEntry(raw),
 			})
 		}
 		return nil
