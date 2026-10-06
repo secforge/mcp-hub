@@ -464,6 +464,12 @@ func rootFromClient(ctx context.Context) string {
 	if mcpServer == nil {
 		return ""
 	}
+	// A client that declared no roots capability at initialize will never
+	// answer the request, so it is not sent: waiting on it would hold the
+	// calling tool until the call itself is abandoned.
+	if !clientDeclaresRoots(ctx) {
+		return ""
+	}
 	// NO TIMEOUT OF ITS OWN. A deadline here turns a slow client into a
 	// DIFFERENT ANSWER: the request gives up, this returns nothing, and
 	// the scope falls through to $PWD — silently filing this session's
@@ -483,6 +489,17 @@ func rootFromClient(ctx context.Context) string {
 		return ""
 	}
 	return connstore.NormalizeProject(rootPath(result.Roots[0].URI))
+}
+
+// clientDeclaresRoots reports whether the MCP client said at initialize
+// that it answers roots requests. A session that does not record what the
+// client declared reports true, so the request is still made there.
+func clientDeclaresRoots(ctx context.Context) bool {
+	session, ok := server.ClientSessionFromContext(ctx).(server.SessionWithClientInfo)
+	if !ok {
+		return true
+	}
+	return session.GetClientCapabilities().Roots != nil
 }
 
 // rootPath is the filesystem path a root URI names. A file: URI is
@@ -2537,6 +2554,52 @@ func buildWaitBlock(ctx context.Context, w *waiter.Waiter, reconnectInstruction 
 	)
 }
 
+// actionsNote says which actions on messages this conversation supports
+// and which it does not, from what the server declared. Without it the only
+// way to learn whether, say, hub_edit works is to try it — on a real
+// message, in a conversation people read.
+func actionsNote(conn *hubconn.Conn) string {
+	if !conn.FeaturesDeclared() {
+		return "\nThis server declares nothing about what it supports, so whether reactions, " +
+			"edits, deletes, pins, mentions, threaded replies or attachments work here is unknown."
+	}
+	type action struct{ feature, what string }
+	actions := []action{
+		{"reactions", "reactions (hub_react)"},
+		{"edit", "editing your messages (hub_edit)"},
+		{"delete", "deleting your messages (hub_delete)"},
+		{"pins", "pins (hub_pin, hub_unpin, hub_pins)"},
+		{"mentions", "@-mentions (the mentions parameter)"},
+		{"replyTo", "threaded replies (replyTo)"},
+		{"attachments", "attachments (filePath, imagePath)"},
+	}
+	var yes, no []string
+	for _, a := range actions {
+		if !conn.HasFeature(a.feature) {
+			no = append(no, a.what)
+			continue
+		}
+		what := a.what
+		if a.feature == "attachments" {
+			if conn.AcceptsImagesOnly() {
+				what += ", images only"
+			}
+			if n := conn.MaxAttachmentBytes(); n > 0 {
+				what += fmt.Sprintf(", up to %d MB", n/(1024*1024))
+			}
+		}
+		yes = append(yes, what)
+	}
+	note := ""
+	if len(yes) > 0 {
+		note += "\nSupported here: " + strings.Join(yes, "; ") + "."
+	}
+	if len(no) > 0 {
+		note += "\nNOT supported here, refused before sending: " + strings.Join(no, "; ") + "."
+	}
+	return note
+}
+
 // formatsNote tells the reader which format values this conversation
 // takes and which to reach for: markdown where it is accepted, html only
 // where markdown cannot say it. Empty when the server declares no formats,
@@ -2968,20 +3031,20 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		// connection from here, and the server can see it was not one
 		// for this link.
 		if n, minted := conn.MintedWithResumablePeers(); minted {
-			peers := "1 peer"
-			if n > 1 {
-				peers = fmt.Sprintf("%d peers", n)
+			peers := "1 identity"
+			if n != 1 {
+				peers = fmt.Sprintf("%d identities", n)
 			}
 			identityNote += fmt.Sprintf(
-				"\nNOTE: the server says it gave this connection a NEW identity while this "+
-					"conversation still held %s that could have been resumed. This client had "+
-					"nothing stored for that link in its own project scope, which is why it asked "+
-					"for none — a stored identity belongs to ONE scope, and the scope comes from "+
-					"MCP_HUB_PROJECT_DIR when set, otherwise from the MCP client's project root.\n"+
-					"If this session was meant to continue an earlier one, it is not: the earlier "+
-					"identity still exists with its own read position, and nothing here can adopt "+
-					"it. Check which scope is in force before sending anything that assumes "+
-					"continuity.", peers)
+				"\nNOTE: this connection has a NEW identity. The server reports %s already "+
+					"held in this conversation — by other participants, or by earlier sessions "+
+					"on this link. Nothing of theirs was used or taken: an "+
+					"identity is resumed only with the secret stored for it, and this client had "+
+					"none stored for this link in its project scope (MCP_HUB_PROJECT_DIR when set, "+
+					"otherwise the MCP client's project root).\n"+
+					"That matters only if this session was meant to continue an earlier one on "+
+					"this link: it does not — that one keeps its own identity and read position, "+
+					"under the scope it was opened in.", peers)
 		}
 
 		// NOTHING HERE LOOKS AT ANOTHER SCOPE. An earlier version
@@ -3018,9 +3081,9 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			target.Project, defaultProject)
 	}
 
-	notes := formatsNote(conn.AcceptedFormats(), conn.DefaultFormat())
+	notes := formatsNote(conn.AcceptedFormats(), conn.DefaultFormat()) + actionsNote(conn)
 	if mirrored {
-		notes = "\nThis mirrors a real chat conversation, not an ordinary hub session — some " +
+		notes += "\nThis mirrors a real chat conversation, not an ordinary hub session — some " +
 			"things behave differently: a directed hub_send (`to`) has no meaning here and " +
 			"will be refused rather than delivered; sends may be routinely refused for policy " +
 			"reasons (e.g. a participant outside the relay's home organization) — expected, " +

@@ -653,12 +653,12 @@ func TestConnectReportsAMintWhenPeersCouldHaveBeenResumed(t *testing.T) {
 			defer hub.handleDisconnect(ctx, connReqFor(testConn))
 
 			text := textOf(res)
-			said := strings.Contains(text, "gave this connection a NEW identity")
+			said := strings.Contains(text, "this connection has a NEW identity")
 			if said != tc.wantSaid {
 				t.Fatalf("mint notice said=%v, want %v:\n%s", said, tc.wantSaid, text)
 			}
 			if tc.wantSaid {
-				if !strings.Contains(text, "4 peers") {
+				if !strings.Contains(text, "4 identities already held") || strings.Contains(text, "could have been resumed") {
 					t.Errorf("the count is not in what the reader is told:\n%s", text)
 				}
 				if !strings.Contains(text, "MCP_HUB_PROJECT_DIR") {

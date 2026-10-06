@@ -318,9 +318,7 @@ func dir() string {
 	return filepath.Join(os.TempDir(), "mcp-hub")
 }
 
-func path() string {
-	return filepath.Join(dir(), "state.json")
-}
+func pathIn(d string) string { return filepath.Join(d, "state.json") }
 
 // lockPath is a separate file from state.json itself — flock locking and
 // the atomic write-tmp-then-rename save() both want exclusive use of
@@ -328,8 +326,8 @@ func path() string {
 // held lock is exactly the kind of subtlety not worth relying on working
 // consistently across platforms. Locking a dedicated, never-renamed file
 // sidesteps the question entirely.
-func lockPath() string {
-	return filepath.Join(dir(), "state.json.lock")
+func lockPath(d string) string {
+	return filepath.Join(d, "state.json.lock")
 }
 
 // withLock runs fn while holding a cross-process advisory lock on
@@ -339,11 +337,17 @@ func lockPath() string {
 // closes the lost-update race a bare load-then-save has: two writers
 // racing here now serialize instead of one silently overwriting the
 // other's change with a stale snapshot.
-func withLock(exclusive bool, fn func() error) error {
-	if err := ensureDir(); err != nil {
+//
+// The directory is resolved ONCE, here, and handed to fn: the lock, the
+// load and the save of one operation must all be in the same place, or a
+// change of MCP_HUB_CONNSTORE_DIR between them saves one directory's
+// snapshot over another directory's file.
+func withLock(exclusive bool, fn func(d string) error) error {
+	d := dir()
+	if err := ensureDir(d); err != nil {
 		return err
 	}
-	fl := flock.New(lockPath())
+	fl := flock.New(lockPath(d))
 	var err error
 	if exclusive {
 		err = fl.Lock()
@@ -354,7 +358,7 @@ func withLock(exclusive bool, fn func() error) error {
 		return err
 	}
 	defer fl.Unlock()
-	return fn()
+	return fn(d)
 }
 
 // load reads the persisted store. A missing or unreadable file is not an
@@ -375,13 +379,13 @@ func withLock(exclusive bool, fn func() error) error {
 //
 // A missing file is still not an error — that genuinely means nothing has
 // been persisted. Anything else stops the write.
-func load() (state, error) {
-	data, err := os.ReadFile(path())
+func load(d string) (state, error) {
+	data, err := os.ReadFile(pathIn(d))
 	if errors.Is(err, fs.ErrNotExist) {
 		return state{}, nil
 	}
 	if err != nil {
-		return state{}, fmt.Errorf("reading %s: %w", path(), err)
+		return state{}, fmt.Errorf("reading %s: %w", pathIn(d), err)
 	}
 	var s state
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -396,7 +400,7 @@ func load() (state, error) {
 		// been told.
 		return state{}, fmt.Errorf("%w: parsing %s: %v — stored identities and positions are "+
 			"unavailable until it is repaired, restored from a backup, or moved aside "+
-			"(nothing here will overwrite it)", ErrUnreadable, path(), err)
+			"(nothing here will overwrite it)", ErrUnreadable, pathIn(d), err)
 	}
 	return s, nil
 }
@@ -419,15 +423,15 @@ func load() (state, error) {
 // directory for this still leaves a correct file, just one whose NAME may
 // not survive a power loss, and failing the save outright over that would
 // be the worse trade.
-func save(s state) error {
-	if err := ensureDir(); err != nil {
+func save(d string, s state) error {
+	if err := ensureDir(d); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	target := path()
+	target := pathIn(d)
 	tmp := target + ".tmp"
 	if err := writeFileSynced(tmp, data); err != nil {
 		return err
@@ -435,7 +439,7 @@ func save(s state) error {
 	if err := os.Rename(tmp, target); err != nil {
 		return err
 	}
-	syncDir(dir())
+	syncDir(d)
 	return nil
 }
 
@@ -445,8 +449,7 @@ func save(s state) error {
 // ~/.config/mcp-hub stayed loose for the life of the install while the
 // package doc claimed 0700 as part of its contract. Found by an external
 // reviewer.
-func ensureDir() error {
-	d := dir()
+func ensureDir(d string) error {
 	if err := os.MkdirAll(d, 0o700); err != nil {
 		return err
 	}
@@ -629,8 +632,8 @@ func Get(target Target) (Entry, bool, error) {
 	// for a store that could not be read states an absence that was never
 	// established — and it is the one answer that makes a caller go on to
 	// mint a new identity over the top of the old one.
-	err := withLock(false, func() error {
-		st, err := load()
+	err := withLock(false, func(d string) error {
+		st, err := load(d)
 		if err != nil {
 			return err
 		}
@@ -645,8 +648,11 @@ func Get(target Target) (Entry, bool, error) {
 // under the exclusive lock, never a side effect of reading. Returns where
 // the old bytes went so a caller can say it.
 func MoveAside() (string, error) {
-	aside := path() + ".corrupt"
-	err := withLock(true, func() error { return os.Rename(path(), aside) })
+	var aside string
+	err := withLock(true, func(d string) error {
+		aside = pathIn(d) + ".corrupt"
+		return os.Rename(pathIn(d), aside)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -657,23 +663,23 @@ func MoveAside() (string, error) {
 // is already stored for it — identity and read position are written by
 // different callers at different times, so neither may clobber the other.
 func Upsert(target Target, identity Entry) error {
-	return withLock(true, func() error {
-		s, err := load()
+	return withLock(true, func(d string) error {
+		s, err := load(d)
 		if err != nil {
 			return err
 		}
 		existing, _ := getEntry(s, target.Project, target.Link)
 		identity.CatchUp = existing.CatchUp
 		setEntry(&s, target.Project, target.Link, identity)
-		return save(s)
+		return save(d, s)
 	})
 }
 
 // MarkDisconnected clears target's Connected flag, leaving everything
 // else — including the identity needed to reconnect — in place.
 func MarkDisconnected(target Target) error {
-	return withLock(true, func() error {
-		s, err := load()
+	return withLock(true, func(d string) error {
+		s, err := load(d)
 		if err != nil {
 			return err
 		}
@@ -684,7 +690,7 @@ func MarkDisconnected(target Target) error {
 		e.Connected = false
 		e.Holder = nil
 		setEntry(&s, target.Project, target.Link, e)
-		return save(s)
+		return save(d, s)
 	})
 }
 
@@ -694,8 +700,8 @@ func MarkDisconnected(target Target) error {
 // Reports whether there was an entry to remove.
 func Delete(target Target) (bool, error) {
 	var existed bool
-	err := withLock(true, func() error {
-		s, err := load()
+	err := withLock(true, func(d string) error {
+		s, err := load(d)
 		if err != nil {
 			return err
 		}
@@ -703,7 +709,7 @@ func Delete(target Target) (bool, error) {
 			return nil
 		}
 		setEntry(&s, target.Project, target.Link, Entry{})
-		return save(s)
+		return save(d, s)
 	})
 	return existed, err
 }
@@ -711,8 +717,8 @@ func Delete(target Target) (bool, error) {
 // SetPeerID records the identity a server assigned, so a later connect can
 // ask for it back (see hubconn.DialOptions.AgentID).
 func SetPeerID(target Target, peerID string) error {
-	return withLock(true, func() error {
-		s, err := load()
+	return withLock(true, func(d string) error {
+		s, err := load(d)
 		if err != nil {
 			return err
 		}
@@ -720,7 +726,7 @@ func SetPeerID(target Target, peerID string) error {
 		e.PeerID = peerID
 		e.LastConnectedAt = time.Now().UTC()
 		setEntry(&s, target.Project, target.Link, e)
-		return save(s)
+		return save(d, s)
 	})
 }
 
@@ -728,30 +734,30 @@ func SetPeerID(target Target, peerID string) error {
 // the same one is presented on every later connect and the identity keeps
 // resuming without a caller ever holding it.
 func SetReconnectSecret(target Target, secret string) error {
-	return withLock(true, func() error {
-		s, err := load()
+	return withLock(true, func(d string) error {
+		s, err := load(d)
 		if err != nil {
 			return err
 		}
 		e, _ := getEntry(s, target.Project, target.Link)
 		e.ReconnectSecret = secret
 		setEntry(&s, target.Project, target.Link, e)
-		return save(s)
+		return save(d, s)
 	})
 }
 
 // SetTopic persists topic as target's conversation display name (see
 // Entry.Topic).
 func SetTopic(target Target, topic string) error {
-	return withLock(true, func() error {
-		s, err := load()
+	return withLock(true, func(d string) error {
+		s, err := load(d)
 		if err != nil {
 			return err
 		}
 		e, _ := getEntry(s, target.Project, target.Link)
 		e.Topic = topic
 		setEntry(&s, target.Project, target.Link, e)
-		return save(s)
+		return save(d, s)
 	})
 }
 
@@ -770,7 +776,7 @@ func SetTopic(target Target, topic string) error {
 // could do otherwise. Every accessor takes a Target or a project, so the
 // scope is an argument the caller must supply and cannot omit.
 //
-// load() reads the whole file because one file holds every project, and
+// load(d) reads the whole file because one file holds every project, and
 // it is unexported for exactly that reason.
 
 // ListForProject returns one project's stored connections — a direct
@@ -779,8 +785,8 @@ func SetTopic(target Target, topic string) error {
 func ListForProject(project string) ([]ListedEntry, error) {
 	project = NormalizeProject(project)
 	var out []ListedEntry
-	err := withLock(false, func() error {
-		st, err := load()
+	err := withLock(false, func(d string) error {
+		st, err := load(d)
 		if err != nil {
 			return err
 		}
@@ -803,8 +809,8 @@ func ListForProject(project string) ([]ListedEntry, error) {
 // which re-walks a backlog at best and, where something else moves the
 // position, skips one — so the error is returned and callers decide.
 func GetCatchUp(target Target) (cs CatchUpState, ok bool, err error) {
-	err = withLock(false, func() error {
-		st, lerr := load()
+	err = withLock(false, func(d string) error {
+		st, lerr := load(d)
 		if lerr != nil {
 			return lerr
 		}
@@ -840,29 +846,29 @@ func GetCatchUp(target Target) (cs CatchUpState, ok bool, err error) {
 // across an identity write. The hazard was seen once, fixed where it was
 // seen, and left in the contract of the API whose whole job is that state.
 func UpdateCatchUp(target Target, mutate func(*CatchUpState)) error {
-	return withLock(true, func() error {
-		s, err := load()
+	return withLock(true, func(d string) error {
+		s, err := load(d)
 		if err != nil {
 			return err
 		}
 		e, _ := getEntry(s, target.Project, target.Link)
 		mutate(&e.CatchUp)
 		setEntry(&s, target.Project, target.Link, e)
-		return save(s)
+		return save(d, s)
 	})
 }
 
 // SetCatchUp records target's hub_catch_up state, preserving the identity
 // fields stored alongside it.
 func SetCatchUp(target Target, cs CatchUpState) error {
-	return withLock(true, func() error {
-		s, err := load()
+	return withLock(true, func(d string) error {
+		s, err := load(d)
 		if err != nil {
 			return err
 		}
 		e, _ := getEntry(s, target.Project, target.Link)
 		e.CatchUp = cs
 		setEntry(&s, target.Project, target.Link, e)
-		return save(s)
+		return save(d, s)
 	})
 }

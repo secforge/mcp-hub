@@ -385,7 +385,7 @@ func TestSetTopicPreservesCatchUpAndViceVersa(t *testing.T) {
 		t.Fatalf("expected the catch-up cursor to survive SetTopic, got %+v (ok=%v)", cs, ok)
 	}
 
-	s, err := load()
+	s, err := load(dir())
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestTheModeContractIsEnforcedNotRequested(t *testing.T) {
 		t.Fatalf("seed tmp: %v", err)
 	}
 
-	if err := save(state{}); err != nil {
+	if err := save(dir(), state{}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -701,3 +701,6 @@ func TestDeleteRemovesOneEntryCompletely(t *testing.T) {
 		t.Fatalf("deleting again = %v, %v; want false, nil", existed, err)
 	}
 }
+
+// path is the store file in the directory the environment names now.
+func path() string { return pathIn(dir()) }
