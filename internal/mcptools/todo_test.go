@@ -37,7 +37,7 @@ func TestATodoListIsReadAndChangedThroughTheTodoTools(t *testing.T) {
 		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
 			ServerVersion: wire.ProtocolVersion, ConversationKind: "todo",
 			Features: map[string]json.RawMessage{
-				"todo": json.RawMessage(`{"maxText":20,"maxNotes":100}`), "actionAcks": json.RawMessage(`{}`),
+				"todo": json.RawMessage(`{"maxText":20,"maxNotes":100,"notesFormat":"markdown"}`), "actionAcks": json.RawMessage(`{}`),
 				"delete": json.RawMessage(`{}`), "edit": json.RawMessage(`{}`), "correlation": json.RawMessage(`{}`),
 			},
 			Items: &items, ItemsCursor: "c7"})
@@ -98,7 +98,7 @@ func TestATodoListIsReadAndChangedThroughTheTodoTools(t *testing.T) {
 			t.Errorf("a todo list's connect result carries chat guidance %q:\n%s", absent, text)
 		}
 	}
-	for _, want := range []string{"This connection is a TODO LIST", "[ ] buy milk (id=i1)",
+	for _, want := range []string{"This connection is a TODO LIST", "notes are rendered as Markdown", "[ ] buy milk (id=i1)",
 		"[x] write flyer (id=i2, done 2026-10-06T10:00:00Z)", "notes: two variants"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("connect result lacks %q:\n%s", want, text)

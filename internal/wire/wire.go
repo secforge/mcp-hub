@@ -1493,6 +1493,9 @@ const FeatureTodo = "todo"
 type TodoFeature struct {
 	MaxText  int `json:"maxText,omitempty"`
 	MaxNotes int `json:"maxNotes,omitempty"`
+	// NotesFormat is how notes are rendered: "markdown", or plain text
+	// when empty.
+	NotesFormat string `json:"notesFormat,omitempty"`
 }
 
 // TodoFeature returns the declared todo parameters, and whether the

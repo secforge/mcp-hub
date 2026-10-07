@@ -190,7 +190,7 @@ client, and a server must not send one to request client behaviour.
 | `replyTo` | — | Accepts `replyTo` on `msg`/`edit` and renders a native threaded citation. |
 | `formats` | `accepted` array of strings; `default` string | The `format` values this conversation accepts on `msg`/`edit` — e.g. `["text","html"]` — and what an omitted `format` means there (e.g. `"markdown"` on a hub session, `"text"` elsewhere). A value not listed is refused; a client refuses it locally. Absent `default` says nothing about the default; it does not mean `"text"`. Declared per conversation, since what a path can render differs. |
 | `pins` | — | Mirrors the conversation's pinned set (`joined.pinned`, `pinned`/`unpinned` events) and accepts `pin`/`unpin`/`pins` (§2.8a). |
-| `todo` | `maxText`, `maxNotes` int | The conversation is a todo list: a message is an item, and `msg`/`edit`/`delete` add, change and remove items with the fields of §2.8b. `joined.items` carries the current list. |
+| `todo` | `maxText`, `maxNotes` int; `notesFormat` string | The conversation is a todo list: a message is an item, and `msg`/`edit`/`delete` add, change and remove items with the fields of §2.8b. `joined.items` carries the current list. |
 | `correlation` | — | Echoes a request's `id` verbatim on the frame that answers it and on an `error` refusing it (§2.2, §2.5). |
 | `mintNotice` | — | Sends `joined.resumablePeers` whenever it mints a fresh identity (§2.1, §4). |
 | `piggybackAckRefusals` | — | Refuses a piggybacked `ackCursor` it cannot record with `error{code:"bad_piggyback_ack"}` instead of dropping it silently (§2.7). |
@@ -871,7 +871,7 @@ refusal at the upgrade like 4001: it does not reconnect on its own.
 | Field | Type | Notes |
 |---|---|---|
 | `text` | string | The item's text, at most `maxText` characters. |
-| `notes` | string | Free-text notes, at most `maxNotes` characters. The server always sends it, `""` when there are none; absent never means "none". |
+| `notes` | string | Free-text notes, at most `maxNotes` characters, in the format the feature's `notesFormat` names — `"markdown"` (CommonMark + GFM, as in `formats`) or, when absent, plain text. Stored and sent exactly as written. The server always sends it, `""` when there are none; absent never means "none". |
 | `done` | bool | Whether the item is completed. |
 | `doneAt` | string (RFC 3339) | Server → client only, on a done item: when it was completed. Done items sort by it. |
 | `position` | number | Server → client only: an opaque sort key. Open items sort by it ascending; a client never computes with it or sends one. |

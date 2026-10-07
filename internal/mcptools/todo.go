@@ -37,7 +37,8 @@ func (h *Hub) registerTodoTools(addTool func(mcp.Tool, server.ToolHandlerFunc)) 
 			mcp.WithDescription("Add an item to a todo list. It goes last unless afterId or top " +
 				"says otherwise. The result names the new item's id"),
 			mcp.WithString("text", mcp.Required(), mcp.Description("The item's text")),
-			mcp.WithString("notes", mcp.Description("Optional notes for the item")),
+			mcp.WithString("notes", mcp.Description("Optional notes for the item: Markdown where the "+
+				"list declares it (the connect result says), plain text otherwise")),
 			mcp.WithBoolean("done", mcp.Description("Optional: add it already completed")),
 		}, placement...)...),
 		h.handleTodoAdd,
@@ -50,7 +51,8 @@ func (h *Hub) registerTodoTools(addTool func(mcp.Tool, server.ToolHandlerFunc)) 
 				"move it to the top), or a new place with afterId/top. A done item cannot be moved"),
 			mcp.WithString("itemId", mcp.Required(), mcp.Description("The item's id")),
 			mcp.WithString("text", mcp.Description("Optional new text")),
-			mcp.WithString("notes", mcp.Description("Optional new notes; \"\" removes them")),
+			mcp.WithString("notes", mcp.Description("Optional new notes; \"\" removes them. Markdown "+
+				"where the list declares it (the connect result says), plain text otherwise")),
 			mcp.WithBoolean("done", mcp.Description("Optional: completed or not")),
 		}, placement...)...),
 		h.handleTodoUpdate,
@@ -226,9 +228,18 @@ func todoNote(conn *hubconn.Conn) string {
 		return ""
 	}
 	items, _ := conn.JoinedItems()
+	notes := "Item text and notes are plain text."
+	switch f := conn.TodoLimits().NotesFormat; f {
+	case "":
+	case "markdown":
+		notes = "Item text is plain text; notes are rendered as Markdown (CommonMark with GitHub " +
+			"tables and strikethrough), so use it in notes where structure helps."
+	default:
+		notes = fmt.Sprintf("Item text is plain text; notes are rendered as %q.", f)
+	}
 	return "\nThis connection is a TODO LIST, not a chat: every message is an item. Use " +
 		"hub_todo_items to see the whole list at any time, hub_todo_add / hub_todo_update / " +
 		"hub_todo_delete to change it; hub_send, hub_edit and hub_delete are refused here. " +
-		"Changes the user makes in the list arrive as events like messages do.\n" +
+		"Changes the user makes in the list arrive as events like messages do. " + notes + "\n" +
 		hubconn.FormatTodoList(items)
 }
