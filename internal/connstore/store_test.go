@@ -507,6 +507,9 @@ func TestAnUnreadableStoreIsNotReplacedByTheNextWrite(t *testing.T) {
 // this machine. A default that must be overridden correctly by every
 // test, forever, is not isolation; this is.
 func TestMain(m *testing.M) {
+	// The generic scope override would otherwise decide every scope a
+	// test means to take from MCP_HUB_PROJECT_DIR or the cwd.
+	os.Unsetenv("MCP_PROJECT_DIR")
 	if os.Getenv("MCP_HUB_CONNSTORE_DIR") == "" {
 		tmp, err := os.MkdirTemp("", "connstore-tests-")
 		if err != nil {
@@ -704,3 +707,27 @@ func TestDeleteRemovesOneEntryCompletely(t *testing.T) {
 
 // path is the store file in the directory the environment names now.
 func path() string { return pathIn(dir()) }
+
+// MCP_HUB_PROJECT_DIR wins; MCP_PROJECT_DIR, the generic variable one
+// setting can scope several MCP servers with, applies when it is unset.
+func TestTheProjectOverrideFallsBackToMCPProjectDir(t *testing.T) {
+	hub, generic := t.TempDir(), t.TempDir()
+	for _, tc := range []struct {
+		hub, generic, wantDir, wantVar string
+	}{
+		{hub, generic, NormalizeProject(hub), "MCP_HUB_PROJECT_DIR"},
+		{"", generic, NormalizeProject(generic), "MCP_PROJECT_DIR"},
+		{"", "", "", ""},
+	} {
+		t.Setenv("MCP_HUB_PROJECT_DIR", tc.hub)
+		t.Setenv("MCP_PROJECT_DIR", tc.generic)
+		dir, variable := ProjectOverrideFrom()
+		if dir != tc.wantDir || variable != tc.wantVar {
+			t.Errorf("hub=%q generic=%q: got %q from %q, want %q from %q",
+				tc.hub, tc.generic, dir, variable, tc.wantDir, tc.wantVar)
+		}
+		if tc.wantDir != "" && CurrentProject() != tc.wantDir {
+			t.Errorf("CurrentProject %q does not follow the override %q", CurrentProject(), tc.wantDir)
+		}
+	}
+}

@@ -251,6 +251,8 @@ The project is resolved once per process, in this order:
 
 . `MCP_HUB_PROJECT_DIR`, if set. It is an explicit statement and wins
   outright.
+. `MCP_PROJECT_DIR`, if set: the same statement made for every MCP server
+  that reads it, so one variable can scope several at once.
 . The first root the MCP client advertises (`roots/list`).
 . The process's working directory, which a stdio MCP server normally
   inherits from its project.
@@ -268,12 +270,12 @@ Two consequences worth knowing:
   getting a peer id of its own. Give an agent its own `MCP_HUB_PROJECT_DIR`
   (e.g. `/src/app+review`) when it needs its own identity.
 * *A different project is a different identity*, with its own peer id and
-  read position. Nothing a reader sees says so; when `MCP_HUB_PROJECT_DIR`
-  is set, the `hub_connect` description names the scope so the connection
-  can be named after it.
+  read position. Nothing a reader sees says so; when either variable is
+  set, the `hub_connect` description names it and the scope, so the
+  connection can be named after it.
 
-A project scope is a *name*, not a folder: neither `MCP_HUB_PROJECT_DIR`
-nor `projectDir` has to exist, so there is never a reason to create a
+A project scope is a *name*, not a folder: neither variable nor
+`projectDir` has to exist, so there is never a reason to create a
 directory just to get a separate identity. `/src/app+review` is the usual
 form, and is what a `claude-session` `+variant` exports.
 
@@ -532,6 +534,11 @@ waiting.
 |The project scope for stored connections, overriding the MCP client's
 roots and the working directory (see <<_the_project_scope>>). Canonicalised
 like any other scope. Set it to give one agent an identity of its own.
+
+|`MCP_PROJECT_DIR`
+|The generic project override shared by several MCP servers: used as the
+project scope when `MCP_HUB_PROJECT_DIR` is unset, still ahead of roots and
+the working directory.
 
 |`MCP_HUB_CONNSTORE_DIR`
 |Directory holding `state.json` and its lock. Default: `mcp-hub` under the

@@ -209,7 +209,7 @@ func parseMentions(raw any) ([]wire.Mention, error) {
 }
 
 // projectOverrideNote returns text to append to hub_connect's own
-// description when MCP_HUB_PROJECT_DIR is set, naming the scope and
+// description when a project override is set, naming the variable and scope and
 // suggesting a connection name derived from it.
 //
 // The variable decides which bucket of stored identities this client
@@ -224,17 +224,17 @@ func parseMentions(raw any) ([]wire.Mention, error) {
 // a server no way to push into the model's context, so this is seen only
 // when the model reads the description, which tool search may defer.
 func projectOverrideNote() string {
-	dir := connstore.ProjectOverride()
+	dir, variable := connstore.ProjectOverrideFrom()
 	if dir == "" {
 		return ""
 	}
 	return fmt.Sprintf(
-		"\n\nNOTE: MCP_HUB_PROJECT_DIR is set to %q, so this client's stored connections are "+
+		"\n\nNOTE: %s is set to %q, so this client's stored connections are "+
 			"scoped to that name rather than to the working directory. A connection opened here "+
 			"is a SEPARATE identity from one opened by a session without it — its own peer id and "+
 			"its own read position — and nothing a reader sees says so. Name this connection "+
 			"after that scope, e.g. as: %q, so the two are distinguishable later.",
-		dir, suggestedConnName(dir))
+		variable, dir, suggestedConnName(dir))
 }
 
 // suggestedConnName turns a project scope into a name that satisfies the
@@ -326,7 +326,8 @@ func startupConnectionsNote() string {
 // projectForConnect resolves the project scope for a connstore.Target,
 // in three steps, most explicit first.
 //
-// MCP_HUB_PROJECT_DIR wins outright. It is a statement rather than an
+// The explicit override (MCP_HUB_PROJECT_DIR, else MCP_PROJECT_DIR) wins
+// outright. It is a statement rather than an
 // inference, and it is consulted BEFORE roots: asking the client first
 // meant the variable had no effect in an MCP session at all, since a
 // client that answers roots always answers, so the fallback that reads it
@@ -1887,7 +1888,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"use a different project scope for this one connection, and never on your "+
 					"own initiative. An absolute path — it need not exist, it is a name, not a "+
 					"folder to create — that replaces this client's project scope "+
-					"(MCP_HUB_PROJECT_DIR, else the client's project root) for THIS connection "+
+					"(MCP_HUB_PROJECT_DIR, else MCP_PROJECT_DIR, else the client's project root) for THIS connection "+
 					"only: its stored identity, secret and read position are looked up and "+
 					"written under that scope for its whole life, reconnects included. A "+
 					"different scope is a different identity — a new peer id and a fresh read "+
@@ -3062,7 +3063,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 					"held in this conversation — by other participants, or by earlier sessions "+
 					"on this link. Nothing of theirs was used or taken: an "+
 					"identity is resumed only with the secret stored for it, and this client had "+
-					"none stored for this link in its project scope (MCP_HUB_PROJECT_DIR when set, "+
+					"none stored for this link in its project scope (MCP_HUB_PROJECT_DIR or MCP_PROJECT_DIR when set, "+
 					"otherwise the MCP client's project root).\n"+
 					"That matters only if this session was meant to continue an earlier one on "+
 					"this link: it does not — that one keeps its own identity and read position, "+

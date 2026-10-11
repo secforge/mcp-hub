@@ -32,6 +32,9 @@ import (
 func TestMain(m *testing.M) {
 	restoreHarness := harness.ClearEnvForTesting()
 	defer restoreHarness()
+	// The generic scope override would otherwise decide every scope a
+	// test means to take from MCP_HUB_PROJECT_DIR, roots or the cwd.
+	os.Unsetenv("MCP_PROJECT_DIR")
 	dir, err := os.MkdirTemp("", "mcp-hub-mcptools-logs")
 	if err != nil {
 		panic(err)

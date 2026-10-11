@@ -236,7 +236,10 @@ type ListedEntry struct {
 // every other entry is written back as it was read.
 type state map[string]map[string]json.RawMessage
 
-// ProjectOverride is MCP_HUB_PROJECT_DIR, or "" when it is unset.
+// ProjectOverride is the explicitly set project scope, or "" when none is
+// set: MCP_HUB_PROJECT_DIR, else MCP_PROJECT_DIR — the generic variable one
+// setting can scope several MCP servers with. See ProjectOverrideFrom for
+// which of them it came from.
 //
 // It is an EXPLICIT override and outranks everything a caller can infer,
 // including an MCP client's advertised roots. Roots is the better guess
@@ -244,7 +247,21 @@ type state map[string]map[string]json.RawMessage
 // variable someone set by hand is a statement. A caller that consults
 // roots must consult this first, or the variable silently does nothing in
 // the one place it is most likely to be used.
-func ProjectOverride() string { return NormalizeProject(os.Getenv("MCP_HUB_PROJECT_DIR")) }
+func ProjectOverride() string {
+	dir, _ := ProjectOverrideFrom()
+	return dir
+}
+
+// ProjectOverrideFrom is ProjectOverride and the name of the variable that
+// set it, "" for both when neither is set.
+func ProjectOverrideFrom() (dir, variable string) {
+	for _, name := range []string{"MCP_HUB_PROJECT_DIR", "MCP_PROJECT_DIR"} {
+		if v := os.Getenv(name); v != "" {
+			return NormalizeProject(v), name
+		}
+	}
+	return "", ""
+}
 
 // NormalizeProject is the one spelling a project scope is filed and
 // looked up under. "/source/x/", "/source/x", a relative path to it and a
@@ -282,7 +299,7 @@ func NormalizeProject(p string) string {
 }
 
 // CurrentProject identifies "this working directory" for Target.Project —
-// MCP_HUB_PROJECT_DIR if set (an explicit override, and how tests get
+// the explicit override if set (see ProjectOverride; it is how tests get
 // isolation without touching the real cwd), else the process's actual
 // working directory. mcp-hub-client is launched by its MCP client (e.g.
 // Claude Code) as a local stdio subprocess, which normally inherits the
