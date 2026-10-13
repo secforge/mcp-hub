@@ -269,3 +269,42 @@ func TestACatchUpAnswerFromTheOperatorIsMarked(t *testing.T) {
 		t.Fatalf("a catch-up answer from the operator is not marked: %+v", ev)
 	}
 }
+
+// externalId is outside the AAD, so a server could deliver one message's
+// sealed content under another's id. Once an id carries a sealed message
+// id, content moved to or from it is refused.
+func TestSealedContentCannotBeMovedToAnotherMessage(t *testing.T) {
+	key := newKey(t)
+	p := encParams(t, key)
+	s, err := hubenc.Open(key, p.Salt, p.Check)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Conn{encParams: p, enc: s, encMsgs: map[string]*encState{}, encMids: map[string]string{}}
+	seal := func(mid, text string) *wire.Enc {
+		n, ct, err := s.Seal([]byte(text), encPeer, mid, 0, hubenc.FieldText())
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := hubenc.B64()
+		return &wire.Enc{V: 1, Mid: mid, Rev: 0, Nonce: b.EncodeToString(n), Ct: b.EncodeToString(ct)}
+	}
+	a, b := seal("mid-a", "message A"), seal("mid-b", "message B")
+	deliver := func(ext string, e *wire.Enc) string {
+		ev := Event{Kind: "msg", PeerID: encPeer, ExternalID: ext, Enc: e}
+		c.openEvent(&ev)
+		return ev.Text
+	}
+	if got := deliver("x1", a); got != "message A" {
+		t.Fatalf("A: %q", got)
+	}
+	if got := deliver("x1", b); !strings.Contains(got, "refused") {
+		t.Fatalf("B's content under A's id was shown: %q", got)
+	}
+	if got := deliver("x2", a); !strings.Contains(got, "refused") {
+		t.Fatalf("A's content under a new id was shown: %q", got)
+	}
+	if got := deliver("x2", b); got != "message B" {
+		t.Fatalf("B under its own id: %q", got)
+	}
+}

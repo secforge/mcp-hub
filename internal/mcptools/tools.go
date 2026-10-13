@@ -2859,6 +2859,13 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	s.mu.Unlock()
 
 	keyFile := req.GetString("keyFile", "")
+	// A link once joined encrypted stays encrypted: without its stored key,
+	// a server that stopped announcing encryption would be joined in the
+	// clear and everything sent there would be readable. With the key, such
+	// a server is refused (see hubconn.setupEncryption).
+	if keyFile == "" {
+		keyFile = stored.KeyFile
+	}
 	var key []byte
 	if keyFile != "" {
 		abs, err := filepath.Abs(keyFile)

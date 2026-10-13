@@ -57,6 +57,7 @@ func (c *Conn) setupEncryption(params *wire.Encryption, key []byte) error {
 	}
 	c.encParams, c.enc = params, s
 	c.encMsgs = map[string]*encState{}
+	c.encMids = map[string]string{}
 	c.encRefs = map[string]encRef{}
 	return nil
 }
@@ -216,6 +217,24 @@ func (c *Conn) openEvent(ev *Event) {
 	e := ev.Enc
 	c.mu.Lock()
 	st := c.encMsgs[ev.ExternalID]
+	// externalId is the server's to assign and is outside the AAD, so the
+	// binding between a message and its sealed id is checked here: once an
+	// externalId is known to carry one mid, a different one under it — or
+	// that mid turning up under another externalId — is a ciphertext moved
+	// to a message it does not belong to.
+	if ev.ExternalID != "" {
+		moved := st != nil && st.mid != e.Mid
+		if other, ok := c.encMids[e.Mid]; ok && other != ev.ExternalID {
+			moved = true
+		}
+		if moved {
+			c.mu.Unlock()
+			ev.Text = "[encrypted message refused: its sealed id does not belong to this message — " +
+				"the server presented another message's content under it]"
+			ev.Attachments = nil
+			return
+		}
+	}
 	sender := ev.PeerID
 	if sender == "" && st != nil {
 		sender = st.sender
@@ -251,6 +270,7 @@ func (c *Conn) openEvent(ev *Event) {
 		if st == nil || e.Rev > st.rev {
 			c.encMsgs[ev.ExternalID] = &encState{sender: sender, mid: e.Mid, rev: e.Rev}
 		}
+		c.encMids[e.Mid] = ev.ExternalID
 		c.mu.Unlock()
 	}
 }

@@ -990,7 +990,10 @@ server from attributing a ciphertext to another peer.
 
 **Messages.** `msg` and `edit` carry `enc: {v: 1, mid, rev, nonce, ct}`
 (base64url without padding, `ct` = ciphertext‖tag) and no `text`. `mid` is
-a random UUID the sending client mints; `rev` is 0 for a new message. An
+a random UUID the sending client mints for each new message — never
+reused, not even when resending — and unique within the conversation: the
+server refuses a new message whose `mid` it already holds (`bad_mid`).
+`rev` is 0 for a new message. An
 edit keeps the `mid` and sets `rev` to the stored revision + 1; the server
 refuses any other (`bad_mid`), and a client rejects a delivered edit whose
 `rev` is not newer than the revision it has shown, so an older version
@@ -1002,6 +1005,13 @@ historical answers carry `enc` and no `text`.
 "contentType"}` (field `filemeta:{i}`). No plaintext name or type is sent or
 delivered, inline or by reference; `size` is the ciphertext size.
 `attachmentData` carries `encMeta` too.
+
+**Client rules.** `externalId` is the server's and outside the AAD, so a
+client binds each `externalId` to the `mid` it first carried and refuses a
+delivery that breaks that pairing in either direction — otherwise a server
+could present one message's sealed content as another's. And a link once
+joined encrypted is always joined with its key: a server that stops
+declaring `encryption` for it is refused, never joined in the clear.
 
 **Refusals.** `encryption_required` (plaintext `text` or attachment name in
 an encrypted session), `bad_mid` (wrong `mid` or `rev` on an edit),

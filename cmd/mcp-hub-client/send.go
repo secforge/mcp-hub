@@ -169,6 +169,14 @@ func dialForSend(link, project, name string, key []byte) (*hubconn.Conn, error) 
 	if err != nil {
 		return nil, fmt.Errorf("reading the connection store: %w", err)
 	}
+	// A link once joined encrypted stays encrypted; see hub_connect.
+	if key == nil && stored.KeyFile != "" {
+		k, err := hubenc.ReadKeyFile(stored.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("this link was joined encrypted, and its key file cannot be read: %w", err)
+		}
+		key = k
+	}
 	secret := stored.ReconnectSecret
 	if secret == "" {
 		secret = uuid.NewString()

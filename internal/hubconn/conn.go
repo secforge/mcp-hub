@@ -340,6 +340,7 @@ type Conn struct {
 	encParams  *wire.Encryption
 	encProblem string
 	encMsgs    map[string]*encState
+	encMids    map[string]string
 	encRefs    map[string]encRef
 	encPending map[string]encState
 	// todo is set when the server declared a todo list; todoItems and
