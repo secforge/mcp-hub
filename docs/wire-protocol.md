@@ -196,6 +196,7 @@ client, and a server must not send one to request client behaviour.
 | `piggybackAckRefusals` | — | Refuses a piggybacked `ackCursor` it cannot record with `error{code:"bad_piggyback_ack"}` instead of dropping it silently (§2.7). |
 | `serverStopping` | — | Sends `serverStopping` before a deliberate shutdown (§2.10). |
 | `clientRelease` | — | Sends `joined.clientRelease` when it has verified a release. |
+| `encryption` | `versions` array of int | Supports end-to-end encrypted sessions (§2.11). |
 
 Adding a feature needs no version bump — a client at protocol 3 or above
 already knows to look. A feature name is removed in the same change that
@@ -957,6 +958,57 @@ once. The close code is what says "graceful"; this frame only adds the
 estimate, and a client must never require it. Its absence says nothing:
 a killed process sends no frame at all, so a bare 1006 stays exactly as
 ambiguous as before.
+
+### 2.11 Encrypted sessions (feature `encryption`)
+
+A hub session can be created end-to-end encrypted; a server declaring
+`encryption: {versions: [1]}` supports it. All clients of the session share
+one random 32-byte key (base64url without padding, in a key file). The
+server never sees the key or any message body.
+
+**Creation.** The creating client sends `Hub-Encryption:
+{"v":1,"salt":"…","check":"…"}` beside `Hub-Create-Token`: a fresh 16-byte
+salt and the check value below. The server cannot compute `check`; it stores
+what the creator sent.
+
+**Join.** `joined.encryption = {v, salt, check}`. A client derives
+
+* `encKey = HKDF-SHA256(key, salt, "chat-relay hub-enc v1 key", 32)`
+* `check = HKDF-SHA256(key, salt, "chat-relay hub-enc v1 check", 32)`
+
+and refuses the session when its `check` differs: that is the wrong key,
+not corruption. A client holding a key for a session that is not encrypted
+refuses to connect, so nothing meant to be sealed goes out readable.
+
+**Sealing.** AES-256-GCM with a random 12-byte nonce. AAD is the UTF-8
+string `v1|{salt}|{senderPeerId}|{mid}|{rev}|{field}`, with `salt` exactly as
+in `joined.encryption` and `field` one of `text`, `file:{i}` or
+`filemeta:{i}`. The salt binds a value to its session: it is per-session
+random and public, unlike the session id, which is a credential. Operator posts use sender
+`00000000-0000-0000-0000-000000000000`. The sender in the AAD stops the
+server from attributing a ciphertext to another peer.
+
+**Messages.** `msg` and `edit` carry `enc: {v: 1, mid, rev, nonce, ct}`
+(base64url without padding, `ct` = ciphertext‖tag) and no `text`. `mid` is
+a random UUID the sending client mints; `rev` is 0 for a new message. An
+edit keeps the `mid` and sets `rev` to the stored revision + 1; the server
+refuses any other (`bad_mid`), and a client rejects a delivered edit whose
+`rev` is not newer than the revision it has shown, so an older version
+cannot be presented as an edit. Delivered `msg`, `messageEdited` and
+historical answers carry `enc` and no `text`.
+
+**Attachments.** `contentBytes` is standard base64 of nonce‖ciphertext‖tag
+(field `file:{i}`), and `encMeta: {nonce, ct}` seals `{"name",
+"contentType"}` (field `filemeta:{i}`). No plaintext name or type is sent or
+delivered, inline or by reference; `size` is the ciphertext size.
+`attachmentData` carries `encMeta` too.
+
+**Refusals.** `encryption_required` (plaintext `text` or attachment name in
+an encrypted session), `bad_mid` (wrong `mid` or `rev` on an edit),
+`encryption_not_enabled` (`enc` in a plain session), and `unsupported` for
+a `query` filter, since the server cannot search ciphertext. The server never
+renders, recodes or derives text from a sealed body: no reply previews, no
+mention substrings.
 
 ## 3. Ordering and atomicity
 

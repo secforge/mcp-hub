@@ -246,6 +246,8 @@ type Joined struct {
 	// declared (§2.8b); ItemsCursor is the newest change it reflects.
 	Items       *[]TodoItem `json:"items,omitempty,case:strict"`
 	ItemsCursor string      `json:"itemsCursor,omitempty,case:strict"`
+	// Encryption is set when the session is encrypted (§2.11).
+	Encryption *Encryption `json:"encryption,omitempty,case:strict"`
 }
 
 // ClientRelease is a server's verified statement of the current client
@@ -528,6 +530,8 @@ type Msg struct {
 	Format string `json:"format,omitempty,case:strict"`
 	// TodoFields are set on a todo list's items (§2.8b).
 	TodoFields
+	// Enc replaces Text in an encrypted session (§2.11).
+	Enc *Enc `json:"enc,omitempty,case:strict"`
 }
 
 // Attachment is binary content attached to a Msg/Edit — a server
@@ -584,6 +588,9 @@ type Attachment struct {
 	// row cannot be read, which is exactly the case a plain int would
 	// render as an empty attachment.
 	Size *int64 `json:"size,omitempty,case:strict"`
+	// EncMeta seals {"name","contentType"} in an encrypted session (§2.11),
+	// where Name and ContentType are absent and ContentBytes is sealed.
+	EncMeta *EncValue `json:"encMeta,omitempty,case:strict"`
 }
 
 // IsReference reports whether this Attachment is the reference form (a
@@ -626,6 +633,8 @@ type AttachmentData struct {
 	// in ContentType from whatever was originally sent (e.g. an upstream
 	// platform's own re-encode).
 	ContentBytes string `json:"contentBytes,case:strict"`
+	// EncMeta seals {"name","contentType"} in an encrypted session (§2.11).
+	EncMeta *EncValue `json:"encMeta,omitempty,case:strict"`
 }
 
 // MaxAttachmentRawBytes is the raw (pre-base64) size cap a sending client
@@ -735,6 +744,7 @@ func ReadAttachmentFile(path string) ([]Attachment, error) {
 	return []Attachment{{
 		ContentType:  contentType,
 		ContentBytes: base64.StdEncoding.EncodeToString(data),
+		Name:         filepath.Base(path),
 	}}, nil
 }
 
@@ -1221,6 +1231,8 @@ type MessageEdited struct {
 	// PeerID names who made the change, where the server says — a todo
 	// list does (§2.8b).
 	PeerID string `json:"peerId,omitempty,case:strict"`
+	// Enc replaces Text in an encrypted session (§2.11).
+	Enc *Enc `json:"enc,omitempty,case:strict"`
 }
 
 // Reaction is a client request to add or remove a reaction on an earlier
@@ -1564,4 +1576,30 @@ type ItemsResponse struct {
 	ID          string      `json:"id,omitempty,case:strict"`
 	List        *[]TodoItem `json:"list,case:strict"`
 	ItemsCursor string      `json:"itemsCursor,omitempty,case:strict"`
+}
+
+// FeatureEncryption declares encrypted hub sessions (§2.11).
+const FeatureEncryption = "encryption"
+
+// Encryption is an encrypted session's parameters as joined states them.
+type Encryption struct {
+	V     int    `json:"v,case:strict"`
+	Salt  string `json:"salt,case:strict"`
+	Check string `json:"check,case:strict"`
+}
+
+// Enc is a sealed message body: the message's client-minted id, its
+// revision, and the nonce and ciphertext, base64url without padding.
+type Enc struct {
+	V     int    `json:"v,case:strict"`
+	Mid   string `json:"mid,case:strict"`
+	Rev   int    `json:"rev,case:strict"`
+	Nonce string `json:"nonce,case:strict"`
+	Ct    string `json:"ct,case:strict"`
+}
+
+// EncValue is a sealed value with its nonce, base64url without padding.
+type EncValue struct {
+	Nonce string `json:"nonce,case:strict"`
+	Ct    string `json:"ct,case:strict"`
 }

@@ -288,6 +288,58 @@ shows `[scope overridden: …]` in `hub_list_connections`, whose stored
 entries it does not appear among, and a previous run's connection under an
 override is not reported at the next start.
 
+== Encrypted sessions
+
+A hub session can be created end-to-end encrypted. Every client of it holds
+the same random key; the client seals each message body and attachment
+before sending and opens it on arrival, so the server relays ciphertext and
+the model reads and writes plain text as usual. The server still sees the
+metadata: who wrote when, display names, the topic, reactions and pins. It
+cannot search message text. The protocol is §2.11 of
+`docs/wire-protocol.md`.
+
+* `mcp-hub-client keygen <file>` writes a new key, readable by its owner
+  only, and never overwrites an existing file. Every client of the session
+  needs the same file; share it out of band, never through the hub.
+* `mcp-hub-client send --key-file <file> …` sends into one from a script
+  (see <<_sending_from_a_script>>).
+* `hub_connect(..., keyFile: "<file>")` joins with it, and with `createToken`
+  creates the session encrypted. The client stores the path for reconnects,
+  never the key, and refuses a key file others can read.
+* A key passed for a session that is not encrypted is refused, so nothing
+  meant to be sealed goes out readable. The wrong key is refused at connect.
+  Joined without a key, an encrypted session sends nothing and shows a
+  notice in place of each message.
+* Plaintext reaches this machine's disk only as received attachments and
+  oversized message bodies the client saves for the model, all owner-only.
+
+== Sending from a script
+
+`mcp-hub-client send` sends one message into a conversation and exits,
+without an MCP session:
+
+[source,bash]
+----
+mcp-hub-client send --link "$LINK" "build finished"
+echo "deploy done" | mcp-hub-client send --link "$LINK" --if-present Alice -
+----
+
+`--connection NAME` takes the link, identity and key file of the connection
+stored under `--project` by that name, instead of `--link`; one a running
+client holds right now is refused, since sending under its identity would
+knock it off.
+
+`--if-present PEER` sends only when PEER (a peer id, or an exact display
+name) is in the conversation, and then privately to them; otherwise it sends
+nothing and exits 3. `--file` attaches a file, `--key-file` handles an
+encrypted session, `--format` picks markdown or text. Exit codes: 0 sent,
+1 error, 2 usage, 3 peer not present, 4 refused or not acknowledged.
+
+The command needs a link of its own: a link token connects one client at a
+time, so create a new link for the conversation rather than reusing an MCP
+session's. It keeps its own identity per link, under the project scope plus
+`+send`, so its sends always come from the same peer.
+
 == Tools
 
 Every tool except `hub_connect`, `hub_list_connections` and
@@ -297,7 +349,7 @@ Every tool except `hub_connect`, `hub_list_connections` and
 |===
 |Tool |Purpose
 
-|`hub_connect(link, as, name?, agePublicKey?, createToken?, topic?, projectDir?)`
+|`hub_connect(link, as, name?, agePublicKey?, keyFile?, createToken?, topic?, projectDir?)`
 |Open a connection. `name` is the display name other peers see (untrusted,
 sanitized server-side). `agePublicKey` is an
 https://age-encryption.org[age] public key, distributed to peers so they can
@@ -308,7 +360,8 @@ unknown one; both are ignored when the session exists. The result names the
 peer id, whether a previous identity was resumed, what the server declared
 about itself, and how messages will arrive. `projectDir` overrides the
 project scope for this connection only, and is discouraged — see
-<<_the_project_scope>>.
+<<_the_project_scope>>. `keyFile` joins an end-to-end encrypted session
+(see <<_encrypted_sessions>>).
 
 |`hub_disconnect(connection, remove?)`
 |Leave and tear the connection down. The stored entry stays, so the next

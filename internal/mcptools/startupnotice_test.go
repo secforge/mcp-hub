@@ -20,6 +20,9 @@ import (
 // and did not deliberately let go, and at startup this process has
 // connected nothing, so anything still marked belongs to a previous run.
 func TestAPreviousRunsConnectionsAreReportedOnce(t *testing.T) {
+	// A known scope, so the report runs now rather than being deferred
+	// until roots answers; without an override nothing knows it at startup.
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440000", Project: project}
@@ -50,6 +53,9 @@ func TestAPreviousRunsConnectionsAreReportedOnce(t *testing.T) {
 // and repeating it back is nagging about something already done. An
 // explicit disconnect clears the mark, which is what says so.
 func TestADeliberateDisconnectIsNotReported(t *testing.T) {
+	// A known scope, so the report runs now rather than being deferred
+	// until roots answers; without an override nothing knows it at startup.
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440001", Project: project}
@@ -74,6 +80,9 @@ func TestADeliberateDisconnectIsNotReported(t *testing.T) {
 // while the process was still running, and the mark was cleared then.
 // Only what a run was still holding when it ended is news.
 func TestADroppedConnectionIsNotReported(t *testing.T) {
+	// A known scope, so the report runs now rather than being deferred
+	// until roots answers; without an override nothing knows it at startup.
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440002", Project: project}
@@ -96,6 +105,9 @@ func TestADroppedConnectionIsNotReported(t *testing.T) {
 // exit indistinguishable from a deliberate departure — which is the bug
 // the whole notice exists to fix.
 func TestShutdownLeavesTheMarkForTheNextRun(t *testing.T) {
+	// A known scope, so the report runs now rather than being deferred
+	// until roots answers; without an override nothing knows it at startup.
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
 	src, err := os.ReadFile("tools.go")
 	if err != nil {
 		t.Fatalf("reading tools.go: %v", err)
@@ -125,6 +137,9 @@ func TestShutdownLeavesTheMarkForTheNextRun(t *testing.T) {
 // and exercising the push half needs a live harness socket this suite
 // deliberately does not have (see TestMain).
 func TestTheStartupNoticeIsPushedWhenItCanBe(t *testing.T) {
+	// A known scope, so the report runs now rather than being deferred
+	// until roots answers; without an override nothing knows it at startup.
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
 	src, err := os.ReadFile("startupnotice.go")
 	if err != nil {
 		t.Fatalf("reading startupnotice.go: %v", err)
@@ -157,6 +172,9 @@ func TestTheStartupNoticeIsPushedWhenItCanBe(t *testing.T) {
 // longer existed, was announced as something a previous run had just been
 // holding.
 func TestReportingClearsTheMarkSoItIsNotSaidAgain(t *testing.T) {
+	// A known scope, so the report runs now rather than being deferred
+	// until roots answers; without an override nothing knows it at startup.
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 	target := connstore.Target{Link: "wss://example/550e8400-e29b-41d4-a716-446655440003", Project: project}
@@ -200,6 +218,9 @@ func TestReportingClearsTheMarkSoItIsNotSaidAgain(t *testing.T) {
 // DIFFERENT process (same pid, other start time), or no recorded holder
 // at all is reported and cleared as before.
 func TestAConnectionHeldByALiveProcessIsLeftAlone(t *testing.T) {
+	// A known scope, so the report runs now rather than being deferred
+	// until roots answers; without an override nothing knows it at startup.
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	project := connstore.CurrentProject()
 
@@ -267,4 +288,46 @@ func TestProcessStartReadsTheStartTimeField(t *testing.T) {
 	if got := processStart(4343); got != "" {
 		t.Fatalf("processStart for a missing pid = %q, want empty", got)
 	}
+}
+
+// A restarted client starts before the run it replaces has exited, so at
+// startup that run still holds its connections. They are reported once it
+// is gone; a live holder that is not the predecessor is still left alone.
+func TestThePredecessorsConnectionsAreReportedOnceItExits(t *testing.T) {
+	t.Setenv("MCP_HUB_PROJECT_DIR", t.TempDir())
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	cmd := exec.Command("sleep", "0.5")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	prev := isPredecessor
+	isPredecessor = func(pid int) bool { return pid == cmd.Process.Pid }
+	t.Cleanup(func() { isPredecessor = prev })
+
+	project := connstore.CurrentProject()
+	target := connstore.Target{Link: "wss://example/pred", Project: project}
+	if err := connstore.Upsert(target, connstore.Entry{
+		PeerID: "550e8400-e29b-41d4-a716-446655440000", LocalName: "relay", Connected: true,
+		Holder: &connstore.Holder{PID: cmd.Process.Pid, Start: processStart(cmd.Process.Pid)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &Hub{}
+	h.reportAbandonedConnections()
+	if note := h.takeAutoReconnectNote(); note != "" {
+		t.Fatalf("reported while the predecessor was still running: %s", note)
+	}
+	cmd.Wait()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if note := h.takeAutoReconnectNote(); note != "" {
+			if !strings.Contains(note, "relay") {
+				t.Fatalf("note does not name the connection: %s", note)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the predecessor's connection was never reported after it exited")
 }

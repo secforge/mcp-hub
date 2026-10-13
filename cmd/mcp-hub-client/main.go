@@ -20,6 +20,12 @@ func main() {
 		fmt.Println(version.String())
 		return
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "send" {
+		os.Exit(runSend(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "keygen" {
+		os.Exit(runKeygen(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "wait" {
 		fs := flag.NewFlagSet("wait", flag.ExitOnError)
 		socket := fs.String("socket", "", "path to the wait unix socket")
@@ -27,6 +33,15 @@ func main() {
 			"delivery as it arrives, instead of exiting after one")
 		fs.Parse(os.Args[2:])
 		os.Exit(runWait(*socket, *follow, os.Stdout, os.Stderr))
+	}
+
+	// Any other argument is a command this build does not have. Starting the
+	// MCP server instead would read an empty stdin and exit 0 — a silent
+	// success for a command that never ran.
+	if len(os.Args) >= 2 {
+		fmt.Fprintf(os.Stderr, "mcp-hub-client %s: unknown command %q (commands: send, keygen, wait, "+
+			"version; no argument runs the MCP server)\n", version.Short(), os.Args[1])
+		os.Exit(2)
 	}
 
 	// Before anything looks for a harness: a socket this process inherited

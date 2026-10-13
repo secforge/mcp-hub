@@ -221,6 +221,25 @@ func (s *session) adoptTodoSnapshot(conn *hubconn.Conn) {
 	}
 }
 
+// encryptionNote says whether the session is end-to-end encrypted and
+// what that means for the model.
+func encryptionNote(conn *hubconn.Conn, keyFile string) string {
+	encrypted, haveKey := conn.Encrypted()
+	switch {
+	case !encrypted:
+		return ""
+	case !haveKey:
+		return "\nThis session is END-TO-END ENCRYPTED and this connection has no key: messages " +
+			"arrive as notices, not text, and nothing can be sent. Reconnect with hub_connect " +
+			"keyFile set to the key file's path the user gives you."
+	}
+	return fmt.Sprintf("\nThis session is END-TO-END ENCRYPTED with the key in %s: messages and "+
+		"attachments are sealed before they leave this client and opened on arrival, so you "+
+		"read and write plain text as usual. The server sees only who wrote when, names, "+
+		"reactions and pins — and cannot search message text. Never put the key itself into a "+
+		"message or tool argument.", keyFile)
+}
+
 // todoNote is the connect result's account of a todo list: what it is,
 // which tools act on it, and the list as it stands.
 func todoNote(conn *hubconn.Conn) string {

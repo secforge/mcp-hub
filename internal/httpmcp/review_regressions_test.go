@@ -29,9 +29,14 @@ func TestOverflowDoesNotDeadlockSession(t *testing.T) {
 		}
 		close(done)
 	}()
+	// A deadlock never finishes, so the deadline only needs to be longer
+	// than a slow run: under -race on a loaded machine the burst takes
+	// well over the few hundred milliseconds it needs otherwise.
+	start := time.Now()
 	select {
 	case <-done:
-	case <-time.After(300 * time.Millisecond):
+		t.Logf("burst took %v", time.Since(start))
+	case <-time.After(10 * time.Second):
 		t.Fatal("broadcast deadlocked on undrained HTTP peer")
 	}
 }

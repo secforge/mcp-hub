@@ -21,6 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/secforge/mcp-hub/internal/agekey"
+	"github.com/secforge/mcp-hub/internal/hubenc"
 	"github.com/secforge/mcp-hub/internal/sanitize"
 	"github.com/secforge/mcp-hub/internal/version"
 	"github.com/secforge/mcp-hub/internal/wire"
@@ -281,6 +282,11 @@ type Event struct {
 	// TodoItems and ItemsCursor are an "items" answer's list and cursor.
 	TodoItems   []wire.TodoItem
 	ItemsCursor string
+	// Enc is a sealed body as delivered; openEvent replaces Text with its
+	// plaintext and clears nothing else (§2.11).
+	Enc *wire.Enc
+	// AttachmentEncMeta is attachmentData's sealed name and type.
+	AttachmentEncMeta *wire.EncValue
 }
 
 // PeerInfo is what's known about one other peer in the session.
@@ -326,6 +332,16 @@ type Conn struct {
 	pinnedAtConnect  []string
 	features         map[string]json.RawMessage
 	featuresDeclared bool
+	// enc seals and opens an encrypted session's messages (§2.11); nil
+	// on a session that is not encrypted, and on an encrypted one joined
+	// without its key, where encProblem says so. encMsgs and encRefs are
+	// what edits and referenced attachments need to be sealed and opened.
+	enc        *hubenc.Session
+	encParams  *wire.Encryption
+	encProblem string
+	encMsgs    map[string]*encState
+	encRefs    map[string]encRef
+	encPending map[string]encState
 	// todo is set when the server declared a todo list; todoItems and
 	// todoCursor are the list as joined.items stated it.
 	todo       *wire.TodoFeature
@@ -807,6 +823,10 @@ const (
 // the shape of the link it was handed. A server ignores what it does not
 // use.
 type DialOptions struct {
+	// Key is an encrypted session's key (§2.11). Required to read or send
+	// in one, and refused for a session that is not encrypted. With
+	// CreateToken it creates the session encrypted.
+	Key []byte
 	// ReconnectSecret is REQUIRED. It is what reclaims this client's
 	// identity on a later connect, and a server refuses a connection
 	// without one: an identity with no secret behind it can never be
@@ -929,6 +949,13 @@ func Dial(link string, opts DialOptions) (*Conn, error) {
 	}
 	if opts.CreateToken != "" {
 		header.Set("Hub-Create-Token", opts.CreateToken)
+		if opts.Key != nil {
+			enc, err := NewEncryptionHeader(opts.Key)
+			if err != nil {
+				return nil, err
+			}
+			header.Set("Hub-Encryption", enc)
+		}
 	}
 	if topic := sanitize.Text(opts.Topic, maxTopicRunes); topic != "" {
 		header.Set("Hub-Topic", topic)
@@ -938,7 +965,7 @@ func Dial(link string, opts DialOptions) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return finishHandshake(ws, snapPongWait, snapWriteWait, snapConfirmReminderInterval)
+	return finishHandshake(ws, snapPongWait, snapWriteWait, snapConfirmReminderInterval, opts.Key)
 }
 
 // dialWS opens the WebSocket and, when the server answers with anything
@@ -1017,7 +1044,7 @@ const maxReadFrameBytes = 48 * 1024 * 1024
 // Authorization/etc. header). Nothing downstream of here differs between
 // the two: everything behavioural comes from the server's declared
 // features, never from which of them dialled.
-func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfirmReminderInterval time.Duration) (*Conn, error) {
+func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfirmReminderInterval time.Duration, key []byte) (*Conn, error) {
 	// BOUNDED, because an upgrade is not an answer. A server that
 	// completes the HTTP upgrade and then says nothing left this read
 	// blocked with no deadline set yet — the deadline the read loop
@@ -1100,6 +1127,12 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfir
 		c.mu.Unlock()
 		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(snapWriteWait))
 	})
+	// Before anything is read: a sealed message delivered first must be
+	// opened like every later one.
+	if err := c.setupEncryption(joined.Encryption, key); err != nil {
+		ws.Close()
+		return nil, err
+	}
 	go c.readLoop()
 	go c.activityLoop()
 	go c.confirmReminderLoop()
@@ -2229,6 +2262,13 @@ func (c *Conn) readLoop() {
 			debugf("readLoop: decodeEvent failed, dropping frame raw=%s", raw)
 			continue
 		}
+		c.openEvent(&ev)
+		// Before any routing: a catch-up answer is diverted to its waiting
+		// request below, and an operator's message must be marked there
+		// exactly as it is when it arrives live.
+		if ev.PeerID == SystemPeerIDOperator || ev.PeerID == SystemPeerIDSystem {
+			ev.IsOperator = true
+		}
 		c.mu.Lock()
 		c.lastFrameKind, c.lastFrameAt = ev.Kind, time.Now()
 		// Stamped here, before the ack claim can divert the event, because
@@ -2255,9 +2295,6 @@ func (c *Conn) readLoop() {
 		if !lateSpent && c.tryDivertToClaimLocked(ev) {
 			c.mu.Unlock()
 			continue
-		}
-		if ev.PeerID == SystemPeerIDOperator || ev.PeerID == SystemPeerIDSystem {
-			ev.IsOperator = true
 		}
 		// The wire states the whole membership, this connection included.
 		// Everything above works on that list; everything a READER is
@@ -2435,7 +2472,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,
-			Matching: m.Matching, CorrelationID: m.ID, Todo: todoFields(m.TodoFields)}, true
+			Matching: m.Matching, CorrelationID: m.ID, Todo: todoFields(m.TodoFields), Enc: m.Enc}, true
 	case wire.TypeServerStopping:
 		var st wire.ServerStopping
 		if err := json.Unmarshal(raw, &st); err != nil {
@@ -2494,7 +2531,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		return Event{Kind: "messageEdited", ExternalID: m.ExternalID, Text: m.Text, TS: m.TS, Own: m.Own,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Cursor: m.Cursor, Historical: m.Historical,
-			Answers: m.Answers, CorrelationID: m.ID, Todo: todoFields(m.TodoFields), PeerID: m.PeerID}, true
+			Answers: m.Answers, CorrelationID: m.ID, Todo: todoFields(m.TodoFields), PeerID: m.PeerID, Enc: m.Enc}, true
 	case wire.TypeReactionAck:
 		var a wire.ReactionAck
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -2591,7 +2628,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		}
 		return Event{Kind: "attachmentData", AttachmentToken: a.Token, AttachmentName: a.Name,
 			AttachmentContentType: a.ContentType, AttachmentContentBytes: a.ContentBytes,
-			CorrelationID: a.ID}, true
+			CorrelationID: a.ID, AttachmentEncMeta: a.EncMeta}, true
 	default:
 		return Event{}, false
 	}
@@ -2652,6 +2689,9 @@ func (c *Conn) Send(text string, attachments []wire.Attachment, format, replyTo 
 }
 
 func (c *Conn) sendWithID(text string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention, corrID string) error {
+	if err := c.requireSendable(); err != nil {
+		return err
+	}
 	if err := c.RequireContent(len(attachments) > 0, replyTo != "", len(mentions) > 0); err != nil {
 		return err
 	}
@@ -2665,6 +2705,13 @@ func (c *Conn) sendWithID(text string, attachments []wire.Attachment, format, re
 	m.Format = format
 	m.ReplyTo = replyTo
 	m.Mentions = mentions
+	if c.enc != nil {
+		sealed, err := c.sealMsg(m)
+		if err != nil {
+			return err
+		}
+		return c.writeJSON(sealed)
+	}
 	return c.writeJSON(m)
 }
 
@@ -2677,6 +2724,9 @@ func (c *Conn) SendTo(text, peerID string, attachments []wire.Attachment, format
 }
 
 func (c *Conn) sendToWithID(text, peerID string, attachments []wire.Attachment, format, replyTo string, mentions []wire.Mention, corrID string) error {
+	if err := c.requireSendable(); err != nil {
+		return err
+	}
 	if err := c.RequireContent(len(attachments) > 0, replyTo != "", len(mentions) > 0); err != nil {
 		return err
 	}
@@ -2690,6 +2740,13 @@ func (c *Conn) sendToWithID(text, peerID string, attachments []wire.Attachment, 
 	m.Format = format
 	m.ReplyTo = replyTo
 	m.Mentions = mentions
+	if c.enc != nil {
+		sealed, err := c.sealMsg(m)
+		if err != nil {
+			return err
+		}
+		return c.writeJSON(sealed)
+	}
 	return c.writeJSON(m)
 }
 
@@ -2757,6 +2814,10 @@ func (c *Conn) SupportsMessageAfterFilter(name string) bool {
 // actually applied, and the caller must read that rather than assume the
 // filter it sent was honoured.
 func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filter) (Event, bool, error) {
+	if filter.Query != "" && c.encParams != nil {
+		return Event{}, false, errors.New("this session is end-to-end encrypted, so the server " +
+			"cannot search message text; read without a query instead")
+	}
 	ch := make(chan Event, 1)
 	c.mu.Lock()
 	// REFUSED, not replaced — the same reasoning as claimNextAck. A
@@ -2920,9 +2981,19 @@ func (c *Conn) editMessageWithID(externalID, text string, attachments []wire.Att
 	if err := c.RequireFormat(format); err != nil {
 		return err
 	}
+	if err := c.requireSendable(); err != nil {
+		return err
+	}
 	e := wire.NewEditRequest(externalID, text, attachments, format, replyTo, mentions)
 	e.ID = corrID
 	e.AckCursor = c.ackCursorForOutbound()
+	if c.enc != nil {
+		sealed, err := c.sealEdit(e)
+		if err != nil {
+			return err
+		}
+		return c.writeJSON(sealed)
+	}
 	return c.writeJSON(e)
 }
 
@@ -3059,6 +3130,7 @@ func (c *Conn) SendAwaitingAck(text, to string, attachments []wire.Attachment, f
 	}
 	select {
 	case ev := <-resultCh:
+		c.noteSealedAck(corrID, ev)
 		return ev, true, nil
 	case <-c.gone:
 		// The connection dropped. Waiting out the rest of the deadline
@@ -3121,6 +3193,7 @@ func (c *Conn) EditMessageAwaitingAck(externalID, text string, attachments []wir
 	}
 	select {
 	case ev := <-resultCh:
+		c.noteSealedAck(corrID, ev)
 		return ev, true, nil
 	case <-c.gone:
 		// The connection dropped. Waiting out the rest of the deadline

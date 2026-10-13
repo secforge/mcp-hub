@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/harness"
 	"github.com/secforge/mcp-hub/internal/hubconn"
+	"github.com/secforge/mcp-hub/internal/hubenc"
 	"github.com/secforge/mcp-hub/internal/selfupdate"
 	"github.com/secforge/mcp-hub/internal/version"
 	"github.com/secforge/mcp-hub/internal/waiter"
@@ -41,6 +43,10 @@ type Hub struct {
 	// run's connections, because the scope was not yet known; the first
 	// tool call reports them instead. See reportAbandonedConnections.
 	abandonedPending atomic.Bool
+	// shuttingDown is set while Shutdown closes every connection, so the
+	// closes are not reported as drops with a reconnect that will never
+	// happen: this process is ending, and the next one reports what it held.
+	shuttingDown atomic.Bool
 	// sessions is every open connection, keyed by the name its caller
 	// gave it at connect. That name is the address: every tool that acts
 	// on a connection names one, and an unknown name is an error rather
@@ -1051,6 +1057,9 @@ func reconnectBackoff(attempt int) time.Duration {
 // which is the silence this whole project exists to remove. Observed
 // after a host was hibernated for several hours.
 func (s *session) scheduleReconnect(conn *hubconn.Conn) {
+	if s.hub != nil && s.hub.shuttingDown.Load() {
+		return
+	}
 	if reason, permanent := conn.PermanentFailure(); permanent {
 		s.alert(fmt.Sprintf("Connection %q ENDED and will NOT be reconnected: %s. Retrying "+
 			"cannot fix that. The name is free again if you want to open something else "+
@@ -1204,10 +1213,22 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 			"new one. Retrying cannot fix that. Call hub_connect yourself when ready.")
 		return reconnectFatal
 	}
+	var key []byte
+	if stored.KeyFile != "" {
+		k, err := hubenc.ReadKeyFile(stored.KeyFile)
+		if err != nil {
+			s.abandonReconnect(fmt.Sprintf("Automatic reconnect STOPPED: this connection is to an "+
+				"encrypted session and its key could not be read (%v). Fix the key file, then call "+
+				"hub_connect with keyFile.", err))
+			return reconnectFatal
+		}
+		key = k
+	}
 	conn, err := hubconn.Dial(link, hubconn.DialOptions{
 		ReconnectSecret: secret,
 		AgentID:         stored.PeerID,
 		Name:            name,
+		Key:             key,
 	})
 	if err != nil {
 		var refused *hubconn.HandshakeRefusedError
@@ -1320,6 +1341,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	if !s.persistConnectedIfStillHolding(conn, gen, target, connstore.Entry{
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
 		ReconnectSecret: secret, LastConnectedAt: time.Now().UTC(), Connected: true, Holder: selfHolder(),
+		KeyFile: stored.KeyFile,
 	}) {
 		conn.Close()
 		return reconnectDone
@@ -1649,7 +1671,11 @@ func (s *session) notConnected() *mcp.CallToolResult {
 	w := s.hub.currentWaiter()
 	whatHappensNext := "Nothing is following, so you will NOT be told when it returns — try again " +
 		"after that, then call hub_catch_up()."
-	if w != nil && w.Following() {
+	switch {
+	case pushOnly() && s.pusher != nil:
+		whatHappensNext = "When it reconnects you are told so by a RECONNECTED notice delivered " +
+			"to you, which also says to call hub_catch_up(). Just wait for it."
+	case w != nil && w.Following():
 		whatHappensNext = "You are following, so you will be notified on this channel when it " +
 			"reconnects; that notice tells you to call hub_catch_up(). Just wait for it."
 	}
@@ -1873,6 +1899,13 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"every other peer can see it, so granting peerId reuse on it would let anyone "+
 					"who saw it impersonate you. Identity is resumed by a secret this client "+
 					"manages for you, which no peer ever sees")),
+			mcp.WithString("keyFile", mcp.Description(
+				"Optional: the path of the key file for an END-TO-END ENCRYPTED session — "+
+					"required to read or send in one, and refused for a session that is not "+
+					"encrypted. Pass the PATH the user gives you; never read the file, and never "+
+					"put a key into a tool argument or a message. The file must be readable by its "+
+					"owner only. With createToken it creates the session encrypted. The path is "+
+					"remembered for reconnects; the key is not stored")),
 			mcp.WithString("createToken", mcp.Description(
 				"Optional, server-specific: a capability for creating and claiming a brand-new "+
 					"session in this same handshake, for a server that refuses an unknown session "+
@@ -2825,11 +2858,25 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	installGen := s.reconnectGen
 	s.mu.Unlock()
 
+	keyFile := req.GetString("keyFile", "")
+	var key []byte
+	if keyFile != "" {
+		abs, err := filepath.Abs(keyFile)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("keyFile: %v", err)), nil
+		}
+		keyFile = abs
+		if key, err = hubenc.ReadKeyFile(keyFile); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("keyFile: %v — nothing was connected", err)), nil
+		}
+	}
+
 	conn, err := hubconn.Dial(link, hubconn.DialOptions{
 		ReconnectSecret: reconnectSecret,
 		AgentID:         stored.PeerID,
 		Name:            name,
 		AgePublicKey:    agePublicKey,
+		Key:             key,
 		CreateToken:     req.GetString("createToken", ""),
 		Topic:           req.GetString("topic", ""),
 	})
@@ -2963,6 +3010,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	_ = s.persistConnectedIfStillHolding(conn, installGen, target, connstore.Entry{
 		PeerID: conn.PeerID(), Name: conn.Name(), Topic: topic, LocalName: s.name,
 		ReconnectSecret: reconnectSecret, LastConnectedAt: time.Now().UTC(), Connected: true, Holder: selfHolder(),
+		KeyFile: keyFile,
 	})
 
 	waitBlock := buildWaitBlock(ctx, w, "reconnect via hub_connect with the same link — your "+
@@ -3104,7 +3152,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			target.Project, defaultProject)
 	}
 
-	notes := todoNote(conn)
+	notes := todoNote(conn) + encryptionNote(conn, keyFile)
 	if !conn.IsTodo() {
 		notes += formatsNote(conn.AcceptedFormats(), conn.DefaultFormat()) + actionsNote(conn)
 	}
@@ -3229,7 +3277,16 @@ func (s *session) behindNote(conn *hubconn.Conn) string {
 // that comes up empty (an unrecognized or missing content type is not a
 // reason to fail the save — a generic byte blob is exactly as usable
 // under a generic extension as under no extension at all).
-func attachmentExtension(contentType string) string {
+//
+// The sender's own extension is kept when the content type allows it:
+// "notes.txt" sent as text/plain stays .txt, where the mime table's first
+// candidate for that type would be .asc.
+func attachmentExtension(contentType, name string) string {
+	if own := strings.ToLower(filepath.Ext(name)); own != "" {
+		if exts, err := mime.ExtensionsByType(contentType); err == nil && slices.Contains(exts, own) {
+			return own
+		}
+	}
 	switch contentType {
 	case "image/png":
 		return ".png"
@@ -3327,6 +3384,26 @@ func processStart(pid int) string {
 	return fields[19]
 }
 
+// processParent is pid's parent pid from /proc/<pid>/stat, or 0 where it
+// cannot be read.
+func processParent(pid int) int {
+	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0
+	}
+	s := string(raw)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return 0
+	}
+	fields := strings.Fields(s[i+1:])
+	if len(fields) < 2 {
+		return 0
+	}
+	ppid, _ := strconv.Atoi(fields[1])
+	return ppid
+}
+
 // selfHolder identifies this process for a stored Connected mark.
 func selfHolder() *connstore.Holder {
 	return &connstore.Holder{PID: os.Getpid(), Start: processStart(os.Getpid())}
@@ -3335,6 +3412,10 @@ func selfHolder() *connstore.Holder {
 // holderLive reports whether h still names the process that recorded it.
 // A pid that is running but started at a different time is a reused pid,
 // and its holder is gone. Anything that cannot be told counts as live.
+// HolderLive reports whether the process recorded as holding a stored
+// connection is still that process and running.
+func HolderLive(h *connstore.Holder) bool { return h != nil && holderLive(h) }
+
 func holderLive(h *connstore.Holder) bool {
 	if alive, _ := processLive(h.PID); !alive {
 		return false
@@ -3787,7 +3868,7 @@ func (s *session) saveReceivedAttachments(conn *hubconn.Conn, events []hubconn.E
 			// different contentType than that name implies — trusting the
 			// name's extension there would mislabel the file actually
 			// written to disk.
-			ext := attachmentExtension(contentType)
+			ext := attachmentExtension(contentType, a.Name)
 			base := fmt.Sprintf("attachment-%d%s", seq, ext)
 			if a.Name != "" {
 				cleaned := filepath.Base(a.Name)
@@ -4279,6 +4360,7 @@ func (h *Hub) disconnectAndRemove(ctx context.Context, name string) (*mcp.CallTo
 // about) — but is meant to be called once, at process shutdown, not from
 // a tool call. A no-op if nothing is connected.
 func (h *Hub) Shutdown() {
+	h.shuttingDown.Store(true)
 	for _, s := range h.allSessions() {
 		s.closeReturnPath()
 		h.close(s.name)

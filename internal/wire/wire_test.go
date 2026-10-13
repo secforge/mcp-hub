@@ -1127,3 +1127,19 @@ func TestTheWireIsReadCaseSensitively(t *testing.T) {
 		t.Fatalf("an unknown field must not stop the known ones reading, got %q", future.Text)
 	}
 }
+
+// An image sent by path carries its file name, as a file sent by path
+// does: a receiver otherwise shows a nameless "file".
+func TestAnImageAttachmentCarriesItsFileName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chart.png")
+	if err := os.WriteFile(path, []byte("\x89PNG\r\n\x1a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := ReadAttachmentFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a) != 1 || a[0].Name != "chart.png" {
+		t.Fatalf("got %+v", a)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/harness"
@@ -46,9 +47,20 @@ func (h *Hub) reportAbandonedConnections() {
 	h.reportAbandonedConnectionsFor(project)
 }
 
+// predecessorWait is how long a restarted client waits for the run it
+// replaces to exit before giving up on reporting its connections.
+var predecessorWait = 15 * time.Second
+
 // reportAbandonedConnectionsFor reports, once, the connections a previous
 // run in project was holding when it ended.
 func (h *Hub) reportAbandonedConnectionsFor(project string) {
+	h.reportAbandoned(project, true)
+}
+
+// reportAbandoned is reportAbandonedConnectionsFor; waitForPredecessor
+// says whether a connection still held by the run this process replaces
+// may be waited for.
+func (h *Hub) reportAbandoned(project string, waitForPredecessor bool) {
 	entries, err := connstore.ListForProject(project)
 	if err != nil {
 		// Nothing to report FROM is different from nothing to report, and
@@ -60,6 +72,12 @@ func (h *Hub) reportAbandonedConnectionsFor(project string) {
 	}
 	var abandoned []string
 	var reported []connstore.Target
+	var predecessors []*connstore.Holder
+	defer func() {
+		if len(predecessors) > 0 {
+			go h.reportAfterPredecessor(project, predecessors)
+		}
+	}()
 	for _, le := range entries {
 		// Connected means "a run was holding this and did not
 		// deliberately let go". At startup this process has connected
@@ -80,7 +98,18 @@ func (h *Hub) reportAbandonedConnectionsFor(project string) {
 		// a previous run's, then clearing the mark, would erase live state
 		// on the word of a process that never held it. An unknown answer
 		// counts as live, for the same reason.
-		if h := le.Entry.Holder; h != nil && h.PID != os.Getpid() && holderLive(h) {
+		//
+		// Except the run this process REPLACES. An MCP client restarting
+		// its server (Claude Code's /mcp reconnect) starts the new process
+		// before the old one has exited, so at this moment the old one is
+		// still alive — and its connections are about to end with it,
+		// unreported. It is told apart from another client by being a
+		// child of the same session: it is waited for, and the scan runs
+		// again once it is gone.
+		if hd := le.Entry.Holder; hd != nil && hd.PID != os.Getpid() && holderLive(hd) {
+			if waitForPredecessor && isPredecessor(hd.PID) {
+				predecessors = append(predecessors, hd)
+			}
 			continue
 		}
 		name := le.Entry.LocalName
@@ -133,4 +162,32 @@ func (h *Hub) reportAbandonedConnectionsFor(project string) {
 		}
 	}
 	h.noteAutoReconnect(note)
+}
+
+// isPredecessor reports whether pid is another child of the process that
+// started this one — the run being replaced, rather than another client.
+var isPredecessor = func(pid int) bool {
+	parent := os.Getppid()
+	return parent > 1 && processParent(pid) == parent
+}
+
+// reportAfterPredecessor waits for the run this process replaces to exit,
+// then reports its connections. If it outlives the wait, its connections
+// are left as they are, as for any live holder.
+func (h *Hub) reportAfterPredecessor(project string, holders []*connstore.Holder) {
+	deadline := time.Now().Add(predecessorWait)
+	for time.Now().Before(deadline) {
+		live := false
+		for _, hd := range holders {
+			if holderLive(hd) {
+				live = true
+				break
+			}
+		}
+		if !live {
+			h.reportAbandoned(project, false)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }

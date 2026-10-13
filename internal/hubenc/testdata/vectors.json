@@ -1,0 +1,40 @@
+{
+  "description": "Encrypted hub sessions v1. See docs/superpowers/specs/2026-10-12-encrypted-hub-sessions-design.md.",
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "salt": "ZGVmZ2hpamtsbW5vcHFycw",
+  "encKey": "ixRprPn_l9QTcgk-eatpM-bJnqQqcZtj6y1OBpr3sXg",
+  "check": "IeuAItQBUEOUA6UNBwOewUxO4o0ldFm3kvpI-3sAceg",
+  "senderPeerId": "039d8443-48fe-4eee-b926-ad617a4a3465",
+  "mid": "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+  "nonce": "yMnKy8zNzs_Q0dLT",
+  "cases": [
+    {
+      "rev": 0,
+      "field": "text",
+      "aad": "v1|ZGVmZ2hpamtsbW5vcHFycw|039d8443-48fe-4eee-b926-ad617a4a3465|6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b|0|text",
+      "plaintext": "hello **world** \u00E4\u00F6\u00FC \uD83D\uDC4D",
+      "ct": "74F4RNX7Jp2dduTK8PqICWjh99pu1M-paIdvTQL5TkCfXSRyVGCZgnu77A"
+    },
+    {
+      "rev": 1,
+      "field": "text",
+      "aad": "v1|ZGVmZ2hpamtsbW5vcHFycw|039d8443-48fe-4eee-b926-ad617a4a3465|6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b|1|text",
+      "plaintext": "edited",
+      "ct": "4oB9XN-_oZwKFon2tG8FHSleZEFcIg"
+    },
+    {
+      "rev": 0,
+      "field": "filemeta:0",
+      "aad": "v1|ZGVmZ2hpamtsbW5vcHFycw|039d8443-48fe-4eee-b926-ad617a4a3465|6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b|0|filemeta:0",
+      "plaintext": "{\u0022name\u0022:\u0022report.pdf\u0022,\u0022contentType\u0022:\u0022application/pdf\u0022}",
+      "ct": "_MZ6Sde-Lo3Ia_PW-6LWB9shUk6BSow2mWKHrF-2gUf_lVAcHzNTbQVHenfSsqpPI8W4sudE22dTgmSHeglhhooslKeb"
+    },
+    {
+      "rev": 0,
+      "field": "file:0",
+      "aad": "v1|ZGVmZ2hpamtsbW5vcHFycw|039d8443-48fe-4eee-b926-ad617a4a3465|6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b|0|file:0",
+      "plaintext": "%PDF-1.4 bytes",
+      "ct": "orRQbpfqIoPKe-_S8aN5lM6Ppt-Q4Ib8JgsZVNIA"
+    }
+  ]
+}

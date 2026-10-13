@@ -192,8 +192,12 @@ type Entry struct {
 	// the wire — purely so a later session can offer the name this
 	// project used last, rather than the caller having to remember it or
 	// invent a second one for the same conversation.
-	LocalName string       `json:"localName,omitempty"`
-	CatchUp   CatchUpState `json:"catchUp,omitempty"`
+	LocalName string `json:"localName,omitempty"`
+	// KeyFile is the path of an encrypted session's key file, so a
+	// reconnect can read the key again. Only the path is stored, never
+	// the key.
+	KeyFile string       `json:"keyFile,omitempty"`
+	CatchUp CatchUpState `json:"catchUp,omitempty"`
 }
 
 // empty reports whether e carries nothing worth keeping on disk.

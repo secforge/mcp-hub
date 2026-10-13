@@ -88,3 +88,23 @@ func TestOutOfCallNoticesArePushedNotOnlyQueued(t *testing.T) {
 		}
 	}
 }
+
+// A client shutting down closes its connections on purpose and reconnects
+// none of them, so it must not announce a drop and an automatic reconnect.
+// The next process reports what this one held.
+func TestShutdownDoesNotAnnounceADropOrAReconnect(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	link, _ := startRelayTestServer(t)
+	h := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := h.handleConnect(context.Background(), req); err != nil || res.IsError {
+		t.Fatalf("connect: %v %s", err, textOf(res))
+	}
+	h.takeAutoReconnectNote()
+	h.Shutdown()
+	time.Sleep(300 * time.Millisecond)
+	if note := h.takeAutoReconnectNote(); strings.Contains(note, "DOWN") || strings.Contains(note, "Reconnecting") {
+		t.Fatalf("shutdown announced a drop: %s", note)
+	}
+}
