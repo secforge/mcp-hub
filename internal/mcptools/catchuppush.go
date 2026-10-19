@@ -179,6 +179,12 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			res.StoppedBy = "a message arrived with no cursor, so the walk could not continue"
 			break
 		}
+		if s.pushedLive(ev.Cursor) {
+			// Already pushed live since this connection came up: the
+			// reader has it, and a second copy reads as a second message.
+			anchor = wire.Anchor{Cursor: ev.Cursor}
+			continue
+		}
 
 		if held != nil {
 			if release(true); res.Err != nil {

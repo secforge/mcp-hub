@@ -112,6 +112,12 @@ type session struct {
 	// are not comparable. Who delivered it is knowable, so it is kept.
 	delivered      map[string]bool
 	deliveredOrder []string
+	// live is the cursors this connection pushed live since it last
+	// connected, so a catch-up walk does not push them a second time. Only
+	// live ones: what an earlier catch-up delivered is delivered again on
+	// request, which is how a message cut off in transit is recovered.
+	live      map[string]bool
+	liveOrder []string
 
 	// redialLink/redialName are what a graceful restart needs in order to
 	// come back without the model having to act. Held only after a
@@ -471,6 +477,7 @@ func (s *session) adoptCatchUp(id connstore.Target, cs connstore.CatchUpState, o
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.catchUpID = id
+	s.live, s.liveOrder = nil, nil
 	s.lastHandedOverCursor = ""
 	s.seekedSinceConnect = false
 	// Nothing is known about what precedes live traffic until a server
@@ -636,6 +643,34 @@ func (s *session) noteDelivered(cursor string) {
 		delete(s.delivered, s.deliveredOrder[0])
 		s.deliveredOrder = s.deliveredOrder[1:]
 	}
+}
+
+// noteLive records that cursor was pushed live on this connection.
+func (s *session) noteLive(cursor string) {
+	if cursor == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live == nil {
+		s.live = map[string]bool{}
+	}
+	if s.live[cursor] {
+		return
+	}
+	s.live[cursor] = true
+	s.liveOrder = append(s.liveOrder, cursor)
+	for len(s.liveOrder) > maxRecentCursors {
+		delete(s.live, s.liveOrder[0])
+		s.liveOrder = s.liveOrder[1:]
+	}
+}
+
+// pushedLive reports whether cursor was pushed live since the last connect.
+func (s *session) pushedLive(cursor string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.live[cursor]
 }
 
 // hasDelivered reports whether this connection handed cursor over.

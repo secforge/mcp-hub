@@ -3846,14 +3846,18 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		budget.Deliver(hubconn.Delivery{
 			Owner: s.name, Cursor: cursor, Bytes: len(text),
 			Send: func() {
-				s.noteDelivered(cursor)
 				if _, err := s.pusher.Push(cursor, text, more); err != nil {
 					// Out of the buffer and delivered nowhere. Nothing is
 					// durably lost — the position only moves on a confirm,
 					// so the server still holds it — but it has to be said.
 					s.note("a message could not be delivered to you live — the push into this " +
 						"session failed. Nothing is lost: call hub_catch_up() to read it.")
+					return
 				}
+				// Only once it went out: a catch-up skips what was
+				// pushed live, and must not skip what failed.
+				s.noteDelivered(cursor)
+				s.noteLive(cursor)
 			},
 			Pause: func(paused string) { _, _ = s.pusher.Push("", paused, false) },
 		})

@@ -117,3 +117,63 @@ func TestCatchUpSaysMoreIsWaitingOnlyWhenAnotherMessageFollows(t *testing.T) {
 		}
 	}
 }
+
+// A message pushed live while a catch-up walk was on its way to it is not
+// pushed a second time by the walk.
+func TestACatchUpSkipsWhatWasAlreadyPushedLive(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
+		joined.Features = teamsTestFeatures()
+		joined.ConversationKind = "group"
+		raw, _ := json.Marshal(joined)
+		conn.WriteMessage(websocket.TextMessage, raw)
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			next := 1
+			if m.Cursor != "" {
+				fmt.Sscanf(m.Cursor, "c%d", &next)
+				next++
+			}
+			if next > 3 {
+				conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+				continue
+			}
+			conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+				Cursor: fmt.Sprintf("c%d", next), Text: fmt.Sprintf("message %d", next),
+				TS: "ts", Historical: true, Answers: &wire.Anchor{At: m.At, Cursor: m.Cursor}})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#skip-secret"
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+	s, _ := hub.session(testConn)
+	conn, _ := s.activeConn()
+	s.noteLive("c2") // pushed live already
+	rec := &recordingDeliverer{}
+	s.pusher = harness.PusherForTesting(rec)
+	res := s.walkCatchUpPush(conn, connstore.Target{}, wire.Anchor{}, catchUpWant{})
+	if !res.CaughtUp || res.Delivered != 2 {
+		t.Fatalf("walk ended %+v, want caught up after delivering 2", res)
+	}
+	for _, d := range rec.got {
+		if strings.Contains(d.Body, "message 2") {
+			t.Fatal("the walk pushed again what had been pushed live")
+		}
+	}
+}
