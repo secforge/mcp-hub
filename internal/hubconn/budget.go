@@ -299,12 +299,15 @@ func (b *budget) note(owner, cursor string) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, ch := range b.outstanding {
+	for i, ch := range b.outstanding {
 		// Owner-scoped for the same reason release is: the same cursor
 		// from a different connection is a different position, and
 		// treating it as already noted left this connection's confirm
 		// with no entry to locate a prefix from.
 		if ch.owner == owner && ch.cursor == cursor {
+			// A held message handed over now has been seen, so a confirm
+			// past it skips nothing.
+			b.outstanding[i].held = false
 			return
 		}
 	}

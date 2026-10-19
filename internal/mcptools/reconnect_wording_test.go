@@ -1,6 +1,7 @@
 package mcptools
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -25,5 +26,20 @@ func TestTheReconnectingRefusalSaysTheReturnIsAnnouncedInPushMode(t *testing.T) 
 	text := textOf(s.notConnected())
 	if strings.Contains(text, "NOT be told") || !strings.Contains(text, "RECONNECTED notice") {
 		t.Fatalf("push-mode refusal:\n%s", text)
+	}
+}
+
+// With nothing following the connection, a failed attempt does not speak
+// of releasing a follower.
+func TestAFailedAttemptMentionsNoFollowerWhenNoneIsHeld(t *testing.T) {
+	h := NewHub()
+	s, err := h.open("t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reportFailedAttempt(1, time.Second, errors.New("network down"))
+	note := h.takeAutoReconnectNote()
+	if strings.Contains(note, "follower") || !strings.Contains(note, "hub_disconnect to stop trying.") {
+		t.Fatalf("notice: %s", note)
 	}
 }

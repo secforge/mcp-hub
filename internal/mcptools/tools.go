@@ -567,6 +567,22 @@ func setCatchUpGapFromCursor(id connstore.Target, cursor, to string) {
 	appendCatchUpGap(id, connstore.GapState{FromCursor: cursor, To: to})
 }
 
+// pastGapEnd reports whether a message timestamped ts lies at or after a
+// gap's end. Compared as times, not strings: "…:14.5Z" sorts before
+// "…:14Z" as text although it is later. Text order is the fallback only
+// for a timestamp that does not parse.
+func pastGapEnd(ts, to string) bool {
+	if ts == "" || to == "" {
+		return false
+	}
+	t, err1 := time.Parse(time.RFC3339Nano, ts)
+	end, err2 := time.Parse(time.RFC3339Nano, to)
+	if err1 != nil || err2 != nil {
+		return ts >= to
+	}
+	return !t.Before(end)
+}
+
 func appendCatchUpGap(id connstore.Target, g connstore.GapState) {
 	if id.Link == "" || !g.Started() {
 		return
@@ -1405,11 +1421,15 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 // because an automatic retry with no visible exit is indistinguishable
 // from being stuck.
 func (s *session) reportFailedAttempt(attempt int, interval time.Duration, err error) {
+	stop := "call hub_disconnect to stop trying, which also releases the follower being held " +
+		"open for it."
+	if w := s.hub.currentWaiter(); w == nil || !w.Following() {
+		stop = "call hub_disconnect to stop trying."
+	}
 	msg := fmt.Sprintf("Automatic reconnect attempt %d FAILED: %v. You are still disconnected. "+
 		"Another attempt follows in about %s, and it will keep retrying at that interval. Either "+
-		"WAIT — you will be told when it succeeds — or call hub_disconnect to stop trying, which "+
-		"also releases the follower being held open for it.",
-		attempt, err, interval.Round(time.Second))
+		"WAIT — you will be told when it succeeds — or %s",
+		attempt, err, interval.Round(time.Second), stop)
 	s.alert(msg)
 	if w := s.hub.currentWaiter(); w != nil {
 		w.Announce("[connection: " + s.name + "]\n[hub: " + msg + "]")
@@ -4754,7 +4774,7 @@ func (s *session) noteReadCoveredGap(start wire.Anchor, events []hubconn.Event) 
 		return
 	}
 	for _, ev := range events {
-		if gap.To != "" && ev.TS != "" && ev.TS >= gap.To {
+		if pastGapEnd(ev.TS, gap.To) {
 			clearCatchUpGap(id, gap)
 			return
 		}
@@ -5652,6 +5672,9 @@ func (s *session) handleCatchUpGap(conn *hubconn.Conn, id connstore.Target, limi
 	// than as text, because the same ending reads differently depending on
 	// whether anything was collected before it.
 	var finished, finishedAllSeen, hitBudget bool
+	// Whether the walk's latest message was one already shown, which is
+	// what decides how reaching the end reads.
+	var lastSkipped bool
 
 walk:
 	for len(events) < limit && skipped < catchUpDedupSkipLimit {
@@ -5684,10 +5707,20 @@ walk:
 				fmt.Sprintf("gap retrieval refused (code=%s, retryable=%t): %s", ev.Code, ev.Retryable, ev.Text),
 			), nil
 		case "msg", "messageEdited", "messageDeleted":
+			// The first message at or after To is where ordinary catch-up
+			// began, so it belongs to that walk, not to the gap.
+			if pastGapEnd(ev.TS, gap.To) {
+				clearCatchUpGap(id, gap)
+				if lastSkipped {
+					finishedAllSeen = true
+				} else {
+					finished = true
+				}
+				break walk
+			}
 			s.mu.Lock()
 			alreadyHandedOver := ev.Cursor != "" && s.handedOverAhead[ev.Cursor]
 			s.mu.Unlock()
-			reachedEnd := gap.To != "" && ev.TS != "" && ev.TS >= gap.To
 			if alreadyHandedOver {
 				// Same reasoning as the ordinary walk's dedup branch —
 				// already shown to the model via a synchronous call, so
@@ -5708,24 +5741,16 @@ walk:
 				s.mu.Unlock()
 				saveHandedOverAhead(aheadID, snapshot)
 				skipped++
-				if reachedEnd {
-					clearCatchUpGap(id, gap)
-					finishedAllSeen = true
-					break walk
-				}
+				lastSkipped = true
 				gap.AnchorCursor = ev.Cursor
 				saveCatchUpGap(id, gap)
 				anchor = wire.Anchor{Cursor: ev.Cursor}
 				continue
 			}
 			events = append(events, ev)
+			lastSkipped = false
 			spent += len(ev.Text)
 			gap.AnchorCursor = ev.Cursor
-			if reachedEnd {
-				clearCatchUpGap(id, gap)
-				finished = true
-				break walk
-			}
 			saveCatchUpGap(id, gap)
 			// A message with no cursor cannot anchor the next step, so the
 			// walk stops rather than asking the same question again.

@@ -1857,8 +1857,8 @@ func TestCatchUpGapReportsNoneWhenNoGapRecorded(t *testing.T) {
 // actually walk back into it. This proves hub_catch_up(gap: true) walks
 // forward from the gap's own start (independent of the normal
 // lastHandedOverCursor position), advances AnchorCursor as it goes, and
-// clears the gap entirely once a retrieved message's own TS reaches the
-// gap's recorded end.
+// clears the gap entirely, without delivering it, at the first message
+// whose TS reaches the gap's recorded end.
 func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	var reqLog []wire.MessageAfter
@@ -1890,12 +1890,20 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 					Answers: &wire.Anchor{At: "2026-09-01T09:00:00Z"},
 				})
 			case m.Cursor == "cursor-gap-1":
-				// Second step: precise cursor continuation. Its TS
-				// reaches the gap's recorded To, so this closes it.
+				// Second step: precise cursor continuation, the gap's
+				// last message.
 				conn.WriteJSON(wire.Msg{
-					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "last gap message", TS: "2026-09-01T10:00:00Z",
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "last gap message", TS: "2026-09-01T09:59:59.5Z",
 					Historical: true, Cursor: "cursor-gap-2", ExternalID: "ext-gap-2",
 					Answers: &wire.Anchor{Cursor: "cursor-gap-1"},
+				})
+			case m.Cursor == "cursor-gap-2":
+				// At the gap's recorded To: where ordinary catch-up
+				// began, so it closes the gap without being part of it.
+				conn.WriteJSON(wire.Msg{
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "first message after the gap", TS: "2026-09-01T10:00:00.25Z",
+					Historical: true, Cursor: "cursor-after-gap", ExternalID: "ext-after-gap",
+					Answers: &wire.Anchor{Cursor: "cursor-gap-2"},
 				})
 			default:
 				conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
@@ -1944,8 +1952,8 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 		t.Fatalf("expected the gap's AnchorCursor to advance to cursor-gap-1, got: %+v (ok=%v)", g, ok)
 	}
 
-	// Step 2: retrieves the last message, whose TS reaches the gap's own
-	// To — this must clear the gap entirely.
+	// Step 2: retrieves the gap's last message. At one message per call
+	// it cannot yet know nothing follows inside the range.
 	res, err = hub.handleCatchUp(ctx, gapReq)
 	if err != nil || res.IsError {
 		t.Fatalf("hub_catch_up(gap: true) step 2 failed: err=%v result=%+v", err, res)
@@ -1953,6 +1961,17 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 	text = textOf(res)
 	if !strings.Contains(text, "last gap message") {
 		t.Fatalf("expected the last gap message, got: %s", text)
+	}
+
+	// Step 3: the next message reaches the gap's own To, which must clear
+	// the gap entirely without delivering that message.
+	res, err = hub.handleCatchUp(ctx, gapReq)
+	if err != nil || res.IsError {
+		t.Fatalf("hub_catch_up(gap: true) step 3 failed: err=%v result=%+v", err, res)
+	}
+	text = textOf(res)
+	if strings.Contains(text, "first message after the gap") {
+		t.Fatalf("the message at the gap's end belongs to ordinary catch-up, yet the gap delivered it: %s", text)
 	}
 	if !strings.Contains(text, "gap range fully retrieved") {
 		t.Fatalf("expected a gap-fully-retrieved note, got: %s", text)
@@ -1967,8 +1986,8 @@ func TestCatchUpGapWalksThenClearsOnReachingTo(t *testing.T) {
 	reqMu.Lock()
 	got := len(reqLog)
 	reqMu.Unlock()
-	if got != 2 {
-		t.Fatalf("expected exactly 2 messageAfter calls (one per gap step), got %d: %+v", got, reqLog)
+	if got != 3 {
+		t.Fatalf("expected exactly 3 messageAfter calls (one per gap step), got %d: %+v", got, reqLog)
 	}
 }
 
@@ -4721,7 +4740,7 @@ func TestAGapIsRetrievedInABatchWhenALimitIsGiven(t *testing.T) {
 				})
 			case m.Cursor == "batch-gap-2":
 				conn.WriteJSON(wire.Msg{
-					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "gap three", TS: "2026-09-01T10:00:00Z",
+					Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "gap three", TS: "2026-09-01T09:07:00Z",
 					Historical: true, Cursor: "batch-gap-3", ExternalID: "ext-batch-3",
 					Answers: &wire.Anchor{Cursor: "batch-gap-2"},
 				})
@@ -5390,3 +5409,21 @@ func uniqueConvID() string {
 }
 
 var convIDSeq atomic.Uint64
+
+func TestPastGapEndComparesTimesNotText(t *testing.T) {
+	for _, c := range []struct {
+		ts, to string
+		want   bool
+	}{
+		{"2026-10-19T06:37:14.5Z", "2026-10-19T06:37:14Z", true},
+		{"2026-10-19T06:37:14Z", "2026-10-19T06:37:14Z", true},
+		{"2026-10-19T06:37:13.9999Z", "2026-10-19T06:37:14Z", false},
+		{"2026-10-19T08:37:15+02:00", "2026-10-19T06:37:14Z", true},
+		{"", "2026-10-19T06:37:14Z", false},
+		{"2026-10-19T06:37:14Z", "", false},
+	} {
+		if got := pastGapEnd(c.ts, c.to); got != c.want {
+			t.Errorf("pastGapEnd(%q, %q) = %v, want %v", c.ts, c.to, got, c.want)
+		}
+	}
+}

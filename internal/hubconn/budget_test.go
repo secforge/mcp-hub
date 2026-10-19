@@ -325,8 +325,8 @@ func TestConfirmingACursorThatWasPulledRatherThanPushedReopensTheWindow(t *testi
 	b.note("", "held-2")
 	b.note("", "walked-3")
 
-	if skipped := b.release("", "walked-3"); !skipped {
-		t.Error("releasing past a held message did not report the skip")
+	if skipped := b.release("", "walked-3"); skipped {
+		t.Error("the held message was handed over by the walk, yet releasing past it reported a skip")
 	}
 	if b.closed() {
 		t.Fatal("the window is still shut after confirming what the reader actually read")
@@ -348,6 +348,19 @@ func TestReleasingPastAHeldMessageReportsTheSkip(t *testing.T) {
 	}
 	if skipped := b.release("", "c"); !skipped {
 		t.Error("releasing past the held message did not report a skip")
+	}
+}
+
+// A held message that catch-up then hands over has been seen, so
+// confirming past it skips nothing.
+func TestAHeldMessageHandedOverLaterIsNoSkip(t *testing.T) {
+	b := testBudget(t)
+	b.hold("", "b")
+	b.note("", "b")
+	b.note("", "c")
+
+	if skipped := b.release("", "c"); skipped {
+		t.Error("confirming past a held message catch-up had delivered reported a skip")
 	}
 }
 
