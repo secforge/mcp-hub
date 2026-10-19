@@ -179,7 +179,55 @@ func (ag *agentSession) install(a *hubconn.Agent) (opened []*session, failed map
 		}
 	}
 	ag.mu.Unlock()
-	return ag.openAll(a, todo)
+	opened, failed = ag.openAll(a, todo)
+	ag.retryFailed(a, failed)
+	return opened, failed
+}
+
+// retryFailed keeps trying the conversations that could not be opened.
+func (ag *agentSession) retryFailed(a *hubconn.Agent, failed map[string]string) {
+	for conv := range failed {
+		go ag.retryOpen(a, conv, 1)
+	}
+}
+
+// retryOpen opens a granted conversation that failed to open, backing off
+// between attempts, until it is open, its grant ends, the agent socket is
+// replaced, or the attempts run out — then it says so once.
+func (ag *agentSession) retryOpen(a *hubconn.Agent, conv string, attempt int) {
+	time.Sleep(reconnectBackoff(attempt))
+	ag.opMu.Lock()
+	defer ag.opMu.Unlock()
+	ag.mu.Lock()
+	it, granted := ag.grants[conv]
+	_, open := ag.children[conv]
+	current := ag.agent == a && !ag.leaving && !ag.userClosed[conv]
+	ag.mu.Unlock()
+	if !current || !granted || open {
+		return
+	}
+	s, err := ag.openChild(a, it, nil, nil)
+	switch {
+	case err == nil:
+		ag.mu.Lock()
+		delete(ag.failed, conv)
+		ag.mu.Unlock()
+		ag.alert(fmt.Sprintf("Conversation %q, which could not be opened at first, is open now as "+
+			"connection %q (%s). Call hub_catch_up(connection: %q) before acting in it.",
+			it.Title, s.name, accessText(s), s.name))
+	case attempt >= maxReopenAttempts:
+		ag.mu.Lock()
+		ag.failed[conv] = err.Error()
+		ag.mu.Unlock()
+		ag.alert(fmt.Sprintf("Conversation %q could not be opened after %d attempts (last: %v). It "+
+			"stays shared and is tried again when the agent connection next reconnects.",
+			it.Title, attempt, err))
+	default:
+		ag.mu.Lock()
+		ag.failed[conv] = err.Error()
+		ag.mu.Unlock()
+		go ag.retryOpen(a, conv, attempt+1)
+	}
 }
 
 // openAll opens items concurrently, a bounded number at a time.
@@ -527,7 +575,8 @@ func (ag *agentSession) handleEvent(a *hubconn.Agent, ev hubconn.AgentEvent) {
 			ag.failed[ev.Conv] = err.Error()
 			ag.mu.Unlock()
 			ag.alert(fmt.Sprintf("A new conversation %q was shared with this agent, but opening it "+
-				"failed: %v.", ev.Item.Title, err))
+				"failed: %v. It is tried again by itself.", ev.Item.Title, err))
+			go ag.retryOpen(a, ev.Conv, 1)
 			return
 		}
 		ag.alert(fmt.Sprintf("NEW CONVERSATION shared with this agent: %q, open as connection %q "+
@@ -616,7 +665,9 @@ func (ag *agentSession) handleEvent(a *hubconn.Agent, ev hubconn.AgentEvent) {
 		for _, s := range gone {
 			ag.release(s, "it is no longer shared with this agent", true)
 		}
-		if opened, _ := ag.openAll(a, fresh); len(opened) > 0 {
+		opened, failedNow := ag.openAll(a, fresh)
+		ag.retryFailed(a, failedNow)
+		if len(opened) > 0 {
 			ag.alert(fmt.Sprintf("%d conversation(s) newly shared with this agent are open: %s.",
 				len(opened), sessionNames(opened)))
 		}
@@ -663,6 +714,7 @@ func sessionNames(ss []*session) string {
 
 // alert tells the reader something about the agent connection as a whole.
 func (ag *agentSession) alert(text string) {
+	text = noticeText(text)
 	if ag.pusher != nil {
 		if ok, _ := ag.pusher.Available(); ok {
 			if _, err := ag.hub.gate().push(ag.pusher, "[hub: on agent "+ag.name+": "+text+"]"); err == nil {
@@ -936,7 +988,8 @@ func (ag *agentSession) connectSummary(opened []*session, failed map[string]stri
 			convs = append(convs, c)
 		}
 		sort.Strings(convs)
-		b.WriteString(fmt.Sprintf("%d shared conversation(s) could NOT be opened:\n", len(failed)))
+		b.WriteString(fmt.Sprintf("%d shared conversation(s) could NOT be opened yet; each is tried "+
+			"again by itself, and you are told when it opens:\n", len(failed)))
 		for i, c := range convs {
 			if i == 10 {
 				b.WriteString(fmt.Sprintf("  … and %d more\n", len(convs)-10))

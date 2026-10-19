@@ -12,6 +12,7 @@ import (
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/harness"
 	"github.com/secforge/mcp-hub/internal/hubconn"
+	"github.com/secforge/mcp-hub/internal/sanitize"
 	"github.com/secforge/mcp-hub/internal/waiter"
 )
 
@@ -538,6 +539,7 @@ func (s *session) note(text string) {
 // when that push does not happen. Never called with s.mu held: a push is
 // a socket write.
 func (s *session) alert(text string) {
+	text = noticeText(text)
 	if s.pusher != nil {
 		if ok, _ := s.pusher.Available(); ok {
 			if _, err := s.hub.gate().push(s.pusher, "[hub: on "+s.name+": "+text+"]"); err == nil {
@@ -546,6 +548,20 @@ func (s *session) alert(text string) {
 		}
 	}
 	s.note(text)
+}
+
+// maxNoticeRunes caps one of this client's own notices.
+const maxNoticeRunes = 4000
+
+// noticeText makes text safe to frame as one of this client's own
+// "[hub: …]" notices. Such a notice routinely carries words the server
+// chose — an error, a reason a conversation was removed, a refusal — and a
+// server that put a line break and a closing bracket into them could make
+// the rest read as a second, separate notice in this client's voice. So
+// control characters go, "]" becomes ")", and the length is capped. None
+// of this client's own wording uses either.
+func noticeText(text string) string {
+	return strings.ReplaceAll(sanitize.Text(text, maxNoticeRunes), "]", ")")
 }
 
 // forRequest resolves the connection a tool call names, and answers for

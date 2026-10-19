@@ -345,13 +345,25 @@ func (a *Agent) Open(conv string, key []byte) (*Conn, error) {
 		a.forget(v)
 		return nil, err
 	}
-	c, err := finishHandshake(v, a.pongWait, a.writeWait, confirmReminderInterval, key)
+	raw, err := readFirstFrameWithin(v, convOpenWait)
+	if err != nil {
+		v.Close()
+		return nil, err
+	}
+	c, err := startConn(v, raw, a.pongWait, a.writeWait, confirmReminderInterval, key)
 	if err != nil {
 		v.Close()
 		return nil, err
 	}
 	return c, nil
 }
+
+// convOpenWait is how long an opened conversation's "joined" may take.
+// Longer than a socket's own handshake wait: an agent opens many
+// conversations at once on one socket, and a server answering them one
+// after another can take seconds each — a Teams conversation's open is
+// calls to Microsoft's API — so the last in line wait for all the others.
+var convOpenWait = 30 * time.Second
 
 // forget removes v, if it is still the session registered for its
 // conversation.

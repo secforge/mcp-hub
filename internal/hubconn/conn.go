@@ -1097,6 +1097,11 @@ const maxReadFrameBytes = 48 * 1024 * 1024
 
 // readFirstFrame reads the first frame a server sends after the upgrade.
 func readFirstFrame(ws transport, snapPongWait time.Duration) ([]byte, error) {
+	return readFirstFrameWithin(ws, min(10*time.Second, snapPongWait))
+}
+
+// readFirstFrameWithin is readFirstFrame with the wait given.
+func readFirstFrameWithin(ws transport, handshakeWait time.Duration) ([]byte, error) {
 	// BOUNDED, because an upgrade is not an answer. A server that
 	// completes the HTTP upgrade and then says nothing left this read
 	// blocked with no deadline set yet — the deadline the read loop
@@ -1109,10 +1114,6 @@ func readFirstFrame(ws transport, snapPongWait time.Duration) ([]byte, error) {
 	// nothing — hub_connect simply hung for it. A joined frame is the
 	// first thing a server sends and it sends it immediately. Found by
 	// an external reviewer, 2026-09-20.
-	handshakeWait := 10 * time.Second
-	if snapPongWait < handshakeWait {
-		handshakeWait = snapPongWait
-	}
 	_ = ws.SetReadDeadline(time.Now().Add(handshakeWait))
 	// Set BEFORE the first read, not with the rest of the connection's
 	// settings further down: the joined frame is itself a frame from a

@@ -1438,10 +1438,10 @@ func (s *session) reportFailedAttempt(attempt int, interval time.Duration, err e
 	if w := s.hub.currentWaiter(); w == nil || !w.Following() {
 		stop = "call hub_disconnect to stop trying."
 	}
-	msg := fmt.Sprintf("Automatic reconnect attempt %d FAILED: %v. You are still disconnected. "+
+	msg := noticeText(fmt.Sprintf("Automatic reconnect attempt %d FAILED: %v. You are still disconnected. "+
 		"Another attempt follows in about %s, and it will keep retrying at that interval. Either "+
 		"WAIT — you will be told when it succeeds — or %s",
-		attempt, err, interval.Round(time.Second), stop)
+		attempt, err, interval.Round(time.Second), stop))
 	s.alert(msg)
 	if w := s.hub.currentWaiter(); w != nil {
 		w.Announce("[connection: " + s.name + "]\n[hub: " + msg + "]")
