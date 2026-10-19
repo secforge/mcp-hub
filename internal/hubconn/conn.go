@@ -2445,6 +2445,10 @@ func (c *Conn) readLoop() {
 				c.peers[p.ID] = p
 			}
 			c.rosterAnnounced = true
+			// Recorded on arrival rather than when the buffer is
+			// drained: a catch-up can show the roster before that, and
+			// must not leave it looking new to the next live message.
+			c.rosterStale = true
 		}
 		c.mu.Unlock()
 		if abandoned {
@@ -3688,25 +3692,46 @@ func (c *Conn) rosterBeforeMessagesLocked(evs []Event) []Event {
 	for _, e := range evs {
 		switch {
 		case e.Kind == "roster":
-			c.rosterStale = true
+			// Delivered in front of a message instead; that it changed
+			// was recorded when it arrived.
 			continue
 		case e.Kind == "msg" && !e.Historical:
-			due := c.rosterStale || c.lastPushedMsg.IsZero() || time.Since(c.lastPushedMsg) > c.rosterQuiet
-			c.lastPushedMsg = time.Now()
-			if due && c.rosterAnnounced {
-				c.rosterStale = false
-				peers := make([]PeerInfo, 0, len(c.peers))
-				for _, p := range c.peers {
-					peers = append(peers, p)
-				}
-				sort.Slice(peers, func(i, j int) bool { return peers[i].ID < peers[j].ID })
-				out = append(out, Event{Kind: "roster", RosterPeers: peers,
-					RosterNameTaken: nameTaken(c.name, peers)})
+			if r, ok := c.rosterDueLocked(); ok {
+				out = append(out, r)
 			}
 		}
 		out = append(out, e)
 	}
 	return out
+}
+
+// RosterDue returns the current roster when it is due in front of the
+// message about to be delivered — by a catch-up walk, which reads from
+// the server rather than from the buffer — and records it as shown.
+func (c *Conn) RosterDue() (Event, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.rosterBeforeMessages {
+		return Event{}, false
+	}
+	return c.rosterDueLocked()
+}
+
+// rosterDueLocked records a message as delivered and returns the roster
+// when one is due in front of it. Caller holds c.mu.
+func (c *Conn) rosterDueLocked() (Event, bool) {
+	due := c.rosterStale || c.lastPushedMsg.IsZero() || time.Since(c.lastPushedMsg) > c.rosterQuiet
+	c.lastPushedMsg = time.Now()
+	if !due || !c.rosterAnnounced {
+		return Event{}, false
+	}
+	c.rosterStale = false
+	peers := make([]PeerInfo, 0, len(c.peers))
+	for _, p := range c.peers {
+		peers = append(peers, p)
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].ID < peers[j].ID })
+	return Event{Kind: "roster", RosterPeers: peers, RosterNameTaken: nameTaken(c.name, peers)}, true
 }
 
 // ShapeForPush renders one event for the push path, spilling an

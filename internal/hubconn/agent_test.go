@@ -359,3 +359,25 @@ func TestTheRosterGoesOutAgainAfterAQuietSpell(t *testing.T) {
 		t.Fatalf("got %v, want the roster again after the quiet spell", got)
 	}
 }
+
+func TestACatchUpGetsTheRosterWhenItIsDueAndOnlyThen(t *testing.T) {
+	srv := agenttest.New(t, grant("c-a", "Alpha", wire.AccessReadWrite))
+	a := dialAgent(t, srv)
+	c := openConv(t, a, "c-a")
+	c.PushRosterBeforeMessages(time.Hour)
+	srv.Conv("c-a", wire.NewRoster([]wire.RosterMember{{PeerID: testPeer, Name: "Alice"}}))
+	deadline := time.Now().Add(3 * time.Second)
+	for !c.RosterComplete() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if r, ok := c.RosterDue(); !ok || len(r.RosterPeers) != 1 {
+		t.Fatalf("no roster in front of the first message of a catch-up: %+v %v", r, ok)
+	}
+	if _, ok := c.RosterDue(); ok {
+		t.Fatal("the roster was due again right after it was shown")
+	}
+	srv.Msg("c-a", testPeer, "live", "1")
+	if got := drainUntil(t, c, 1); got[0] != "live" {
+		t.Fatalf("a live message after the catch-up repeated the roster: %v", got)
+	}
+}

@@ -478,3 +478,34 @@ func TestAConversationThatFailedToOpenIsTriedAgainByItself(t *testing.T) {
 		return false
 	})
 }
+
+func TestTheListCanBeNarrowedByTitleKindAndAccess(t *testing.T) {
+	srv := agenttest.New(t,
+		wire.Assignment{Conv: "c1", Title: "Einkauf Müller", Kind: "oneOnOne", Channel: "teams", Access: wire.AccessReadWrite},
+		wire.Assignment{Conv: "c2", Title: "Support", Kind: "group", Channel: "teams", Access: wire.AccessRead},
+		wire.Assignment{Conv: "c3", Title: "Einkauf Team", Kind: "group", Channel: "teams", Access: wire.AccessReadWrite})
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	list := func(args map[string]any) string {
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = args
+		res, _ := h.handleListConnections(context.Background(), req)
+		return textOf(res)
+	}
+	count := func(text string) int { return strings.Count(text, "desk-") }
+	if got := list(map[string]any{"query": "einkauf"}); count(got) != 2 || strings.Contains(got, "PREVIOUSLY USED") {
+		t.Fatalf("query: %s", got)
+	}
+	if got := list(map[string]any{"kind": "group", "access": "readwrite"}); count(got) != 1 ||
+		!strings.Contains(got, "Einkauf Team") {
+		t.Fatalf("kind+access: %s", got)
+	}
+	if got := list(map[string]any{"limit": 1}); count(got) != 1 || !strings.Contains(got, "and 2 more") {
+		t.Fatalf("limit: %s", got)
+	}
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"access": "write"}
+	if res, _ := h.handleListConnections(context.Background(), req); !res.IsError {
+		t.Fatal("an unknown access value was accepted")
+	}
+}

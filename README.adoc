@@ -429,11 +429,16 @@ tools tell the model to do this only when the user asks.
 session, and reopen it with that key. The path is stored for that
 conversation, never the key.
 
-|`hub_list_connections()`
+|`hub_list_connections(query?, kind?, access?, unread?, limit?)`
 |The links this project has used, with the peer id, display name,
 conversation name and `as` name each last used, any recorded catch-up gap,
 and whether the entry is still marked open from a connection that never got
-a `hub_disconnect`. Read-only.
+a `hub_disconnect`. An agent connection's conversations are listed under it,
+with title, kind, access and unread count at open. The optional filters
+combine: `query` matches name or title, `kind` the conversation kind
+(`oneOnOne`, `group`, `channel`, …), `access` `read` or `readwrite`, `unread`
+only those that had unread messages when opened, and `limit` caps the lines.
+A filtered listing shows only what is open. Read-only.
 
 |`hub_send(connection, text, to?, imagePath?, filePath?, format?, replyTo?, mentions?, confirmCursor?)`
 |Send a message; broadcast unless `to` names one peer id. `imagePath`

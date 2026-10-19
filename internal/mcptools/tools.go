@@ -2095,7 +2095,23 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"marked open from a connect that never got an explicit hub_disconnect. "+
 				"Read-only, no side effects. Never includes the secret behind an identity — "+
 				"that stays out of your context by design; you don't need it, hub_connect "+
-				"presents it for you")),
+				"presents it for you. An agent connection's conversations are listed under it; "+
+				"with many of them, narrow the list with the optional filters, which combine"),
+			mcp.WithString("query", mcp.Description(
+				"Optional: only connections and conversations whose name or title contains this, "+
+					"ignoring case")),
+			mcp.WithString("kind", mcp.Description(
+				"Optional: only conversations of this kind as the server names it, e.g. oneOnOne, "+
+					"group, channel, meeting, hub")),
+			mcp.WithString("access", mcp.Description(
+				"Optional: \"read\" or \"readwrite\" — only conversations an agent connection may "+
+					"read only, or also write in")),
+			mcp.WithBoolean("unread", mcp.Description(
+				"Optional: only conversations that reported unread messages when they were opened. "+
+					"A snapshot from that moment, not a live count")),
+			mcp.WithNumber("limit", mcp.Description(
+				"Optional: list at most this many conversations, saying how many more matched")),
+		),
 		h.handleListConnections,
 	)
 	addTool(
@@ -5015,6 +5031,10 @@ func (h *Hub) handleSelfUpdate(ctx context.Context, req mcp.CallToolRequest) (*m
 }
 
 func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	f, err := listFilterFrom(req)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	// What is OPEN comes first and separately from what is merely stored.
 	// A stored entry is a link this project has used; an open one is a
 	// name that tools will answer to right now, and only the second is
@@ -5026,6 +5046,9 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 			continue
 		}
 		conn, _ := s.activeConn()
+		if !f.matchSession(s, conn, "", "", "") {
+			continue
+		}
 		state := "connecting"
 		switch {
 		case conn != nil && conn.Connected():
@@ -5047,7 +5070,7 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		openLines = append(openLines, line)
 	}
 	for _, ag := range h.allAgents() {
-		openLines = append(openLines, strings.Join(ag.listing(), "\n  "))
+		openLines = append(openLines, strings.Join(ag.listing(f), "\n  "))
 	}
 	openBlock := "No connection is open. hub_connect opens one and gives it a name.\n\n"
 	if len(openLines) > 0 {
@@ -5062,6 +5085,11 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 	}
 	if len(entries) == 0 {
 		return mcp.NewToolResultText(openBlock + "no stored connections for this project"), nil
+	}
+	if f.active() {
+		// The stored entries say nothing about kind, access or unread
+		// messages, so a filtered listing is about what is open.
+		return mcp.NewToolResultText(strings.TrimRight(openBlock, "\n")), nil
 	}
 	lines := make([]string, 0, len(entries))
 	agentConvs := 0
@@ -5726,8 +5754,12 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				s.mu.Unlock()
 				_ = setCatchUpCursor(id, ev.Cursor)
 			}
+			roster := ""
+			if r, ok := conn.RosterDue(); ok {
+				roster = hubconn.FormatEventOn(s.name, r) + "\n\n"
+			}
 			formatted := decisionNote(cursor, project, conn, measuredBehind, branch) +
-				seekNote + hubconn.FormatEventOn(s.name, ev) +
+				seekNote + roster + hubconn.FormatEventOn(s.name, ev) +
 				"\n\n[hub: more may remain — call hub_catch_up again; you'll be told \"caught up\" once " +
 				"there's nothing further]"
 			return s.resultWithReceivedAttachments(conn, formatted, []hubconn.Event{ev}), nil

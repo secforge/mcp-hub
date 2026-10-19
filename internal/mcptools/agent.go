@@ -1042,7 +1042,7 @@ func (ag *agentSession) childLine(s *session) string {
 }
 
 // listing describes the agent connection and every conversation on it.
-func (ag *agentSession) listing() []string {
+func (ag *agentSession) listing(f listFilter) []string {
 	ag.mu.Lock()
 	children := make([]*session, 0, len(ag.children))
 	for _, s := range ag.children {
@@ -1071,13 +1071,32 @@ func (ag *agentSession) listing() []string {
 	}
 	ag.mu.Unlock()
 	sort.Slice(children, func(i, j int) bool { return children[i].name < children[j].name })
-	lines := []string{fmt.Sprintf("%s — AGENT connection, %s, %d conversation(s) open (link=%s). Its "+
-		"conversations, each addressed by its own name:", ag.name, state, len(children), ag.link)}
+	var matched []string
 	for _, s := range children {
-		lines = append(lines, "    "+ag.childLine(s))
+		it := grants[s.conv]
+		conn, _ := s.activeConn()
+		if f.matchSession(s, conn, it.Title, strings.TrimSpace(it.Kind+" "+it.Channel), it.Access) {
+			matched = append(matched, "    "+ag.childLine(s))
+		}
 	}
+	header := fmt.Sprintf("%s — AGENT connection, %s, %d conversation(s) open (link=%s). Its "+
+		"conversations, each addressed by its own name:", ag.name, state, len(children), ag.link)
+	if f.active() {
+		header = fmt.Sprintf("%s — AGENT connection, %s, %d conversation(s) open (link=%s), %d "+
+			"matching the filter:", ag.name, state, len(children), ag.link, len(matched))
+	}
+	lines := []string{header}
+	if f.limit > 0 && len(matched) > f.limit {
+		more := len(matched) - f.limit
+		matched = append(matched[:f.limit], fmt.Sprintf("    … and %d more matching; narrow the "+
+			"filter or raise limit", more))
+	}
+	lines = append(lines, matched...)
 	for c, why := range failed {
-		lines = append(lines, fmt.Sprintf("    (not open) %q — could not be opened: %s", grants[c].Title, why))
+		// Kind, access and unread messages are only known once open.
+		if f.kind == "" && f.access == "" && !f.unread && f.matchTitle(grants[c].Title) {
+			lines = append(lines, fmt.Sprintf("    (not open) %q — could not be opened: %s", grants[c].Title, why))
+		}
 	}
 	if closed > 0 {
 		lines = append(lines, fmt.Sprintf("    %d conversation(s) closed by you; reopened when the agent "+

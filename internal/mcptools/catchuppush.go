@@ -184,6 +184,8 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			if release(true); res.Err != nil {
 				break
 			}
+		} else if res.Delivered == 0 {
+			s.pushRosterIfDue(conn)
 		}
 		text := conn.ShapeForPush(ev)
 		text += s.saveReceivedAttachments(conn, []hubconn.Event{ev})
@@ -235,6 +237,21 @@ func (s *session) pushCatchUpMessage(conn *hubconn.Conn, id connstore.Target, ev
 		s.recordHandedOver([]hubconn.Event{ev})
 	}
 	return nil
+}
+
+// pushRosterIfDue pushes the conversation's member list in front of a
+// run's first message, when one is due — as live delivery does for an
+// agent connection's conversations.
+func (s *session) pushRosterIfDue(conn *hubconn.Conn) {
+	r, ok := conn.RosterDue()
+	if !ok {
+		return
+	}
+	text := conn.ShapeForPush(r)
+	if text == "" || !s.hub.gate().budget.Take(s.name, "", len(text)) {
+		return
+	}
+	_, _ = s.pusher.Push("", text, true)
 }
 
 // pushCatchUpSummary is the last thing a run delivers: what happened and
