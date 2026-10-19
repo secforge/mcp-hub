@@ -313,6 +313,47 @@ cannot search message text. The protocol is §2.11 of
 * Plaintext reaches this machine's disk only as received attachments and
   oversized message bodies the client saves for the model, all owner-only.
 
+== Agent connections
+
+On a server that supports them (chat-relay), an operator creates an *agent*
+in the UI and shares conversations of any kind with it: each read-only or
+read-write, with all history, history from a date, or none, and removable
+again. The agent's link is connected like any other:
+
+[source]
+----
+hub_connect(as: "desk", link: "<agent link>", name: "Claude Code (desk)")
+----
+
+The client recognizes the agent connection from the server's first frame,
+never from the link. One socket carries every shared conversation, and each
+one opens as its own connection named after the agent connection: a slug of
+the conversation's title plus a hash of the server's handle for it, for
+example `desk-einkauf-mueller-3fa1c2`. The name stays the same across
+reconnects and restarts. Every tool call names the conversation it acts on,
+exactly as with ordinary connections, and a tool call that names the agent
+itself is refused. `hub_list_connections` lists every conversation with its
+title, access and unread count. The agent connection's own name is at most
+16 characters, since each conversation's name has to fit beside it.
+
+* *Read-only* conversations refuse every write (send, edit, react, delete,
+  pin) in the client before anything is sent. The server refuses them too.
+* A conversation shared at runtime opens as a new connection, and the model
+  is told. A changed grant reopens it under the new rules. A withdrawn one
+  ends, its name stops working, and its stored read position is deleted.
+* When the socket drops, the client reconnects it and reopens every
+  conversation, each from its own read position, and says so once.
+  `hub_disconnect` with the agent's name ends all of them, and with a
+  conversation's name closes only that one until the agent next reconnects.
+* An encrypted conversation needs its key file, given per conversation with
+  `hub_set_key(connection, keyFile)`. Until then it can be read only as
+  sealed notices, and nothing can be sent there.
+* The number of conversations is the server's decision and is not capped by
+  the client (tested with 1000). The limit of 8 connections counts the agent
+  connection as one.
+
+The protocol is §2.12 of `docs/wire-protocol.md`.
+
 == Sending from a script
 
 `mcp-hub-client send` sends one message into a conversation and exits,
@@ -361,7 +402,8 @@ peer id, whether a previous identity was resumed, what the server declared
 about itself, and how messages will arrive. `projectDir` overrides the
 project scope for this connection only, and is discouraged — see
 <<_the_project_scope>>. `keyFile` joins an end-to-end encrypted session
-(see <<_encrypted_sessions>>).
+(see <<_encrypted_sessions>>). An agent link opens every conversation shared
+with the agent, each as its own connection (see <<_agent_connections>>).
 
 |`hub_disconnect(connection, remove?)`
 |Leave and tear the connection down. The stored entry stays, so the next
@@ -381,6 +423,11 @@ entry an open connection holds is disconnected and removed the same way.
 *Irreversible*: the next connect to that link gets a new identity, which the
 other peers see as a new participant, and nothing to catch up from. Both
 tools tell the model to do this only when the user asks.
+
+|`hub_set_key(connection, keyFile)`
+|Give one conversation of an agent connection the key file of its encrypted
+session, and reopen it with that key. The path is stored for that
+conversation, never the key.
 
 |`hub_list_connections()`
 |The links this project has used, with the peer id, display name,
@@ -498,6 +545,21 @@ address a message came from, with an optional first line
 `#hub conn=<name> to=<peerId> replyTo=<externalId> confirm=<cursor> format=html`;
 `conn` is required. `hub_send` does the same with no address needed, and is
 the only way to attach files or mentions.
+
+The client keeps at most 25 deliveries, or 500 KB, that the model has
+not confirmed: every kind (messages, member lists, its own notices,
+catch-up deliveries, operator messages and mentions) across every
+connection, pushed or written to a follower. The 25th is a notice that
+more is waiting. What does not fit waits, in order, and nothing is lost.
+Only `hub_confirm` frees room: with a cursor it frees everything delivered
+up to that message, from every connection, and moves that connection's
+read position; with no arguments it frees everything delivered so far and
+moves no position. A catch-up run delivers only what fits.
+
+A conversation of an agent connection does not push its member list when
+it arrives. The current one goes out in front of the conversation's first
+message, again in front of the first message after 30 minutes without
+one, and after a membership change. `hub_peers` returns it at any time.
 
 === Pull (everything else): the `wait` mode
 

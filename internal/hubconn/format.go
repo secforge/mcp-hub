@@ -225,16 +225,12 @@ func FormatEvent(e Event) string {
 		}
 		return "[hub: the server is shutting down on purpose, with no estimate of when it will be " +
 			"back. The disconnect that follows is expected]"
-	case "deliveryHeld":
+	case "deliveryPaused":
 		// Deliberately short: this is the message that says delivery has
 		// stopped, so it is the one that must survive the notification
-		// path's own 500-rune cut. Said once per closure, not per event —
-		// repeating it would spend the attention the gate exists to save.
-		return fmt.Sprintf("[hub: LIVE DELIVERY PAUSED after %d message(s) — this client has "+
-			"pushed as much as it will without a confirm, so new messages are no longer being "+
-			"delivered here. Nothing is lost: they are on the server. Call hub_confirm with the "+
-			"last cursor you have COMPLETE to resume, or hub_catch_up to read on regardless. "+
-			"Mentions and operator messages still come through]", e.HeldCount)
+		// path's own 500-rune cut. Said once per pause, across every
+		// connection — repeating it would spend the window it reports on.
+		return DeliveryPausedText()
 	case "roster":
 		// Names them, because this is the ONLY line the reader gets about
 		// who was already here, and a list of names is what makes it
@@ -592,6 +588,16 @@ const pushEnvelopeBound = 80
 // are never written.
 func pushDeliveredCost(e Event) int {
 	return len(FormatEventForPush(e)) + pushEnvelopeBound
+}
+
+// DeliveryPausedText is the one notice that the process's delivery window
+// is full, whichever path finds it full first.
+func DeliveryPausedText() string {
+	return "[hub: DELIVERY PAUSED — this client keeps at most 25 deliveries (or 500 KB) for you " +
+		"that you have not confirmed, across every connection and every kind. More is waiting, in " +
+		"order, and nothing is lost. To receive it: hub_confirm(connection, cursor) with the last " +
+		"message you have read COMPLETE frees everything delivered up to it, or hub_confirm() " +
+		"with no arguments once you have taken in everything delivered so far]"
 }
 
 func FormatEventsBatch(events []Event) []string {

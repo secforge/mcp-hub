@@ -157,7 +157,7 @@ func (h *Hub) reportAbandoned(project string, waitForPredecessor bool) {
 	// does not happen — never as well, which would say it twice.
 	pusher := harness.Open()
 	if ok, _ := pusher.Available(); ok {
-		if _, err := pusher.Push("", "[hub: "+note+"]", false); err == nil {
+		if _, err := h.gate().push(pusher, "[hub: "+note+"]"); err == nil {
 			return
 		}
 	}

@@ -52,6 +52,15 @@ type Hub struct {
 	// on a connection names one, and an unknown name is an error rather
 	// than a fallback to whichever is open.
 	sessions map[string]*session
+	// agents is every open agent connection, keyed by its name. Its
+	// conversations are sessions in the map above, under names derived
+	// from it; the agent's own name addresses the agent as a whole.
+	agents map[string]*agentSession
+	// pushGate delivers this client's own notices within the delivery
+	// window — see pushgate.go. Created on first use, so a Hub built as a
+	// literal has one too.
+	gateOnce sync.Once
+	pushGate *pushGate
 	// srv is the MCP server these tools are registered on, kept so the
 	// tool set can change once the caller has identified itself — see
 	// adoptCodexMode.
@@ -930,7 +939,10 @@ func (s *session) teardown(conn *hubconn.Conn, keepWaiter bool) {
 			w.Detach(s.name, "it disconnected and is not coming back on its own")
 		}
 	}
-	if target != (connstore.Target{}) {
+	// A conversation of an agent connection carries no mark to clear (its
+	// agent's entry does), and a thousand of them ending with their agent
+	// would otherwise rewrite the file a thousand times for nothing.
+	if target != (connstore.Target{}) && s.agent == nil {
 		_ = connstore.MarkDisconnected(target)
 	}
 	// A connection that is not coming back gives up its name, so the
@@ -1876,7 +1888,10 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"The link may address an ordinary hub session or a conversation mirrored from a "+
 				"real chat platform (e.g. Microsoft Teams); that is the server's business, not "+
 				"something to work out from the link, and hub_send/"+receiveTools()+"/"+
-				"hub_peers/hub_catch_up work the same way either way. The connect result states "+
+				"hub_peers/hub_catch_up work the same way either way. A link can also turn out to "+
+				"be an AGENT connection, which carries every conversation shared with an agent: "+
+				"each conversation then opens as its own connection, named after `as` (at most 16 "+
+				"characters then), and the result says so. The connect result states "+
 				"what this particular server declared about itself"+
 				projectOverrideNote()+startupConnectionsNote()),
 			mcp.WithString("as", mcp.Required(), mcp.Description(
@@ -2057,6 +2072,20 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"project's stored entries. Exactly one of connection and link")),
 		),
 		h.handleRemove,
+	)
+	addTool(
+		mcp.NewTool("hub_set_key",
+			mcp.WithDescription("Give one conversation of an AGENT connection the key file of its "+
+				"END-TO-END ENCRYPTED session, and reopen it with that key — the only way to read or "+
+				"send in an encrypted conversation shared with an agent. An ordinary connection takes "+
+				"keyFile at hub_connect instead. Pass the PATH the user gives you; never read the file, "+
+				"and never put a key into a tool argument or a message. The path is remembered for "+
+				"this conversation; the key is not stored"),
+			connectionParam(),
+			mcp.WithString("keyFile", mcp.Required(), mcp.Description(
+				"Path of the key file, readable by its owner only")),
+		),
+		h.handleSetKey,
 	)
 	addTool(
 		mcp.NewTool("hub_list_connections",
@@ -2300,7 +2329,9 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	)
 	addTool(
 		mcp.NewTool("hub_confirm",
-			connectionParam(),
+			mcp.WithString("connection", mcp.Description(
+				"Which connection the cursor belongs to — the name you gave it at hub_connect. "+
+					"Required with cursor; leave both out to free the delivery window only.")),
 			mcp.WithDescription("Explicitly confirm you received a message INTACT, by its cursor — "+
 				confirmWhyNote()+
 				" Advances this session's persisted catch-up position to cursor and "+
@@ -2313,8 +2344,13 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"can re-deliver it properly. "+confirmCadenceNote()+
 				" On a server that "+
 				"reports it, the result also states how many messages remain after the position "+
-				"you confirmed. Errors if not connected."),
-			mcp.WithString("cursor", mcp.Required(), mcp.Description(
+				"you confirmed. Errors if not connected.\n\nDELIVERY WINDOW: this client keeps at most 25 "+
+				"deliveries (or 500 KB) for you unconfirmed, across every connection and every kind. "+
+				"A confirm frees everything delivered up to the cursor you name, from every connection. "+
+				"Called with NO arguments it frees the whole window without moving any read position — "+
+				"for when you have taken in everything delivered so far, including notices that carry no "+
+				"cursor."),
+			mcp.WithString("cursor", mcp.Description(
 				"The opaque cursor of the last message you received intact — copy it verbatim from "+
 					"that message's own \"cursor=...\" field, rendered inline wherever a message is "+
 					"delivered. Everything at or before this position is marked confirmed handed "+
@@ -2898,7 +2934,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		}
 	}
 
-	conn, err := hubconn.Dial(link, hubconn.DialOptions{
+	conn, agent, err := hubconn.DialAny(link, hubconn.DialOptions{
 		ReconnectSecret: reconnectSecret,
 		AgentID:         stored.PeerID,
 		Name:            name,
@@ -2907,6 +2943,16 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		CreateToken:     req.GetString("createToken", ""),
 		Topic:           req.GetString("topic", ""),
 	})
+	if err == nil && agent != nil {
+		// The server answered as an agent connection: many conversations
+		// on one socket, each becoming its own session.
+		s.mu.Lock()
+		s.redialLink, s.redialName = "", ""
+		s.redialTarget = connstore.Target{}
+		s.mu.Unlock()
+		return h.connectAgent(s, agent, agentConnect{link: link, display: name, target: target,
+			secret: reconnectSecret}, req.GetString("keyFile", ""))
+	}
 	if err != nil {
 		// The reservation goes back if nothing came of it, so a failed
 		// dial does not leave a session claiming it wants to reconnect
@@ -3074,9 +3120,15 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				"tell the user to update mcp-hub-client (see "+
 				"https://github.com/secforge/mcp-hub/releases).", wire.ProtocolVersion, sv)
 	} else if sv := conn.ServerVersion(); sv < wire.ProtocolVersion {
+		// Servers are updated before clients, so this should not happen.
+		// The client degrades rather than refusing: it only ever uses what
+		// the server declares, so an older server simply has fewer of the
+		// newer things (agent connections came with v5).
 		versionNote = fmt.Sprintf(
-			"\nNOTE: this mcp-hub-client speaks protocol v%d, ahead of the server's v%d — "+
-				"the server may need updating.", wire.ProtocolVersion, sv)
+			"\nNOTE: the server speaks protocol v%d, older than this mcp-hub-client's v%d. "+
+				"Servers are meant to be updated first, so tell the user. Nothing to do on your "+
+				"side: this client uses only what the server declares, so everything it supports "+
+				"works.", sv, wire.ProtocolVersion)
 	}
 
 	versionNote += releaseNote(conn)
@@ -3760,7 +3812,7 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		return
 	}
 	items, _ := conn.DrainForPush()
-	failed := 0
+	budget := s.hub.gate().budget
 	for i, it := range items {
 		// An image or a file on a pushed message has to be saved here, by
 		// the same path hub_receive uses. Push mode does not offer
@@ -3768,24 +3820,27 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		// chance: the attachment would be named by an event nothing ever
 		// resolved, and unreachable rather than merely inconvenient.
 		it.Text += s.saveReceivedAttachments(conn, []hubconn.Event{it.Event})
-		// Charged here rather than at render time: the attachment notes
-		// above are part of what the reader receives, and a budget that
-		// does not count them is not counting what it delivers.
-		conn.ChargeDelivered(it.Cursor, len(it.Text))
-		s.noteDelivered(it.Cursor)
 		// More says another delivery is already on its way, so a reader
 		// that wants to act on a burst knows to wait for the rest of it
 		// rather than treating each arrival as the whole of the news.
-		if _, err := s.pusher.Push(it.Cursor, it.Text, i < len(items)-1); err != nil {
-			// The event is already out of the buffer, so a failed push
-			// leaves it delivered nowhere. Nothing is durably lost — the
-			// catch-up position only advances on an explicit confirm, so
-			// the server still holds it — but nothing would otherwise SAY
-			// so, and a silence that recovers itself only if the reader
-			// happens to guess is the failure mode this whole system keeps
-			// relearning.
-			failed++
-		}
+		more := i < len(items)-1
+		cursor, text := it.Cursor, it.Text
+		// Sent now, or queued behind whatever already waits — one queue
+		// for every connection and kind, see hubconn.Budget.Deliver.
+		budget.Deliver(hubconn.Delivery{
+			Owner: s.name, Cursor: cursor, Bytes: len(text),
+			Send: func() {
+				s.noteDelivered(cursor)
+				if _, err := s.pusher.Push(cursor, text, more); err != nil {
+					// Out of the buffer and delivered nowhere. Nothing is
+					// durably lost — the position only moves on a confirm,
+					// so the server still holds it — but it has to be said.
+					s.note("a message could not be delivered to you live — the push into this " +
+						"session failed. Nothing is lost: call hub_catch_up() to read it.")
+				}
+			},
+			Pause: func(paused string) { _, _ = s.pusher.Push("", paused, false) },
+		})
 	}
 	if n := conn.TakeStaleAnswerNotice(); n > 0 {
 		// Said rather than dropped silently, which is the failure this
@@ -3796,12 +3851,6 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 			"finished, and were NOT delivered again — you already have them from the read "+
 			"itself, and re-delivering would hand you messages older than your own confirmed "+
 			"position. They remain on the server if you want them again.", n))
-	}
-	if failed > 0 {
-		s.note(fmt.Sprintf("%d message(s) could not be delivered to you live — the "+
-			"push into this session failed. Nothing is lost: your catch-up position only moves "+
-			"on an explicit confirm, so the server still holds them. Call hub_catch_up() to read "+
-			"them.", failed))
 	}
 }
 
@@ -4222,15 +4271,26 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	remove := req.GetBool("remove", false)
+	h.mu.Lock()
+	ag := h.agents[name]
+	h.mu.Unlock()
+	if ag != nil {
+		return mcp.NewToolResultText(ag.disconnect(remove)), nil
+	}
 	s, err := h.session(name)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if s.agent != nil {
+		// One conversation of an agent connection: closed here, and kept
+		// closed until the agent itself reconnects. Its grant stays.
+		s.agent.closeChild(s)
 	}
 	// The stored target, taken before anything below clears it: a
 	// connection mid-reconnect has no live one, and the redial target is
 	// the next thing reset. It is the target the connect resolved, so a
 	// projectDir override is honoured here too.
-	remove := req.GetBool("remove", false)
 	s.mu.Lock()
 	removeTarget := s.redialTarget
 	if removeTarget == (connstore.Target{}) {
@@ -4324,6 +4384,13 @@ func (h *Hub) handleRemove(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 			return h.disconnectAndRemove(ctx, name)
 		}
 	}
+	// An open agent connection, by its name or its link: removed through
+	// its own disconnect, which also removes its conversations' entries.
+	for _, ag := range h.allAgents() {
+		if ag.name == name || (link != "" && ag.link == link) {
+			return h.disconnectAndRemove(ctx, ag.name)
+		}
+	}
 	entries, err := connstore.ListForProject(projectForConnect(ctx))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("could not read the stored connections: %v", err)), nil
@@ -4388,6 +4455,18 @@ func (h *Hub) disconnectAndRemove(ctx context.Context, name string) (*mcp.CallTo
 // a tool call. A no-op if nothing is connected.
 func (h *Hub) Shutdown() {
 	h.shuttingDown.Store(true)
+	// Agent sockets first: closing one ends all its conversations at once,
+	// so the loop below finds them closed instead of closing a thousand
+	// one at a time. The stored mark stays set, as for every connection.
+	for _, ag := range h.allAgents() {
+		ag.mu.Lock()
+		ag.leaving = true
+		a := ag.agent
+		ag.mu.Unlock()
+		if a != nil {
+			a.Close()
+		}
+	}
 	for _, s := range h.allSessions() {
 		s.closeReturnPath()
 		h.close(s.name)
@@ -4942,6 +5021,10 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 	// something to act on.
 	var openLines []string
 	for _, s := range h.allSessions() {
+		if s.agent != nil {
+			// Listed under its agent connection, below.
+			continue
+		}
 		conn, _ := s.activeConn()
 		state := "connecting"
 		switch {
@@ -4963,6 +5046,9 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		}
 		openLines = append(openLines, line)
 	}
+	for _, ag := range h.allAgents() {
+		openLines = append(openLines, strings.Join(ag.listing(), "\n  "))
+	}
 	openBlock := "No connection is open. hub_connect opens one and gives it a name.\n\n"
 	if len(openLines) > 0 {
 		openBlock = "OPEN CONNECTIONS — these are the names every other tool takes:\n  " +
@@ -4978,8 +5064,19 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultText(openBlock + "no stored connections for this project"), nil
 	}
 	lines := make([]string, 0, len(entries))
+	agentConvs := 0
+	conversations := connstore.AgentConversations(entries)
 	for _, le := range entries {
+		if conversations[le.Target.Link] {
+			// One conversation of an agent connection: its agent's entry
+			// stands for it, and there may be a thousand of these.
+			agentConvs++
+			continue
+		}
 		line := fmt.Sprintf("link=%s peerId=%s", le.Target.Link, le.Entry.PeerID)
+		if le.Entry.Agent {
+			line = "AGENT connection: " + line
+		}
 		if le.Entry.LocalName != "" {
 			// Offered, not implied: nothing is open under it unless the
 			// list above says so. It is here so a reconnect can reuse the
@@ -5017,8 +5114,28 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		}
 		lines = append(lines, line)
 	}
+	if agentConvs > 0 {
+		lines = append(lines, fmt.Sprintf("(and the stored read positions of %d conversation(s) of "+
+			"agent connections, listed under their agent while it is open)", agentConvs))
+	}
 	return mcp.NewToolResultText(openBlock + "PREVIOUSLY USED LINKS in this project:\n" +
 		strings.Join(lines, "\n")), nil
+}
+
+// allAgents snapshots every open agent connection, by name.
+func (h *Hub) allAgents() []*agentSession {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	names := make([]string, 0, len(h.agents))
+	for n := range h.agents {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]*agentSession, 0, len(names))
+	for _, n := range names {
+		out = append(out, h.agents[n])
+	}
+	return out
 }
 
 func (h *Hub) handleReceive(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -5836,6 +5953,11 @@ walk:
 // itself closes that gap by construction: the call can only originate
 // once the model has actually seen cursor.
 func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if req.GetString("cursor", "") == "" && req.GetString("connection", "") == "" {
+		h.gate().budget.ReleaseAll()
+		return mcp.NewToolResultText("the delivery window is free again — whatever was waiting " +
+			"follows now. No read position moved: confirm a cursor for that."), nil
+	}
 	s, conn, bad := h.forRequest(req)
 	if bad != nil {
 		return bad, nil
@@ -5948,12 +6070,6 @@ func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error)
 			"%q instead", other, s.name, s.name, other)
 	}
 	behind, err := conn.ConfirmReceived(cursor)
-	if conn.TakeSkippedHeldNotice() {
-		s.note("that confirm moved your read position PAST message(s) live delivery " +
-			"had held back, so they will not be delivered and will not be walked to. They are " +
-			"still on the server: hub_read(after: <a cursor from before the hold>) retrieves " +
-			"them. Said once — nothing will mention this gap again.")
-	}
 	if err != nil {
 		return nil, err
 	}

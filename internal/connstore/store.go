@@ -196,7 +196,12 @@ type Entry struct {
 	// KeyFile is the path of an encrypted session's key file, so a
 	// reconnect can read the key again. Only the path is stored, never
 	// the key.
-	KeyFile string       `json:"keyFile,omitempty"`
+	KeyFile string `json:"keyFile,omitempty"`
+	// Agent marks the entry of an agent connection, which carries many
+	// conversations. Each of them is stored under AgentConvTarget, holding
+	// its name, read position and key file, and never a secret or a
+	// connected mark — the agent's own entry holds those.
+	Agent   bool         `json:"agent,omitempty"`
 	CatchUp CatchUpState `json:"catchUp,omitempty"`
 }
 
@@ -204,7 +209,35 @@ type Entry struct {
 func (e Entry) empty() bool {
 	return e.PeerID == "" && e.Name == "" && e.ReconnectSecret == "" &&
 		e.Topic == "" && e.LocalName == "" && !e.Connected &&
-		e.LastConnectedAt.IsZero() && e.CatchUp.empty()
+		e.LastConnectedAt.IsZero() && e.CatchUp.empty() && !e.Agent
+}
+
+// AgentConvTarget is where one conversation of the agent connection at
+// agent is stored: the agent's link with the conversation's handle
+// appended after a second "#". Never dialled: the conversation is only
+// ever reached through its agent.
+func AgentConvTarget(agent Target, conv string) Target {
+	return Target{Project: agent.Project, Link: agent.Link + "#" + conv}
+}
+
+// AgentConversations is the set of links among entries that are
+// conversations of an agent connection stored among them.
+func AgentConversations(entries []ListedEntry) map[string]bool {
+	var agents []string
+	for _, le := range entries {
+		if le.Entry.Agent {
+			agents = append(agents, le.Target.Link+"#")
+		}
+	}
+	out := map[string]bool{}
+	for _, le := range entries {
+		for _, prefix := range agents {
+			if strings.HasPrefix(le.Target.Link, prefix) {
+				out[le.Target.Link] = true
+			}
+		}
+	}
+	return out
 }
 
 // Holder identifies one process for as long as it runs. A pid alone does
@@ -692,6 +725,28 @@ func Upsert(target Target, identity Entry) error {
 		existing, _ := getEntry(s, target.Project, target.Link)
 		identity.CatchUp = existing.CatchUp
 		setEntry(&s, target.Project, target.Link, identity)
+		return save(d, s)
+	})
+}
+
+// UpsertMany is Upsert for many targets in one transaction: one read and
+// one write of the file, however many entries change. An agent connection
+// opening a thousand conversations for the first time would otherwise
+// rewrite the whole file a thousand times.
+func UpsertMany(identities map[Target]Entry) error {
+	if len(identities) == 0 {
+		return nil
+	}
+	return withLock(true, func(d string) error {
+		s, err := load(d)
+		if err != nil {
+			return err
+		}
+		for target, identity := range identities {
+			existing, _ := getEntry(s, target.Project, target.Link)
+			identity.CatchUp = existing.CatchUp
+			setEntry(&s, target.Project, target.Link, identity)
+		}
 		return save(d, s)
 	})
 }

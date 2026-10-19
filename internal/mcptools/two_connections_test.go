@@ -288,9 +288,6 @@ func TestConnectionsShareOneDeliveryWindow(t *testing.T) {
 	connA, _ := alpha.activeConn()
 	connB, _ := beta.activeConn()
 
-	// Spending on one is visible to the other, which is the whole point
-	// and also the accepted cost.
-	connA.ChargeDelivered("cursor-a", 1000)
 	if !connB.SameDeliveryBudget(connA) {
 		t.Fatal("expected both connections to spend against one window")
 	}

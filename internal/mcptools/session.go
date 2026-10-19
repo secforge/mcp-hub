@@ -35,6 +35,12 @@ type session struct {
 	// are genuinely process-wide: the queued notes (one reader), the
 	// harness push target, the delivery budget.
 	hub *Hub
+	// agent and conv are set for a conversation carried by an agent
+	// connection: the agent that opens, reopens and ends it, and the
+	// server's handle for it. Such a session never dials or reconnects by
+	// itself; its agent does both.
+	agent *agentSession
+	conv  string
 
 	// mu guards everything below. Needed because, unlike a tool call,
 	// conn.OnActivity's disconnect callback runs on the Conn's own read
@@ -204,6 +210,10 @@ func (h *Hub) open(name string) (*session, error) {
 	// there. Reclaim it here rather than making a caller disconnect
 	// something that is already gone: "already open" would be true of the
 	// map and false of the world.
+	if prev, err := h.session(name); err == nil && prev.agent != nil {
+		return nil, fmt.Errorf("%q is a conversation of the agent connection %q, which opens and "+
+			"reopens it — pick another name", name, prev.agent.name)
+	}
 	if prev, err := h.session(name); err == nil {
 		conn, _ := prev.activeConn()
 		prev.mu.Lock()
@@ -224,6 +234,15 @@ func (h *Hub) open(name string) (*session, error) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if _, ok := h.agents[name]; ok {
+		return nil, fmt.Errorf("a connection named %q is already open (an agent connection) — "+
+			"disconnect it first, or pick another name; this is never silently reattached", name)
+	}
+	if prev, ok := h.sessions[name]; ok && prev.agent != nil {
+		// Checked again under the lock: one could have been opened since.
+		return nil, fmt.Errorf("%q is a conversation of the agent connection %q, which opens and "+
+			"reopens it — pick another name", name, prev.agent.name)
+	}
 	if prev, ok := h.sessions[name]; ok {
 		// A name held by an automatic reconnect YIELDS to the caller.
 		// Every drop is retried now, so refusing here would make the
@@ -253,14 +272,20 @@ func (h *Hub) open(name string) (*session, error) {
 				"or pick another name; this is never silently reattached to the existing one", name)
 		}
 	}
-	if len(h.sessions) >= maxSessions {
+	if n := h.countedLocked(); n >= maxSessions {
 		return nil, fmt.Errorf("already holding %d connections (%s) — the limit is %d; "+
-			"disconnect one first", len(h.sessions), strings.Join(h.names(), ", "), maxSessions)
+			"disconnect one first", n, h.summaryLocked(), maxSessions)
 	}
+	return h.registerLocked(name, nil, ""), nil
+}
+
+// registerLocked adds a session under name. Caller holds h.mu and has
+// checked the name is free.
+func (h *Hub) registerLocked(name string, agent *agentSession, conv string) *session {
 	if h.sessions == nil {
 		h.sessions = map[string]*session{}
 	}
-	s := &session{name: name, hub: h}
+	s := &session{name: name, hub: h, agent: agent, conv: conv}
 	// Built HERE, before anything can run against this session. Assigning
 	// it later raced the connection's own goroutines, which read it to
 	// decide whether an arriving event can be delivered.
@@ -274,7 +299,47 @@ func (h *Hub) open(name string) (*session, error) {
 		_ = s.pusher.Adopt(h.lastMeta)
 	}
 	h.sessions[name] = s
-	return s, nil
+	return s
+}
+
+// countedLocked is how many connections count against maxSessions: every
+// ordinary one and every agent connection as one. An agent's
+// conversations are not counted — how many are shared with it is the
+// server's decision, made in its UI, and not one this client may cap.
+// Caller holds h.mu.
+func (h *Hub) countedLocked() int {
+	n := len(h.agents)
+	for _, s := range h.sessions {
+		if s.agent == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// summaryLocked names what is open, short enough to quote in an error
+// even with a thousand conversations open: ordinary connections by name,
+// each agent connection by name with its count of conversations.
+// Caller holds h.mu.
+func (h *Hub) summaryLocked() string {
+	var parts []string
+	perAgent := map[*agentSession]int{}
+	for _, n := range h.names() {
+		if s := h.sessions[n]; s.agent != nil {
+			perAgent[s.agent]++
+		} else {
+			parts = append(parts, n)
+		}
+	}
+	agents := make([]string, 0, len(h.agents))
+	for n := range h.agents {
+		agents = append(agents, n)
+	}
+	sort.Strings(agents)
+	for _, n := range agents {
+		parts = append(parts, fmt.Sprintf("%s (agent connection, %d conversations open)", n, perAgent[h.agents[n]]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // session resolves a name to its connection, or explains what is open.
@@ -291,12 +356,15 @@ func (h *Hub) session(name string) (*session, error) {
 	if s, ok := h.sessions[name]; ok {
 		return s, nil
 	}
-	open := h.names()
-	if len(open) == 0 {
+	if ag, ok := h.agents[name]; ok {
+		return nil, ag.notAConversation()
+	}
+	if len(h.sessions) == 0 && len(h.agents) == 0 {
 		return nil, fmt.Errorf("no connection named %q — not connected to anything; hub_connect "+
 			"opens a connection and gives it a name", name)
 	}
-	return nil, fmt.Errorf("no connection named %q — open: %s", name, strings.Join(open, ", "))
+	return nil, fmt.Errorf("no connection named %q — open: %s. hub_list_connections lists every "+
+		"conversation by name", name, h.summaryLocked())
 }
 
 // rememberMeta keeps the most recent request's _meta so a connection
@@ -387,6 +455,18 @@ func (s *session) setActiveConn(conn *hubconn.Conn, w *waiter.Waiter, target con
 // identity (or an external edit to the store) cannot silently diverge from
 // what is on disk.
 func (s *session) setCatchUpKey(id connstore.Target) {
+	var cs connstore.CatchUpState
+	var ok bool
+	var err error
+	if id.Link != "" {
+		cs, ok, err = connstore.GetCatchUp(id)
+	}
+	s.adoptCatchUp(id, cs, ok, err)
+}
+
+// adoptCatchUp is setCatchUpKey with the stored state already read — by a
+// caller that read many entries at once rather than one file read each.
+func (s *session) adoptCatchUp(id connstore.Target, cs connstore.CatchUpState, ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.catchUpID = id
@@ -410,7 +490,6 @@ func (s *session) setCatchUpKey(id connstore.Target) {
 		// position. The two are opposite situations and only one of them
 		// is an ordinary first connection, so the failure is said rather
 		// than absorbed.
-		cs, ok, err := connstore.GetCatchUp(id)
 		switch {
 		case err != nil:
 			s.note(fmt.Sprintf("this client could not read its own record of where it had got "+
@@ -419,8 +498,13 @@ func (s *session) setCatchUpKey(id connstore.Target) {
 				"you are missing, before relying on anything being already seen.", err))
 		case ok:
 			s.lastHandedOverCursor = cs.Cursor
+			if len(cs.Ahead) > 0 {
+				s.handedOverAhead = make(map[string]bool, len(cs.Ahead))
+				for _, c := range cs.Ahead {
+					s.handedOverAhead[c] = true
+				}
+			}
 		}
-		s.handedOverAhead = loadHandedOverAhead(id)
 	}
 }
 
@@ -456,7 +540,7 @@ func (s *session) note(text string) {
 func (s *session) alert(text string) {
 	if s.pusher != nil {
 		if ok, _ := s.pusher.Available(); ok {
-			if _, err := s.pusher.Push("", "[hub: on "+s.name+": "+text+"]", false); err == nil {
+			if _, err := s.hub.gate().push(s.pusher, "[hub: on "+s.name+": "+text+"]"); err == nil {
 				return
 			}
 		}

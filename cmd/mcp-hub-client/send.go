@@ -228,6 +228,13 @@ func storedConnection(project, name string) (connstore.ListedEntry, error) {
 			len(found), name, connstore.NormalizeProject(project))
 	}
 	e := found[0]
+	if e.Entry.Agent || connstore.AgentConversations(entries)[e.Target.Link] {
+		// An agent connection carries many conversations on one identity,
+		// and a conversation of one is only reachable through its agent:
+		// neither is a link this command can send into.
+		return connstore.ListedEntry{}, fmt.Errorf("%q belongs to an agent connection, which this "+
+			"command cannot send through; use a link of its own", name)
+	}
 	if e.Entry.Connected && mcptools.HolderLive(e.Entry.Holder) {
 		return connstore.ListedEntry{}, fmt.Errorf("connection %q is open in a running client (pid %d); "+
 			"sending under its identity would knock that connection off — use a link of its own",

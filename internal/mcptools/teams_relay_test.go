@@ -140,6 +140,9 @@ func TestTeamsRelayConnectSendsHeadersAndReturnsGuidance(t *testing.T) {
 // real (non-own) message arrives it must deliver both together.
 func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T) {
 	upgrader := websocket.Upgrader{}
+	// The reply is sent only once the test has seen hub_wait still
+	// blocked on the own message alone, so no timing decides the order.
+	sendReply := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -157,7 +160,7 @@ func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T)
 		own.ExternalID = "ext-1"
 		conn.WriteJSON(own)
 
-		time.Sleep(300 * time.Millisecond) // give handleWait time to observe it's not woken yet
+		<-sendReply
 
 		reply := wire.NewBroadcastMsg("550e8400-e29b-41d4-a716-446655440001", "their reply", "ts2", nil, "", "", nil)
 		conn.WriteJSON(reply)
@@ -192,6 +195,7 @@ func TestHubWaitDoesNotWakeOnOwnMessageAloneButDeliversItAlongside(t *testing.T)
 	case <-time.After(150 * time.Millisecond):
 		// expected: still blocked, own message alone isn't wake-worthy
 	}
+	close(sendReply)
 
 	select {
 	case res := <-resultCh:

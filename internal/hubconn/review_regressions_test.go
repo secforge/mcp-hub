@@ -72,24 +72,11 @@ func TestActivityLoopEndsAfterClose(t *testing.T) {
 
 func TestBudgetNotesAreScopedToOwner(t *testing.T) {
 	b := newBudget()
-	b.charge("second", "older", 20)
+	b.Take("second", "older", 20)
 	b.note("first", "shared-cursor")
 	b.note("second", "shared-cursor")
 	b.release("second", "shared-cursor")
 	if b.bytes != 0 {
 		t.Fatalf("second owner's confirmed prefix still charged: %d bytes", b.bytes)
-	}
-}
-
-func TestBudgetAdjustIsScopedToOwner(t *testing.T) {
-	b := newBudget()
-	first := &Conn{budget: b, budgetOwner: "first"}
-	second := &Conn{budget: b, budgetOwner: "second"}
-	b.charge("first", "same", 10)
-	b.charge("second", "same", 20)
-	second.ChargeDelivered("same", 30)
-	b.release(first.budgetOwner, "same")
-	if b.bytes != 30 {
-		t.Fatalf("second owner's delivery charged to first: remaining %d want 30", b.bytes)
 	}
 }

@@ -268,8 +268,8 @@ type Event struct {
 	// ReconnectAfter carries a "serverStopping" frame's own estimate, in
 	// seconds — see wire.ServerStopping.
 	ReconnectAfter int
-	// HeldCount, on a "deliveryHeld" event, is how many live messages the
-	// push window has withheld. SpillPath and SpillBytes, on a message
+	// HeldCount, on a "deliveryPaused" event, is how many deliveries of
+	// that connection are waiting for room in the window. SpillPath and SpillBytes, on a message
 	// whose body was too large to deliver inline, name the file it was
 	// written to and its size. All three exist so a shaped delivery states
 	// what was done to it rather than quietly arriving smaller.
@@ -296,9 +296,28 @@ type PeerInfo struct {
 	AgePublicKey string
 }
 
+// transport is what a Conn reads and writes: a websocket of its own, or one
+// conversation carried on an agent socket (see agentConv). Everything a
+// Conn does to its socket goes through these, so a conversation runs the
+// same code whichever of the two carries it.
+type transport interface {
+	ReadMessage() (messageType int, p []byte, err error)
+	WriteJSON(v any) error
+	WriteControl(messageType int, data []byte, deadline time.Time) error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+	SetReadLimit(limit int64)
+	SetPingHandler(h func(appData string) error)
+	Close() error
+}
+
 type Conn struct {
-	ws            *websocket.Conn
-	peerID        string
+	ws     transport
+	peerID string
+	// access and historyFrom describe a conversation carried by an agent
+	// connection (see wire.Joined.Access); empty and nil everywhere else.
+	access        string
+	historyFrom   *string
 	name          string
 	agePublicKey  string
 	serverVersion int
@@ -517,11 +536,7 @@ type Conn struct {
 	// confirm releases what this connection delivered rather than a
 	// prefix of everyone's. Empty where the window is this connection's
 	// alone — see ShareDeliveryBudget.
-	budgetOwner string
-	// skippedHeld records that a confirm released a prefix containing a
-	// message the window had held back, so the next tool result can tell
-	// the reader their position moved over something they never saw.
-	skippedHeld     bool
+	budgetOwner     string
 	peers           map[string]PeerInfo
 	rosterAnnounced bool
 	// fatalText is set by an "error" event the server marked NOT
@@ -542,6 +557,15 @@ type Conn struct {
 	// staleAnswers counts history answers that reached the buffer after
 	// the query they answered had finished — see DrainForPush.
 	staleAnswers int
+	// rosterBeforeMessages replaces pushing the roster with pushing it in
+	// front of a message: before the first, before the first after
+	// rosterQuiet without one, and before the first after a membership
+	// change. lastPushedMsg and rosterStale are what decide it. See
+	// PushRosterBeforeMessages.
+	rosterBeforeMessages bool
+	rosterQuiet          time.Duration
+	lastPushedMsg        time.Time
+	rosterStale          bool
 	// pushSeq counts pushes made on this connection, so each carries a
 	// position a reader can check for gaps — see Event.PushSeq.
 	pushSeq int
@@ -885,7 +909,30 @@ type DialOptions struct {
 //
 // Joining happens as part of the websocket handshake; no separate join
 // message is sent. Starts a background read loop on success.
+//
+// An agent link is refused here: it carries many conversations, which a
+// single Conn cannot stand for. DialAny accepts both.
 func Dial(link string, opts DialOptions) (*Conn, error) {
+	conn, agent, err := DialAny(link, opts)
+	if err != nil {
+		return nil, err
+	}
+	if agent != nil {
+		agent.Close()
+		return nil, ErrAgentLink
+	}
+	return conn, nil
+}
+
+// ErrAgentLink is Dial's answer for a link that turned out to be an agent's.
+var ErrAgentLink = errors.New("this link is an agent connection, which carries many conversations; " +
+	"it is opened with hub_connect")
+
+// DialAny connects to a link and returns whichever kind it turned out to
+// be: one conversation (*Conn), or an agent connection carrying many
+// (*Agent). Which one is the server's first frame, never the link's
+// shape.
+func DialAny(link string, opts DialOptions) (*Conn, *Agent, error) {
 	// Snapshot once, synchronously, before any goroutine is spawned — see
 	// the pongWait field's doc comment on Conn for why.
 	snapPongWait, snapWriteWait, snapConfirmReminderInterval := pongWait, writeWait, confirmReminderInterval
@@ -896,13 +943,13 @@ func Dial(link string, opts DialOptions) (*Conn, error) {
 		// identifies the session, so there is no address left to dial
 		// without it. Refused here rather than dialled, since a server
 		// applying the same rule would refuse it anyway, less clearly.
-		return nil, fmt.Errorf("link must carry its #-delimited credential — pass the link exactly as it was issued")
+		return nil, nil, fmt.Errorf("link must carry its #-delimited credential — pass the link exactly as it was issued")
 	}
 	if opts.ReconnectSecret == "" {
-		return nil, fmt.Errorf("reconnectSecret is required")
+		return nil, nil, fmt.Errorf("reconnectSecret is required")
 	}
 	if opts.AgePublicKey != "" && !agekey.Valid(opts.AgePublicKey) {
-		return nil, fmt.Errorf("agePublicKey is not a validly formatted age public key")
+		return nil, nil, fmt.Errorf("agePublicKey is not a validly formatted age public key")
 	}
 
 	// A header value carrying a control character does not travel as
@@ -920,7 +967,7 @@ func Dial(link string, opts DialOptions) (*Conn, error) {
 		"createToken":     opts.CreateToken,
 	} {
 		if strings.ContainsFunc(value, unicode.IsControl) {
-			return nil, fmt.Errorf("%s contains a control character, which cannot be sent in a request header", field)
+			return nil, nil, fmt.Errorf("%s contains a control character, which cannot be sent in a request header", field)
 		}
 	}
 
@@ -953,7 +1000,7 @@ func Dial(link string, opts DialOptions) (*Conn, error) {
 		if opts.Key != nil {
 			enc, err := NewEncryptionHeader(opts.Key)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			header.Set("Hub-Encryption", enc)
 		}
@@ -962,11 +1009,22 @@ func Dial(link string, opts DialOptions) (*Conn, error) {
 		header.Set("Hub-Topic", topic)
 	}
 
+	// Which kind of endpoint answered — one conversation or an agent
+	// connection — is the first frame's to say, never the link's.
 	ws, err := dialWS(target, header)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return finishHandshake(ws, snapPongWait, snapWriteWait, snapConfirmReminderInterval, opts.Key)
+	raw, err := readFirstFrame(ws, snapPongWait)
+	if err != nil {
+		return nil, nil, err
+	}
+	if wire.FrameType(raw) == wire.TypeAgentJoined {
+		agent, err := startAgent(ws, raw, snapPongWait, snapWriteWait)
+		return nil, agent, err
+	}
+	conn, err := startConn(ws, raw, snapPongWait, snapWriteWait, snapConfirmReminderInterval, opts.Key)
+	return conn, nil, err
 }
 
 // dialWS opens the WebSocket and, when the server answers with anything
@@ -1037,15 +1095,8 @@ func (e *HandshakeRefusedError) Deliberate() bool {
 // untrusted-content design here refuses to make everywhere else.
 const maxReadFrameBytes = 48 * 1024 * 1024
 
-// finishHandshake reads the server's initial "joined" message off an
-// already-connected ws, validates it, and builds the running Conn —
-// the tail shared by Dial and DialRelay, which differ only in how they
-// reach an open *websocket.Conn (a normalized host+sessionId URL with no
-// custom headers, vs. an arbitrary caller-supplied URL with an
-// Authorization/etc. header). Nothing downstream of here differs between
-// the two: everything behavioural comes from the server's declared
-// features, never from which of them dialled.
-func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfirmReminderInterval time.Duration, key []byte) (*Conn, error) {
+// readFirstFrame reads the first frame a server sends after the upgrade.
+func readFirstFrame(ws transport, snapPongWait time.Duration) ([]byte, error) {
 	// BOUNDED, because an upgrade is not an answer. A server that
 	// completes the HTTP upgrade and then says nothing left this read
 	// blocked with no deadline set yet — the deadline the read loop
@@ -1073,6 +1124,33 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfir
 		return nil, fmt.Errorf("no joined message from the server after the connection was "+
 			"accepted (waited %s): %w", handshakeWait, err)
 	}
+	return raw, nil
+}
+
+// finishHandshake reads the server's first frame off ws and builds the
+// running Conn from it. Nothing downstream of here differs between a
+// websocket of its own and a conversation on an agent socket: everything
+// behavioural comes from the server's declared features.
+func finishHandshake(ws transport, snapPongWait, snapWriteWait, snapConfirmReminderInterval time.Duration, key []byte) (*Conn, error) {
+	raw, err := readFirstFrame(ws, snapPongWait)
+	if err != nil {
+		return nil, err
+	}
+	return startConn(ws, raw, snapPongWait, snapWriteWait, snapConfirmReminderInterval, key)
+}
+
+// startConn validates the server's "joined" frame and builds the running
+// Conn on ws.
+func startConn(ws transport, raw []byte, snapPongWait, snapWriteWait, snapConfirmReminderInterval time.Duration, key []byte) (*Conn, error) {
+	// A refusal in place of "joined" is the server's answer, and says why;
+	// read as a joined frame it would only be a malformed peerId.
+	if wire.FrameType(raw) == wire.TypeError {
+		ws.Close()
+		if ev, ok := decodeEvent(raw); ok {
+			return nil, fmt.Errorf("the server refused: %s (%s)", ev.Text, ev.Code)
+		}
+		return nil, fmt.Errorf("the server refused: %s", raw)
+	}
 	var joined wire.Joined
 	if err := json.Unmarshal(raw, &joined); err != nil {
 		ws.Close()
@@ -1098,6 +1176,8 @@ func finishHandshake(ws *websocket.Conn, snapPongWait, snapWriteWait, snapConfir
 		activityStop:            make(chan struct{}),
 		gone:                    make(chan struct{}),
 		canSend:                 joined.CanSend,
+		access:                  joined.Access,
+		historyFrom:             joined.HistoryFrom,
 		conversationKind:        joined.ConversationKind,
 		todo:                    todoOf(joined),
 		todoItems:               itemsOf(joined.Items),
@@ -1990,18 +2070,11 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	}
 
 	c.MarkConsumed([]Event{{Cursor: cursor}})
-	// A confirm names a POSITION, so it releases a prefix of the ledger
-	// rather than clearing it: bytes delivered after this cursor are still
-	// occupying the reader's context, unread rather than freed.
-	if c.budget != nil && c.budget.release(c.budgetOwner, cursor) {
-		// The confirm just moved the read position past a message the
-		// delivery window refused to send. Nothing is lost — the server
-		// still holds it and the gap is retrievable — but the reader
-		// believes they are caught up, and a gap nobody mentions again is
-		// indistinguishable from no gap. Recorded so the caller can say so.
-		c.mu.Lock()
-		c.skippedHeld = true
-		c.mu.Unlock()
+	// A confirm names a POSITION, so it frees the window up to it rather
+	// than clearing it: what was delivered after this cursor is still
+	// waiting for the reader.
+	if c.budget != nil {
+		c.budget.release(c.budgetOwner, cursor)
 	}
 	// The server's own declaration (wire.Joined.Features) settles this
 	// whenever it's available: never infer a capability from silence at
@@ -3534,15 +3607,10 @@ func (c *Conn) Drain() (formatted string, connected bool) {
 // consumed-boundary semantics as Drain/DrainEvents; only one of the three
 // should be called on a given batch.
 func (c *Conn) DrainBatch() (chunks []string, connected bool) {
-	events, connected := c.DrainEvents()
-	return FormatEventsBatch(c.applyBudget(events, deliveredCost)), connected
+	events, connected := c.drainWithinWindow(deliveredCost, func(e Event) bool { return FormatEvent(e) == "" })
+	return FormatEventsBatch(events), connected
 }
 
-// TakeSkippedHeldNotice reports — once — that a confirm moved the read
-// position past a message live delivery had withheld, and clears the
-// flag. Read once rather than left set, because it describes an event
-// that happened, not a state that persists: repeating it after the reader
-// has been told would make a resolved gap look like an unresolved one.
 // TakeStaleAnswerNotice reports how many history answers arrived after
 // the query they answered had finished, and were therefore not pushed as
 // live traffic. Resets on read, so a caller says it once.
@@ -3554,18 +3622,17 @@ func (c *Conn) TakeStaleAnswerNotice() int {
 	return n
 }
 
-func (c *Conn) TakeSkippedHeldNotice() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	skipped := c.skippedHeld
-	c.skippedHeld = false
-	return skipped
-}
-
 // writeJSON is the ONLY way a frame should reach the socket. Every write
 // goes through here so the single-writer contract holds by construction
 // rather than by each call site remembering.
 func (c *Conn) writeJSON(v any) error {
+	// A read-only grant is refused here as well as by the server: this is
+	// the one place every frame passes, so no tool can forget to check.
+	if c.access == wire.AccessRead {
+		if raw, err := json.Marshal(v); err == nil && readOnlyRefused[wire.FrameType(raw)] {
+			return ErrReadOnly
+		}
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	// A write with no deadline can block for as long as the peer declines
@@ -3575,6 +3642,70 @@ func (c *Conn) writeJSON(v any) error {
 	// counting. The deadline is the same one the keepalive writes use.
 	_ = c.ws.SetWriteDeadline(time.Now().Add(c.writeWait))
 	return c.ws.WriteJSON(v)
+}
+
+// readOnlyRefused are the frames a read-only grant may not send.
+var readOnlyRefused = map[wire.Type]bool{
+	wire.TypeMsg: true, wire.TypeEdit: true, wire.TypeReaction: true,
+	wire.TypeDelete: true, wire.TypePin: true, wire.TypeUnpin: true,
+}
+
+// ErrReadOnly refuses a write in a conversation shared read-only.
+var ErrReadOnly = errors.New("this conversation is shared with this agent READ-ONLY: nothing can be " +
+	"sent, edited, reacted to, deleted, pinned or unpinned here — nothing was sent")
+
+// Access is what an agent connection's grant allows in this conversation:
+// wire.AccessRead or wire.AccessReadWrite, or empty for a connection that
+// is not part of an agent connection.
+func (c *Conn) Access() string { return c.access }
+
+// ReadOnly reports a conversation shared read-only with an agent.
+func (c *Conn) ReadOnly() bool { return c.access == wire.AccessRead }
+
+// HistoryFrom is where this conversation's visible history starts for an
+// agent connection, or nil for all of it.
+func (c *Conn) HistoryFrom() *string { return c.historyFrom }
+
+// PushRosterBeforeMessages stops delivering this conversation's roster as
+// it arrives and delivers the current one in front of a message instead:
+// before the first, before the first after quiet without a message, and
+// before the first after the membership changed. For a conversation of an
+// agent connection, where hundreds of conversations opening at once would
+// otherwise push hundreds of rosters nobody asked for, while a reader
+// still never sees a message without knowing who it is in front of.
+func (c *Conn) PushRosterBeforeMessages(quiet time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rosterBeforeMessages = true
+	c.rosterQuiet = quiet
+}
+
+// rosterBeforeMessagesLocked drops arriving rosters and puts the current
+// one in front of a live message when one is due. Caller holds c.mu.
+func (c *Conn) rosterBeforeMessagesLocked(evs []Event) []Event {
+	out := make([]Event, 0, len(evs))
+	for _, e := range evs {
+		switch {
+		case e.Kind == "roster":
+			c.rosterStale = true
+			continue
+		case e.Kind == "msg" && !e.Historical:
+			due := c.rosterStale || c.lastPushedMsg.IsZero() || time.Since(c.lastPushedMsg) > c.rosterQuiet
+			c.lastPushedMsg = time.Now()
+			if due && c.rosterAnnounced {
+				c.rosterStale = false
+				peers := make([]PeerInfo, 0, len(c.peers))
+				for _, p := range c.peers {
+					peers = append(peers, p)
+				}
+				sort.Slice(peers, func(i, j int) bool { return peers[i].ID < peers[j].ID })
+				out = append(out, Event{Kind: "roster", RosterPeers: peers,
+					RosterNameTaken: nameTaken(c.name, peers)})
+			}
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // ShapeForPush renders one event for the push path, spilling an
@@ -3622,17 +3753,6 @@ func (c *Conn) NoteHandedOver(events []Event) {
 	}
 }
 
-// ChargeDelivered records what a pushed message actually cost, once the
-// caller has finished assembling it. Rendering is not the last step —
-// attachment notes are appended afterwards — and a budget that charges
-// before the text is final is measuring something the reader never sees.
-func (c *Conn) ChargeDelivered(cursor string, n int) {
-	if c.budget == nil || cursor == "" {
-		return
-	}
-	c.budget.adjust(c.budgetOwner, cursor, n)
-}
-
 // PushItem is one event ready to be pushed into a model harness: the
 // formatted text, and the cursor that text can be re-fetched from.
 //
@@ -3662,7 +3782,12 @@ type PushItem struct {
 // is the kind of off-by-one that reports the wrong message as delivered.
 func (c *Conn) DrainForPush() (items []PushItem, connected bool) {
 	events, connected := c.DrainEvents()
-	for _, e := range c.applyBudget(events, pushDeliveredCost) {
+	for _, e := range events {
+		// Shaped here; the window and its queue are the pusher's to apply
+		// (see Budget.Deliver), across every connection at once.
+		if c.budget != nil {
+			e = c.budget.shape(e)
+		}
 		// A HISTORY ANSWER IS NOT LIVE TRAFFIC. The server marks a
 		// message historical when it is answering a query — hub_read or
 		// a catch-up walk — and such an answer reaches this buffer only
@@ -3705,41 +3830,45 @@ func (c *Conn) DrainForPush() (items []PushItem, connected bool) {
 	return items, connected
 }
 
-// applyBudget is the only place a delivery is SHAPED rather than merely
-// formatted, and it runs on the live push path alone. A reader that asked
-// for events — hub_receive, hub_catch_up, hub_read — gets them whole,
-// because it chose to spend its own context; charging it would make
-// reading expensive, which is the opposite of the intent.
+// drainWithinWindow is DrainEvents for a delivery nobody asked for — a
+// push, or a follower's next line — spending the process's one window.
+// Events that fit are shaped (an oversized body spilled to a file) and
+// charged; the first that does not fit stays in the buffer with
+// everything after it, in order, until a confirm frees room. When that
+// happens the window's single pause notice is added, charged to the slot
+// kept for it.
 //
-// Urgency crosses a closed window. An operator message or a direct mention
-// is exactly what must not be held behind a mechanism meant to protect
-// attention, or the guard against volume becomes the reason the one
-// message that mattered never arrived.
-func (c *Conn) applyBudget(events []Event, cost func(Event) int) []Event {
+// A reader that asked for events — hub_receive, hub_catch_up, hub_read —
+// gets them whole: it chose to spend its own context.
+//
+// undelivered names events the caller will not deliver at all, which
+// therefore take no room.
+func (c *Conn) drainWithinWindow(cost func(Event) int, undelivered func(Event) bool) (out []Event, connected bool) {
+	events, connected := c.DrainEvents()
 	if c.budget == nil {
-		return events
+		return events, connected
 	}
-	out := make([]Event, 0, len(events))
-	for _, e := range events {
-		// Only peer MESSAGES are held. This client's own notices — the
-		// held-window announcement, the confirm reminder, roster and
-		// shutdown notices — are the escape hatch from a closed window,
-		// and holding them meant the mechanism suppressed the only thing
-		// that could reopen it. They are a line or two each; withholding
-		// them saves nothing worth having.
-		if e.Kind == "msg" && !(e.IsOperator || e.MentionedMe) && c.budget.closed() {
-			if announce, held := c.budget.hold(c.budgetOwner, e.Cursor); announce {
-				out = append(out, Event{Kind: "deliveryHeld", HeldCount: held})
-			}
+	out = make([]Event, 0, len(events))
+	for i, e := range events {
+		if undelivered(e) {
+			out = append(out, e)
 			continue
 		}
 		shaped := c.budget.shape(e)
-		out = append(out, shaped)
-		if shaped.Cursor != "" {
-			c.budget.charge(c.budgetOwner, shaped.Cursor, cost(shaped))
+		if c.budget.Take(c.budgetOwner, shaped.Cursor, cost(shaped)) {
+			out = append(out, shaped)
+			continue
 		}
+		c.mu.Lock()
+		c.buffer = append(append([]Event(nil), events[i:]...), c.buffer...)
+		c.mu.Unlock()
+		paused := Event{Kind: "deliveryPaused", HeldCount: len(events) - i}
+		if c.budget.Pause(cost(paused)) {
+			out = append(out, paused)
+		}
+		break
 	}
-	return out
+	return out, connected
 }
 
 // DrainEvents is Drain without the text formatting — for a caller (like
@@ -3753,6 +3882,9 @@ func (c *Conn) applyBudget(events []Event, cost func(Event) int) []Event {
 func (c *Conn) DrainEvents() (events []Event, connected bool) {
 	c.mu.Lock()
 	events = c.freshenRemindersLocked(c.buffer)
+	if c.rosterBeforeMessages {
+		events = c.rosterBeforeMessagesLocked(events)
+	}
 	c.buffer = nil
 	connected = !c.closed
 	c.mu.Unlock()
