@@ -146,7 +146,7 @@ func TestTheStartupNoticeIsPushedWhenItCanBe(t *testing.T) {
 	}
 	text := string(src)
 
-	push := strings.Index(text, "pusher.Push(")
+	push := strings.Index(text, "h.gate().push(pusher,")
 	queue := strings.Index(text, "h.noteAutoReconnect(note)")
 	if push < 0 {
 		t.Fatal("the notice is never pushed — it would wait for a tool call that may not come")

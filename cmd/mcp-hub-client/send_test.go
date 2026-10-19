@@ -152,4 +152,18 @@ func TestSendByStoredConnectionName(t *testing.T) {
 		!strings.Contains(errs, "knock that connection off") {
 		t.Fatalf("held connection: code %d err %q", code, errs)
 	}
+	agent := connstore.Target{Link: link + "-agent", Project: target.Project}
+	if err := connstore.Upsert(agent, connstore.Entry{LocalName: "desk", ReconnectSecret: "s2", Agent: true}); err != nil {
+		t.Fatal(err)
+	}
+	conv := connstore.AgentConvTarget(agent, "conv-1")
+	if err := connstore.Upsert(conv, connstore.Entry{LocalName: "desk-alpha-1a2b3c"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"desk", "desk-alpha-1a2b3c"} {
+		if code, errs := run("--project", project, "--connection", name, "x"); code != sendError ||
+			!strings.Contains(errs, "agent connection") {
+			t.Fatalf("%s: code %d err %q", name, code, errs)
+		}
+	}
 }

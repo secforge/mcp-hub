@@ -13,28 +13,31 @@ import (
 //
 // Measured, 2026-09-15: a receiving session stopped participating after
 // roughly 1.3 MB delivered across four messages — still accepting
-// connections, never answering again. That failure is invisible from the
-// sending side (every send succeeded), indistinguishable from a slow reply
-// until it simply does not end, and unreachable by any acknowledgement,
-// because an ack says a message was taken, not that the receiver can still
-// think.
+// connections, never answering again. And the receiving session queues at
+// most about 50 messages for its model, shared with every other sender
+// reaching it; past that, deliveries are dropped and the sender is not told.
 //
-// So delivery is governed by two independent rules:
+// So delivery is governed by two rules:
 //
-//   - SPILL: no single push may be larger than SpillBytes. Anything bigger
-//     is written to a file and announced by head, size, path and cursor.
-//     Nothing is lost; the reader decides whether to spend the budget.
-//   - WINDOW: the total pushed and not yet confirmed is capped. Past it,
-//     bodies stop and a notice says so. Confirmation reopens it.
+//   - SPILL: no single delivery may be larger than spillBytes. Anything
+//     bigger is written to a file and announced by head, size, path and
+//     cursor. Nothing is lost; the reader decides whether to spend the
+//     budget.
+//   - WINDOW: one window for the whole process — every connection, every
+//     kind of delivery (messages, rosters, this client's own notices,
+//     catch-up deliveries, operator messages and mentions alike). At most
+//     windowCount deliveries or windowBytes that the reader has not
+//     confirmed. The last slot is kept for one notice saying more is
+//     waiting. Only a confirm frees room: it is the one thing that proves
+//     the reader took something in.
+//   - QUEUE: a push that does not fit joins one queue, in arrival order
+//     across every connection and kind, and while anything waits there
+//     every new push joins behind it — so nothing overtakes anything. A
+//     confirm drains it from the front as far as the window allows.
 //
-// Both are needed and neither substitutes for the other: the first bounds
-// one delivery, the second bounds their sum, and it was the sum that
-// killed the receiver.
-// Budget is exported so one process can hold a SINGLE window across
-// several connections. The window bounds what a reader can absorb, and a
-// reader is a process, not a socket: eight connections with a window each
-// is eight times the ceiling that was set by measuring one receiver
-// dying. The spill threshold stays per-message and needs no sharing.
+// Budget is exported so one process holds a SINGLE window across all its
+// connections, and so the code that pushes this client's own notices can
+// spend from it too.
 type Budget = budget
 
 type budget struct {
@@ -53,80 +56,84 @@ type budget struct {
 	spillDir func() (string, error)
 
 	// windowBytes and windowCount cap what may be outstanding. Two limits
-	// because the evidence cannot yet distinguish whether volume or
-	// message count exhausted the receiver: 1.29 MB over four messages
-	// killed one, 1.00 MB in a single message did not kill another. Two
-	// data points, two hypotheses, so both are bounded until someone
-	// separates them.
+	// because the evidence cannot distinguish whether volume or count
+	// exhausts a receiver: 1.29 MB over four messages killed one, and a
+	// queue of 50 is a count.
 	windowBytes int
 	windowCount int
 
-	// outstanding is the ledger, in delivery order. A confirm names a
-	// CURSOR, and everything at or before it is released — so the ledger
-	// is walked as a prefix and the remainder stays charged. Zeroing on
-	// confirm would credit back budget that is still occupied: messages
-	// delivered after the confirmed cursor are still sitting in the
-	// reader's context, unread rather than freed.
+	// outstanding is the ledger, in delivery order across every
+	// connection. A confirm names a cursor, and everything delivered at or
+	// before it is released, whichever connection it came from: the
+	// receiving queue is first in, first out, so a reader who took in one
+	// delivery has been handed everything before it.
 	outstanding []charge
+	count       int
 	bytes       int
-	// held counts what the window refused since it last closed, so the
-	// notice can say how much is waiting rather than that something is.
-	held int
-	// announced records that the closed window has been reported once.
-	// Repeating it on every event would spend the budget the gate exists
-	// to protect.
-	announced bool
+	// paused records that the window is full and its notice has gone out,
+	// so the notice is said once until room is freed.
+	paused bool
+	// waiting is called whenever room is freed, so a connection whose
+	// follower deliveries wait in its own buffer drains again.
+	waiting map[any]func()
+
+	// queue holds pushes that did not fit, in arrival order. sendMu is
+	// held from the decision to send until the send is done, so pushes
+	// leave in the order they were decided and a queued one is never
+	// overtaken.
+	sendMu  sync.Mutex
+	queue   []Delivery
+	dropped int
 }
 
+// Delivery is one push: who it is from, where a confirm locates it, what
+// it costs, how to send it, and how to send the pause notice on the same
+// way if it is the one that finds the window full.
+type Delivery struct {
+	Owner  string
+	Cursor string
+	Bytes  int
+	Send   func()
+	Pause  func(text string)
+}
+
+// maxQueued bounds the queue. Past it the oldest queued message that the
+// server still holds is let go — a catch-up recovers it — and the reader
+// is told how many; deliveries without a cursor are never let go.
+const maxQueued = 5000
+
 type charge struct {
-	// owner names the connection this charge belongs to. It exists
-	// because one window is now shared by several connections, and a
-	// confirm is a statement about ONE of them: releasing a prefix of the
-	// whole ledger would credit back budget for messages another
-	// connection's reader has not confirmed and which are still occupying
-	// the context this window exists to protect. Empty for a client that
-	// never shared its window, where the ledger has one owner by
-	// construction.
+	// owner and cursor locate the entry for a confirm. A cursor is opaque
+	// and issued by one server, so two connections can hold the same
+	// value; the owner tells them apart.
 	owner  string
 	cursor string
 	bytes  int
-	// held marks an entry the window refused to deliver. It occupies no
-	// budget — nothing was sent — but it holds a POSITION, so a confirm
-	// that releases a prefix containing one can report that the reader has
-	// just moved past something they were never shown.
-	held bool
+	// counted marks a delivery that occupies the window. A cursor handed
+	// over by a path the reader asked for — hub_catch_up, hub_read — costs
+	// nothing and is in the ledger only so a confirm of it locates a
+	// position.
+	counted bool
 }
 
-// newBudget returns the default policy. Values are deliberately far apart:
-// the spill threshold guards one message, the window guards a session, and
-// a session is many messages.
-// NewDeliveryBudget builds a window for a caller that intends to share
-// one across several connections — see Conn.ShareDeliveryBudget.
+// NewDeliveryBudget builds the window a process shares across its
+// connections — see Conn.ShareDeliveryBudget.
 func NewDeliveryBudget() *Budget { return newBudget() }
 
-// pushWindowCount is how many unconfirmed messages this client will push
-// into a session before holding the rest.
+// pushWindowCount is how many deliveries this process keeps unconfirmed in
+// the receiving session.
 //
-// IT BOUNDS THE RECEIVER'S INBOX, NOT THE READER'S CONTEXT — which is
-// what the byte window does, and why the two numbers are far apart.
+// The receiving session queues at most 50 accepted messages for its model
+// to read, per Claude Code's own documentation, and also rate-limits per
+// sender and drops identical repeats arriving close together. That queue
+// is per SESSION and shared by every sender reaching it, so this process
+// may not spend all of it. A busy session dropped 28 pushes on 2026-09-21
+// when this was 200; nothing came back, since a successful push is written
+// and unverified.
 //
-// The receiving session queues at most 50 accepted messages for its
-// model to read, per Claude Code's own documentation, and also
-// rate-limits per sender and drops identical repeats arriving close
-// together. That queue is per SESSION and shared by every sender
-// reaching it, so a single connection may not spend all of it.
-//
-// It was 200, chosen against the reader's context, and a busy session
-// dropped 28 pushes on 2026-09-21 long before reaching it — this client
-// pushing steadily into a queue that was discarding. Nothing came back:
-// a successful Deliver returns ObservedNothing, written and unverified,
-// so the drop is invisible to the sender. The RECEIVING session is told
-// which sender dropped it; the sender is not.
-//
-// 25 is half the documented cap, which leaves the other half for
-// everything else reaching that session. Not a tuning choice: the two
-// errors are not symmetric, since too low pauses delivery and says so
-// and a confirm reopens it, while too high loses messages silently.
+// 25 is half the documented cap. Not a tuning choice: the two errors are
+// not symmetric, since too low pauses delivery and says so and a confirm
+// reopens it, while too high loses messages silently.
 const pushWindowCount = 25
 
 func newBudget() *budget {
@@ -134,26 +141,31 @@ func newBudget() *budget {
 		spillBytes:  128 * 1024,
 		windowBytes: 500 * 1024,
 		windowCount: pushWindowCount,
+		waiting:     map[any]func(){},
 	}
 }
 
 // ShareDeliveryBudget replaces this connection's own window with a shared
-// one, so several connections spend against the same ceiling. Call it
+// one, so every connection spends against the same ceiling. Call it
 // before SetDeliveryBudget, which configures whatever window is in place.
-//
-// Deliberately a replacement rather than a second layer: two windows
-// would each be satisfied while their sum was not, which is the exact
-// arithmetic that made a per-connection window wrong.
 func (c *Conn) ShareDeliveryBudget(b *Budget, owner string) {
 	if b == nil {
 		return
 	}
 	c.budget = b
 	// The owner is this connection's identity INSIDE the shared ledger,
-	// so a confirm releases what this connection delivered and nothing
-	// else. Unshared windows leave it empty, which is correct: a ledger
-	// with one owner needs no filter.
+	// so a confirm finds this connection's cursor and not another's with
+	// the same value.
 	c.budgetOwner = owner
+	// Woken when a confirm frees room, so what waits in its buffer goes
+	// out; a connection that has ended takes itself off instead.
+	b.whenFreed(c, func() {
+		if c.Connected() {
+			c.signalActivity()
+			return
+		}
+		b.Forget(c)
+	})
 }
 
 // SetDeliveryBudget configures the push policy. spillDir is called only
@@ -175,49 +187,180 @@ func (c *Conn) SetDeliveryBudget(spillDir func() (string, error), spillBytes, wi
 	}
 }
 
-// charge records a delivery against the window. Only pushes are charged:
-// what a reader fetches for itself with hub_catch_up or hub_read is its
-// own decision to spend, and charging for it would make reading feel
-// expensive, which is the opposite of the intent.
-func (b *budget) charge(owner, cursor string, n int) {
+// WhenFreed registers f to be called whenever a confirm frees room, under
+// key; a later call with the same key replaces it. Exported for the code
+// that pushes this client's own notices.
+func (b *budget) WhenFreed(key any, f func()) { b.whenFreed(key, f) }
+
+func (b *budget) whenFreed(key any, f func()) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor, bytes: n})
-	b.bytes += n
+	if b.waiting == nil {
+		b.waiting = map[any]func(){}
+	}
+	b.waiting[key] = f
 }
 
-// release drops every charge at or before cursor and subtracts exactly
-// those bytes. It reports whether the released prefix contained a HELD
-// entry — a message the window refused to deliver — because confirming
-// past one moves the read position over content the reader never saw, and
-// silence is exactly what that must not produce.
-func (b *budget) release(owner, cursor string) (skipped bool) {
+// Forget stops calling what was registered under key.
+func (b *budget) Forget(key any) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.waiting, key)
+}
+
+// Take charges one delivery of n bytes if it fits, keeping the last slot
+// for the pause notice, and reports whether it did. Nothing fits while the
+// queue holds anything: taking now would overtake it.
+func (b *budget) Take(owner, cursor string, n int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.queue) > 0 {
+		return false
+	}
+	return b.takeLocked(owner, cursor, n)
+}
+
+func (b *budget) takeLocked(owner, cursor string, n int) bool {
+	if b.paused || b.count >= b.windowCount-1 || (b.count > 0 && b.bytes+n > b.windowBytes) {
+		return false
+	}
+	b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor, bytes: n, counted: true})
+	b.count++
+	b.bytes += n
+	return true
+}
+
+// pauseLocked charges the pause notice to the last slot when it is due,
+// and reports whether it is.
+func (b *budget) pauseLocked(n int) bool {
+	if b.paused {
+		return false
+	}
+	b.paused = true
+	b.outstanding = append(b.outstanding, charge{bytes: n, counted: true})
+	b.count++
+	b.bytes += n
+	return true
+}
+
+// Deliver sends d now if it fits and nothing is queued, and otherwise
+// queues it — saying once, through d's own Pause, that delivery is
+// paused. It reports whether d was queued.
+func (b *budget) Deliver(d Delivery) (queued bool) {
+	b.sendMu.Lock()
+	defer b.sendMu.Unlock()
+	b.mu.Lock()
+	if len(b.queue) == 0 && b.takeLocked(d.Owner, d.Cursor, d.Bytes) {
+		b.mu.Unlock()
+		d.Send()
+		return false
+	}
+	b.queue = append(b.queue, d)
+	if len(b.queue) > maxQueued {
+		for i, w := range b.queue {
+			if w.Cursor != "" {
+				b.queue = append(b.queue[:i], b.queue[i+1:]...)
+				b.dropped++
+				break
+			}
+		}
+	}
+	paused := DeliveryPausedText()
+	announce := d.Pause != nil && b.pauseLocked(len(paused))
+	b.mu.Unlock()
+	if announce {
+		d.Pause(paused)
+	}
+	return true
+}
+
+// Queued reports how many pushes wait.
+func (b *budget) Queued() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.queue)
+}
+
+// TakeDropped reports how many queued messages were let go since the last
+// call, and resets the count.
+func (b *budget) TakeDropped() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := b.dropped
+	b.dropped = 0
+	return n
+}
+
+// flush sends from the front of the queue as far as the window allows.
+func (b *budget) flush() {
+	b.sendMu.Lock()
+	defer b.sendMu.Unlock()
+	for {
+		b.mu.Lock()
+		if len(b.queue) == 0 {
+			b.mu.Unlock()
+			return
+		}
+		d := b.queue[0]
+		if !b.takeLocked(d.Owner, d.Cursor, d.Bytes) {
+			paused := DeliveryPausedText()
+			announce := d.Pause != nil && b.pauseLocked(len(paused))
+			b.mu.Unlock()
+			if announce {
+				d.Pause(paused)
+			}
+			return
+		}
+		b.queue = b.queue[1:]
+		b.mu.Unlock()
+		d.Send()
+	}
+}
+
+// Pause reports whether the pause notice is due — the window is full and
+// has not said so yet — and if so charges it to the last slot.
+func (b *budget) Pause(n int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.pauseLocked(n)
+}
+
+// Free reports how many more deliveries, and bytes, fit before the window
+// pauses.
+func (b *budget) Free() (count, bytes int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.paused || len(b.queue) > 0 {
+		return 0, 0
+	}
+	return max(b.windowCount-1-b.count, 0), max(b.windowBytes-b.bytes, 0)
+}
+
+// note records a cursor handed to the model by a path that spends no
+// window — hub_catch_up, hub_read, a synchronous tool result — so a later
+// confirm of it locates a position.
+func (b *budget) note(owner, cursor string) {
+	if cursor == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, ch := range b.outstanding {
+		if ch.owner == owner && ch.cursor == cursor {
+			return
+		}
+	}
+	b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor})
+}
+
+// release frees everything delivered at or before owner's cursor, from
+// every connection. It reports whether the cursor was in the ledger; an
+// unknown one frees nothing, since it locates no position.
+func (b *budget) release(owner, cursor string) bool {
 	if cursor == "" {
 		return false
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	// Release a PREFIX located by position, WITHIN ONE OWNER. The ledger
-	// is in delivery order — this client's own arrival sequence — so
-	// "everything up to and including that cursor" is an index, and no
-	// comparison of one opaque cursor against another is needed. That
-	// matters: a cursor's format and precision belong to the server,
-	// today's happen to be sortable ticks, and a client that ordered them
-	// would be depending on an accident it was told not to rely on.
-	//
-	// The owner filter is what makes one window safe to share. A confirm
-	// says "I have read up to here" about ONE conversation; the entries
-	// another connection interleaved before it are still unread and still
-	// occupying the reader. Releasing them would credit back budget for
-	// messages nobody confirmed — a ceiling that rises exactly when
-	// several conversations are busy, which is when it is load-bearing.
-	//
-	// For the index to exist, every cursor handed to the model must be in
-	// the ledger — pulled ones at zero cost (see note) and held ones at
-	// zero cost (see hold), not only pushed ones. Without that, a reader
-	// that followed the notice's own advice and called hub_catch_up
-	// confirmed a cursor this ledger had never heard of, released nothing,
-	// and left the window shut forever while hub_confirm reported success.
 	cut := -1
 	for i, ch := range b.outstanding {
 		if ch.owner == owner && ch.cursor == cursor {
@@ -226,115 +369,56 @@ func (b *budget) release(owner, cursor string) (skipped bool) {
 		}
 	}
 	if cut < 0 {
-		// An unknown cursor cannot locate a prefix, so nothing is
-		// released — under-releasing costs headroom, over-releasing costs
-		// the exhaustion this whole file exists to prevent. But it is
-		// evidence the reader is reading, so the closure becomes
-		// announceable again rather than staying silent forever.
-		b.announced = false
-		return
+		b.mu.Unlock()
+		return false
 	}
-	kept := make([]charge, 0, len(b.outstanding))
-	for i, ch := range b.outstanding {
-		if i > cut || ch.owner != owner {
+	for _, ch := range b.outstanding[:cut+1] {
+		if ch.counted {
+			b.count--
+			b.bytes -= ch.bytes
+		}
+	}
+	b.outstanding = append([]charge(nil), b.outstanding[cut+1:]...)
+	b.afterFreeLocked()
+	return true
+}
+
+// ReleaseAll frees the whole window: the reader says it has taken in
+// everything delivered so far. Positions are not touched — no cursor was
+// named — so the ledger keeps the entries a later confirm may locate.
+func (b *budget) ReleaseAll() {
+	b.mu.Lock()
+	kept := b.outstanding[:0]
+	for _, ch := range b.outstanding {
+		if ch.cursor != "" {
+			ch.counted, ch.bytes = false, 0
 			kept = append(kept, ch)
-			continue
 		}
-		// At or before the cut AND this owner's: released.
-		if ch.held {
-			skipped = true
-		}
-		b.bytes -= ch.bytes
+	}
+	b.outstanding = kept
+	b.count, b.bytes = 0, 0
+	b.afterFreeLocked()
+}
+
+// afterFreeLocked ends the pause and wakes whatever waits. Called with
+// b.mu held; releases it.
+func (b *budget) afterFreeLocked() {
+	if b.count < 0 {
+		b.count = 0
 	}
 	if b.bytes < 0 {
 		b.bytes = 0
 	}
-	b.outstanding = kept
-	if b.bytes < b.windowBytes && len(b.outstanding) < b.windowCount {
-		b.held, b.announced = 0, false
+	b.paused = false
+	wake := make([]func(), 0, len(b.waiting))
+	for _, f := range b.waiting {
+		wake = append(wake, f)
 	}
-	return skipped
-}
-
-// adjust corrects an entry's cost once the caller knows the true size.
-// The estimate charged at render time is what enforces the window DURING
-// a burst — without it a single large batch would pass entirely before
-// anything was counted — and this replaces it with what was actually
-// delivered, rather than adding a second entry for the same message.
-// Matched on OWNER AND CURSOR, like release and hold: a cursor is opaque
-// and issued by one server, so two connections sharing this ledger can
-// legitimately hold the same value. Matching on the cursor alone moved
-// the other connection's charge.
-func (b *budget) adjust(owner, cursor string, n int) {
-	if cursor == "" {
-		return
+	b.mu.Unlock()
+	b.flush()
+	for _, f := range wake {
+		f()
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for i, ch := range b.outstanding {
-		if ch.owner == owner && ch.cursor == cursor {
-			b.bytes += n - ch.bytes
-			b.outstanding[i].bytes = n
-			if b.bytes < 0 {
-				b.bytes = 0
-			}
-			return
-		}
-	}
-	b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor, bytes: n})
-	b.bytes += n
-}
-
-// note records a cursor handed to the model by a path that spends no push
-// budget — hub_catch_up, hub_read, a synchronous tool result. It costs
-// nothing and exists purely so the cursor has a POSITION in the ledger,
-// which is what lets a later confirm of it locate a prefix.
-//
-// Without this, the two halves of the design contradict each other: the
-// held-window notice tells the reader to pull and confirm, and confirming
-// what was pulled released nothing at all.
-func (b *budget) note(owner, cursor string) {
-	if cursor == "" {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for i, ch := range b.outstanding {
-		// Owner-scoped for the same reason release is: the same cursor
-		// from a different connection is a different position, and
-		// treating it as already noted left this connection's confirm
-		// with no entry to locate a prefix from.
-		if ch.owner == owner && ch.cursor == cursor {
-			// A held message handed over now has been seen, so a confirm
-			// past it skips nothing.
-			b.outstanding[i].held = false
-			return
-		}
-	}
-	b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor})
-}
-
-// closed reports whether the window is full.
-func (b *budget) closed() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.bytes >= b.windowBytes || len(b.outstanding) >= b.windowCount
-}
-
-// hold records one withheld event and reports whether the closure still
-// needs announcing.
-func (b *budget) hold(owner, cursor string) (announce bool, heldNow int) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if cursor != "" {
-		b.outstanding = append(b.outstanding, charge{owner: owner, cursor: cursor, held: true})
-	}
-	b.held++
-	if b.announced {
-		return false, b.held
-	}
-	b.announced = true
-	return true, b.held
 }
 
 // spill writes body to a file and returns its path. Failure is reported

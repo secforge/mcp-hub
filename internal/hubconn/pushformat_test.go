@@ -111,7 +111,7 @@ func TestThePushHeaderDropsWhatTheEnvelopeAlreadyCarries(t *testing.T) {
 // A hub-authored line must stay distinguishable from a peer's inside the
 // payload, because the envelope's sender name is static and cannot say so.
 func TestHubAuthoredEventsKeepTheirOwnPrefixOnThePushPath(t *testing.T) {
-	got := FormatEventForPush(Event{Kind: "deliveryHeld", HeldCount: 3})
+	got := FormatEventForPush(Event{Kind: "deliveryPaused", HeldCount: 3})
 	if !strings.HasPrefix(got, "[hub:") {
 		t.Fatalf("a hub-authored notice lost its own-voice prefix on the push path: %q", got)
 	}

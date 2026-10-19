@@ -104,6 +104,19 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 	want catchUpWant) catchUpResult {
 	var res catchUpResult
 	maxMessages, maxBytes := want.limits()
+	// No more than the push gate takes now, keeping a slot for the
+	// summary: a run that pushed past it would only queue messages behind
+	// a pause, and the summary would arrive after all of them.
+	// No more than the delivery window takes now, keeping a slot for the
+	// summary: a run that pushed past it would only stop half way.
+	gated := false
+	freeCount, freeBytes := s.hub.gate().budget.Free()
+	if freeCount-1 < maxMessages {
+		maxMessages, gated = max(freeCount-1, 0), true
+	}
+	if freeBytes < maxBytes {
+		maxBytes, gated = freeBytes, true
+	}
 
 	// ONE MESSAGE IS HELD BACK until the next fetch answers, because only
 	// that answer says whether anything follows it: each delivery's trailer
@@ -184,6 +197,10 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 	if res.StoppedBy == "" && !res.CaughtUp && res.Err == nil {
 		res.StoppedBy = fmt.Sprintf("this run reached its limit of %d messages or %d KB",
 			maxMessages, maxBytes/1024)
+		if gated {
+			res.StoppedBy = "the delivery window (25 deliveries or 500 KB unconfirmed, across " +
+				"every connection) has no more room; confirm what you have read first"
+		}
 	}
 	return res
 }
@@ -200,6 +217,9 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 // server with the position unmoved.
 func (s *session) pushCatchUpMessage(conn *hubconn.Conn, id connstore.Target, ev hubconn.Event,
 	text string, more bool) error {
+	if !s.hub.gate().budget.Take(s.name, ev.Cursor, len(text)) {
+		return fmt.Errorf("the delivery window filled up while this run was delivering")
+	}
 	receipt, err := s.pusher.Push(ev.Cursor, text, more)
 	if err != nil {
 		return err
@@ -242,7 +262,7 @@ func (s *session) pushCatchUpSummary(res catchUpResult) {
 	}
 	// No cursor: this is this client's own words about a run, not a
 	// message anyone can re-fetch.
-	if _, err := s.pusher.Push("", text, false); err != nil {
+	if _, err := s.hub.gate().push(s.pusher, text); err != nil {
 		s.note(fmt.Sprintf("a catch-up run finished but its summary could not be "+
 			"delivered (%v): %d message(s) were pushed.", err, res.Delivered))
 	}

@@ -1065,20 +1065,16 @@ func TestThePushWindowHoldsLongBeforeAnInboxCouldOverflow(t *testing.T) {
 	}
 	items, _ := c.DrainForPush()
 
-	var held, msgs int
+	var sent, paused int
 	for _, it := range items {
-		switch it.Event.Kind {
-		case "deliveryHeld":
-			held++
-		case "msg":
-			msgs++
-		}
+		c.budget.Deliver(Delivery{Owner: "", Cursor: it.Cursor, Bytes: len(it.Text),
+			Send:  func() { sent++ },
+			Pause: func(string) { paused++ }})
 	}
-	if msgs > pushWindowCount {
-		t.Fatalf("pushed %d messages with a window of %d — the window did not close",
-			msgs, pushWindowCount)
+	if sent+paused > pushWindowCount {
+		t.Fatalf("pushed %d with a window of %d — the window did not close", sent+paused, pushWindowCount)
 	}
-	if held == 0 {
+	if paused != 1 {
 		t.Fatal("delivery was capped and nothing said so — a silent cap is the same failure as a " +
 			"silent drop, just on this side of the wire")
 	}

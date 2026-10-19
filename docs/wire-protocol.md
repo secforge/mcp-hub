@@ -1020,6 +1020,48 @@ a `query` filter, since the server cannot search ciphertext. The server never
 renders, recodes or derives text from a sealed body: no reply previews, no
 mention substrings.
 
+### 2.12 Agent connections (protocol v5)
+
+An agent connection is one socket carrying every conversation a server has
+shared with an agent, each read-only or read-write, with all history, history
+from a point in time, or none, and changed at runtime. The full design is
+chat-relay's `docs/superpowers/specs/2026-10-19-agent-connection-design.md`,
+agreed between the two projects; this section is what a client implements.
+
+**Dialling.** An agent endpoint refuses a client whose `Hub-Protocol-Version`
+is below 5, naming v5 in the reason. A client never decides from the link
+which kind it is dialling; the first frame says which kind answered: `agentJoined {agentId, name, features}` instead of `joined`,
+followed by `assignments {items: [{conv, title, kind, channel, access,
+historyFrom, behind}]}`. `access` is `read` or `readwrite`; `historyFrom`
+absent means all history. The `Agent-Secret` authenticates the agent on this
+socket only.
+
+**Framing.** Every frame about one conversation travels both ways as
+`{type: "conv", conv: "<handle>", frame: {…}}`, and the inner `frame` is
+exactly this protocol for that conversation, beginning with its own
+`joined` (plus `access` and `historyFrom`). The client also stamps `conv`
+inside every inner frame it sends; the server refuses a write, ack or walk
+whose inner `conv` is missing or differs from the wrapper's (`conv_mismatch`).
+A frame for a conversation the client has not opened is dropped, never
+delivered to another.
+
+**Control frames** (unwrapped). Server → client: `assigned {item}`,
+`changed {item}`, `revoked {conv, reason}`, `closed {conv, code, reason,
+reopen}` (today's close codes; `reopen` accompanies `changed`), `activity
+{conv, behind}` for a conversation that is not open. Client → server:
+`open {conv}`, answered by that conversation's wrapped `joined`, and `close
+{conv}`. Nothing is sent inside a conversation before its `joined`
+(`not_open`).
+
+**Refusals** (wrapped when about a conversation): `not_assigned`, `revoked`,
+`bad_conv`, `conv_mismatch`, `read_only`, `not_open`. Revoking the agent
+closes its socket with 4001.
+
+**This client** opens every conversation at connect and after every
+reconnect, each resuming from its own stored position, and presents each as
+its own connection named after the agent connection. A read-only
+conversation's writes are refused in the client before anything is sent.
+
 ## 3. Ordering and atomicity
 
 - **`joined` → `roster`**: `joined` is always first; the first `roster`
@@ -1121,7 +1163,7 @@ abort acceptable rather than a loss.
 
 ## 6. Versioning
 
-`ProtocolVersion` is currently `4`. The policy: bump it only for a
+`ProtocolVersion` is currently `5`. The policy: bump it only for a
 genuinely breaking change. New optional fields and new event kinds are
 additive and don't need it — `encoding/json` ignores unknown fields on
 decode, and an unrecognized `type` is silently dropped rather than
@@ -1137,13 +1179,25 @@ specific version to accept a connection.
 - `3` → `4`: the membership burst (`peerCount`, one `peerJoined` per peer,
   `peerLeft`, `rosterComplete`) replaced by the `roster` frame (§2.3). A
   client waiting for `rosterComplete` would wait forever.
+- `4` → `5`: agent connections (§2.12). An agent endpoint's first frame is
+  `agentJoined`, which an older client would take for a broken `joined`, so
+  the agent endpoint refuses clients below 5. Every other endpoint keeps
+  accepting any version.
+
+Servers are updated before clients. A server newer than its client asks the
+client to update and keeps serving it wherever it reasonably can; only an
+endpoint that cannot serve an older client at all (an agent endpoint, below
+5) refuses it, naming the version it needs. A client newer than its server
+should not happen; it degrades rather than refusing, since it uses only what
+the server declares.
 
 If `Joined.serverVersion` differs from the client's own `ProtocolVersion`,
 the reference client does **not** refuse the connection or alter its own
 behavior beyond this — it's surfaced as an explicit note in
 `hub_connect`'s result text: "tell the user to
-update mcp-hub-client" if the server is newer, "the server may need
-updating" if the server is older. This is the mechanism an incompatible
+update mcp-hub-client" if the server is newer, and, if the server is older,
+that servers are meant to be updated first and that everything the server
+declares works. This is the mechanism an incompatible
 peer is expected to be caught by — at connect time, as a clear
 human-actionable instruction, rather than a silent hang or a confusing
 per-request failure discovered only once a client tries to page. There is

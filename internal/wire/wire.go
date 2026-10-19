@@ -89,7 +89,11 @@ const (
 // this mechanism" — 3 is a floor meaning "this server declares its
 // features," after which an individual additive feature needs no
 // further bump.
-const ProtocolVersion = 4
+//
+// 5 is agent connections (agent.go): an agent endpoint refuses a client
+// below it, since an older client would read its first frame as a broken
+// "joined".
+const ProtocolVersion = 5
 
 type envelope struct {
 	Type Type `json:"type,case:strict"`
@@ -172,6 +176,11 @@ type Joined struct {
 	// recorded, recoverable-on-demand range rather than a silent loss.
 	// Omitted under the same conditions as Behind.
 	BehindSince string `json:"behindSince,omitempty,case:strict"`
+	// Access and HistoryFrom are set only on a conversation carried by an
+	// agent connection: what the grant allows ("read" or "readwrite") and
+	// where its visible history starts (absent: all of it). See agent.go.
+	Access      string  `json:"access,omitempty,case:strict"`
+	HistoryFrom *string `json:"historyFrom,omitempty,case:strict"`
 	// Features declares this server's supported capabilities explicitly
 	// — added 2026-09-08 (ProtocolVersion 3, a floor meaning "this server
 	// declares its features" — an individual feature needs no version

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/secforge/mcp-hub/internal/wire"
@@ -21,98 +22,151 @@ func msg(cursor string, size int) Event {
 	return Event{Kind: "msg", Cursor: cursor, Text: strings.Repeat("x", size)}
 }
 
-// A confirm names one cursor, and only what came at or before it has been
-// read. Crediting back the whole ledger would reopen the window while the
-// messages after that cursor are still sitting unread in the receiver's
-// context — the exact overspend the window exists to prevent.
-func TestConfirmReleasesOnlyThePrefixUpToTheConfirmedCursor(t *testing.T) {
+func TestTheWindowTakesTwentyFourAndKeepsTheLastSlotForThePause(t *testing.T) {
 	b := testBudget(t)
-	b.charge("", "c1", 100)
-	b.charge("", "c2", 200)
-	b.charge("", "c3", 400)
-
-	b.release("", "c2")
-
-	if b.bytes != 400 {
-		t.Fatalf("bytes after confirming c2 = %d, want 400 (c3 still unread)", b.bytes)
-	}
-	if len(b.outstanding) != 1 || b.outstanding[0].cursor != "c3" {
-		t.Fatalf("outstanding = %+v, want just c3", b.outstanding)
-	}
-}
-
-// A cursor that was never charged must not silently release anything. It
-// means the reader confirmed something it pulled itself, which spends no
-// push budget and therefore frees none.
-func TestConfirmingAnUnchargedCursorReleasesNothing(t *testing.T) {
-	b := testBudget(t)
-	b.charge("", "c1", 100)
-
-	b.release("", "pulled-not-pushed")
-
-	if b.bytes != 100 || len(b.outstanding) != 1 {
-		t.Fatalf("bytes=%d outstanding=%d, want the ledger untouched", b.bytes, len(b.outstanding))
-	}
-}
-
-func TestTheWindowClosesOnBytesAndReopensOnConfirm(t *testing.T) {
-	b := testBudget(t)
-	b.windowBytes = 1000
-	b.charge("", "c1", 600)
-	if b.closed() {
-		t.Fatal("window closed at 600 of 1000")
-	}
-	b.charge("", "c2", 500)
-	if !b.closed() {
-		t.Fatal("window still open at 1100 of 1000")
-	}
-	b.release("", "c1")
-	if b.closed() {
-		t.Fatal("window still closed at 500 of 1000 after confirming c1")
-	}
-}
-
-func TestTheWindowClosesOnCountEvenWhenTheBytesAreTiny(t *testing.T) {
-	b := testBudget(t)
-	b.windowCount = 3
-	for _, c := range []string{"c1", "c2", "c3"} {
-		b.charge("", c, 1)
-	}
-	if !b.closed() {
-		t.Fatalf("window open at 3 messages of 3 (bytes=%d)", b.bytes)
-	}
-}
-
-// The closure is announced once, not once per withheld message: repeating
-// it would spend the very attention the gate was closed to protect. But
-// the count must keep climbing, so the one notice can say how much is
-// waiting rather than merely that something is.
-func TestAClosedWindowIsAnnouncedOnceAndKeepsCounting(t *testing.T) {
-	b := testBudget(t)
-	announce, held := b.hold("", "held-cursor")
-	if !announce || held != 1 {
-		t.Fatalf("first hold = (%v, %d), want (true, 1)", announce, held)
-	}
-	for i := 0; i < 4; i++ {
-		if announce, _ = b.hold("", fmt.Sprintf("held-%d", i)); announce {
-			t.Fatal("the closure was announced a second time")
+	for i := 0; i < pushWindowCount-1; i++ {
+		if !b.Take("a", fmt.Sprintf("c%d", i), 10) {
+			t.Fatalf("delivery %d refused", i)
 		}
 	}
-	if _, held = b.hold("", "held-last"); held != 6 {
-		t.Fatalf("held = %d, want 6", held)
+	if b.Take("a", "one-too-many", 10) {
+		t.Fatal("the slot kept for the pause notice was given to a delivery")
+	}
+	if !b.Pause(10) {
+		t.Fatal("the pause notice was refused its slot")
+	}
+	if b.Pause(10) {
+		t.Fatal("the pause notice was due twice")
+	}
+	if n, _ := b.Free(); n != 0 {
+		t.Fatalf("a paused window reports %d free", n)
 	}
 }
 
-func TestReopeningTheWindowRearmsTheAnnouncement(t *testing.T) {
+func TestTheWindowFillsOnBytesTooButNeverRefusesAFirstDelivery(t *testing.T) {
 	b := testBudget(t)
-	b.windowBytes = 100
-	b.charge("", "c1", 200)
-	b.hold("", "held-cursor")
-	b.release("", "c1")
-	announce, held := b.hold("", "held-cursor")
-	if !announce || held != 1 {
-		t.Fatalf("hold after reopening = (%v, %d), want (true, 1) — a new closure is news again",
-			announce, held)
+	b.windowBytes = 1000
+	if !b.Take("a", "c1", 5000) {
+		t.Fatal("a first delivery larger than the window was refused, so nothing could ever go out")
+	}
+	if b.Take("a", "c2", 1) {
+		t.Fatal("the window took more after its bytes were spent")
+	}
+}
+
+// The receiving queue is first in, first out: a reader who confirms one
+// delivery has been handed everything before it, whichever connection it
+// came from.
+func TestAConfirmFreesEverythingDeliveredUpToItFromEveryConnection(t *testing.T) {
+	b := testBudget(t)
+	b.Take("alpha", "a1", 100)
+	b.Take("beta", "b1", 100)
+	b.Take("", "", 100) // a notice
+	b.Take("alpha", "a2", 100)
+	b.Take("beta", "b2", 100)
+	if !b.release("alpha", "a2") {
+		t.Fatal("the confirmed cursor was not found")
+	}
+	if b.count != 1 || b.bytes != 100 || len(b.outstanding) != 1 || b.outstanding[0].cursor != "b2" {
+		t.Fatalf("after confirming a2: count %d bytes %d ledger %+v", b.count, b.bytes, b.outstanding)
+	}
+}
+
+func TestAForeignOrUnknownCursorFreesNothing(t *testing.T) {
+	b := testBudget(t)
+	b.Take("alpha", "a1", 100)
+	b.Take("beta", "b1", 100)
+	if b.release("beta", "a1") || b.release("alpha", "never-delivered") {
+		t.Fatal("a cursor that locates nothing reported a release")
+	}
+	if b.count != 2 || b.bytes != 200 {
+		t.Fatalf("something was freed: count %d bytes %d", b.count, b.bytes)
+	}
+}
+
+func TestReleasingEverythingFreesTheWindowAndKeepsThePositions(t *testing.T) {
+	b := testBudget(t)
+	for i := 0; i < pushWindowCount-1; i++ {
+		b.Take("a", fmt.Sprintf("c%d", i), 10)
+	}
+	b.Pause(10)
+	woken := 0
+	b.WhenFreed("watcher", func() { woken++ })
+	b.ReleaseAll()
+	if n, _ := b.Free(); n != pushWindowCount-1 {
+		t.Fatalf("free %d after releasing everything", n)
+	}
+	if woken != 1 {
+		t.Fatalf("waiters woken %d times, want 1", woken)
+	}
+	// A later confirm of an earlier cursor still finds its position.
+	if !b.release("a", "c3") {
+		t.Fatal("releasing everything forgot the positions a confirm locates")
+	}
+}
+
+// A cursor the reader pulled for itself costs nothing, but a confirm of it
+// must still locate a position and free what was delivered before it.
+func TestConfirmingAPulledCursorFreesWhatCameBefore(t *testing.T) {
+	b := testBudget(t)
+	b.Take("a", "pushed", 100)
+	b.note("a", "pulled")
+	if !b.release("a", "pulled") || b.count != 0 {
+		t.Fatalf("confirming a pulled cursor left count %d", b.count)
+	}
+}
+
+// What does not fit stays in the buffer, in order, and goes out after a
+// confirm; the pause is said once. Every kind counts, an operator message
+// included.
+func TestDeliveriesThatDoNotFitWaitInTheBufferInOrder(t *testing.T) {
+	c := &Conn{budget: newBudget()}
+	for i := 0; i < 30; i++ {
+		e := msg(fmt.Sprintf("c%02d", i), 10)
+		if i == 3 {
+			e.IsOperator = true
+		}
+		c.buffer = append(c.buffer, e)
+	}
+	first, _ := c.drainWithinWindow(deliveredCost, func(Event) bool { return false })
+	if len(first) != pushWindowCount || first[len(first)-1].Kind != "deliveryPaused" {
+		t.Fatalf("first drain gave %d events ending in %q", len(first), first[len(first)-1].Kind)
+	}
+	if again, _ := c.drainWithinWindow(deliveredCost, func(Event) bool { return false }); len(again) != 0 {
+		t.Fatalf("a full window delivered %d more, the pause notice included", len(again))
+	}
+	c.budget.release("", first[pushWindowCount-2].Cursor)
+	rest, _ := c.drainWithinWindow(deliveredCost, func(Event) bool { return false })
+	if len(rest) != 6 {
+		t.Fatalf("after the confirm %d delivered, want the 6 that waited", len(rest))
+	}
+	for i, e := range rest {
+		if want := fmt.Sprintf("c%02d", 24+i); e.Cursor != want {
+			t.Fatalf("out of order: got %s, want %s", e.Cursor, want)
+		}
+	}
+}
+
+func TestEventsTheCallerWillNotDeliverTakeNoRoom(t *testing.T) {
+	c := &Conn{budget: newBudget()}
+	c.buffer = []Event{msg("c1", 10), {Kind: "msg", Cursor: "h1", Historical: true}}
+	c.drainWithinWindow(deliveredCost, func(e Event) bool { return e.Historical })
+	if c.budget.count != 1 {
+		t.Fatalf("count %d, want only the delivered message charged", c.budget.count)
+	}
+}
+
+func TestABurstOfShortMessagesFillsTheWindowOnFramingAlone(t *testing.T) {
+	c := &Conn{budget: newBudget()}
+	c.budget.windowBytes = 10 * 1024
+	c.budget.windowCount = 10000
+	for i := 0; i < 60; i++ {
+		c.buffer = append(c.buffer, Event{Kind: "msg", Cursor: fmt.Sprintf("c%d", i), PeerID: "peer-a",
+			TS: "2026-09-15T10:00:00Z", Text: "ack"})
+	}
+	out, _ := c.drainWithinWindow(deliveredCost, func(Event) bool { return false })
+	if len(out) >= 60 {
+		t.Fatal("delivered all 60 one-liners without filling a 10 KB window")
 	}
 }
 
@@ -181,68 +235,6 @@ func TestABodyWithinTheThresholdIsUntouched(t *testing.T) {
 	}
 }
 
-// applyBudget is where the policy meets the live push path. A closed
-// window must stop ordinary bodies and say so exactly once.
-func TestApplyBudgetHoldsOrdinaryMessagesOnceTheWindowIsClosed(t *testing.T) {
-	c := &Conn{budget: newBudget()}
-	c.budget.windowBytes = 1000
-
-	out := c.applyBudget([]Event{msg("c1", 1200), msg("c2", 10), msg("c3", 10)}, deliveredCost)
-
-	if len(out) != 2 {
-		t.Fatalf("delivered %d events, want the first message plus one notice: %+v", len(out), out)
-	}
-	if out[0].Cursor != "c1" {
-		t.Fatalf("first delivered event = %+v, want the message that fit", out[0])
-	}
-	if out[1].Kind != "deliveryHeld" || out[1].HeldCount != 1 {
-		t.Fatalf("second event = %+v, want a deliveryHeld notice counting 1", out[1])
-	}
-	if rendered := FormatEvent(out[1]); rendered == "" {
-		t.Fatal("the held notice renders as nothing — a closed window would be silent")
-	}
-}
-
-// A mention or an operator message is the one thing a paused reader must
-// still see: the pause exists to protect attention, not to hide the
-// messages that are asking for it.
-func TestMentionsAndOperatorMessagesCrossAClosedWindow(t *testing.T) {
-	c := &Conn{budget: newBudget()}
-	c.budget.windowBytes = 100
-	c.budget.charge("", "c0", 500)
-
-	mention := msg("c1", 10)
-	mention.MentionedMe = true
-	operator := msg("c2", 10)
-	operator.IsOperator = true
-
-	out := c.applyBudget([]Event{msg("c3", 10), mention, operator}, deliveredCost)
-
-	var cursors []string
-	for _, e := range out {
-		if e.Kind == "msg" {
-			cursors = append(cursors, e.Cursor)
-		}
-	}
-	if len(cursors) != 2 || cursors[0] != "c1" || cursors[1] != "c2" {
-		t.Fatalf("delivered messages %v, want the mention and the operator message only", cursors)
-	}
-}
-
-func TestConfirmingThroughTheConnReopensThePushWindow(t *testing.T) {
-	c := &Conn{budget: newBudget()}
-	c.budget.windowBytes = 1000
-	c.applyBudget([]Event{msg("c1", 1200)}, deliveredCost)
-	if !c.budget.closed() {
-		t.Fatal("the window did not close")
-	}
-	c.budget.release("", "c1")
-	out := c.applyBudget([]Event{msg("c2", 10)}, deliveredCost)
-	if len(out) != 1 || out[0].Kind != "msg" {
-		t.Fatalf("after confirming, delivery gave %+v, want the message through", out)
-	}
-}
-
 // The charge must cover what is actually written, or the window stops
 // being a bound at all. Measured against the real output of the path that
 // does the writing — FormatEventsBatch plus the wait socket's own "\n\n"
@@ -268,174 +260,6 @@ func TestTheChargeIsAnUpperBoundOnWhatIsActuallyDelivered(t *testing.T) {
 
 	if charged < written {
 		t.Fatalf("charged %d bytes for %d actually written — the window undercounts", charged, written)
-	}
-}
-
-// A burst of short messages is the case the body-only charge missed
-// entirely: two hundred one-liners are a few KB of text and most of a
-// megabyte of envelope.
-func TestABurstOfShortMessagesClosesTheWindowOnFramingAlone(t *testing.T) {
-	c := &Conn{budget: newBudget()}
-	c.budget.windowBytes = 10 * 1024
-	c.budget.windowCount = 10000 // take the count limit out of the picture
-
-	body := 0
-	events := make([]Event, 0, 60)
-	for i := 0; i < 60; i++ {
-		e := Event{Kind: "msg", Cursor: fmt.Sprintf("c%d", i), PeerID: "peer-a",
-			TS: "2026-09-15T10:00:00Z", Text: "ack"}
-		body += len(e.Text)
-		events = append(events, e)
-	}
-
-	out := c.applyBudget(events, deliveredCost)
-
-	if body >= 10*1024 {
-		t.Fatalf("test is not exercising the framing: %d bytes of body already exceeds the window", body)
-	}
-	held := 0
-	for _, e := range out {
-		if e.Kind == "deliveryHeld" {
-			held = e.HeldCount
-		}
-	}
-	if held == 0 {
-		t.Fatalf("delivered all 60 messages (%d bytes of body) without closing a %d-byte window",
-			body, 10*1024)
-	}
-}
-
-// The bug this pins was the worst of the set: the window closed, the
-// notice told the reader to call hub_catch_up, the reader did, confirmed
-// what the walk returned — and release matched cursors EXACTLY, so a
-// pulled cursor was absent from the ledger, nothing was released, the
-// window stayed shut, and the closure was never announced again. The
-// documented cure silently did nothing, permanently.
-func TestConfirmingACursorThatWasPulledRatherThanPushedReopensTheWindow(t *testing.T) {
-	b := testBudget(t)
-	b.windowBytes = 1000
-	b.charge("", "pushed-1", 1200)
-	if !b.closed() {
-		t.Fatal("window did not close")
-	}
-	b.hold("", "held-2")
-
-	// What hub_catch_up hands over is recorded at zero cost — it spends no
-	// push budget, but it must have a POSITION.
-	b.note("", "held-2")
-	b.note("", "walked-3")
-
-	if skipped := b.release("", "walked-3"); skipped {
-		t.Error("the held message was handed over by the walk, yet releasing past it reported a skip")
-	}
-	if b.closed() {
-		t.Fatal("the window is still shut after confirming what the reader actually read")
-	}
-}
-
-// Confirming past a message the window refused to deliver moves the read
-// position over content the reader never saw. That must be reported, not
-// silent — it is the same contiguous-watermark rule a live message shown
-// mid-gap obeys.
-func TestReleasingPastAHeldMessageReportsTheSkip(t *testing.T) {
-	b := testBudget(t)
-	b.charge("", "a", 1)
-	b.hold("", "b")
-	b.note("", "c")
-
-	if skipped := b.release("", "a"); skipped {
-		t.Error("releasing before the held message reported a skip")
-	}
-	if skipped := b.release("", "c"); !skipped {
-		t.Error("releasing past the held message did not report a skip")
-	}
-}
-
-// A held message that catch-up then hands over has been seen, so
-// confirming past it skips nothing.
-func TestAHeldMessageHandedOverLaterIsNoSkip(t *testing.T) {
-	b := testBudget(t)
-	b.hold("", "b")
-	b.note("", "b")
-	b.note("", "c")
-
-	if skipped := b.release("", "c"); skipped {
-		t.Error("confirming past a held message catch-up had delivered reported a skip")
-	}
-}
-
-// An unknown cursor cannot locate a prefix, so nothing may be released —
-// but it is evidence the reader is reading, and a closure that is
-// announced once and never again leaves the channel looking alive while
-// everything is held.
-func TestAnUnknownCursorReleasesNothingButMakesTheClosureAnnounceableAgain(t *testing.T) {
-	b := testBudget(t)
-	b.windowBytes = 100
-	b.charge("", "known", 500)
-	if announce, _ := b.hold("", "h1"); !announce {
-		t.Fatal("first closure was not announced")
-	}
-	if announce, _ := b.hold("", "h2"); announce {
-		t.Fatal("announced twice in a row")
-	}
-
-	b.release("", "a-cursor-this-ledger-never-saw")
-
-	if b.bytes != 500 {
-		t.Fatalf("bytes = %d, want 500 — an unlocatable cursor must not release", b.bytes)
-	}
-	if announce, _ := b.hold("", "h3"); !announce {
-		t.Fatal("the closure stayed silent after an unlocatable confirm")
-	}
-}
-
-// Holding this client's own notices meant the mechanism suppressed the
-// only messages that could reopen it: the held-window announcement and
-// the confirm reminder are the escape hatch.
-func TestAClosedWindowStillDeliversThisClientsOwnNotices(t *testing.T) {
-	c := &Conn{budget: newBudget()}
-	c.budget.windowBytes = 100
-	c.budget.charge("", "c0", 500)
-
-	out := c.applyBudget([]Event{
-		msg("m1", 10),
-		{Kind: "confirmReminder", Text: "c0"},
-		{Kind: "rosterComplete"},
-	}, pushDeliveredCost)
-
-	var kinds []string
-	for _, e := range out {
-		kinds = append(kinds, e.Kind)
-	}
-	for _, want := range []string{"confirmReminder", "rosterComplete"} {
-		found := false
-		for _, k := range kinds {
-			if k == want {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("a closed window swallowed %q, which is how it reopens; got %v", want, kinds)
-		}
-	}
-	for _, k := range kinds {
-		if k == "msg" {
-			t.Error("a closed window delivered an ordinary message")
-		}
-	}
-}
-
-// The estimate charged at render time enforces the window during a burst;
-// the correction replaces it rather than adding a second entry.
-func TestAdjustingACostCorrectsTheEntryRatherThanDoubleCharging(t *testing.T) {
-	b := testBudget(t)
-	b.charge("", "c1", 100)
-	b.adjust("", "c1", 180)
-	if b.bytes != 180 {
-		t.Fatalf("bytes = %d, want 180", b.bytes)
-	}
-	if len(b.outstanding) != 1 {
-		t.Fatalf("ledger has %d entries, want 1 — the message was counted twice", len(b.outstanding))
 	}
 }
 
@@ -483,88 +307,18 @@ func TestASecondClaimOfTheSameKindIsRefusedRatherThanReplacingTheFirst(t *testin
 	}
 }
 
-// One window shared by several connections must release per CONNECTION,
-// not per position. A confirm says "I have read up to here" about one
-// conversation; another connection's entries interleaved before it are
-// still unread and still occupying the reader. Releasing them credits
-// back budget nobody confirmed — and does it exactly when several
-// conversations are busy, which is when the ceiling is load-bearing.
-func TestASharedWindowReleasesOnlyTheConfirmingConnection(t *testing.T) {
-	b := newBudget()
-	b.charge("alpha", "a1", 100)
-	b.charge("beta", "b1", 100)
-	b.charge("alpha", "a2", 100)
-	b.charge("beta", "b2", 100)
-
-	// alpha confirms its latest. Only alpha's 200 bytes come back.
-	b.release("alpha", "a2")
-	b.mu.Lock()
-	gotBytes, gotEntries := b.bytes, len(b.outstanding)
-	b.mu.Unlock()
-	if gotBytes != 200 {
-		t.Fatalf("expected beta's 200 bytes to stay charged, window holds %d", gotBytes)
-	}
-	if gotEntries != 2 {
-		t.Fatalf("expected beta's two entries to remain, got %d", gotEntries)
-	}
-	for _, ch := range b.outstanding {
-		if ch.owner != "beta" {
-			t.Fatalf("expected only beta's entries to survive, found %q", ch.owner)
-		}
-	}
-
-	// And beta's own confirm releases beta's.
-	b.release("beta", "b2")
-	b.mu.Lock()
-	gotBytes, gotEntries = b.bytes, len(b.outstanding)
-	b.mu.Unlock()
-	if gotBytes != 0 || gotEntries != 0 {
-		t.Fatalf("expected an empty window after both confirmed, got %d bytes / %d entries",
-			gotBytes, gotEntries)
-	}
-}
-
-// A cursor belonging to another connection locates nothing, so it
-// releases nothing — the client refuses such a confirm before it reaches
-// here, and this is the second line of that defence.
-func TestAForeignCursorReleasesNothing(t *testing.T) {
-	b := newBudget()
-	b.charge("alpha", "a1", 100)
-	b.charge("beta", "b1", 100)
-
-	b.release("beta", "a1")
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.bytes != 200 || len(b.outstanding) != 2 {
-		t.Fatalf("expected nothing released for a foreign cursor, got %d bytes / %d entries",
-			b.bytes, len(b.outstanding))
-	}
-}
-
 // TestTwoConnectionsWithTheSameCursorKeepTheirOwnCharges is Codex's
 // finding, 2026-09-19: cursors are opaque and issued per server, so two
 // connections sharing one ledger can legitimately hold the same value.
-// note and adjust matched on the cursor alone, so one connection's entry
-// answered for the other's — a confirm released nothing, and a byte
-// correction moved the wrong charge.
+// note matched on the cursor alone, so one connection's entry answered
+// for the other's and a confirm released nothing.
 func TestTwoConnectionsWithTheSameCursorKeepTheirOwnCharges(t *testing.T) {
 	b := testBudget(t)
-	b.charge("alpha", "same-cursor", 100)
-	b.charge("beta", "same-cursor", 100)
+	b.Take("alpha", "same-cursor", 100)
+	b.Take("beta", "same-cursor", 100)
 
-	// The correction belongs to alpha alone.
-	b.adjust("alpha", "same-cursor", 300)
-	for _, ch := range b.outstanding {
-		if ch.owner == "beta" && ch.bytes != 100 {
-			t.Fatalf("beta's charge was moved by alpha's correction: %d", ch.bytes)
-		}
-		if ch.owner == "alpha" && ch.bytes != 300 {
-			t.Fatalf("alpha's own charge was not corrected: %d", ch.bytes)
-		}
-	}
-
-	// And a note for beta must still land, rather than being swallowed
-	// because alpha already holds that cursor.
+	// A note for beta must land, rather than being swallowed because
+	// alpha already holds that cursor.
 	b.note("beta", "noted-cursor")
 	b.note("alpha", "noted-cursor")
 	owners := map[string]bool{}
@@ -575,5 +329,102 @@ func TestTwoConnectionsWithTheSameCursorKeepTheirOwnCharges(t *testing.T) {
 	}
 	if !owners["alpha"] || !owners["beta"] {
 		t.Fatalf("expected both connections to have their own entry for the same cursor, got %v", owners)
+	}
+}
+
+type sentLog struct {
+	mu   sync.Mutex
+	sent []string
+}
+
+func (l *sentLog) add(s string) {
+	l.mu.Lock()
+	l.sent = append(l.sent, s)
+	l.mu.Unlock()
+}
+
+func (l *sentLog) all() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.sent...)
+}
+
+func delivery(log *sentLog, owner, cursor string) Delivery {
+	return Delivery{Owner: owner, Cursor: cursor, Bytes: 10,
+		Send:  func() { log.add(owner + ":" + cursor) },
+		Pause: func(string) { log.add("PAUSED") }}
+}
+
+// One queue, in arrival order across every connection: nothing overtakes
+// anything, and a confirm drains it from the front.
+func TestPushesThatDoNotFitQueueInArrivalOrderAcrossConnections(t *testing.T) {
+	b := testBudget(t)
+	log := &sentLog{}
+	for i := 0; i < 30; i++ {
+		owner := []string{"busy", "quiet"}[min(i/20, 1)]
+		b.Deliver(delivery(log, owner, fmt.Sprintf("c%02d", i)))
+	}
+	if got := log.all(); len(got) != pushWindowCount || got[len(got)-1] != "PAUSED" {
+		t.Fatalf("before any confirm: %v", got)
+	}
+	if b.Queued() != 6 {
+		t.Fatalf("%d queued, want 6", b.Queued())
+	}
+	b.release("busy", "c19")
+	got := log.all()[pushWindowCount:]
+	if len(got) != 6 {
+		t.Fatalf("after the confirm %d sent, want the 6 that waited: %v", len(got), got)
+	}
+	for i, s := range got {
+		owner := "busy"
+		if 24+i >= 20 {
+			owner = "quiet"
+		}
+		if s != fmt.Sprintf("%s:c%02d", owner, 24+i) {
+			t.Fatalf("out of order at %d: %v", i, got)
+		}
+	}
+}
+
+func TestNothingTakesRoomPastAWaitingQueue(t *testing.T) {
+	b := testBudget(t)
+	log := &sentLog{}
+	for i := 0; i < pushWindowCount; i++ {
+		b.Deliver(delivery(log, "a", fmt.Sprintf("c%d", i)))
+	}
+	b.ReleaseAll()
+	b.Deliver(delivery(log, "a", "x"))
+	if b.Queued() != 0 {
+		t.Fatal("the queue did not drain after the release")
+	}
+	for i := 0; i < pushWindowCount; i++ {
+		b.Deliver(delivery(log, "a", fmt.Sprintf("d%d", i)))
+	}
+	if b.Take("catchup", "z", 1) {
+		t.Fatal("a direct take overtook the waiting queue")
+	}
+	if n, _ := b.Free(); n != 0 {
+		t.Fatalf("free %d with a queue waiting", n)
+	}
+}
+
+func TestPastTheQueueLimitOnlyRefetchableMessagesAreLetGo(t *testing.T) {
+	b := testBudget(t)
+	log := &sentLog{}
+	for i := 0; i < pushWindowCount-1; i++ {
+		b.Deliver(delivery(log, "a", fmt.Sprintf("c%d", i)))
+	}
+	b.Deliver(delivery(log, "", "")) // a notice: queued, never let go
+	for i := 0; i < maxQueued+10; i++ {
+		b.Deliver(delivery(log, "a", fmt.Sprintf("q%d", i)))
+	}
+	if n := b.TakeDropped(); n != 11 {
+		t.Fatalf("dropped %d, want 11", n)
+	}
+	b.mu.Lock()
+	first := b.queue[0]
+	b.mu.Unlock()
+	if first.Cursor != "" {
+		t.Fatal("the notice without a cursor was let go")
 	}
 }

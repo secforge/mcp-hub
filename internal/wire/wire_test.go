@@ -18,7 +18,7 @@ func TestJoinedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","serverVersion":4}` {
+	if got := string(raw); got != `{"type":"joined","peerId":"550e8400-e29b-41d4-a716-446655440000","serverVersion":5}` {
 		t.Fatalf("unexpected json: %s", got)
 	}
 	typ, err := DecodeType(raw)
@@ -50,15 +50,13 @@ func TestNewJoinedStampsCurrentProtocolVersion(t *testing.T) {
 }
 
 func TestProtocolVersionIsCurrent(t *testing.T) {
-	// Bumped for the roster becoming state (wire.Roster) and the
-	// peerJoined/peerLeft/rosterComplete frames going away with it. There
-	// is no compatibility path: an older client waits for a
-	// rosterComplete that will never arrive, which is exactly why the
-	// version says so at connect. A client/server that doesn't send a
+	// Bumped for agent connections: an agent endpoint's first frame is
+	// agentJoined, which an older client would read as a broken joined, so
+	// the agent endpoint refuses clients below this version. A client/server that doesn't send a
 	// version at all is still treated as v1 (see wsserver's clientVersion
 	// parsing) — that baseline is unaffected by this bump.
-	if ProtocolVersion != 4 {
-		t.Fatalf("got ProtocolVersion %d, want 4", ProtocolVersion)
+	if ProtocolVersion != 5 {
+		t.Fatalf("got ProtocolVersion %d, want 5", ProtocolVersion)
 	}
 }
 
