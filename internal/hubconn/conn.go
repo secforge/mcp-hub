@@ -215,6 +215,13 @@ type Event struct {
 	// Own marks a "msg" this exact connection sent — see wire.Msg.Own. Also
 	// used on "reactionChanged" for the same purpose — see wire.ReactionChanged.Own.
 	Own bool
+	// SenderName is a "msg" sender's display name, as the server gave it.
+	SenderName string
+	// OwnAccount marks a "msg" from the identity this connection speaks
+	// as, sent some other way than through this connection — the user
+	// writing in Teams themselves, say. Own stays false: this connection
+	// did not send it.
+	OwnAccount bool
 	// Reaction, ReactionLabel, and ReactionAction carry a "reactionChanged"
 	// event's payload — see wire.ReactionChanged. PeerID may be empty for
 	// an unattributed removal (see wire.ReactionChanged.PeerID).
@@ -2405,6 +2412,7 @@ func (c *Conn) readLoop() {
 			ev.IsOperator = true
 		}
 		c.mu.Lock()
+		ev.OwnAccount = ev.Kind == "msg" && !ev.Own && ev.PeerID != "" && ev.PeerID == c.peerID
 		c.lastFrameKind, c.lastFrameAt = ev.Kind, time.Now()
 		// Stamped here, before the ack claim can divert the event, because
 		// this is where the connection's own nature is known and the
@@ -2607,7 +2615,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &m); err != nil || (m.PeerID != "" && !wire.IsValidID(m.PeerID)) {
 			return Event{}, false
 		}
-		return Event{Kind: "msg", PeerID: m.PeerID, Text: m.Text, TS: m.TS, Private: m.Private,
+		return Event{Kind: "msg", PeerID: m.PeerID, SenderName: m.Name, Text: m.Text, TS: m.TS, Private: m.Private,
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,

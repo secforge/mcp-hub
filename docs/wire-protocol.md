@@ -216,6 +216,7 @@ removes the capability it names, never left describing something gone.
 | `historical` | bool | no | server→client | True if this is answering a `messageAfter` request (§2.6a) rather than live traffic. |
 | `externalId` | string | no | server→client | Teams-only concept: this server's own id for the message, correlating it with an earlier `sendAck`. |
 | `own` | bool | no | server→client | True if *this exact connection* sent it. A receiving client's own policy decision whether to treat this as wake-worthy — see §3 for what the reference client does. |
+| `name` | string | no | server→client | The sender's display name, so a sender who has left and is in no member list is still named. Absent when the server knows none. The reference client shows it beside the `peerId`, and marks a message whose `peerId` is this connection's own `joined.peerId` but which is not `own` as the connection's own account writing some other way (in Teams itself, say). |
 | `cursor` | string | no | server→client | This message's own opaque position — pass back as a `messageAfter` anchor (§2.6a). |
 | `answers` | Anchor (see §2.6a) | no | server→client | Present only when this `msg` is the direct answer to a `messageAfter` request — the exact anchor that request was sent with, echoed back verbatim. |
 | `matching` | Filter (see §2.6a) | no | server→client | On an answer to a filtered `messageAfter`: the filter that was *applied*. |

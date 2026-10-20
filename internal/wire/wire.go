@@ -426,8 +426,12 @@ type Msg struct {
 	// CODE, never by the absence, since an unsolicited error (a close
 	// reason, a server-side refusal with no frame behind it) legitimately
 	// carries no id either.
-	ID      string `json:"id,omitempty,case:strict"`
-	PeerID  string `json:"peerId,omitempty,case:strict"`
+	ID     string `json:"id,omitempty,case:strict"`
+	PeerID string `json:"peerId,omitempty,case:strict"`
+	// Name, server->client, is the sender's display name, so a sender who
+	// has left — and is in no member list any more — is still named.
+	// Absent when the server knows none.
+	Name    string `json:"name,omitempty,case:strict"`
 	Text    string `json:"text,case:strict"`
 	TS      string `json:"ts,omitempty,case:strict"`
 	To      string `json:"to,omitempty,case:strict"`      // set by the client to request directed (private) delivery

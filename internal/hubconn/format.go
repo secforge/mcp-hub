@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/secforge/mcp-hub/internal/sanitize"
 )
 
 // randomBoundary returns an 8-hex-char random token for FormatEventsBatch's
@@ -96,6 +98,21 @@ func formatIdentity(e Event) string {
 	return "someone the server did not name"
 }
 
+// senderTag names a message's sender beside its id: the display name the
+// server gave, and whether it is this connection's own account writing
+// some other way. Without the second, the user writing in Teams
+// themselves reads as an unknown peer.
+func senderTag(e Event) string {
+	tag := ""
+	if name := strings.ReplaceAll(sanitize.Text(e.SenderName, 80), "]", ")"); name != "" {
+		tag = fmt.Sprintf(" %q", name)
+	}
+	if e.OwnAccount {
+		tag += " — YOUR OWN ACCOUNT, the one this connection speaks as, writing some other way than through this connection"
+	}
+	return tag
+}
+
 func formatOperatorTag(e Event) string {
 	if !e.IsOperator {
 		return ""
@@ -169,12 +186,12 @@ func FormatEvent(e Event) string {
 			endMarker = fmt.Sprintf("\n[end cursor=%s]", e.Cursor)
 		}
 		if e.Historical {
-			return fmt.Sprintf("[HUB HISTORY — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
+			return fmt.Sprintf("[HUB HISTORY — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID+senderTag(e), operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 		}
 		if e.Private {
-			return fmt.Sprintf("[HUB PRIVATE MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
+			return fmt.Sprintf("[HUB PRIVATE MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID+senderTag(e), operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 		}
-		return fmt.Sprintf("[HUB MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID, operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
+		return fmt.Sprintf("[HUB MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID+senderTag(e), operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 	case "error":
 		if e.Code != "" {
 			return fmt.Sprintf("[HUB ERROR — code=%s, retryable=%t] %s", e.Code, e.Retryable, e.Text)
@@ -550,7 +567,7 @@ func FormatEventForPush(e Event) string {
 		kind = "untrusted, private"
 	}
 	return withPushSeq(e, fmt.Sprintf("[%s, from peer %s%s at %s%s%s%s%s]\n%s",
-		kind, e.PeerID, operator, e.TS, externalID,
+		kind, e.PeerID+senderTag(e), operator, e.TS, externalID,
 		formatReplyTo(e), formatMentions(e), own, e.Text))
 }
 
