@@ -217,6 +217,9 @@ type Event struct {
 	Own bool
 	// SenderName is a "msg" sender's display name, as the server gave it.
 	SenderName string
+	// ExternalLink is a "msg"'s address in its platform — remembered by
+	// the connection (see links.go), never rendered.
+	ExternalLink string
 	// OwnAccount marks a "msg" from the identity this connection speaks
 	// as, sent some other way than through this connection — the user
 	// writing in Teams themselves, say. Own stays false: this connection
@@ -355,8 +358,10 @@ type Conn struct {
 	// live set: it is what was pinned when this connection opened, and
 	// pinned/unpinned events move it on from there. Kept so the connect
 	// result can state it without a round trip.
-	pinnedAtConnect  []string
-	features         map[string]json.RawMessage
+	pinnedAtConnect []string
+	features        map[string]json.RawMessage
+	// links remembers recent messages' external links by externalId.
+	links            linkStore
 	featuresDeclared bool
 	// enc seals and opens an encrypted session's messages (§2.11); nil
 	// on a session that is not encrypted, and on an encrypted one joined
@@ -2413,6 +2418,9 @@ func (c *Conn) readLoop() {
 		}
 		c.mu.Lock()
 		ev.OwnAccount = ev.Kind == "msg" && !ev.Own && ev.PeerID != "" && ev.PeerID == c.peerID
+		if ev.Kind == "msg" {
+			c.links.record(ev.ExternalID, ev.ExternalLink)
+		}
 		c.lastFrameKind, c.lastFrameAt = ev.Kind, time.Now()
 		// Stamped here, before the ack claim can divert the event, because
 		// this is where the connection's own nature is known and the
@@ -2615,7 +2623,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &m); err != nil || (m.PeerID != "" && !wire.IsValidID(m.PeerID)) {
 			return Event{}, false
 		}
-		return Event{Kind: "msg", PeerID: m.PeerID, SenderName: m.Name, Text: m.Text, TS: m.TS, Private: m.Private,
+		return Event{Kind: "msg", PeerID: m.PeerID, SenderName: m.Name, ExternalLink: m.ExternalLink, Text: m.Text, TS: m.TS, Private: m.Private,
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,

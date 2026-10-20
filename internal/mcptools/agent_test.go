@@ -713,3 +713,54 @@ func TestSearchIsRefusedWhereTheServerDoesNotOfferIt(t *testing.T) {
 		t.Fatalf("a search was sent anyway: %s", srv.Controls())
 	}
 }
+
+func linkReq(conn, id string) mcp.CallToolRequest {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"connection": conn, "externalId": id}
+	return req
+}
+
+func TestALinkIsGivenForAMessageReceivedAndOnlyThen(t *testing.T) {
+	srv := agenttest.New(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	srv.Features = map[string]json.RawMessage{"externalLinks": json.RawMessage(`true`)}
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	s := childNamed(t, h, "conv-1")
+	send := func(id, link string) {
+		m := wire.NewBroadcastMsg(agentPeer, "text "+id, "2026-10-20T12:00:00Z", nil, "", "", nil)
+		m.ExternalID, m.ExternalLink, m.Cursor = id, link, "c-"+id
+		srv.Conv("conv-1", m)
+	}
+	send("with", "https://teams.microsoft.com/l/message/1")
+	send("without", "")
+	send("plain-http", "http://example.com/x")
+	waitUntil(t, "the messages", func() bool {
+		conn, _ := s.activeConn()
+		if conn == nil {
+			return false
+		}
+		_, known := conn.ExternalLink("plain-http")
+		return known
+	})
+	for id, want := range map[string]string{
+		"with":       "https://teams.microsoft.com/l/message/1",
+		"without":    "has no link",
+		"plain-http": "has no link",
+		"unknown":    "Read it with hub_read",
+	} {
+		res, _ := h.handleLink(context.Background(), linkReq(s.name, id))
+		if out := textOf(res); !strings.Contains(out, want) {
+			t.Errorf("hub_link(%s) = %q, want it to contain %q", id, out, want)
+		}
+	}
+}
+
+func TestALinkIsRefusedWhereTheServerOffersNone(t *testing.T) {
+	srv := agenttest.New(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	res, _ := h.handleLink(context.Background(), linkReq(childNamed(t, h, "conv-1").name, "x"))
+	if !res.IsError || !strings.Contains(textOf(res), "gives no links") {
+		t.Fatalf("result: %s", textOf(res))
+	}
+}

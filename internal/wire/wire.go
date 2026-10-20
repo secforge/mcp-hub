@@ -431,11 +431,15 @@ type Msg struct {
 	// Name, server->client, is the sender's display name, so a sender who
 	// has left — and is in no member list any more — is still named.
 	// Absent when the server knows none.
-	Name    string `json:"name,omitempty,case:strict"`
-	Text    string `json:"text,case:strict"`
-	TS      string `json:"ts,omitempty,case:strict"`
-	To      string `json:"to,omitempty,case:strict"`      // set by the client to request directed (private) delivery
-	Private bool   `json:"private,omitempty,case:strict"` // set by the server on a delivered directed message
+	Name string `json:"name,omitempty,case:strict"`
+	// ExternalLink, server->client, is the message's address in the
+	// platform it was mirrored from (Teams' webUrl), where the server
+	// declares features.externalLinks. Absent when it has none.
+	ExternalLink string `json:"externalLink,omitempty,case:strict"`
+	Text         string `json:"text,case:strict"`
+	TS           string `json:"ts,omitempty,case:strict"`
+	To           string `json:"to,omitempty,case:strict"`      // set by the client to request directed (private) delivery
+	Private      bool   `json:"private,omitempty,case:strict"` // set by the server on a delivered directed message
 	// Historical marks a msg delivered in answer to a History request
 	// rather than live traffic — additive, so a client that doesn't know
 	// the field just renders it as an ordinary message. mcp-hub-server

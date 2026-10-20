@@ -445,6 +445,12 @@ connection, the sender, the time and a snippet, marked untrusted, with the
 `hub_read` call that reads the whole message. Naming one conversation as
 `connection` searches only that one. Needs a server that declares search.
 
+|`hub_link(connection, externalId)`
+|The link to one message in the platform it came from (Teams), for a message
+this connection received recently: live, by `hub_catch_up` or by `hub_read`.
+Messages never show their link themselves. Only `https` links of at most
+2048 characters are kept.
+
 |`hub_list_connections(query?, kind?, access?, unread?, limit?)`
 |The links this project has used, with the peer id, display name,
 conversation name and `as` name each last used, any recorded catch-up gap,
