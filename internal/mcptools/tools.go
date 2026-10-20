@@ -1653,6 +1653,15 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 				sess.note(d)
 			}
 		}
+		// A PAUSE IS SAID IN EVERY RESULT while pushes wait. The pushed
+		// notice can be lost on the way, and a reader who does not know that
+		// delivery stopped never confirms; a tool result cannot be lost.
+		if queued, paused := h.gate().budget.Waiting(); paused && queued > 0 {
+			h.noteAutoReconnect(fmt.Sprintf("DELIVERY IS PAUSED — %d push(es) are waiting because 25 "+
+				"deliveries (or 500 KB) are unconfirmed, and nothing reaches you until you confirm: "+
+				"hub_confirm(connection, cursor) with the last message you have read COMPLETE, or "+
+				"hub_confirm() with no arguments once you have taken in everything delivered so far.", queued))
+		}
 		note := h.takeAutoReconnectNote()
 		if note == "" || res == nil {
 			return res, err

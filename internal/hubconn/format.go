@@ -600,6 +600,14 @@ func DeliveryPausedText() string {
 		"with no arguments once you have taken in everything delivered so far]"
 }
 
+// DeliveryStillPausedText repeats the pause notice while pushes wait.
+func DeliveryStillPausedText(waiting int) string {
+	return fmt.Sprintf("[hub: DELIVERY IS STILL PAUSED — %d push(es) are waiting because 25 "+
+		"deliveries (or 500 KB) are unconfirmed. Nothing reaches you until you confirm: "+
+		"hub_confirm(connection, cursor) with the last message you have read COMPLETE, or "+
+		"hub_confirm() with no arguments once you have taken in everything delivered so far]", waiting)
+}
+
 func FormatEventsBatch(events []Event) []string {
 	chunks := make([]string, 0, len(events))
 	for _, e := range events {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // The receiver's context is the scarce resource in this system, and it is
@@ -71,8 +72,16 @@ type budget struct {
 	count       int
 	bytes       int
 	// paused records that the window is full and its notice has gone out,
-	// so the notice is said once until room is freed.
+	// so the notice is charged once until room is freed.
 	paused bool
+	// pauseSend is how the pause notice went out, and pauseSaid when. While
+	// pushes wait it is said again every pauseRepeat: one notice can be
+	// lost on the way, and a reader who never learns that delivery stopped
+	// never confirms, so nothing would ever arrive again.
+	pauseSend   func(text string)
+	pauseSaid   time.Time
+	pauseRepeat time.Duration
+	repeating   bool
 	// waiting is called whenever room is freed, so a connection whose
 	// follower deliveries wait in its own buffer drains again.
 	waiting map[any]func()
@@ -142,6 +151,7 @@ func newBudget() *budget {
 		windowBytes: 500 * 1024,
 		windowCount: pushWindowCount,
 		waiting:     map[any]func(){},
+		pauseRepeat: pauseRepeatEvery,
 	}
 }
 
@@ -267,11 +277,62 @@ func (b *budget) Deliver(d Delivery) (queued bool) {
 	}
 	paused := DeliveryPausedText()
 	announce := d.Pause != nil && b.pauseLocked(len(paused))
+	if announce {
+		b.saidPauseLocked(d.Pause)
+	}
 	b.mu.Unlock()
 	if announce {
 		d.Pause(paused)
 	}
 	return true
+}
+
+// pauseRepeatEvery is how often the pause notice is said again while
+// pushes wait.
+const pauseRepeatEvery = 3 * time.Minute
+
+// saidPauseLocked records that the pause notice went out through send,
+// and starts repeating it while pushes wait. Caller holds b.mu.
+func (b *budget) saidPauseLocked(send func(string)) {
+	b.pauseSend, b.pauseSaid = send, time.Now()
+	if !b.repeating {
+		b.repeating = true
+		go b.repeatPause()
+	}
+}
+
+// repeatPause says the pause notice again every pauseRepeat for as long
+// as pushes wait. Not charged: the slot it was charged to is still held.
+func (b *budget) repeatPause() {
+	for {
+		b.mu.Lock()
+		every := b.pauseRepeat
+		b.mu.Unlock()
+		time.Sleep(every)
+		b.mu.Lock()
+		if !b.paused || len(b.queue) == 0 || b.pauseSend == nil {
+			b.repeating = false
+			b.mu.Unlock()
+			return
+		}
+		if time.Since(b.pauseSaid) < b.pauseRepeat {
+			b.mu.Unlock()
+			continue
+		}
+		send := b.pauseSend
+		b.pauseSaid = time.Now()
+		waiting := len(b.queue)
+		b.mu.Unlock()
+		send(DeliveryStillPausedText(waiting))
+	}
+}
+
+// Waiting reports how many pushes wait for room, and whether the window
+// is paused.
+func (b *budget) Waiting() (queued int, paused bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.queue), b.paused
 }
 
 // Queued reports how many pushes wait.
@@ -305,6 +366,9 @@ func (b *budget) flush() {
 		if !b.takeLocked(d.Owner, d.Cursor, d.Bytes) {
 			paused := DeliveryPausedText()
 			announce := d.Pause != nil && b.pauseLocked(len(paused))
+			if announce {
+				b.saidPauseLocked(d.Pause)
+			}
 			b.mu.Unlock()
 			if announce {
 				d.Pause(paused)

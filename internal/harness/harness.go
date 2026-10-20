@@ -390,6 +390,7 @@ func (p *Pusher) Push(cursor, body string, more bool) (deliver.Receipt, error) {
 	p.mu.Lock()
 	d := p.deliverer()
 	p.mu.Unlock()
+	pace.wait()
 	ctx, cancel := context.WithTimeout(context.Background(), deliverTimeout)
 	defer cancel()
 	return d.Deliver(ctx, deliver.Delivery{Cursor: cursor, Body: body, More: more})

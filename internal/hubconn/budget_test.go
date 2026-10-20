@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/secforge/mcp-hub/internal/wire"
 )
@@ -426,5 +427,41 @@ func TestPastTheQueueLimitOnlyRefetchableMessagesAreLetGo(t *testing.T) {
 	b.mu.Unlock()
 	if first.Cursor != "" {
 		t.Fatal("the notice without a cursor was let go")
+	}
+}
+
+func TestThePauseIsSaidAgainWhilePushesWait(t *testing.T) {
+	b := newBudget()
+	b.pauseRepeat = 30 * time.Millisecond
+	var mu sync.Mutex
+	var said []string
+	pause := func(text string) {
+		mu.Lock()
+		said = append(said, text)
+		mu.Unlock()
+	}
+	for i := 0; i < 26; i++ {
+		b.Deliver(Delivery{Bytes: 10, Send: func() {}, Pause: pause})
+	}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(said)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for count() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	if len(said) < 3 || !strings.Contains(said[1], "STILL PAUSED") || !strings.Contains(said[1], "2 push(es)") {
+		mu.Unlock()
+		t.Fatalf("the pause was not repeated: %q", said)
+	}
+	mu.Unlock()
+	b.ReleaseAll()
+	n := count()
+	time.Sleep(100 * time.Millisecond)
+	if count() != n {
+		t.Fatal("the pause was still repeated after a confirm freed the window")
 	}
 }

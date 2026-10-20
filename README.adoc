@@ -576,6 +576,12 @@ Only `hub_confirm` frees room: with a cursor it frees everything delivered
 up to that message, from every connection, and moves that connection's
 read position; with no arguments it frees everything delivered so far and
 moves no position. A catch-up run delivers only what fits.
+While anything waits, the pause notice is pushed again every 3 minutes, and
+every tool result begins with it, so a reader whose notice was lost on the
+way still learns that delivery stopped. Pushes are also paced below the
+receiving session's rate limit (Claude Code drops a sender's messages past
+a burst of 30 and one every 2 seconds): after a burst of 20, one leaves
+every 2.5 seconds.
 
 A conversation of an agent connection does not push its member list when
 it arrives. The current one goes out in front of the conversation's first

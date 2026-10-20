@@ -1,12 +1,15 @@
 package mcptools
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/secforge/harness-transport/deliver"
 )
 
@@ -107,5 +110,28 @@ func TestAConfirmWithoutArgumentsFreesTheWholeWindow(t *testing.T) {
 	}
 	if n, _ := h.gate().budget.Free(); n != 24 {
 		t.Fatalf("free %d after the confirm, want 24", n)
+	}
+}
+
+func TestEveryToolResultSaysDeliveryIsPausedWhilePushesWait(t *testing.T) {
+	h := NewHub()
+	s := server.NewMCPServer("test", "0")
+	h.Register(s)
+	g := h.gate()
+	p := &recordingPusher{}
+	for i := 0; i < 30; i++ {
+		g.push(p, fmt.Sprintf("notice %d", i))
+	}
+	call := func() string {
+		raw, _ := json.Marshal(s.HandleMessage(context.Background(), []byte(
+			`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hub_list_connections","arguments":{}}}`)))
+		return string(raw)
+	}
+	if out := call(); !strings.Contains(out, "DELIVERY IS PAUSED") || !strings.Contains(out, "6 push(es)") {
+		t.Fatalf("a tool result while pushes wait does not say so: %s", out)
+	}
+	g.budget.ReleaseAll()
+	if out := call(); strings.Contains(out, "DELIVERY IS PAUSED") {
+		t.Fatalf("still reported paused after the window was freed: %s", out)
 	}
 }
