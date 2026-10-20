@@ -18,16 +18,18 @@ import (
 // 5, the version that introduced agent connections.
 
 const (
-	TypeAgentJoined Type = "agentJoined"
-	TypeConv        Type = "conv"
-	TypeAssignments Type = "assignments"
-	TypeAssigned    Type = "assigned"
-	TypeChanged     Type = "changed"
-	TypeRevoked     Type = "revoked"
-	TypeClosed      Type = "closed"
-	TypeActivity    Type = "activity"
-	TypeOpen        Type = "open"
-	TypeClose       Type = "close"
+	TypeAgentJoined   Type = "agentJoined"
+	TypeConv          Type = "conv"
+	TypeAssignments   Type = "assignments"
+	TypeAssigned      Type = "assigned"
+	TypeChanged       Type = "changed"
+	TypeRevoked       Type = "revoked"
+	TypeClosed        Type = "closed"
+	TypeActivity      Type = "activity"
+	TypeOpen          Type = "open"
+	TypeClose         Type = "close"
+	TypeSearch        Type = "search"
+	TypeSearchResults Type = "searchResults"
 )
 
 // Access values of a grant.
@@ -169,4 +171,45 @@ func WrapConv(conv string, inner []byte) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(ConvFrame{Type: TypeConv, Conv: conv, Frame: stamped})
+}
+
+// Search looks for text across every conversation the agent holds live,
+// open or not, each within its share's rules. It is answered unwrapped,
+// with SearchResults or an error, either carrying ID. Declared as
+// agentJoined.features.search = SearchFeature.
+type Search struct {
+	Type   Type     `json:"type,case:strict"`
+	ID     string   `json:"id,omitempty,case:strict"`
+	Query  string   `json:"query,case:strict"`
+	Sender string   `json:"sender,omitempty,case:strict"`
+	Conv   []string `json:"conv,omitempty,case:strict"`
+	// Before is the position a previous answer returned, for the next
+	// page.
+	Before string `json:"before,omitempty,case:strict"`
+	Limit  int    `json:"limit,omitempty,case:strict"`
+}
+
+// SearchHit is one matching message. Cursor is that conversation's own
+// messageAfter cursor; Sender is a display name.
+type SearchHit struct {
+	Conv       string `json:"conv,case:strict"`
+	ExternalID string `json:"externalId,omitempty,case:strict"`
+	Cursor     string `json:"cursor,case:strict"`
+	TS         string `json:"ts,omitempty,case:strict"`
+	Sender     string `json:"sender,omitempty,case:strict"`
+	Snippet    string `json:"snippet,omitempty,case:strict"`
+}
+
+// SearchResults answers a Search, newest first. Before is present only
+// when more results exist.
+type SearchResults struct {
+	Type   Type        `json:"type,case:strict"`
+	ID     string      `json:"id,omitempty,case:strict"`
+	Items  []SearchHit `json:"items,case:strict"`
+	Before string      `json:"before,omitempty,case:strict"`
+}
+
+// SearchFeature is agentJoined.features.search.
+type SearchFeature struct {
+	MaxLimit int `json:"maxLimit,omitempty,case:strict"`
 }

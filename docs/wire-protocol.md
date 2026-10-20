@@ -1053,6 +1053,19 @@ reopen}` (today's close codes; `reopen` accompanies `changed`), `activity
 {conv}`. Nothing is sent inside a conversation before its `joined`
 (`not_open`).
 
+**Search.** `search {id, query, sender?, conv?: [handles], before?, limit?}`
+looks across every conversation the agent holds live, open or not, each
+within its share's rules; encrypted ones are never searched. It is answered
+unwrapped with `searchResults {id, items: [{conv, externalId, cursor, ts,
+sender, snippet}], before?}`, newest first, or with `error {id, code}`:
+`bad_query`, `bad_cursor`, or `search_failed` (retryable). `cursor` is that
+conversation's `messageAfter` cursor and `sender` a display name; `before`
+is present only when more exist. An empty or absent `conv` searches all of
+them, and a handle that is no longer live is ignored. Declared as
+`agentJoined.features.search = {maxLimit}` (20). The client always sends an
+`id` and hands an answer only to the search that asked under it; it drops a
+hit whose conversation is not open on its side.
+
 **Refusals** (wrapped when about a conversation): `not_assigned`, `revoked`,
 `bad_conv`, `conv_mismatch`, `read_only`, `not_open`. Revoking the agent
 closes its socket with 4001.

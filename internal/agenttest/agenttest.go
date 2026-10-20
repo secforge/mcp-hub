@@ -46,6 +46,11 @@ type Server struct {
 	// Features is what each conversation's "joined" declares; nil
 	// declares nothing.
 	Features map[string]json.RawMessage
+	// AgentFeatures is what "agentJoined" declares.
+	AgentFeatures map[string]json.RawMessage
+	// OnSearch answers a "search": the frame it returns is sent back
+	// unwrapped, and nil sends nothing.
+	OnSearch func(wire.Search) any
 	// encryption is what each encrypted conversation's "joined" declares.
 	encryption map[string]*wire.Encryption
 	// opens counts "open" frames per conversation, over all sockets.
@@ -120,13 +125,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.ws = ws
 	s.dials++
 	s.open = map[string]bool{}
+	agentFeatures := s.AgentFeatures
 	items := make([]wire.Assignment, 0, len(s.order))
 	for _, c := range s.order {
 		items = append(items, s.grants[c])
 	}
 	s.mu.Unlock()
 	s.write(ws, wire.AgentJoined{Type: wire.TypeAgentJoined, AgentID: AgentID, Name: "test agent",
-		ServerVersion: wire.ProtocolVersion})
+		ServerVersion: wire.ProtocolVersion, Features: agentFeatures})
 	s.write(ws, wire.Assignments{Type: wire.TypeAssignments, Items: items})
 	for {
 		_, raw, err := ws.ReadMessage()
@@ -171,6 +177,18 @@ func (s *Server) handle(ws *websocket.Conn, raw []byte) {
 			ServerVersion: wire.ProtocolVersion, Name: "test agent", ConversationKind: g.Kind,
 			Topic: &g.Title, CanSend: g.Writable(), Access: g.Access, HistoryFrom: g.HistoryFrom,
 			Features: features, Encryption: enc})
+	case wire.TypeSearch:
+		var q wire.Search
+		_ = json.Unmarshal(raw, &q)
+		s.mu.Lock()
+		s.controls = append(s.controls, raw)
+		answer := s.OnSearch
+		s.mu.Unlock()
+		if answer != nil {
+			if reply := answer(q); reply != nil {
+				s.write(ws, reply)
+			}
+		}
 	case wire.TypeClose:
 		var f wire.CloseConv
 		_ = json.Unmarshal(raw, &f)

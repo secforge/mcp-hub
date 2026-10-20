@@ -3,10 +3,14 @@ package hubconn
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/secforge/mcp-hub/internal/agenttest"
 	"github.com/secforge/mcp-hub/internal/wire"
@@ -379,5 +383,41 @@ func TestACatchUpGetsTheRosterWhenItIsDueAndOnlyThen(t *testing.T) {
 	srv.Msg("c-a", testPeer, "live", "1")
 	if got := drainUntil(t, c, 1); got[0] != "live" {
 		t.Fatalf("a live message after the catch-up repeated the roster: %v", got)
+	}
+}
+
+func TestABusyServerIsRetriedAfterItsRetryAfter(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n < 3 {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"code":"busy"}`, http.StatusServiceUnavailable)
+			return
+		}
+		up := websocket.Upgrader{}
+		ws, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		joined := wire.NewJoined("550e8400-e29b-41d4-a716-446655440000", "", "")
+		ws.WriteJSON(joined)
+		ws.ReadMessage()
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/x#secret"
+	start := time.Now()
+	c, err := Dial(link, DialOptions{ReconnectSecret: "s"})
+	if err != nil {
+		t.Fatalf("a busy server that recovers was not retried: %v", err)
+	}
+	defer c.Close()
+	if took := time.Since(start); took < 2*time.Second {
+		t.Fatalf("retried after %s, sooner than the two Retry-After waits", took)
 	}
 }

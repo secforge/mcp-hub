@@ -51,7 +51,17 @@ type agentSession struct {
 	userClosed map[string]bool
 	// failed is why a granted conversation could not be opened, kept so a
 	// listing says so instead of the conversation simply being absent.
-	failed       map[string]string
+	failed map[string]string
+	// pendingNew holds conversations opened at runtime whose notice has
+	// not gone out yet: shared conversations are announced together, in
+	// one notice, newConvWindow after the first. A conversation's own
+	// content never goes out before its notice — see announcedBefore.
+	pendingNew []newConv
+	newTimer   *time.Timer
+	// newWindow and remindEvery are newConvWindow and
+	// agentReminderInterval as they were at connect.
+	newWindow    time.Duration
+	remindEvery  time.Duration
 	leaving      bool
 	reconnecting bool
 	reconnectAt  time.Time
@@ -62,6 +72,20 @@ type agentSession struct {
 // without a message before the next one is pushed with its member list in
 // front of it again.
 const rosterQuiet = 30 * time.Minute
+
+// newConvWindow is how long newly shared conversations are collected into
+// one notice.
+var newConvWindow = 5 * time.Second
+
+// agentReminderInterval is how often one notice reminds about every
+// conversation of the agent with unconfirmed deliveries.
+var agentReminderInterval = 5 * time.Minute
+
+type newConv struct {
+	s     *session
+	title string
+	note  string
+}
 
 // maxAgentNameLen bounds an agent connection's name, because every
 // conversation's name starts with it and a name is at most 32 characters:
@@ -103,12 +127,14 @@ func (h *Hub) connectAgent(placeholder *session, a *hubconn.Agent, c agentConnec
 	}
 	ag := &agentSession{
 		hub: h, name: as, link: c.link, display: c.display, target: c.target,
-		pusher:     harness.OpenAs(as),
-		agent:      a,
-		grants:     map[string]wire.Assignment{},
-		children:   map[string]*session{},
-		userClosed: map[string]bool{},
-		failed:     map[string]string{},
+		pusher:      harness.OpenAs(as),
+		agent:       a,
+		grants:      map[string]wire.Assignment{},
+		children:    map[string]*session{},
+		userClosed:  map[string]bool{},
+		failed:      map[string]string{},
+		newWindow:   newConvWindow,
+		remindEvery: agentReminderInterval,
 	}
 	// The name moves from the placeholder to the agent in one step, and
 	// only if the placeholder still holds it: a hub_disconnect during the
@@ -140,6 +166,7 @@ func (h *Hub) connectAgent(placeholder *session, a *hubconn.Agent, c agentConnec
 	opened, failed := ag.install(a)
 	ag.opMu.Unlock()
 	a.OnEvent(func(ev hubconn.AgentEvent) { ag.handleEvent(a, ev) })
+	go ag.remindLoop()
 	return mcp.NewToolResultText(ag.connectSummary(opened, failed)), nil
 }
 
@@ -179,7 +206,7 @@ func (ag *agentSession) install(a *hubconn.Agent) (opened []*session, failed map
 		}
 	}
 	ag.mu.Unlock()
-	opened, failed = ag.openAll(a, todo)
+	opened, failed = ag.openAll(a, todo, false)
 	ag.retryFailed(a, failed)
 	return opened, failed
 }
@@ -206,15 +233,13 @@ func (ag *agentSession) retryOpen(a *hubconn.Agent, conv string, attempt int) {
 	if !current || !granted || open {
 		return
 	}
-	s, err := ag.openChild(a, it, nil, nil)
+	firstFailed := "could not be opened at first"
+	_, err := ag.openChild(a, it, nil, nil, &firstFailed)
 	switch {
 	case err == nil:
 		ag.mu.Lock()
 		delete(ag.failed, conv)
 		ag.mu.Unlock()
-		ag.alert(fmt.Sprintf("Conversation %q, which could not be opened at first, is open now as "+
-			"connection %q (%s). Call hub_catch_up(connection: %q) before acting in it.",
-			it.Title, s.name, accessText(s), s.name))
 	case attempt >= maxReopenAttempts:
 		ag.mu.Lock()
 		ag.failed[conv] = err.Error()
@@ -230,8 +255,13 @@ func (ag *agentSession) retryOpen(a *hubconn.Agent, conv string, attempt int) {
 	}
 }
 
-// openAll opens items concurrently, a bounded number at a time.
-func (ag *agentSession) openAll(a *hubconn.Agent, items []wire.Assignment) ([]*session, map[string]string) {
+// openAll opens items concurrently, a bounded number at a time, announcing
+// each as new when announce is set.
+func (ag *agentSession) openAll(a *hubconn.Agent, items []wire.Assignment, announce bool) ([]*session, map[string]string) {
+	var note *string
+	if announce {
+		note = new(string)
+	}
 	var mu sync.Mutex
 	var opened []*session
 	failed := map[string]string{}
@@ -258,7 +288,7 @@ func (ag *agentSession) openAll(a *hubconn.Agent, items []wire.Assignment) ([]*s
 		go func() {
 			defer wg.Done()
 			for it := range jobs {
-				s, err := ag.openChild(a, it, stored, record)
+				s, err := ag.openChild(a, it, stored, record, note)
 				mu.Lock()
 				if err != nil {
 					failed[it.Conv] = err.Error()
@@ -296,8 +326,11 @@ func (ag *agentSession) childTarget(conv string) connstore.Target {
 // is every stored entry of this project by link, read once by the caller,
 // and record takes the entry to write, for the caller to write with all
 // the others at once.
+//
+// A non-nil announce queues the notice that the conversation is new, with
+// that note, before anything from it can be delivered (see announceNew).
 func (ag *agentSession) openChild(a *hubconn.Agent, it wire.Assignment, preloaded map[string]connstore.Entry,
-	record func(connstore.Target, connstore.Entry)) (*session, error) {
+	record func(connstore.Target, connstore.Entry), announce *string) (*session, error) {
 	if record == nil {
 		record = func(t connstore.Target, e connstore.Entry) { _ = connstore.Upsert(t, e) }
 	}
@@ -349,6 +382,7 @@ func (ag *agentSession) openChild(a *hubconn.Agent, it wire.Assignment, preloade
 	conn.ShareDeliveryBudget(ag.hub.budget, s.name)
 	conn.SetDeliveryBudget(ag.hub.spillDir, 0, 0, 0)
 	conn.PushRosterBeforeMessages(rosterQuiet)
+	conn.RemindElsewhere()
 	s.mu.Lock()
 	// The redial fields say "this session wants a connection", which is
 	// what the install guard and a disconnect both read. A conversation is
@@ -357,6 +391,9 @@ func (ag *agentSession) openChild(a *hubconn.Agent, it wire.Assignment, preloade
 	s.reconnecting, s.reconnectAt = false, time.Time{}
 	gen := s.reconnectGen
 	s.mu.Unlock()
+	if announce != nil {
+		ag.announceNew(s, it.Title, *announce)
+	}
 	conn.OnActivity(func() {
 		w.Poke()
 		s.pushToHarness(conn, w)
@@ -365,6 +402,7 @@ func (ag *agentSession) openChild(a *hubconn.Agent, it wire.Assignment, preloade
 		}
 	})
 	if !s.installIfStillWanted(conn, w, target, gen) {
+		ag.withdrawNew(s)
 		conn.Close()
 		return nil, fmt.Errorf("it was disconnected while opening")
 	}
@@ -569,7 +607,7 @@ func (ag *agentSession) handleEvent(a *hubconn.Agent, ev hubconn.AgentEvent) {
 		if open {
 			return
 		}
-		s, err := ag.openChild(a, ev.Item, nil, nil)
+		_, err := ag.openChild(a, ev.Item, nil, nil, new(string))
 		if err != nil {
 			ag.mu.Lock()
 			ag.failed[ev.Conv] = err.Error()
@@ -577,11 +615,7 @@ func (ag *agentSession) handleEvent(a *hubconn.Agent, ev hubconn.AgentEvent) {
 			ag.alert(fmt.Sprintf("A new conversation %q was shared with this agent, but opening it "+
 				"failed: %v. It is tried again by itself.", ev.Item.Title, err))
 			go ag.retryOpen(a, ev.Conv, 1)
-			return
 		}
-		ag.alert(fmt.Sprintf("NEW CONVERSATION shared with this agent: %q, open as connection %q "+
-			"(%s). Call hub_catch_up(connection: %q) before acting in it.",
-			ev.Item.Title, s.name, accessText(s), s.name))
 	case "changed":
 		ag.mu.Lock()
 		ag.grants[ev.Conv] = ev.Item
@@ -595,7 +629,7 @@ func (ag *agentSession) handleEvent(a *hubconn.Agent, ev hubconn.AgentEvent) {
 			return
 		}
 		if ev.Reopen {
-			if _, err := ag.openChild(a, it, nil, nil); err != nil {
+			if _, err := ag.openChild(a, it, nil, nil, nil); err != nil {
 				ag.mu.Lock()
 				delete(ag.children, ev.Conv)
 				ag.mu.Unlock()
@@ -665,12 +699,8 @@ func (ag *agentSession) handleEvent(a *hubconn.Agent, ev hubconn.AgentEvent) {
 		for _, s := range gone {
 			ag.release(s, "it is no longer shared with this agent", true)
 		}
-		opened, failedNow := ag.openAll(a, fresh)
+		_, failedNow := ag.openAll(a, fresh, true)
 		ag.retryFailed(a, failedNow)
-		if len(opened) > 0 {
-			ag.alert(fmt.Sprintf("%d conversation(s) newly shared with this agent are open: %s.",
-				len(opened), sessionNames(opened)))
-		}
 	case "error":
 		ag.alert(fmt.Sprintf("The server reported on the agent connection: %s (%s). Nothing was "+
 			"delivered to any conversation by whatever caused it.", ev.Reason, ev.ErrCode))
@@ -889,6 +919,11 @@ func (ag *agentSession) end(why string) {
 	ag.mu.Lock()
 	ag.leaving = true
 	ag.gen++
+	if ag.newTimer != nil {
+		ag.newTimer.Stop()
+		ag.newTimer = nil
+	}
+	ag.pendingNew = nil
 	ag.reconnecting, ag.reconnectAt = false, time.Time{}
 	children := ag.children
 	ag.children = map[string]*session{}
@@ -1207,7 +1242,7 @@ func (ag *agentSession) reopen(s *session) error {
 		s.teardown(conn, true)
 		conn.Close()
 	}
-	_, err := ag.openChild(a, it, nil, nil)
+	_, err := ag.openChild(a, it, nil, nil, nil)
 	return err
 }
 
@@ -1239,7 +1274,7 @@ func (ag *agentSession) retryReopen(a *hubconn.Agent, s *session, attempt int) {
 	if conn, _ := s.activeConn(); conn != nil && conn.Connected() {
 		return
 	}
-	_, err := ag.openChild(a, it, nil, nil)
+	_, err := ag.openChild(a, it, nil, nil, nil)
 	switch {
 	case err == nil:
 		ag.alert(fmt.Sprintf("Conversation %q is open again after the server briefly closed it. "+
@@ -1255,5 +1290,128 @@ func (ag *agentSession) retryReopen(a *hubconn.Agent, s *session, attempt int) {
 			attempt, err), false)
 	default:
 		go ag.retryReopen(a, s, attempt+1)
+	}
+}
+
+// announceNew queues the notice that s was opened, to go out with the
+// others opened within newConvWindow — or sooner, in front of s's first
+// content (see announcedBefore).
+func (ag *agentSession) announceNew(s *session, title, note string) {
+	ag.mu.Lock()
+	defer ag.mu.Unlock()
+	if ag.leaving {
+		return
+	}
+	ag.pendingNew = append(ag.pendingNew, newConv{s: s, title: title, note: note})
+	if ag.newTimer == nil {
+		ag.newTimer = time.AfterFunc(ag.newWindow, ag.flushNew)
+	}
+}
+
+// withdrawNew drops the queued notice for s, which did not open after all.
+func (ag *agentSession) withdrawNew(s *session) {
+	ag.mu.Lock()
+	defer ag.mu.Unlock()
+	kept := ag.pendingNew[:0]
+	for _, n := range ag.pendingNew {
+		if n.s != s {
+			kept = append(kept, n)
+		}
+	}
+	ag.pendingNew = kept
+}
+
+// announcedBefore sends the queued notices when s is among them, so the
+// reader learns of a conversation before anything from it arrives.
+func (ag *agentSession) announcedBefore(s *session) {
+	ag.mu.Lock()
+	pending := false
+	for _, n := range ag.pendingNew {
+		if n.s == s {
+			pending = true
+			break
+		}
+	}
+	ag.mu.Unlock()
+	if pending {
+		ag.flushNew()
+	}
+}
+
+// flushNew sends one notice for every conversation queued so far.
+func (ag *agentSession) flushNew() {
+	ag.mu.Lock()
+	pending := ag.pendingNew
+	ag.pendingNew = nil
+	if ag.newTimer != nil {
+		ag.newTimer.Stop()
+		ag.newTimer = nil
+	}
+	ag.mu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	lines := make([]string, 0, len(pending))
+	for _, n := range pending {
+		line := fmt.Sprintf("%q as connection %q (%s)", n.title, n.s.name, accessText(n.s))
+		if n.note != "" {
+			line += ", which " + n.note
+		}
+		lines = append(lines, line)
+	}
+	head := "NEW CONVERSATION shared with this agent, now open: "
+	if len(pending) > 1 {
+		head = fmt.Sprintf("%d NEW CONVERSATIONS shared with this agent, now open: ", len(pending))
+	}
+	ag.alert(head + strings.Join(lines, "; ") + ". Call hub_catch_up(connection: <name>) for " +
+		"one before acting in it.")
+}
+
+// remindLoop reminds, in one notice per interval, about every conversation
+// of this agent with live deliveries the reader has not confirmed — in
+// place of one reminder per conversation, which with hundreds of them
+// would be the noise the reminder is meant to cut through.
+func (ag *agentSession) remindLoop() {
+	t := time.NewTicker(ag.remindEvery)
+	defer t.Stop()
+	for range t.C {
+		ag.mu.Lock()
+		if ag.leaving {
+			ag.mu.Unlock()
+			return
+		}
+		children := make([]*session, 0, len(ag.children))
+		for _, s := range ag.children {
+			children = append(children, s)
+		}
+		ag.mu.Unlock()
+		sort.Slice(children, func(i, j int) bool { return children[i].name < children[j].name })
+		var lines []string
+		more := 0
+		for _, s := range children {
+			conn, _ := s.activeConn()
+			if conn == nil {
+				continue
+			}
+			cursor, count, since, ok := conn.UnconfirmedState()
+			if !ok {
+				continue
+			}
+			if len(lines) == 20 {
+				more++
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("%s: %d unconfirmed since %s, last cursor %s",
+				s.name, count, since.UTC().Format("15:04 UTC"), cursor))
+		}
+		if len(lines) == 0 {
+			continue
+		}
+		if more > 0 {
+			lines = append(lines, fmt.Sprintf("and %d more conversation(s)", more))
+		}
+		ag.alert(fmt.Sprintf("CONFIRM what you have read: %s. hub_confirm(connection, cursor) for "+
+			"each, once you have the message whole; until then a reconnect delivers them again and "+
+			"they hold room in the delivery window.", strings.Join(lines, "; ")))
 	}
 }

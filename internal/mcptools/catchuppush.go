@@ -93,6 +93,9 @@ type catchUpResult struct {
 // goes to the model the same way a live message does.
 func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor wire.Anchor,
 	want catchUpWant) {
+	if s.agent != nil {
+		s.agent.announcedBefore(s)
+	}
 	s.pushCatchUpSummary(s.walkCatchUpPush(conn, id, anchor, want))
 }
 

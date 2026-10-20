@@ -1,6 +1,7 @@
 package hubconn
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,6 +41,9 @@ type Agent struct {
 	// drop that follows it.
 	reconnectAfter int
 	done           chan struct{}
+	// searches holds the searches awaiting an answer, by request id.
+	searches  map[string]chan searchAnswer
+	searchSeq int
 
 	// Agent events are queued and handed to one handler in order, on a
 	// goroutine of their own: the read loop must never wait on whatever
@@ -113,6 +117,7 @@ func startAgent(ws *websocket.Conn, raw []byte, snapPongWait, snapWriteWait time
 		initial:   list.Items,
 		convs:     map[string]*agentConv{},
 		done:      make(chan struct{}),
+		searches:  map[string]chan searchAnswer{},
 	}
 	a.evCond = sync.NewCond(&a.evMu)
 	ws.SetReadDeadline(time.Now().Add(snapPongWait))
@@ -243,7 +248,19 @@ func (a *Agent) readLoop() {
 				continue
 			}
 			a.emit(AgentEvent{Kind: "activity", Conv: f.Conv, Behind: f.Behind})
+		case wire.TypeSearchResults:
+			var f wire.SearchResults
+			if err := json.Unmarshal(raw, &f); err != nil {
+				debugf("agent: unreadable searchResults dropped: %s", raw)
+				continue
+			}
+			a.answerSearch(f.ID, searchAnswer{results: f})
 		case wire.TypeError:
+			var e wire.Error
+			if json.Unmarshal(raw, &e) == nil && e.ID != "" && a.answerSearch(e.ID, searchAnswer{
+				err: &SearchError{Code: e.Code, Message: e.Message, Retryable: e.Retryable}}) {
+				continue
+			}
 			ev, ok := decodeEvent(raw)
 			if !ok {
 				continue
@@ -645,4 +662,93 @@ func (v *agentConv) Close() error {
 	v.agent.forget(v)
 	v.finish(&websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "client disconnect"}, true)
 	return nil
+}
+
+// searchWait bounds how long a search waits for its answer.
+var searchWait = 30 * time.Second
+
+type searchAnswer struct {
+	results wire.SearchResults
+	err     error
+}
+
+// SearchError is the server's refusal of a search.
+type SearchError struct {
+	Code      string
+	Message   string
+	Retryable bool
+}
+
+func (e *SearchError) Error() string {
+	if e.Message == "" {
+		return e.Code
+	}
+	return fmt.Sprintf("%s (%s)", e.Message, e.Code)
+}
+
+// SearchLimit is the most results one search returns, and whether the
+// server offers search at all.
+func (a *Agent) SearchLimit() (int, bool) {
+	raw, ok := a.joined.Features["search"]
+	if !ok {
+		return 0, false
+	}
+	var f wire.SearchFeature
+	if err := json.Unmarshal(raw, &f); err != nil || f.MaxLimit <= 0 {
+		return 20, true
+	}
+	return f.MaxLimit, true
+}
+
+// Search sends q and waits for its answer. The id is set here, so an
+// answer is only ever taken by the search that asked for it.
+func (a *Agent) Search(ctx context.Context, q wire.Search) (wire.SearchResults, error) {
+	if _, ok := a.SearchLimit(); !ok {
+		return wire.SearchResults{}, fmt.Errorf("this server does not offer search across conversations")
+	}
+	ch := make(chan searchAnswer, 1)
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return wire.SearchResults{}, errAgentDown
+	}
+	a.searchSeq++
+	q.ID = fmt.Sprintf("search-%d", a.searchSeq)
+	a.searches[q.ID] = ch
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.searches, q.ID)
+		a.mu.Unlock()
+	}()
+	q.Type = wire.TypeSearch
+	if err := a.writeFrame(q); err != nil {
+		return wire.SearchResults{}, err
+	}
+	timer := time.NewTimer(searchWait)
+	defer timer.Stop()
+	select {
+	case ans := <-ch:
+		return ans.results, ans.err
+	case <-a.done:
+		return wire.SearchResults{}, errAgentDown
+	case <-ctx.Done():
+		return wire.SearchResults{}, ctx.Err()
+	case <-timer.C:
+		return wire.SearchResults{}, fmt.Errorf("the server did not answer the search within %s", searchWait)
+	}
+}
+
+// answerSearch hands an answer to the search waiting under id, reporting
+// whether one was.
+func (a *Agent) answerSearch(id string, ans searchAnswer) bool {
+	a.mu.Lock()
+	ch := a.searches[id]
+	delete(a.searches, id)
+	a.mu.Unlock()
+	if ch == nil {
+		return false
+	}
+	ch <- ans
+	return true
 }

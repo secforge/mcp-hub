@@ -339,15 +339,24 @@ title, access and unread count. The agent connection's own name is at most
 * *Read-only* conversations refuse every write (send, edit, react, delete,
   pin) in the client before anything is sent. The server refuses them too.
 * A conversation shared at runtime opens as a new connection, and the model
-  is told. A changed grant reopens it under the new rules. A withdrawn one
+  is told. Conversations shared within 5 seconds of each other are named in
+  one notice, and a conversation's notice always comes before anything read
+  or pushed from it. A changed grant reopens it under the new rules. A withdrawn one
   ends, its name stops working, and its stored read position is deleted.
 * When the socket drops, the client reconnects it and reopens every
   conversation, each from its own read position, and says so once.
   `hub_disconnect` with the agent's name ends all of them, and with a
   conversation's name closes only that one until the agent next reconnects.
+* `hub_search` searches every conversation of the agent at once (see the
+  tool table).
 * An encrypted conversation needs its key file, given per conversation with
   `hub_set_key(connection, keyFile)`. Until then it can be read only as
   sealed notices, and nothing can be sent there.
+* Unconfirmed deliveries are reminded about once per agent every 5
+  minutes, in one notice naming every conversation concerned, not once per
+  conversation.
+* A server too busy to accept the connection right now (`503` with code
+  `busy`) is dialled again after its `Retry-After`, up to 5 times.
 * The number of conversations is the server's decision and is not capped by
   the client (tested with 1000). The limit of 8 connections counts the agent
   connection as one.
@@ -428,6 +437,13 @@ tools tell the model to do this only when the user asks.
 |Give one conversation of an agent connection the key file of its encrypted
 session, and reopen it with that key. The path is stored for that
 conversation, never the key.
+
+|`hub_search(connection, query, sender?, conversations?, before?, limit?)`
+|Search the text of every conversation of an agent connection at once,
+newest first, at most 20 hits per call. Each hit names its conversation's
+connection, the sender, the time and a snippet, marked untrusted, with the
+`hub_read` call that reads the whole message. Naming one conversation as
+`connection` searches only that one. Needs a server that declares search.
 
 |`hub_list_connections(query?, kind?, access?, unread?, limit?)`
 |The links this project has used, with the peer id, display name,

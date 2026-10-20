@@ -478,6 +478,10 @@ type Conn struct {
 	// stops looking at.
 	unconfirmedCount int
 	unconfirmedSince time.Time
+	// remindersElsewhere stops this connection's own confirm reminder:
+	// whoever set it reminds for many connections at once (see
+	// UnconfirmedState).
+	remindersElsewhere bool
 	// lastConsumed/lastAckSent/ackDisabled implement the read-receipt
 	// contract — see LastConsumedCursor and Drain.
 	//   - lastConsumed: cursor of the most recent event actually returned
@@ -1011,7 +1015,7 @@ func DialAny(link string, opts DialOptions) (*Conn, *Agent, error) {
 
 	// Which kind of endpoint answered — one conversation or an agent
 	// connection — is the first frame's to say, never the link's.
-	ws, err := dialWS(target, header)
+	ws, err := dialBusyRetrying(target, header)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1044,8 +1048,34 @@ func dialWS(target string, header http.Header) (*websocket.Conn, error) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	retryAfter := time.Duration(0)
+	if secs, perr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); perr == nil && secs > 0 {
+		retryAfter = time.Duration(secs) * time.Second
+	}
 	return nil, &HandshakeRefusedError{Status: resp.StatusCode, StatusText: resp.Status,
-		Said: strings.TrimSpace(string(body)), err: err}
+		Said: strings.TrimSpace(string(body)), RetryAfter: retryAfter, err: err}
+}
+
+// busyRetries and busyWaitMax bound how a dial rides out a busy server:
+// a 503 says "try again shortly", and a server that limits how many
+// handshakes it takes at once answers it whenever two clients behind one
+// address connect together — after its own restart, every one of them.
+const (
+	busyRetries = 5
+	busyWaitMax = 5 * time.Second
+)
+
+// dialBusyRetrying is dialWS, retrying a busy server after the wait it
+// names in Retry-After (at least a second, at most busyWaitMax).
+func dialBusyRetrying(target string, header http.Header) (*websocket.Conn, error) {
+	for attempt := 0; ; attempt++ {
+		ws, err := dialWS(target, header)
+		var refused *HandshakeRefusedError
+		if err == nil || attempt >= busyRetries || !errors.As(err, &refused) || !refused.busy() {
+			return ws, err
+		}
+		time.Sleep(min(max(refused.RetryAfter, time.Second), busyWaitMax))
+	}
 }
 
 // HandshakeRefusedError is a server's answer to the upgrade that was not
@@ -1054,6 +1084,8 @@ type HandshakeRefusedError struct {
 	Status     int
 	StatusText string
 	Said       string
+	// RetryAfter is the server's Retry-After, in seconds form, or zero.
+	RetryAfter time.Duration
 	err        error
 }
 
@@ -1065,6 +1097,14 @@ func (e *HandshakeRefusedError) Error() string {
 }
 
 func (e *HandshakeRefusedError) Unwrap() error { return e.err }
+
+// busy reports the server saying it is at capacity and to try again
+// shortly: a 503 naming the code "busy". Any other 503 — a server down or
+// restarting — is reported at once, and left to whoever decides whether to
+// try again.
+func (e *HandshakeRefusedError) busy() bool {
+	return e.Status == http.StatusServiceUnavailable && strings.Contains(e.Said, `"busy"`)
+}
 
 // Deliberate reports a refusal the server means: the link's credential is
 // not honoured (401, 403), or the server has no such link (404, 410).
@@ -2281,7 +2321,7 @@ func (c *Conn) confirmReminderLoop() {
 			return
 		}
 		seen := c.lastSeenCursor
-		if seen == "" || !c.liveUnconfirmed {
+		if seen == "" || !c.liveUnconfirmed || c.remindersElsewhere {
 			c.mu.Unlock()
 			continue
 		}
@@ -2294,6 +2334,26 @@ func (c *Conn) confirmReminderLoop() {
 		c.mu.Unlock()
 		c.signalActivity()
 	}
+}
+
+// RemindElsewhere stops this connection's own confirm reminder, for a
+// caller that reminds about many connections in one notice instead.
+func (c *Conn) RemindElsewhere() {
+	c.mu.Lock()
+	c.remindersElsewhere = true
+	c.mu.Unlock()
+}
+
+// UnconfirmedState reports what a confirm reminder would: the last cursor
+// delivered live, how many live deliveries are unconfirmed, and since
+// when. ok is false when nothing is unconfirmed.
+func (c *Conn) UnconfirmedState() (cursor string, count int, since time.Time, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.lastSeenCursor == "" || !c.liveUnconfirmed {
+		return "", 0, time.Time{}, false
+	}
+	return c.lastSeenCursor, c.unconfirmedCount, c.unconfirmedSince, true
 }
 
 // nameTaken reports whether any of these peers already answers to mine.

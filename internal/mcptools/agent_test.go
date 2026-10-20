@@ -2,10 +2,12 @@ package mcptools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -507,5 +509,207 @@ func TestTheListCanBeNarrowedByTitleKindAndAccess(t *testing.T) {
 	req.Params.Arguments = map[string]any{"access": "write"}
 	if res, _ := h.handleListConnections(context.Background(), req); !res.IsError {
 		t.Fatal("an unknown access value was accepted")
+	}
+}
+
+func TestConversationsSharedTogetherAreAnnouncedTogether(t *testing.T) {
+	defer func(w time.Duration) { newConvWindow = w }(newConvWindow)
+	newConvWindow = 300 * time.Millisecond
+	srv := agenttest.New(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	h.takeAutoReconnectNote()
+	srv.Assign(agentGrant("conv-a", "Neu A", wire.AccessReadWrite))
+	srv.Assign(agentGrant("conv-b", "Neu B", wire.AccessRead))
+	var note string
+	waitUntil(t, "the combined notice", func() bool {
+		note += h.takeAutoReconnectNote()
+		return strings.Contains(note, "2 NEW CONVERSATIONS")
+	})
+	if strings.Count(note, "NEW CONVERSATION") != 1 || !strings.Contains(note, "Neu A") || !strings.Contains(note, "Neu B") {
+		t.Fatalf("not one notice naming both: %s", note)
+	}
+}
+
+func TestANewConversationIsAnnouncedBeforeItsFirstContent(t *testing.T) {
+	defer func(w time.Duration) { newConvWindow = w }(newConvWindow)
+	newConvWindow = time.Hour
+	srv := agenttest.New(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	h.takeAutoReconnectNote()
+	srv.Assign(agentGrant("conv-new", "Neu", wire.AccessReadWrite))
+	waitUntil(t, "the new conversation", func() bool {
+		for _, s := range h.allSessions() {
+			if s.conv == "conv-new" {
+				c, _ := s.activeConn()
+				return c != nil && c.Connected()
+			}
+		}
+		return false
+	})
+	if note := h.takeAutoReconnectNote(); strings.Contains(note, "NEW CONVERSATION") {
+		t.Fatalf("announced before the window and before any content: %s", note)
+	}
+	// Called without the tool wrapper, which puts queued notes in front of
+	// the result: the notice has to be queued by the time the call returns.
+	h.handleCatchUp(context.Background(), connReqFor(childNamed(t, h, "conv-new").name))
+	if note := h.takeAutoReconnectNote(); !strings.Contains(note, "NEW CONVERSATION") {
+		t.Fatalf("reading the conversation came before its announcement: %q", note)
+	}
+}
+
+func TestOneReminderCoversEveryConversationOfTheAgent(t *testing.T) {
+	defer func(d time.Duration) { agentReminderInterval = d }(agentReminderInterval)
+	agentReminderInterval = 200 * time.Millisecond
+	srv := agenttest.New(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite),
+		agentGrant("conv-2", "Beta", wire.AccessReadWrite))
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	srv.Msg("conv-1", agentPeer, "one", "c-1")
+	srv.Msg("conv-2", agentPeer, "two", "c-2")
+	var note string
+	waitUntil(t, "the reminder", func() bool {
+		note += h.takeAutoReconnectNote()
+		return strings.Contains(note, "CONFIRM what you have read")
+	})
+	a, b := childNamed(t, h, "conv-1"), childNamed(t, h, "conv-2")
+	if !strings.Contains(note, a.name) || !strings.Contains(note, b.name) {
+		t.Fatalf("one reminder does not cover both conversations: %s", note)
+	}
+	for _, s := range []*session{a, b} {
+		conn, _ := s.activeConn()
+		evs, _ := conn.DrainEvents()
+		for _, e := range evs {
+			if e.Kind == "confirmReminder" {
+				t.Fatal("a conversation still reminds on its own")
+			}
+		}
+	}
+}
+
+func searchReq(conn, query string, convs ...string) mcp.CallToolRequest {
+	req := mcp.CallToolRequest{}
+	args := map[string]any{"connection": conn, "query": query}
+	if len(convs) > 0 {
+		list := make([]any, len(convs))
+		for i, c := range convs {
+			list[i] = c
+		}
+		args["conversations"] = list
+	}
+	req.Params.Arguments = args
+	return req
+}
+
+func searchServer(t *testing.T, grants ...wire.Assignment) *agenttest.Server {
+	srv := agenttest.New(t, grants...)
+	srv.AgentFeatures = map[string]json.RawMessage{"search": json.RawMessage(`{"maxLimit":20}`)}
+	return srv
+}
+
+func TestASearchHitIsShownUnderItsOwnConversation(t *testing.T) {
+	srv := searchServer(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite),
+		agentGrant("conv-2", "Beta", wire.AccessRead))
+	var got wire.Search
+	var mu sync.Mutex
+	srv.OnSearch = func(q wire.Search) any {
+		mu.Lock()
+		got = q
+		mu.Unlock()
+		return wire.SearchResults{Type: wire.TypeSearchResults, ID: q.ID, Before: "page-2",
+			Items: []wire.SearchHit{
+				{Conv: "conv-2", Cursor: "c-20", ExternalID: "x-20", TS: "2026-10-20T07:00:00Z",
+					Sender: "Anna", Snippet: "the invoice is late"},
+				{Conv: "conv-1", Cursor: "c-10", TS: "2026-10-19T07:00:00Z", Sender: "Ben",
+					Snippet: "invoice sent"},
+				{Conv: "conv-gone", Cursor: "c-99", Snippet: "invoice elsewhere"},
+			}}
+	}
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	res, err := h.handleSearch(context.Background(), searchReq("desk", "invoice"))
+	if err != nil || res.IsError {
+		t.Fatalf("search: err=%v result=%s", err, textOf(res))
+	}
+	out := textOf(res)
+	a, b := childNamed(t, h, "conv-1"), childNamed(t, h, "conv-2")
+	for _, want := range []string{
+		fmt.Sprintf("in connection %q (Beta), from Anna at 2026-10-20T07:00:00Z cursor=c-20 externalId=x-20", b.name),
+		fmt.Sprintf("in connection %q (Alpha), from Ben", a.name),
+		fmt.Sprintf("hub_read(connection: %q, at: \"2026-10-20T06:59:59.999Z\")", b.name),
+		"1 more left out because their conversation is not open here",
+		`before: "page-2"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("result lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "invoice elsewhere") {
+		t.Errorf("a hit for a conversation not open here was shown:\n%s", out)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got.ID == "" || got.Query != "invoice" || got.Limit != 20 || len(got.Conv) != 0 {
+		t.Errorf("request sent: %+v", got)
+	}
+}
+
+func TestASearchNamingConversationsSendsTheirHandles(t *testing.T) {
+	srv := searchServer(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite),
+		agentGrant("conv-2", "Beta", wire.AccessReadWrite))
+	got := make(chan wire.Search, 2)
+	srv.OnSearch = func(q wire.Search) any {
+		got <- q
+		return wire.SearchResults{Type: wire.TypeSearchResults, ID: q.ID}
+	}
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	b := childNamed(t, h, "conv-2")
+	res, _ := h.handleSearch(context.Background(), searchReq("desk", "invoice", b.name))
+	if res.IsError || !strings.Contains(textOf(res), `no message matches "invoice"`) {
+		t.Fatalf("result: %s", textOf(res))
+	}
+	if q := <-got; len(q.Conv) != 1 || q.Conv[0] != "conv-2" {
+		t.Fatalf("conversations sent: %v", q.Conv)
+	}
+	// A conversation's own name searches that conversation only.
+	h.handleSearch(context.Background(), searchReq(b.name, "invoice"))
+	if q := <-got; len(q.Conv) != 1 || q.Conv[0] != "conv-2" {
+		t.Fatalf("searching from a conversation sent: %v", q.Conv)
+	}
+	res, _ = h.handleSearch(context.Background(), searchReq("desk", "invoice", "nope"))
+	if !res.IsError || !strings.Contains(textOf(res), "Nothing was searched") {
+		t.Fatalf("an unknown conversation was not refused: %s", textOf(res))
+	}
+}
+
+func TestASearchRefusalReachesTheSearchThatAsked(t *testing.T) {
+	srv := searchServer(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	srv.OnSearch = func(q wire.Search) any {
+		return wire.Error{Type: wire.TypeError, ID: q.ID, Code: "bad_cursor", Message: "not a cursor"}
+	}
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	h.takeAutoReconnectNote()
+	res, _ := h.handleSearch(context.Background(), searchReq("desk", "invoice"))
+	if !res.IsError || !strings.Contains(textOf(res), "bad_cursor") {
+		t.Fatalf("result: %s", textOf(res))
+	}
+	if note := h.takeAutoReconnectNote(); strings.Contains(note, "bad_cursor") {
+		t.Fatalf("the refusal was also announced as an agent error: %s", note)
+	}
+}
+
+func TestSearchIsRefusedWhereTheServerDoesNotOfferIt(t *testing.T) {
+	srv := agenttest.New(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	res, _ := h.handleSearch(context.Background(), searchReq("desk", "invoice"))
+	if !res.IsError || !strings.Contains(textOf(res), "does not offer search") {
+		t.Fatalf("result: %s", textOf(res))
+	}
+	if len(srv.Controls()) != 0 {
+		t.Fatalf("a search was sent anyway: %s", srv.Controls())
 	}
 }

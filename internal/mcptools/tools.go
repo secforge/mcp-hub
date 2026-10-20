@@ -2087,6 +2087,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		),
 		h.handleSetKey,
 	)
+	addTool(searchTool(), h.handleSearch)
 	addTool(
 		mcp.NewTool("hub_list_connections",
 			mcp.WithDescription("List the links this client has connected to before FROM THIS "+
@@ -3828,6 +3829,9 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		return
 	}
 	items, _ := conn.DrainForPush()
+	if s.agent != nil && len(items) > 0 {
+		s.agent.announcedBefore(s)
+	}
 	budget := s.hub.gate().budget
 	for i, it := range items {
 		// An image or a file on a pushed message has to be saved here, by
@@ -5385,6 +5389,10 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	s, conn, bad := h.forRequest(req)
 	if bad != nil {
 		return bad, nil
+	}
+	if s.agent != nil {
+		// A conversation is announced before anything from it is read.
+		s.agent.announcedBefore(s)
 	}
 	if !conn.Connected() {
 		s.teardownIfCurrent(conn)
