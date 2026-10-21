@@ -338,6 +338,15 @@ func FormatEvent(e Event) string {
 					"The canonical message will still arrive separately, once, when it's actually "+
 					"reflected in the conversation.]", e.ExternalID)
 			}
+			switch {
+			case e.Delivered == nil:
+			case *e.Delivered:
+				return fmt.Sprintf("[hub: send acknowledged (externalId=%s) — delivered to the "+
+					"recipient live]", e.ExternalID)
+			default:
+				return fmt.Sprintf("[hub: send acknowledged (externalId=%s) — the recipient is "+
+					"offline; it is stored and reaches them on their next catch-up]", e.ExternalID)
+			}
 			return fmt.Sprintf("[hub: send acknowledged (externalId=%s)]", e.ExternalID)
 		}
 		if !e.ActionOKStated {

@@ -133,6 +133,9 @@ type Event struct {
 	// So the three states stay apart: succeeded, refused, and didn't say.
 	// Only the first two are claims about the world.
 	ActionOKStated bool
+	// Delivered is a directed send's sendAck saying whether the recipient
+	// got it live or it waits for their next catch-up; nil when not said.
+	Delivered *bool
 
 	// RosterPeers carries the session's membership on a "roster" event —
 	// the server stating the whole list in one message, re-sent in full
@@ -2333,7 +2336,11 @@ func (c *Conn) confirmReminderLoop() {
 			return
 		}
 		seen := c.lastSeenCursor
-		if seen == "" || !c.liveUnconfirmed || c.remindersElsewhere {
+		// Only once the oldest unconfirmed delivery has waited a whole
+		// interval: a reminder seconds after a delivery asks for a confirm
+		// the reader had no reason to make yet.
+		if seen == "" || !c.liveUnconfirmed || c.remindersElsewhere ||
+			time.Since(c.unconfirmedSince) < c.confirmReminderInterval {
 			c.mu.Unlock()
 			continue
 		}
@@ -2667,7 +2674,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "sendAck", ExternalID: a.ExternalID, ActionOK: a.OK,
-			ActionOKStated: statesOK(raw), CorrelationID: a.ID}, true
+			ActionOKStated: statesOK(raw), CorrelationID: a.ID, Delivered: a.Delivered}, true
 	case wire.TypeReactionChanged:
 		var r wire.ReactionChanged
 		if err := json.Unmarshal(raw, &r); err != nil {

@@ -1171,6 +1171,10 @@ type SendAck struct {
 	ID         string `json:"id,omitempty,case:strict"`
 	ExternalID string `json:"externalId,omitempty,case:strict"`
 	OK         bool   `json:"ok,case:strict"`
+	// Delivered, on a directed send only, says whether the recipient got it
+	// live (true) or it is stored for their next catch-up (false), where
+	// the server declares features.directedOffline.
+	Delivered *bool `json:"delivered,omitempty,case:strict"`
 }
 
 // ReactionChanged reports a reaction added to or removed from an earlier

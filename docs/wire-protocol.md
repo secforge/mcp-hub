@@ -180,6 +180,7 @@ client, and a server must not send one to request client behaviour.
 |---|---|---|
 | `messageAfter` | — | Answers `messageAfter` requests (§2.6a). Without it, a client cannot catch up and must say so rather than wait. |
 | `ackReplies` | — | Replies to a *standalone* `ack` (§2.7) with its own `ack` carrying `behind`. |
+| `directedOffline` | — | A directed `msg` may name an agent that is offline; it is stored for that agent's next catch-up, and the `sendAck` says so with `delivered: false` (§2.9). |
 | `actionAcks` | — | Answers a write action with its own ack — `sendAck` for `msg`, and `reactionAck`/`editAck`/`deleteAck` for whichever of `reactions`/`edit`/`delete` are also declared. Which acks exist follows from those features; this one says only that waiting for an ack is worthwhile at all. |
 | `roster` | — | Membership arrives as `roster` frames (§2.3). `roster.readAt` is set where the server knows when the conversation was last read. |
 | `mentions` | — | Accepts `mentions` on `msg`/`edit` and resolves them to platform-native @-mentions. |
@@ -945,6 +946,8 @@ during that gap. The canonical message still arrives exactly once,
 later, as an ordinary `msg` with a real `cursor` — `sendAck` never
 substitutes for it. `mcp-hub-server` never sends this (a plain
 `hub_send` already completes synchronously with no such gap).
+
+On a directed send (`msg` with `to`), a server declaring `directedOffline` adds `delivered`: `true` when the recipient got it live, `false` when the recipient is offline and the message is stored for their next catch-up. With `directedOffline`, `to` may name any agent the session knows and has not removed, connected or not; an unknown peer, an agent of another session or a removed one is still refused (`send_refused`). The reference client reports which of the two happened.
 
 ### 2.10 `serverStopping` (server → client)
 

@@ -1828,8 +1828,12 @@ func confirmWhyNote() string {
 // confirmCadenceNote says when to bother.
 func confirmCadenceNote() string {
 	if pushOnly() {
-		return "Confirming as you go bounds how much has to be re-walked after a drop, and it is " +
-			"what reopens live delivery when a burst has filled this session's delivery budget."
+		return "Do NOT confirm after every message: this client asks you to when it is due — " +
+			"when 25 deliveries are unconfirmed and delivery pauses, in a reminder once a " +
+			"delivery has waited 5 minutes unconfirmed, and when a catch-up finishes. Confirm " +
+			"then, with the last message you have COMPLETE; one confirm covers everything " +
+			"delivered before it. A confirm after each message costs a tool call each and gains " +
+			"nothing."
 	}
 	return "Calling this periodically while reading mostly via wait --follow bounds how much " +
 		"gets re-walked after a drop, without needing to make a synchronous hub_receive/" +
@@ -1989,7 +1993,9 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 			mcp.WithString("text", mcp.Required(), mcp.Description("Message text")),
 			mcp.WithString("to", mcp.Description(
 				"Optional peerId to send this privately to a single peer instead of "+
-					"broadcasting to everyone in the session")),
+					"broadcasting to everyone in the session. Where the server allows it, the "+
+					"peer may be offline: the message is stored and reaches them on their next "+
+					"catch-up, and the acknowledgement says which happened")),
 			mcp.WithString("imagePath", mcp.Description(
 				"Optional local filesystem path to an image to attach — read and base64-"+
 					"encoded here, not something you inline yourself (saves you the tokens). "+

@@ -1,9 +1,12 @@
 package hubconn
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/secforge/mcp-hub/internal/wire"
 )
 
 func TestOnlyAPlainHTTPSLinkIsKept(t *testing.T) {
@@ -36,5 +39,26 @@ func TestTheOldestRememberedLinkIsForgottenFirst(t *testing.T) {
 	s.record("m-none", "")
 	if link, known := s.lookup("m-none"); !known || link != "" {
 		t.Error("a message without a link is not remembered as having none")
+	}
+}
+
+func TestADirectedSendSaysWhetherItWasDeliveredOrStored(t *testing.T) {
+	live, stored := true, false
+	for _, tc := range []struct {
+		delivered *bool
+		want      string
+	}{
+		{&live, "delivered to the recipient live"},
+		{&stored, "the recipient is offline; it is stored and reaches them on their next catch-up"},
+		{nil, "[hub: send acknowledged (externalId=x)]"},
+	} {
+		raw, _ := json.Marshal(wire.SendAck{Type: wire.TypeSendAck, ExternalID: "x", OK: true, Delivered: tc.delivered})
+		ev, ok := decodeEvent(raw)
+		if !ok {
+			t.Fatalf("undecodable: %s", raw)
+		}
+		if got := FormatEvent(ev); !strings.Contains(got, tc.want) {
+			t.Errorf("delivered=%v: %q lacks %q", tc.delivered, got, tc.want)
+		}
 	}
 }

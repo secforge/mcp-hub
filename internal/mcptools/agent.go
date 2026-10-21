@@ -1394,7 +1394,7 @@ func (ag *agentSession) remindLoop() {
 				continue
 			}
 			cursor, count, since, ok := conn.UnconfirmedState()
-			if !ok {
+			if !ok || time.Since(since) < ag.remindEvery {
 				continue
 			}
 			if len(lines) == 20 {

@@ -352,8 +352,8 @@ title, access and unread count. The agent connection's own name is at most
 * An encrypted conversation needs its key file, given per conversation with
   `hub_set_key(connection, keyFile)`. Until then it can be read only as
   sealed notices, and nothing can be sent there.
-* Unconfirmed deliveries are reminded about once per agent every 5
-  minutes, in one notice naming every conversation concerned, not once per
+* Deliveries unconfirmed for 5 minutes are reminded about once per agent,
+  in one notice naming every conversation concerned, not once per
   conversation.
 * A server too busy to accept the connection right now (`503` with code
   `busy`) is dialled again after its `Retry-After`, up to 5 times.
@@ -582,6 +582,9 @@ Only `hub_confirm` frees room: with a cursor it frees everything delivered
 up to that message, from every connection, and moves that connection's
 read position; with no arguments it frees everything delivered so far and
 moves no position. A catch-up run delivers only what fits.
+The model is told not to confirm after every message but when the client
+asks: when the window is full and delivery pauses, in a reminder once a
+delivery has waited 5 minutes unconfirmed, and when a catch-up finishes.
 While anything waits, the pause notice is pushed again every 3 minutes, and
 every tool result begins with it, so a reader whose notice was lost on the
 way still learns that delivery stopped. Pushes are also paced below the
