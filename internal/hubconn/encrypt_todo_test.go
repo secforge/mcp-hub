@@ -140,3 +140,22 @@ func TestAnEncryptedListWithoutTheKeyShowsItemsSealedAndRefusesChanges(t *testin
 		t.Fatal("a client without the key may write")
 	}
 }
+
+func TestAnItemNamingNoItemOrArrivingUnsealedIsNotPassedOff(t *testing.T) {
+	key := newKey(t)
+	params := encParams(t, key)
+	web, agent := todoConn(t, webPeerID, params, key), todoConn(t, agentPeerID, params, key)
+	ev := Event{Kind: "msg", Enc: sealedItem(t, web, "m1", 0, "x", ""), Todo: &wire.TodoFields{SealedBy: webPeerID}}
+	agent.openEvent(&ev)
+	if !strings.Contains(ev.Text, "did not say which item") {
+		t.Fatalf("an envelope naming no item was opened: %q", ev.Text)
+	}
+	notes := "server notes"
+	ev = Event{Kind: "msg", ExternalID: "x9", Text: "server text", Todo: &wire.TodoFields{Notes: &notes},
+		Attachments: []wire.Attachment{{Name: "f.txt"}}}
+	agent.openEvent(&ev)
+	if !strings.HasPrefix(ev.Text, "[UNSEALED item") || !strings.HasPrefix(*ev.Todo.Notes, "[UNSEALED notes") ||
+		ev.Attachments != nil {
+		t.Fatalf("unsealed content passed as a participant's: %q / %q / %v", ev.Text, *ev.Todo.Notes, ev.Attachments)
+	}
+}

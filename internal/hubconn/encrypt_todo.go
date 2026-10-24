@@ -144,9 +144,16 @@ func (c *Conn) itemChange(externalID string, text, notes *string) (string, int, 
 // cannot be opened is replaced by a notice saying why, never shown as
 // the item's text.
 func (c *Conn) openItemEvent(ev *Event) {
+	// An item has no attachments; on an encrypted list any that arrive
+	// were put there by the server.
+	ev.Attachments = nil
 	if ev.Enc == nil {
 		if ev.Kind == "msg" {
 			ev.Text = "[UNSEALED item — written by the server, not by any participant] " + ev.Text
+			if ev.Todo != nil && ev.Todo.Notes != nil && *ev.Todo.Notes != "" {
+				unsealed := "[UNSEALED notes — written by the server] " + *ev.Todo.Notes
+				ev.Todo.Notes = &unsealed
+			}
 			return
 		}
 		ev.Text = "[unsealed change to an item of an encrypted list refused — the server sent plaintext]"
@@ -187,6 +194,9 @@ func (c *Conn) openItems(items []wire.TodoItem) []wire.TodoItem {
 		switch {
 		case it.Enc == nil:
 			it.Text = "[UNSEALED item — written by the server, not by any participant] " + it.Text
+			if it.Notes != "" {
+				it.Notes = "[UNSEALED notes — written by the server] " + it.Notes
+			}
 		default:
 			p, err := c.openItem(it.ExternalID, it.SealedBy, it.Enc)
 			if err != nil {
@@ -209,6 +219,12 @@ func (c *Conn) openItem(externalID, sealedBy string, e *wire.Enc) (itemPlain, er
 	if c.enc == nil {
 		return itemPlain{}, errors.New("encrypted item — " + c.encProblemOr("this client holds no key for it"))
 	}
+	// The binding between an item and its envelope is checked by
+	// externalId, so an envelope that names no item cannot be checked and
+	// is not opened.
+	if externalID == "" {
+		return itemPlain{}, errors.New("encrypted item refused: the server did not say which item it is")
+	}
 	c.mu.Lock()
 	st := c.encMsgs[externalID]
 	var cur encState
@@ -217,7 +233,7 @@ func (c *Conn) openItem(externalID, sealedBy string, e *wire.Enc) (itemPlain, er
 	}
 	other, midSeen := c.encMids[e.Mid]
 	c.mu.Unlock()
-	if externalID != "" && ((st != nil && cur.mid != e.Mid) || (midSeen && other != externalID)) {
+	if (st != nil && cur.mid != e.Mid) || (midSeen && other != externalID) {
 		return itemPlain{}, errors.New("encrypted item refused: its sealed id does not belong to this " +
 			"item — the server presented another item's content under it")
 	}
@@ -251,14 +267,12 @@ func (c *Conn) openItem(externalID, sealedBy string, e *wire.Enc) (itemPlain, er
 	if err := json.Unmarshal(plain, &p); err != nil {
 		return itemPlain{}, errors.New("encrypted item opened, but its content is not an item")
 	}
-	if externalID != "" {
-		c.mu.Lock()
-		if now := c.encMsgs[externalID]; now == nil || e.Rev >= now.rev {
-			c.encMsgs[externalID] = &encState{sender: sealedBy, mid: e.Mid, rev: e.Rev, item: true,
-				text: p.Text, notes: p.Notes, ct: e.Ct}
-		}
-		c.encMids[e.Mid] = externalID
-		c.mu.Unlock()
+	c.mu.Lock()
+	if now := c.encMsgs[externalID]; now == nil || e.Rev >= now.rev {
+		c.encMsgs[externalID] = &encState{sender: sealedBy, mid: e.Mid, rev: e.Rev, item: true,
+			text: p.Text, notes: p.Notes, ct: e.Ct}
 	}
+	c.encMids[e.Mid] = externalID
+	c.mu.Unlock()
 	return p, nil
 }

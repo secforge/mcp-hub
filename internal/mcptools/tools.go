@@ -2194,7 +2194,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"following it. Cursors are opaque: copy one, never construct or edit one. "+
 					"Exactly one of at, after and before")),
 			mcp.WithBoolean("compact", mcp.Description(
-				"One line per message (time, sender, cursor, externalId, text) instead of a full "+
+				"One line per message (time, sender, text; the cursor only on the first and last) instead of a full "+
 					"header each: for long reads, where the headers cost more than the messages")),
 			mcp.WithBoolean("toFile", mcp.Description(
 				"Write the messages to a file instead of into this result, and get its path back: "+
