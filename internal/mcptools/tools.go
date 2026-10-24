@@ -4808,16 +4808,25 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if len(events) > 0 && ev.Kind != "error" && ev.Kind != "noMoreMessages" {
 		ev = events[len(events)-1]
 	}
+	// WHERE TO CONTINUE is the walk's own end, taken before anything is
+	// reordered: the server walks its stored order, and that order is not
+	// always time order — a chat whose history was imported newest first is
+	// stored backwards — so the message shown last need not be where the
+	// walk stopped.
+	var walkEnd hubconn.Event
+	if len(events) > 0 {
+		walkEnd = events[len(events)-1]
+	}
 	if back {
 		slices.Reverse(events)
 	}
-	// Where to continue from, and which way: the walk's own end, which a
-	// backward read leaves at the OLDEST message it handed over.
-	onward, nextParam, nowhere, edge := "last", "after", "no message after that point", "END of the conversation"
+	reordered := sortByTime(events)
+	nextParam, nowhere, edge := "after", "no message after that point", "END of the conversation"
 	if back {
-		onward, nextParam, nowhere, edge = "first", "before", "no message before that point",
+		nextParam, nowhere, edge = "before", "no message before that point",
 			"START of the conversation, or of the history you are allowed to see"
 	}
+	cont := fmt.Sprintf("cursor %s as %s", walkEnd.Cursor, nextParam)
 	if ev.Kind == "error" && len(events) == 0 {
 		// bad_filter and bad_anchor name different halves of the request,
 		// and saying which is what stops a retry fixing the part that was
@@ -4870,18 +4879,15 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// leaving the attachment out with it rendered the message as though
 	// it had none, which is a silence with nothing to retry against.
 	attachments := s.saveReceivedAttachments(conn, events)
-	last := events[len(events)-1]
-	if back {
-		last = events[0]
-	}
+	last := walkEnd
 	reached := ""
 	switch {
 	case cutShort != "":
 		reached = fmt.Sprintf(" INCOMPLETE: %s, so this is what was reachable before that, NOT "+
-			"everything there is. Read on from the %s cursor as %s to find out what lies beyond.", cutShort, onward, nextParam)
+			"everything there is. Read on with %s to find out what lies beyond.", cutShort, cont)
 	case spent >= budget:
 		reached = fmt.Sprintf(" Stopped at %d KB rather than at the message count, so there may "+
-			"well be more: read on from the %s cursor as %s.", spent/1024, onward, nextParam)
+			"well be more: read on with %s.", spent/1024, cont)
 	case len(events) < limit && filter.Set() && ev.Matching == nil:
 		// The filter was never applied, so the walk ended at the end of
 		// the UNFILTERED stream. Saying "everything there was" here
@@ -4895,22 +4901,27 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		// the whole reason the zero-result path below distinguishes
 		// them: there may well be more messages, and this says only that
 		// none of them match.
-		reached = " The server said nothing FURTHER MATCHES beyond the " + onward + " one. That is " +
-			"not the same as there being no more messages — read on from the " + onward + " cursor " +
-			"as " + nextParam + " without the filter to find out whether there are any."
+		reached = " The server said nothing FURTHER MATCHES beyond where this read stopped. That is " +
+			"not the same as there being no more messages — read on with " + cont + " without the " +
+			"filter to find out whether there are any."
 	case len(events) < limit:
-		reached = " The server said there is nothing beyond the " + onward + " one: you have " +
+		reached = " The server said there is nothing beyond where this read stopped: you have " +
 			"reached the " + edge + ", so this is everything there was."
 	}
 	body := hubconn.FormatEventsOn(s.name, events)
 	if compact {
 		body = compactReadText(s.name, events)
 	}
-	direction := fmt.Sprintf(" Read FORWARD from %s, %d message(s), handed over oldest first.",
+	direction := fmt.Sprintf(" Read FORWARD from %s, %d message(s), shown sorted by time, oldest first.",
 		describeAnchor(start), len(events))
 	if back {
-		direction = fmt.Sprintf(" Read BACKWARDS from %s, %d message(s), handed over oldest first "+
-			"(the last one is the newest, just before where you started).", describeAnchor(start), len(events))
+		direction = fmt.Sprintf(" Read BACKWARDS from %s, %d message(s), shown sorted by time, oldest "+
+			"first.", describeAnchor(start), len(events))
+	}
+	if reordered {
+		direction += " NOTE: the server keeps this conversation in an order that is not time order " +
+			"(its history was stored out of order), so the messages were sorted for you, and where " +
+			"the read stopped is the cursor named below, not the first or last message shown."
 	}
 	if toFile {
 		path, err := h.writeReadFile(s.name, body+attachments)
@@ -4928,7 +4939,7 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		"\n\n[hub:" + direction + " This was a read, not a catch-up — your unread position is unchanged, so " +
 		"nothing you still have to read was consumed." + reached + " What is here is recorded as " +
 		"delivered to you, so a later hub_catch_up skips past it rather than showing it twice. " +
-		"To keep reading in this direction, pass the " + strings.ToUpper(onward) + " cursor above as " + nextParam +
+		"To keep reading in this direction, pass " + cont +
 		matchedSuffix(last.Matching) + "]" + unappliedNote(unapplied)), nil
 }
 

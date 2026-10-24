@@ -20,6 +20,11 @@ import (
 // backwardServer holds messages c1..c5 and answers messageAfter and,
 // when before is set, messageBefore.
 func backwardServer(t *testing.T, before bool) string {
+	return backwardServerTS(t, before, func(int) string { return "ts" })
+}
+
+// backwardServerTS is backwardServer with each message n stamped ts(n).
+func backwardServerTS(t *testing.T, before bool, ts func(int) string) string {
 	t.Helper()
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +61,7 @@ func backwardServer(t *testing.T, before bool) string {
 			}
 			conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 				Cursor: fmt.Sprintf("c%d", n), Text: fmt.Sprintf("message %d", n),
-				TS: "ts", Historical: true, Answers: answers})
+				TS: ts(n), Historical: true, Answers: answers})
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -90,12 +95,12 @@ func TestABackwardReadHandsOverOldestFirst(t *testing.T) {
 	if res.IsError || i2 < 0 || !(i2 < i3 && i3 < i4) || strings.Contains(out, "message 5") {
 		t.Fatalf("want messages 2, 3, 4 in that order:\n%s", out)
 	}
-	if !strings.Contains(out, "pass the FIRST cursor above as before") {
+	if !strings.Contains(out, "pass cursor c2 as before") {
 		t.Errorf("the result does not say how to read further back:\n%s", out)
 	}
 	res, _ = hub.handleRead(context.Background(), readReq(map[string]any{"before": "c2", "limit": 5}))
 	out = textOf(res)
-	if !strings.Contains(out, "message 1") || !strings.Contains(out, "nothing beyond the first one") {
+	if !strings.Contains(out, "message 1") || !strings.Contains(out, "nothing beyond where this read stopped") {
 		t.Errorf("reaching the start is not reported as everything there was:\n%s", out)
 	}
 	res, _ = hub.handleRead(context.Background(), readReq(map[string]any{"before": "c1"}))
@@ -120,7 +125,7 @@ func TestAReadSaysWhichWayItWentAndWhereItEnded(t *testing.T) {
 	hub := connectTo(t, backwardServer(t, true))
 	res, _ := hub.handleRead(context.Background(), readReq(map[string]any{"after": "c3", "limit": 5}))
 	out := textOf(res)
-	if !strings.Contains(out, "Read FORWARD from cursor c3, 2 message(s), handed over oldest first") ||
+	if !strings.Contains(out, "Read FORWARD from cursor c3, 2 message(s), shown sorted by time, oldest first") ||
 		!strings.Contains(out, "reached the END of the conversation") {
 		t.Errorf("forward read:\n%s", out)
 	}
@@ -171,5 +176,21 @@ func TestACompactEntryCannotBeForgedByItsMessage(t *testing.T) {
 		if strings.Contains(out, bad) {
 			t.Errorf("an entry line was forged (%q):\n%s", bad, out)
 		}
+	}
+}
+
+func TestAReadStoredOutOfTimeOrderIsShownByTimeAndContinuesWhereTheWalkStopped(t *testing.T) {
+	// Stored newest first: c1 is the newest message, c5 the oldest.
+	hub := connectTo(t, backwardServerTS(t, true, func(n int) string {
+		return fmt.Sprintf("2026-10-24T10:0%d:00Z", 6-n)
+	}))
+	res, _ := hub.handleRead(context.Background(), readReq(map[string]any{"after": "c1", "limit": 3, "compact": true}))
+	out := textOf(res)
+	i4, i3, i2 := strings.Index(out, "message 4"), strings.Index(out, "message 3"), strings.Index(out, "message 2")
+	if i4 < 0 || !(i4 < i3 && i3 < i2) {
+		t.Fatalf("not sorted by time, oldest first:\n%s", out)
+	}
+	if !strings.Contains(out, "not time order") || !strings.Contains(out, "pass cursor c4 as after") {
+		t.Fatalf("the reorder or the place to continue is not stated:\n%s", out)
 	}
 }
