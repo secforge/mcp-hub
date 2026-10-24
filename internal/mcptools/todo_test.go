@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
+	"github.com/secforge/mcp-hub/internal/hubenc"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -220,5 +223,126 @@ func TestATodoCatchUpWalksEditsAndRemovals(t *testing.T) {
 	}
 	if strings.Join(got, ",") != "messageEdited,messageDeleted,noMoreMessages" {
 		t.Errorf("walk answered %v", got)
+	}
+}
+
+// An encrypted todo list (§2.8b, encrypted) is read and changed through the
+// same tools: items open with the key, and nothing readable goes out.
+func TestAnEncryptedTodoListIsReadAndChangedSealed(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	const self = "550e8400-e29b-41d4-a716-446655440000"
+	const web = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+	keyText, _ := hubenc.NewKey()
+	key, _ := hubenc.ParseKey(keyText)
+	salt, _ := hubenc.NewSalt()
+	check, _ := hubenc.Check(key, salt)
+	sess, err := hubenc.Open(key, salt, check)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := hubenc.B64()
+	seal := func(sender, mid string, rev int, text, notes string) *wire.Enc {
+		plain, _ := json.Marshal(map[string]string{"text": text, "notes": notes})
+		nonce, ct, _ := sess.Seal(plain, sender, mid, rev, hubenc.FieldItem())
+		return &wire.Enc{V: 1, Mid: mid, Rev: rev, Nonce: b.EncodeToString(nonce), Ct: b.EncodeToString(ct)}
+	}
+	open := func(sender string, e map[string]any) map[string]string {
+		nonce, _ := b.DecodeString(e["nonce"].(string))
+		ct, _ := b.DecodeString(e["ct"].(string))
+		plain, err := sess.OpenValue(nonce, ct, sender, e["mid"].(string), int(e["rev"].(float64)), hubenc.FieldItem())
+		if err != nil {
+			t.Fatalf("the client's envelope does not open: %v", err)
+		}
+		var p map[string]string
+		json.Unmarshal(plain, &p)
+		return p
+	}
+	var mu sync.Mutex
+	var frames []map[string]any
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		items := []wire.TodoItem{{ExternalID: "i1", Position: 1, SealedBy: web, Enc: seal(web, "m1", 2, "buy milk", "2 litres")}}
+		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: self, ServerVersion: wire.ProtocolVersion,
+			ConversationKind: "todo", Encryption: &wire.Encryption{V: 1, Salt: salt, Check: check},
+			Features: map[string]json.RawMessage{"todo": json.RawMessage(`{}`), "actionAcks": json.RawMessage(`{}`),
+				"edit": json.RawMessage(`{}`), "correlation": json.RawMessage(`{}`)},
+			Items: &items, ItemsCursor: "c1"})
+		for {
+			var f map[string]any
+			if err := conn.ReadJSON(&f); err != nil {
+				return
+			}
+			mu.Lock()
+			frames = append(frames, f)
+			mu.Unlock()
+			id, _ := f["id"].(string)
+			switch f["type"] {
+			case "msg":
+				conn.WriteJSON(wire.SendAck{Type: wire.TypeSendAck, ID: id, ExternalID: "i2", OK: true})
+			case "edit":
+				conn.WriteJSON(wire.EditAck{Type: wire.TypeEditAck, ID: id, ExternalID: f["externalId"].(string), OK: true})
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/hub/join#todo-enc"
+	keyFile := filepath.Join(t.TempDir(), "list.key")
+	os.WriteFile(keyFile, []byte(keyText+"\n"), 0o600)
+	ctx := context.Background()
+	hub := NewHub()
+	call := func(handler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error), args map[string]any) string {
+		t.Helper()
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = args
+		res, err := handler(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return textOf(res)
+	}
+	last := func(kind string) map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		for i := len(frames) - 1; i >= 0; i-- {
+			if frames[i]["type"] == kind {
+				return frames[i]
+			}
+		}
+		return nil
+	}
+
+	out := call(hub.handleConnect, map[string]any{"as": testConn, "link": link, "keyFile": keyFile})
+	t.Cleanup(func() { hub.handleDisconnect(ctx, connReqFor(testConn)) })
+	if !strings.Contains(out, "[ ] buy milk (id=i1)") || !strings.Contains(out, "2 litres") {
+		t.Fatalf("the sealed list was not opened at connect:\n%s", out)
+	}
+
+	call(hub.handleTodoAdd, map[string]any{"connection": testConn, "text": "call Bob"})
+	f := last("msg")
+	if hasKey(f, "text") || hasKey(f, "notes") || !hasKey(f, "enc") {
+		t.Fatalf("the add went out readable: %v", f)
+	}
+	if p := open(self, f["enc"].(map[string]any)); p["text"] != "call Bob" || p["notes"] != "" {
+		t.Fatalf("the add sealed %v", p)
+	}
+
+	call(hub.handleTodoUpdate, map[string]any{"connection": testConn, "itemId": "i1", "text": "buy oat milk"})
+	f = last("edit")
+	enc, _ := f["enc"].(map[string]any)
+	if hasKey(f, "text") || enc == nil || enc["mid"] != "m1" || enc["rev"].(float64) != 3 {
+		t.Fatalf("the text change went out as %v", f)
+	}
+	if p := open(self, enc); p["text"] != "buy oat milk" || p["notes"] != "2 litres" {
+		t.Fatalf("the change sealed %v; the notes must be kept", p)
+	}
+
+	call(hub.handleTodoUpdate, map[string]any{"connection": testConn, "itemId": "i1", "done": true})
+	if f := last("edit"); hasKey(f, "enc") || f["done"] != true {
+		t.Fatalf("a done-only change went out as %v; want done and no envelope", f)
 	}
 }

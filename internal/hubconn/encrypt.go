@@ -18,6 +18,13 @@ type encState struct {
 	sender string
 	mid    string
 	rev    int
+	// item marks a todo item, whose envelope seals text and notes
+	// together; ct is the envelope's ciphertext, so a change that keeps
+	// the envelope (done or position only) is recognised as the same one.
+	item  bool
+	text  string
+	notes string
+	ct    string
 }
 
 // encRef locates a sealed attachment in reference form, for when its
@@ -163,7 +170,8 @@ func (c *Conn) noteSealedAck(corrID string, ack Event) {
 		return
 	}
 	if st := c.encMsgs[ack.ExternalID]; st == nil || p.rev > st.rev {
-		c.encMsgs[ack.ExternalID] = &encState{sender: p.sender, mid: p.mid, rev: p.rev}
+		np := p
+		c.encMsgs[ack.ExternalID] = &np
 	}
 }
 
@@ -191,6 +199,14 @@ func (c *Conn) sealEdit(e wire.Edit) (any, error) {
 // since the server could otherwise put words or files in anyone's name.
 func (c *Conn) openEvent(ev *Event) {
 	encrypted := c.encParams != nil
+	if ev.Kind == "items" {
+		ev.TodoItems = c.openItems(ev.TodoItems)
+		return
+	}
+	if encrypted && c.todo != nil && (ev.Kind == "msg" || ev.Kind == "messageEdited") {
+		c.openItemEvent(ev)
+		return
+	}
 	switch {
 	case ev.Kind == "attachmentData" && ev.AttachmentEncMeta != nil:
 		c.openAttachmentData(ev)

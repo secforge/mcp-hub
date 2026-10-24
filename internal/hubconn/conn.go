@@ -1270,6 +1270,7 @@ func startConn(ws transport, raw []byte, snapPongWait, snapWriteWait, snapConfir
 		ws.Close()
 		return nil, err
 	}
+	c.todoItems = c.openItems(c.todoItems)
 	go c.readLoop()
 	go c.activityLoop()
 	go c.confirmReminderLoop()

@@ -1558,9 +1558,15 @@ type TodoFields struct {
 	Done     *bool    `json:"done,omitempty,case:strict"`
 	DoneAt   string   `json:"doneAt,omitempty,case:strict"`
 	Position *float64 `json:"position,omitempty,case:strict"`
+	// SealedBy, on an encrypted list, is the peer that sealed the item's
+	// current envelope — the sender its AAD names. A done-only change by
+	// someone else keeps the envelope, so it may differ from peerId.
+	SealedBy string `json:"sealedBy,omitempty,case:strict"`
 }
 
-// TodoItem is one item of joined.items and of an items answer.
+// TodoItem is one item of joined.items and of an items answer. On an
+// encrypted list Text and Notes are absent and Enc seals both, under
+// SealedBy.
 type TodoItem struct {
 	ExternalID string  `json:"externalId,case:strict"`
 	Text       string  `json:"text,case:strict"`
@@ -1568,6 +1574,8 @@ type TodoItem struct {
 	Done       bool    `json:"done,case:strict"`
 	DoneAt     string  `json:"doneAt,omitempty,case:strict"`
 	Position   float64 `json:"position,case:strict"`
+	SealedBy   string  `json:"sealedBy,omitempty,case:strict"`
+	Enc        *Enc    `json:"enc,omitempty,case:strict"`
 }
 
 // TodoAdd adds an item: a msg carrying the item fields a client sets.

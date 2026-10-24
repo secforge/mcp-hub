@@ -161,6 +161,7 @@ func Open(key []byte, salt, check string) (*Session, error) {
 
 // Field names what a sealed value fills, as it appears in the AAD.
 func FieldText() string          { return "text" }
+func FieldItem() string          { return "item" }
 func FieldFile(i int) string     { return fmt.Sprintf("file:%d", i) }
 func FieldFileMeta(i int) string { return fmt.Sprintf("filemeta:%d", i) }
 

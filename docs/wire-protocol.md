@@ -938,6 +938,17 @@ start from.
 **Limits.** Text or notes over the declared maximum is refused with
 `error{code:"too_long"}`; a client refuses it locally first.
 
+**Encrypted lists.** A list can be encrypted like a hub session (§2.11): `joined.encryption`, the same key file and the same key check.
+
+- **One envelope per item.** Text and notes travel together as `enc: {v, mid, rev, nonce, ct}`, where `ct` seals the JSON `{"text": …, "notes": …}`. Both fields are always sealed, so the server cannot tell which one a change touched.
+- **AAD.** As in §2.11, with field `item`: `v1|{salt}|{sealedBy}|{mid}|{rev}|item`.
+- **`mid` and `rev`.** The client mints `mid` when it adds an item and keeps it for every change. `rev` is 0 on add, and each change of text or notes uses the stored revision + 1; anything else is `bad_mid`.
+- **`sealedBy`.** Every encrypted item in `joined.items`, `items` and change events names the peer that sealed its current envelope. A change from the web UI or a share-link page is sealed by the system peer `ffffffff-…`.
+- **Done and position only.** Such a change carries no `enc`. The server keeps the envelope and `rev`, and the event repeats them unchanged. Position, done, timestamps and the actor stay readable.
+- **Server refusals.** Plaintext `text`/`notes` on an encrypted list is `encryption_required`, and `enc` on a plain one is `encryption_not_enabled`. A search never finds encrypted items.
+
+The reference client binds each `externalId` to the `mid` it first carried. It refuses a revision older than one it has shown, and accepts the same revision only as the identical envelope. A change of text alone reseals the notes as last opened, and the other way round; a client that has not opened the item yet refuses the change. Without the key, items show as sealed and every write is refused locally.
+
 **A deleted list** is answered with
 `error{code:"conversation_unavailable", retryable:false}` and closed with
 4003, so a client stops reconnecting.

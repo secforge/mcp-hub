@@ -36,7 +36,7 @@ func itemsOf(list *[]wire.TodoItem) []wire.TodoItem {
 }
 
 func todoFields(f wire.TodoFields) *wire.TodoFields {
-	if f.Notes == nil && f.Done == nil && f.DoneAt == "" && f.Position == nil {
+	if f.Notes == nil && f.Done == nil && f.DoneAt == "" && f.Position == nil && f.SealedBy == "" {
 		return nil
 	}
 	return &f
@@ -109,6 +109,9 @@ func (c *Conn) TodoAdd(text string, notes *string, done *bool, at Placement) (Ev
 	if err := c.checkTodoLength(&text, notes); err != nil {
 		return Event{}, false, err
 	}
+	if c.encParams != nil {
+		return c.sealedTodoAdd(text, notes, done, at)
+	}
 	return c.todoRequest("sendAck", func(id string) any {
 		return wire.TodoAdd{Type: wire.TypeMsg, ID: id, Text: text, Notes: notes, Done: done, AfterID: at.raw()}
 	})
@@ -121,6 +124,12 @@ func (c *Conn) TodoUpdate(externalID string, text, notes *string, done *bool, at
 		return Event{}, false, err
 	}
 	if err := c.checkTodoLength(text, notes); err != nil {
+		return Event{}, false, err
+	}
+	if c.encParams != nil && (text != nil || notes != nil) {
+		return c.sealedTodoUpdate(externalID, text, notes, done, at)
+	}
+	if err := c.requireSendable(); err != nil {
 		return Event{}, false, err
 	}
 	return c.todoRequest("editAck", func(id string) any {
