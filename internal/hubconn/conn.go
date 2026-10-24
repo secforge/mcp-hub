@@ -2944,9 +2944,13 @@ func (c *Conn) RequestMessageAfterAwaiting(anchor wire.Anchor) (Event, bool, err
 // or from messageAfter merely being present. The two questions differ:
 // messageAfter says the pull path exists, filters says which constraints
 // that path can honour.
-func (c *Conn) MessageAfterFilters() []string {
+func (c *Conn) MessageAfterFilters() []string { return c.HistoryFilters("messageAfter") }
+
+// HistoryFilters lists the filters declared for one of the two read
+// directions, "messageAfter" or "messageBefore".
+func (c *Conn) HistoryFilters(feature string) []string {
 	c.mu.Lock()
-	raw, ok := c.features["messageAfter"]
+	raw, ok := c.features[feature]
 	c.mu.Unlock()
 	if !ok {
 		return nil
@@ -2963,7 +2967,13 @@ func (c *Conn) MessageAfterFilters() []string {
 // SupportsMessageAfterFilter reports whether the server declared it can
 // apply this named filter.
 func (c *Conn) SupportsMessageAfterFilter(name string) bool {
-	for _, f := range c.MessageAfterFilters() {
+	return c.SupportsHistoryFilter("messageAfter", name)
+}
+
+// SupportsHistoryFilter reports whether the server declared it can apply
+// this named filter in that read direction.
+func (c *Conn) SupportsHistoryFilter(feature, name string) bool {
+	for _, f := range c.HistoryFilters(feature) {
 		if f == name {
 			return true
 		}
@@ -2976,6 +2986,17 @@ func (c *Conn) SupportsMessageAfterFilter(name string) bool {
 // actually applied, and the caller must read that rather than assume the
 // filter it sent was honoured.
 func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filter) (Event, bool, error) {
+	return c.requestHistory(wire.TypeMessageAfter, anchor, filter)
+}
+
+// RequestMessageBeforeFiltered asks for the newest message before anchor
+// — see wire.MessageBefore. Same claim, same answers, same rules as
+// RequestMessageAfterFiltered.
+func (c *Conn) RequestMessageBeforeFiltered(anchor wire.Anchor, filter wire.Filter) (Event, bool, error) {
+	return c.requestHistory(wire.TypeMessageBefore, anchor, filter)
+}
+
+func (c *Conn) requestHistory(typ wire.Type, anchor wire.Anchor, filter wire.Filter) (Event, bool, error) {
 	if filter.Query != "" && c.encParams != nil {
 		return Event{}, false, errors.New("this session is end-to-end encrypted, so the server " +
 			"cannot search message text; read without a query instead")
@@ -3008,7 +3029,7 @@ func (c *Conn) RequestMessageAfterFiltered(anchor wire.Anchor, filter wire.Filte
 	}
 	defer cancel()
 
-	m := wire.MessageAfter{Type: wire.TypeMessageAfter, Anchor: anchor, Filter: filter, ID: claim.corrID}
+	m := wire.MessageAfter{Type: typ, Anchor: anchor, Filter: filter, ID: claim.corrID}
 	if err := c.writeJSON(m); err != nil {
 		debugf("RequestMessageAfterAwaiting: claim=%p write error: %v", claim, err)
 		return Event{}, false, err

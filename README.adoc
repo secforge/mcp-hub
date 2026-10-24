@@ -502,10 +502,15 @@ position. Required after every connect. See <<_catching_up>>.
 |Confirm a message was received *complete*, by its cursor: advances the
 stored read position and sends a read receipt.
 
-|`hub_read(connection, after?, at?, limit?, maxKB?, query?, sender?)`
-|Read history by position — after a cursor or from a timestamp, optionally
-filtered by text or sender, up to 200 messages. A query: it moves no read
-position.
+|`hub_read(connection, after?, at?, before?, limit?, maxKB?, query?, sender?, compact?, toFile?)`
+|Read history by position — after a cursor, from a timestamp, or backwards
+before a cursor or timestamp (where the server declares `messageBefore`),
+optionally filtered by text or sender, up to 200 messages, always handed over
+oldest first. A query: it moves no read position. The result says which way it
+read and whether it reached the start or end of the conversation, as opposed to
+the server not answering. `compact` gives one line per message (time, sender,
+cursor, externalId, text); `toFile` writes the messages to a file and returns
+its path, for reads of up to 2000 messages that would not arrive whole.
 
 |`hub_receive(connection)`, `hub_wait(connection)`
 |Pull delivery: drain buffered events, or block until the next one. Only

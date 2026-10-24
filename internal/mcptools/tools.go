@@ -2180,7 +2180,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"count and total size are different costs, and which of them exhausts a "+
 					"reader first is not something this side can tell")),
 			mcp.WithNumber("limit", mcp.Description(
-				"How many messages to return, oldest first (default 1, maximum 200). Reading a "+
+				"How many messages to return, oldest first (default 1, maximum 200, or 2000 with toFile). Reading a "+
 					"span of history one call at a time is the case this exists for. Safe here "+
 					"in a way it is not for hub_catch_up: this call moves no position and asking "+
 					"twice gives the same answer, so nothing can be skipped by two messages "+
@@ -2188,11 +2188,23 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"another and be missed for good")),
 			mcp.WithString("at", mcp.Description(
 				"Timestamp to read from, RFC 3339 (e.g. 2026-09-10T18:00:00Z). Returns the first "+
-					"message after that instant. Mutually exclusive with after")),
+					"message at or after that instant. Exactly one of at, after and before")),
 			mcp.WithString("after", mcp.Description(
 				"A cursor copied verbatim from a message you were delivered — returns the message "+
 					"following it. Cursors are opaque: copy one, never construct or edit one. "+
-					"Mutually exclusive with at")),
+					"Exactly one of at, after and before")),
+			mcp.WithBoolean("compact", mcp.Description(
+				"One line per message (time, sender, cursor, externalId, text) instead of a full "+
+					"header each: for long reads, where the headers cost more than the messages")),
+			mcp.WithBoolean("toFile", mcp.Description(
+				"Write the messages to a file instead of into this result, and get its path back: "+
+					"for reads too long to arrive whole here. Raises the limit to 2000 messages. "+
+					"Read the file with your file tool and delete it when done")),
+			mcp.WithString("before", mcp.Description(
+				"Read BACKWARDS: a cursor copied verbatim from a message, or an RFC 3339 timestamp. "+
+					"Returns the message(s) before it — with limit, the ones just before it — still "+
+					"handed over oldest first. For 'what led up to this message'. Only where the "+
+					"server declares messageBefore. Exactly one of at, after and before")),
 			mcp.WithString("sender", mcp.Description(
 				"Only consider messages from this one sender — the identity id that messages you "+
 					"were delivered already carry, copied from one of them. Not a display name, "+
@@ -4558,6 +4570,9 @@ func (h *Hub) Shutdown() {
 const (
 	maxReadBatch    = catchUpPushMaxMessages
 	readBatchBudget = catchUpPushBudget
+	// maxReadToFile and readToFileBudget bound a read written to a file.
+	maxReadToFile    = 2000
+	readToFileBudget = 20 << 20
 )
 
 // gapLimit and gapBudget bound one hub_catch_up(gap: true) run the way
@@ -4675,23 +4690,42 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if bad != nil {
 		return bad, nil
 	}
-	at, after := req.GetString("at", ""), req.GetString("after", "")
-	switch {
-	case at == "" && after == "":
-		return mcp.NewToolResultError("pass exactly one of at (a timestamp) or after (a cursor " +
-			"copied from a message you were delivered)"), nil
-	case at != "" && after != "":
-		return mcp.NewToolResultError("pass exactly one of at or after, not both — they are two " +
-			"ways of naming the same starting point"), nil
+	at, after, before := req.GetString("at", ""), req.GetString("after", ""), req.GetString("before", "")
+	named := 0
+	for _, v := range []string{at, after, before} {
+		if v != "" {
+			named++
+		}
+	}
+	if named != 1 {
+		return mcp.NewToolResultError("pass exactly one of at (a timestamp), after (a cursor " +
+			"copied from a message you were delivered) or before (such a cursor, or a timestamp)"), nil
 	}
 	anchor := wire.Anchor{At: at, Cursor: after}
+	// BACKWARD reads walk from the anchor towards the start and are handed
+	// over oldest first, like every other read, so the order of what you
+	// read never depends on the direction it was fetched in.
+	back := before != ""
+	feature, request := "messageAfter", conn.RequestMessageAfterFiltered
+	if back {
+		if !conn.HasFeature("messageBefore") {
+			return mcp.NewToolResultError("this server does not read backwards (it declares no " +
+				"messageBefore). Read forward with at, from a time before the part you want"), nil
+		}
+		feature, request = "messageBefore", conn.RequestMessageBeforeFiltered
+		if _, err := time.Parse(time.RFC3339Nano, before); err == nil {
+			anchor = wire.Anchor{At: before}
+		} else {
+			anchor = wire.Anchor{Cursor: before}
+		}
+	}
 	start := anchor
 
 	filter := wire.Filter{
 		Sender: req.GetString("sender", ""),
 		Query:  req.GetString("query", ""),
 	}
-	if msg := checkFilterSupport(conn, filter); msg != "" {
+	if msg := checkFilterSupport(conn, filter, feature); msg != "" {
 		return mcp.NewToolResultError(msg), nil
 	}
 
@@ -4705,10 +4739,16 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if limit < 1 {
 		limit = 1
 	}
-	if limit > maxReadBatch {
-		limit = maxReadBatch
+	// TO A FILE, a read is not bounded by what fits in a tool result: the
+	// file is what the reader opens, so the walk goes as far as asked.
+	toFile, compact := req.GetBool("toFile", false), req.GetBool("compact", false)
+	maxCount, budget := maxReadBatch, readBatchBudget
+	if toFile {
+		maxCount, budget = maxReadToFile, readToFileBudget
 	}
-	budget := readBatchBudget
+	if limit > maxCount {
+		limit = maxCount
+	}
 	if kb := req.GetInt("maxKB", 0); kb > 0 && kb*1024 < budget {
 		budget = kb * 1024
 	}
@@ -4725,7 +4765,7 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// becomes a confident wrong answer about what was said.
 	cutShort := ""
 	for len(events) < limit {
-		ev, ok, err = conn.RequestMessageAfterFiltered(anchor, filter)
+		ev, ok, err = request(anchor, filter)
 		if err != nil {
 			if len(events) > 0 {
 				cutShort = fmt.Sprintf("the read then failed (%v)", err)
@@ -4768,6 +4808,16 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	if len(events) > 0 && ev.Kind != "error" && ev.Kind != "noMoreMessages" {
 		ev = events[len(events)-1]
 	}
+	if back {
+		slices.Reverse(events)
+	}
+	// Where to continue from, and which way: the walk's own end, which a
+	// backward read leaves at the OLDEST message it handed over.
+	onward, nextParam, nowhere, edge := "last", "after", "no message after that point", "END of the conversation"
+	if back {
+		onward, nextParam, nowhere, edge = "first", "before", "no message before that point",
+			"START of the conversation, or of the history you are allowed to see"
+	}
 	if ev.Kind == "error" && len(events) == 0 {
 		// bad_filter and bad_anchor name different halves of the request,
 		// and saying which is what stops a retry fixing the part that was
@@ -4790,19 +4840,22 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 				"yourself, or say the server cannot answer it."), nil
 		}
 		if ev.Matching != nil {
-			return mcp.NewToolResultText("Nothing FURTHER MATCHES after that point" +
+			return mcp.NewToolResultText("Nothing FURTHER MATCHES " + strings.TrimPrefix(nowhere, "no message ") +
 				describeApplied(*ev.Matching) + ".\n\n[hub: this is not the same statement as " +
 				"\"no more messages\" — there may well be messages past that point, and this says " +
 				"only that none of them match. To find out whether there are any at all, read " +
 				"again from the same anchor without the filter]" + unappliedNote(unapplied)), nil
 		}
-		return mcp.NewToolResultText("no message after that point"), nil
+		return mcp.NewToolResultText(nowhere + ": the server said so, so you have reached the " + edge +
+			". (A server that does not answer is reported differently, as no answer in time.)"), nil
 	}
 	// The delivery is recorded, but this is not resultWithReceivedAttachments:
 	// that also marks the wire-level receipt, which must not point at an
 	// old message. See this function's doc comment.
 	s.recordHandedOver(events)
-	s.noteReadCoveredGap(start, events)
+	if !back {
+		s.noteReadCoveredGap(start, events)
+	}
 	// NoteHandedOver is a LOCAL position in the delivery ledger — no
 	// cursor on the wire, no acknowledgement — so it does not weaken the
 	// split above, and leaving it out reopened the defect it exists to
@@ -4818,14 +4871,17 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	// it had none, which is a silence with nothing to retry against.
 	attachments := s.saveReceivedAttachments(conn, events)
 	last := events[len(events)-1]
+	if back {
+		last = events[0]
+	}
 	reached := ""
 	switch {
 	case cutShort != "":
 		reached = fmt.Sprintf(" INCOMPLETE: %s, so this is what was reachable before that, NOT "+
-			"everything there is. Read on from the last cursor to find out what follows.", cutShort)
+			"everything there is. Read on from the %s cursor as %s to find out what lies beyond.", cutShort, onward, nextParam)
 	case spent >= budget:
 		reached = fmt.Sprintf(" Stopped at %d KB rather than at the message count, so there may "+
-			"well be more: read on from the last cursor.", spent/1024)
+			"well be more: read on from the %s cursor as %s.", spent/1024, onward, nextParam)
 	case len(events) < limit && filter.Set() && ev.Matching == nil:
 		// The filter was never applied, so the walk ended at the end of
 		// the UNFILTERED stream. Saying "everything there was" here
@@ -4839,18 +4895,40 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		// the whole reason the zero-result path below distinguishes
 		// them: there may well be more messages, and this says only that
 		// none of them match.
-		reached = " The server said nothing FURTHER MATCHES after the last one. That is not the " +
-			"same as there being no more messages — read on from the last cursor without the " +
-			"filter to find out whether there are any."
+		reached = " The server said nothing FURTHER MATCHES beyond the " + onward + " one. That is " +
+			"not the same as there being no more messages — read on from the " + onward + " cursor " +
+			"as " + nextParam + " without the filter to find out whether there are any."
 	case len(events) < limit:
-		reached = " The server said there was nothing after the last one, so this is everything " +
-			"there was."
+		reached = " The server said there is nothing beyond the " + onward + " one: you have " +
+			"reached the " + edge + ", so this is everything there was."
 	}
-	return mcp.NewToolResultText(hubconn.FormatEventsOn(s.name, events) + attachments +
-		"\n\n[hub: this was a read, not a catch-up — your unread position is unchanged, so " +
+	body := hubconn.FormatEventsOn(s.name, events)
+	if compact {
+		body = compactReadText(s.name, events)
+	}
+	direction := fmt.Sprintf(" Read FORWARD from %s, %d message(s), handed over oldest first.",
+		describeAnchor(start), len(events))
+	if back {
+		direction = fmt.Sprintf(" Read BACKWARDS from %s, %d message(s), handed over oldest first "+
+			"(the last one is the newest, just before where you started).", describeAnchor(start), len(events))
+	}
+	if toFile {
+		path, err := h.writeReadFile(s.name, body+attachments)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("the messages were read, but the file could not "+
+				"be written (%v); read again without toFile", err)), nil
+		}
+		first, lastEv := events[0], events[len(events)-1]
+		body = fmt.Sprintf("[hub: %d message(s) written to %s — untrusted content, read it with your "+
+			"file tool and delete it when done. Oldest: %s cursor=%s. Newest: %s cursor=%s]",
+			len(events), path, first.TS, first.Cursor, lastEv.TS, lastEv.Cursor)
+		attachments = ""
+	}
+	return mcp.NewToolResultText(body + attachments +
+		"\n\n[hub:" + direction + " This was a read, not a catch-up — your unread position is unchanged, so " +
 		"nothing you still have to read was consumed." + reached + " What is here is recorded as " +
 		"delivered to you, so a later hub_catch_up skips past it rather than showing it twice. " +
-		"To keep reading forward, pass the LAST cursor above as after" +
+		"To keep reading in this direction, pass the " + strings.ToUpper(onward) + " cursor above as " + nextParam +
 		matchedSuffix(last.Matching) + "]" + unappliedNote(unapplied)), nil
 }
 
@@ -4911,15 +4989,15 @@ func (s *session) noteReadCoveredGap(start wire.Anchor, events []hubconn.Event) 
 //
 // A server that declares no features at all has said nothing either way,
 // so the request goes out and the answer's own `matching` settles it.
-func checkFilterSupport(conn *hubconn.Conn, filter wire.Filter) string {
+func checkFilterSupport(conn *hubconn.Conn, filter wire.Filter, feature string) string {
 	if len(filter.Query) == 1 {
 		return "query needs at least two characters — a single character matches too much to be " +
 			"a filter, and this server refuses it outright"
 	}
-	if !conn.HasFeature("messageAfter") {
+	if !conn.HasFeature(feature) {
 		return ""
 	}
-	declared := conn.MessageAfterFilters()
+	declared := conn.HistoryFilters(feature)
 	if len(declared) == 0 {
 		if filter.Set() {
 			return "this server declares no filters on its read path, so sender/query would be " +
@@ -4929,7 +5007,7 @@ func checkFilterSupport(conn *hubconn.Conn, filter wire.Filter) string {
 		return ""
 	}
 	for name, set := range map[string]bool{"sender": filter.Sender != "", "query": filter.Query != ""} {
-		if set && !conn.SupportsMessageAfterFilter(name) {
+		if set && !conn.SupportsHistoryFilter(feature, name) {
 			return fmt.Sprintf("this server declares it can filter by %s, but not by %q — sending "+
 				"it anyway would return an answer that looks filtered and is not",
 				strings.Join(declared, " and "), name)

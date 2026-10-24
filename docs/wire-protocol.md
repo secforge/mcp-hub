@@ -683,6 +683,16 @@ before a listener catches up) has the exact same undetectable-truncation
 exposure `history` used to, with no protocol-level count to fall back on
 at all.
 
+### 2.6b `messageBefore` (client → server) / answer (server → client)
+
+`messageAfter` walking the other way, declared as `features.messageBefore` (with the same `filters` payload; per conversation on an agent connection). Same request fields, filters and answers:
+
+- `cursor` asks for the newest message strictly **before** that position, in the same order `messageAfter` walks.
+- `at: T` asks for the newest message with a timestamp strictly before `T`. That is the mirror of `messageAfter`'s "at or after", so a read forward and a read backward around the same `T` never overlap.
+- The answer is a `msg` with `historical: true` and `answers`, or `noMoreMessages` when the start is reached. A share's history window counts as the start. A filtered `noMoreMessages` means "nothing earlier matches". Malformed requests get `bad_anchor` or `bad_filter`.
+
+The reference client walks backwards one message at a time for `hub_read(before: …)` and hands the result over oldest first, so a reader never sees history in reverse.
+
 ### 2.7 `ack` (both directions) — read receipts
 
 This is the read-cursor / read-receipt mechanism. It answers "has the

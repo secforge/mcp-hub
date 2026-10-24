@@ -47,6 +47,7 @@ const (
 	TypeAttachment      Type = "attachment"
 	TypeAttachmentData  Type = "attachmentData"
 	TypeMessageAfter    Type = "messageAfter"
+	TypeMessageBefore   Type = "messageBefore"
 	TypePinned          Type = "pinned"
 	TypeUnpinned        Type = "unpinned"
 	TypePin             Type = "pin"
@@ -1007,6 +1008,13 @@ type MessageAfter struct {
 	Anchor
 	Filter
 }
+
+// MessageBefore is MessageAfter walking the other way: the newest message
+// strictly before the anchor (a cursor, or an instant: createdAt < At),
+// with the same filters and the same answers — msg, noMoreMessages at the
+// start or at the share's history window, bad_anchor, bad_filter.
+// Declared as features.messageBefore.
+type MessageBefore MessageAfter
 
 // Filter narrows which messages a MessageAfter request will consider. It
 // does not change the shape of the answer: still exactly one message,
