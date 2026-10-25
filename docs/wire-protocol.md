@@ -1028,7 +1028,7 @@ historical answers carry `enc` and no `text`.
 
 **Envelope v2.** A v1 body does not seal how many attachments came with it, so a server could drop one unnoticed. A v2 envelope (`enc.v: 2`) is identical to v1, except that the body is sealed under the field `text:{n}`, where `n` is the message's attachment count (0 when none). The AAD prefix stays `v1|`, and `file:{i}`/`filemeta:{i}` are unchanged.
 
-A reader opens a v2 body with `n` = the attachments that arrived with it, so a dropped one fails the body, and a v2 body relabelled v1 fails too. An edit keeps the count of the original send. v1 envelopes stay valid and are read as before. Todo items stay v1. Writers move to v2 only once every reader opens it. The reference client reads both, and writes v1 until then.
+A reader opens a v2 body with `n` = the attachments that arrived with it, so a dropped one fails the body, and a v2 body relabelled v1 fails too. An edit keeps the count of the original send. v1 envelopes stay valid and are read as before. Todo items stay v1. Writers move to v2 only once every reader opens it. The reference client reads both and writes v2.
 
 **Attachments.** `contentBytes` is standard base64 of nonce‖ciphertext‖tag
 (field `file:{i}`), and `encMeta: {nonce, ct}` seals `{"name",

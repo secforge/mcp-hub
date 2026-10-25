@@ -89,3 +89,54 @@ func TestAV2EditKeepsTheCountOfTheOriginalSend(t *testing.T) {
 		t.Fatalf("a v2 edit without its attachments on the wire: %q", edit.Text)
 	}
 }
+
+func TestThisClientWritesV2AndAnEditKeepsTheCount(t *testing.T) {
+	key := newKey(t)
+	params := encParams(t, key)
+	writer, reader := &Conn{peerID: webPeerID}, &Conn{peerID: agentPeerID}
+	for _, c := range []*Conn{writer, reader} {
+		if err := c.setupEncryption(params, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := []wire.Attachment{
+		{Name: "a.txt", ContentType: "text/plain", ContentBytes: base64.StdEncoding.EncodeToString([]byte("A"))},
+		{Name: "b.txt", ContentType: "text/plain", ContentBytes: base64.StdEncoding.EncodeToString([]byte("B"))},
+	}
+	sealed, err := writer.sealMsg(wire.Msg{ID: "c1", Text: "two files", Attachments: files})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := sealed.(map[string]json.RawMessage)
+	var enc wire.Enc
+	var atts []wire.Attachment
+	json.Unmarshal(frame["enc"], &enc)
+	json.Unmarshal(frame["attachments"], &atts)
+	if enc.V != 2 {
+		t.Fatalf("written as envelope v%d, want 2", enc.V)
+	}
+	ev := Event{Kind: "msg", ExternalID: "x1", PeerID: webPeerID, Enc: &enc, Attachments: atts}
+	reader.openEvent(&ev)
+	if ev.Text != "two files" || len(ev.Attachments) != 2 {
+		t.Fatalf("opened as %q with %d attachments", ev.Text, len(ev.Attachments))
+	}
+	short := Event{Kind: "msg", ExternalID: "x1", PeerID: webPeerID, Enc: &enc, Attachments: atts[:1]}
+	reader2 := &Conn{peerID: agentPeerID}
+	reader2.setupEncryption(params, key)
+	reader2.openEvent(&short)
+	if !strings.Contains(short.Text, "could not be opened") {
+		t.Fatalf("opened with an attachment missing: %q", short.Text)
+	}
+
+	writer.noteSealedAck("c1", Event{Kind: "sendAck", ExternalID: "x1", ActionOK: true, ActionOKStated: true})
+	edited, err := writer.sealEdit(wire.Edit{ID: "c2", ExternalID: "x1", Text: "edited"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	json.Unmarshal(edited.(map[string]json.RawMessage)["enc"], &enc)
+	edit := Event{Kind: "messageEdited", ExternalID: "x1", PeerID: webPeerID, Enc: &enc}
+	reader.openEvent(&edit)
+	if edit.Text != "edited" {
+		t.Fatalf("the edit, sealed under the original count, opened as %q", edit.Text)
+	}
+}

@@ -95,9 +95,10 @@ func newMid() string {
 }
 
 // sealFrame turns an outgoing msg or edit into its encrypted form: the
-// text sealed into enc, each attachment's bytes and name/type sealed, and
-// no plaintext body, name or type left in the frame.
-func (c *Conn) sealFrame(frame any, text string, attachments []wire.Attachment, mid string, rev int) (map[string]json.RawMessage, error) {
+// text sealed into a v2 enc together with files, the message's attachment
+// count, each attachment's bytes and name/type sealed, and no plaintext
+// body, name or type left in the frame.
+func (c *Conn) sealFrame(frame any, text string, attachments []wire.Attachment, mid string, rev, files int) (map[string]json.RawMessage, error) {
 	raw, err := json.Marshal(frame)
 	if err != nil {
 		return nil, err
@@ -107,12 +108,12 @@ func (c *Conn) sealFrame(frame any, text string, attachments []wire.Attachment, 
 		return nil, err
 	}
 	delete(out, "text")
-	nonce, ct, err := c.enc.Seal([]byte(text), c.peerID, mid, rev, hubenc.FieldText())
+	nonce, ct, err := c.enc.Seal([]byte(text), c.peerID, mid, rev, hubenc.FieldTextCount(files))
 	if err != nil {
 		return nil, err
 	}
 	b := hubenc.B64()
-	out["enc"], _ = json.Marshal(wire.Enc{V: hubenc.Version, Mid: mid, Rev: rev,
+	out["enc"], _ = json.Marshal(wire.Enc{V: envelopeCounted, Mid: mid, Rev: rev,
 		Nonce: b.EncodeToString(nonce), Ct: b.EncodeToString(ct)})
 	if len(attachments) > 0 {
 		sealed := make([]map[string]any, len(attachments))
@@ -146,16 +147,20 @@ func (c *Conn) sealFrame(frame any, text string, attachments []wire.Attachment, 
 // without waiting for its own message to come back.
 func (c *Conn) sealMsg(m wire.Msg) (any, error) {
 	mid := newMid()
-	c.notePendingSeal(m.ID, mid, 0)
-	return c.sealFrame(m, m.Text, m.Attachments, mid, 0)
+	c.notePendingSeal(m.ID, mid, 0, len(m.Attachments))
+	return c.sealFrame(m, m.Text, m.Attachments, mid, 0, len(m.Attachments))
 }
 
-func (c *Conn) notePendingSeal(corrID, mid string, rev int) {
+// envelopeCounted is the message envelope version this client writes: v2,
+// whose body seals the attachment count.
+const envelopeCounted = 2
+
+func (c *Conn) notePendingSeal(corrID, mid string, rev, files int) {
 	c.mu.Lock()
 	if c.encPending == nil {
 		c.encPending = map[string]encState{}
 	}
-	c.encPending[corrID] = encState{sender: c.peerID, mid: mid, rev: rev}
+	c.encPending[corrID] = encState{sender: c.peerID, mid: mid, rev: rev, files: files}
 	c.mu.Unlock()
 }
 
@@ -188,8 +193,9 @@ func (c *Conn) sealEdit(e wire.Edit) (any, error) {
 		return nil, fmt.Errorf("this client has not seen message %s in this session, and editing a "+
 			"sealed message needs its id and revision — read it first (hub_read), then edit", e.ExternalID)
 	}
-	c.notePendingSeal(e.ID, st.mid, st.rev+1)
-	return c.sealFrame(e, e.Text, e.Attachments, st.mid, st.rev+1)
+	// An edit keeps the count of the original send.
+	c.notePendingSeal(e.ID, st.mid, st.rev+1, st.files)
+	return c.sealFrame(e, e.Text, e.Attachments, st.mid, st.rev+1, st.files)
 }
 
 // openEvent decrypts a sealed message or edit in place, so everything
