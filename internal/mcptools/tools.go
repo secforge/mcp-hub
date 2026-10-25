@@ -2201,8 +2201,9 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"One line per message (time, sender, text; the cursor only on the first and last) instead of a full "+
 					"header each: for long reads, where the headers cost more than the messages")),
 			mcp.WithBoolean("toFile", mcp.Description(
-				"Write the messages to a file instead of into this result, and get its path back: "+
-					"for reads too long to arrive whole here. Raises the limit to 2000 messages. "+
+				"true or false — NOT a path. true writes the messages to a new file this client "+
+					"names and creates itself (it never overwrites anything), and the result gives its "+
+					"path: for reads too long to arrive whole here. Raises the limit to 2000 messages. "+
 					"Read the file with your file tool and delete it when done")),
 			mcp.WithString("before", mcp.Description(
 				"Read BACKWARDS: a cursor copied verbatim from a message, or an RFC 3339 timestamp. "+

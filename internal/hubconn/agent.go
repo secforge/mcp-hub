@@ -377,7 +377,7 @@ func (a *Agent) Open(conv string, key []byte) (*Conn, error) {
 	v := &agentConv{
 		agent: a,
 		conv:  conv,
-		in:    make(chan []byte, 64),
+		ready: make(chan struct{}, 1),
 		done:  make(chan struct{}),
 		kick:  make(chan struct{}, 1),
 	}
@@ -513,10 +513,15 @@ func (a *Agent) Close() error {
 // agentConv is one conversation's transport on an agent socket. It reads
 // only frames the agent routed to its conversation, and stamps that
 // conversation on every frame it writes.
+//
+// Routed frames wait in a queue of their own that never blocks the agent
+// socket: one conversation not reading must not stop the others' frames,
+// nor the pings that keep every conversation's deadline moving.
 type agentConv struct {
 	agent *Agent
 	conv  string
-	in    chan []byte
+	// ready signals that the queue has frames.
+	ready chan struct{}
 	done  chan struct{}
 	// kick wakes a blocked read when its deadline moves.
 	kick chan struct{}
@@ -526,13 +531,51 @@ type agentConv struct {
 	pingHandler func(string) error
 	err         error
 	closeSent   bool
+	queue       [][]byte
+	queuedBytes int
 }
 
+// maxConvBacklog bounds what one conversation may hold unread in its
+// queue. Past it the conversation is ended as abandoned for its backlog,
+// and is opened again rather than holding more.
+const maxConvBacklog = 64 << 20
+
+// errConvBacklog ends a conversation that stopped reading.
+var errConvBacklog = errors.New("the conversation stopped reading while more than 64 MB arrived for it")
+
 func (v *agentConv) deliver(frame []byte) {
-	select {
-	case v.in <- frame:
-	case <-v.done:
+	v.mu.Lock()
+	if v.err != nil {
+		v.mu.Unlock()
+		return
 	}
+	if v.queuedBytes+len(frame) > maxConvBacklog {
+		v.mu.Unlock()
+		v.agent.forget(v)
+		v.finish(errConvBacklog, true)
+		return
+	}
+	v.queue = append(v.queue, frame)
+	v.queuedBytes += len(frame)
+	v.mu.Unlock()
+	select {
+	case v.ready <- struct{}{}:
+	default:
+	}
+}
+
+// pop takes the oldest queued frame, if there is one.
+func (v *agentConv) pop() ([]byte, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.queue) == 0 {
+		return nil, false
+	}
+	frame := v.queue[0]
+	v.queue[0] = nil
+	v.queue = v.queue[1:]
+	v.queuedBytes -= len(frame)
+	return frame, true
 }
 
 // finish ends the session with err as what reads return from now on.
@@ -577,10 +620,8 @@ func (v *agentConv) ReadMessage() (int, []byte, error) {
 	for {
 		// Frames that arrived before the session ended are still read in
 		// order before the ending is.
-		select {
-		case raw := <-v.in:
+		if raw, ok := v.pop(); ok {
 			return websocket.TextMessage, raw, nil
-		default:
 		}
 		v.mu.Lock()
 		deadline := v.deadline
@@ -612,13 +653,11 @@ func (v *agentConv) ReadMessage() (int, []byte, error) {
 // deadline moving — the last of which asks the caller to wait again.
 func (v *agentConv) await(timeout <-chan time.Time) (raw []byte, err error, again bool) {
 	select {
-	case raw := <-v.in:
-		return raw, nil, false
+	case <-v.ready:
+		return nil, nil, true
 	case <-v.done:
-		select {
-		case raw := <-v.in:
+		if raw, ok := v.pop(); ok {
 			return raw, nil, false
-		default:
 		}
 		v.mu.Lock()
 		err := v.err

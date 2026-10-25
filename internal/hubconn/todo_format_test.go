@@ -1,6 +1,7 @@
 package hubconn
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -45,5 +46,30 @@ func TestAPushedTodoEventCarriesNoEndMarkerOfItsOwn(t *testing.T) {
 	}
 	if !strings.Contains(FormatEvent(ev), "\n[end cursor=2]") {
 		t.Fatalf("returned todo event lost its end marker:\n%s", FormatEvent(ev))
+	}
+}
+
+func TestALongListIsShownWithinItsBoundWithTheOpenItemsFirst(t *testing.T) {
+	var items []wire.TodoItem
+	for i := 0; i < 400; i++ {
+		items = append(items, wire.TodoItem{ExternalID: fmt.Sprintf("i%d", i), Text: fmt.Sprintf("item %d", i),
+			Notes: strings.Repeat("long notes\n", 50), Done: i%2 == 1})
+	}
+	got := FormatTodoOverview(items, 8<<10)
+	if len(got) > 9<<10 {
+		t.Fatalf("overview is %d bytes", len(got))
+	}
+	for _, want := range []string{"[todo list: 200 open, 200 done", "item 0 (id=i0)", "more open item(s)",
+		"hub_todo_items shows the whole list"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("overview lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "item 1 (id=i1)") {
+		t.Fatalf("a done item is listed in an overview that had to be cut:\n%s", got)
+	}
+	small := items[:2]
+	if FormatTodoOverview(small, 8<<10) != FormatTodoList(small) {
+		t.Fatal("a list that fits is not shown whole")
 	}
 }

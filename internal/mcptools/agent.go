@@ -227,11 +227,16 @@ func (ag *agentSession) retryOpen(a *hubconn.Agent, conv string, attempt int) {
 	defer ag.opMu.Unlock()
 	ag.mu.Lock()
 	it, granted := ag.grants[conv]
-	_, open := ag.children[conv]
+	s := ag.children[conv]
 	current := ag.agent == a && !ag.leaving && !ag.userClosed[conv]
 	ag.mu.Unlock()
-	if !current || !granted || open {
+	if !current || !granted {
 		return
+	}
+	if s != nil {
+		if c, _ := s.activeConn(); c != nil && c.Connected() {
+			return
+		}
 	}
 	firstFailed := "could not be opened at first"
 	_, err := ag.openChild(a, it, nil, nil, &firstFailed)
@@ -543,9 +548,16 @@ func (ag *agentSession) childEnded(s *session, conn *hubconn.Conn) {
 		ag.release(s, "far more arrived there than was being read, so it was closed; it is "+
 			"still shared and is opened again when the agent connection next reconnects", false)
 	default:
-		// Coming back: the agent reopens it, after its own reconnect or
-		// on the event that closed it.
+		// Coming back. While the agent socket is down, its reconnect
+		// reopens every conversation; while it is up, nothing else would,
+		// so it is reopened here.
 		s.teardown(conn, true)
+		ag.mu.Lock()
+		a := ag.agent
+		ag.mu.Unlock()
+		if a != nil && a.Connected() {
+			go ag.retryReopen(a, s, 1)
+		}
 	}
 }
 
@@ -1281,7 +1293,9 @@ func (ag *agentSession) retryReopen(a *hubconn.Agent, s *session, attempt int) {
 	it, granted := ag.grants[s.conv]
 	current := ag.agent == a && !ag.leaving && ag.children[s.conv] == s && !ag.userClosed[s.conv]
 	ag.mu.Unlock()
-	if !current || !granted {
+	// A socket that has gone down since is the agent reconnect's to
+	// reopen, with everything else.
+	if !current || !granted || !a.Connected() {
 		return
 	}
 	if conn, _ := s.activeConn(); conn != nil && conn.Connected() {
@@ -1290,7 +1304,7 @@ func (ag *agentSession) retryReopen(a *hubconn.Agent, s *session, attempt int) {
 	_, err := ag.openChild(a, it, nil, nil, nil)
 	switch {
 	case err == nil:
-		ag.alert(fmt.Sprintf("Conversation %q is open again after the server briefly closed it. "+
+		ag.alert(fmt.Sprintf("Conversation %q is open again after it briefly closed. "+
 			"Call hub_catch_up(connection: %q) for anything said meanwhile.", s.name, s.name))
 	case attempt >= maxReopenAttempts:
 		ag.mu.Lock()

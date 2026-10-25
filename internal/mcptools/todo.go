@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -147,8 +148,32 @@ func (h *Hub) handleTodoItems(ctx context.Context, req mcp.CallToolRequest) (*mc
 		return bad, nil
 	}
 	ev, ok, err := conn.TodoItems()
-	return h.todoResult(s, "items request", ev, ok, err), nil
+	res := h.todoResult(s, "items request", ev, ok, err)
+	if res.IsError || !ok || ev.Kind != "items" {
+		return res, nil
+	}
+	text := hubconn.FormatEventOn(s.name, ev)
+	if len(text) <= todoItemsInlineBytes {
+		return res, nil
+	}
+	path, werr := h.writeReadFile(s.name, text)
+	if werr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("the list is %d KB, too long to return here, and "+
+			"writing it to a file failed: %v", len(text)>>10, werr)), nil
+	}
+	head, _, _ := strings.Cut(text, "\n")
+	return mcp.NewToolResultText(fmt.Sprintf("%s\nThe whole list is %d KB, too long to return here, "+
+		"so it was written to %s. Read it with your file tool and delete it when done.",
+		head, len(text)>>10, path)), nil
 }
+
+// The connect result shows an overview of a todo list within
+// todoOverviewBytes; hub_todo_items returns a list up to
+// todoItemsInlineBytes inline and writes a longer one to a file.
+const (
+	todoOverviewBytes    = 8 << 10
+	todoItemsInlineBytes = 60 << 10
+)
 
 func (h *Hub) handleTodoAdd(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	s, conn, bad := h.todoConn(req)
@@ -260,5 +285,5 @@ func todoNote(conn *hubconn.Conn) string {
 		"hub_todo_items to see the whole list at any time, hub_todo_add / hub_todo_update / " +
 		"hub_todo_delete to change it; hub_send, hub_edit and hub_delete are refused here. " +
 		"Changes the user makes in the list arrive as events like messages do. " + notes + "\n" +
-		hubconn.FormatTodoList(items)
+		hubconn.FormatTodoOverview(items, todoOverviewBytes)
 }

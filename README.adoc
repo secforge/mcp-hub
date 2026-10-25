@@ -531,7 +531,7 @@ oldest first, with the cursor to continue from named explicitly (a server may
 store a conversation out of time order). A query: it moves no read position. The result says which way it
 read and whether it reached the start or end of the conversation, as opposed to
 the server not answering. `compact` gives one line per message (time, sender,
-text; the cursor only on the first and last); `toFile` writes the messages to a file and returns
+text; the cursor only on the first and last); `toFile: true` (a boolean, not a path) writes the messages to a new file the client names and returns
 its path, for reads of up to 2000 messages that would not arrive whole.
 
 |`hub_receive(connection)`, `hub_wait(connection)`

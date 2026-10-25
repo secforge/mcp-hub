@@ -3,10 +3,12 @@ package mcptools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -345,4 +347,56 @@ func TestAnEncryptedTodoListIsReadAndChangedSealed(t *testing.T) {
 	if f := last("edit"); hasKey(f, "enc") || f["done"] != true {
 		t.Fatalf("a done-only change went out as %v; want done and no envelope", f)
 	}
+}
+
+func TestALongTodoListIsWrittenToAFileAndTheConnectShowsAnOverview(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	var items []wire.TodoItem
+	for i := 0; i < 300; i++ {
+		items = append(items, wire.TodoItem{ExternalID: fmt.Sprintf("i%d", i), Text: fmt.Sprintf("item %d", i),
+			Notes: strings.Repeat("n", 500), Position: float64(i)})
+	}
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, ConversationKind: "todo",
+			Features: map[string]json.RawMessage{"todo": json.RawMessage(`{}`), "correlation": json.RawMessage(`{}`)},
+			Items:    &items, ItemsCursor: "c1"})
+		for {
+			var f map[string]any
+			if err := conn.ReadJSON(&f); err != nil {
+				return
+			}
+			if f["type"] == "items" {
+				id, _ := f["id"].(string)
+				conn.WriteJSON(wire.ItemsResponse{Type: wire.TypeItems, ID: id, List: &items, ItemsCursor: "c1"})
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := context.Background()
+	hub := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"as": testConn, "link": "ws" + strings.TrimPrefix(srv.URL, "http") + "/hub/join#todo-big"}
+	res, _ := hub.handleConnect(ctx, req)
+	t.Cleanup(func() { hub.handleDisconnect(ctx, connReqFor(testConn)) })
+	if res.IsError || len(textOf(res)) > 20<<10 || !strings.Contains(textOf(res), "more open item(s)") {
+		t.Fatalf("connect result (%d bytes): %.2000s", len(textOf(res)), textOf(res))
+	}
+	req.Params.Arguments = map[string]any{"connection": testConn}
+	res, _ = hub.handleTodoItems(ctx, req)
+	m := regexp.MustCompile(`written to (\S+)\. Read it`).FindStringSubmatch(textOf(res))
+	if res.IsError || m == nil {
+		t.Fatalf("items result: %.2000s", textOf(res))
+	}
+	data, err := os.ReadFile(m[1])
+	if err != nil || !strings.Contains(string(data), "item 299 (id=i299)") {
+		t.Fatalf("the file %s: %v, %d bytes", m[1], err, len(data))
+	}
+	os.Remove(m[1])
 }
