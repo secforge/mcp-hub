@@ -112,7 +112,7 @@ func (c *Conn) TodoAdd(text string, notes *string, done *bool, at Placement) (Ev
 	if c.encParams != nil {
 		return c.sealedTodoAdd(text, notes, done, at)
 	}
-	return c.todoRequest("sendAck", func(id string) any {
+	return c.awaitAnswer("sendAck", func(id string) any {
 		return wire.TodoAdd{Type: wire.TypeMsg, ID: id, Text: text, Notes: notes, Done: done, AfterID: at.raw()}
 	})
 }
@@ -132,7 +132,7 @@ func (c *Conn) TodoUpdate(externalID string, text, notes *string, done *bool, at
 	if err := c.requireSendable(); err != nil {
 		return Event{}, false, err
 	}
-	return c.todoRequest("editAck", func(id string) any {
+	return c.awaitAnswer("editAck", func(id string) any {
 		return wire.TodoEdit{Type: wire.TypeEdit, ID: id, ExternalID: externalID, Text: text, Notes: notes,
 			Done: done, AfterID: at.raw()}
 	})
@@ -143,14 +143,14 @@ func (c *Conn) TodoItems() (Event, bool, error) {
 	if err := c.requireTodo(); err != nil {
 		return Event{}, false, err
 	}
-	return c.todoRequest("items", func(id string) any {
+	return c.awaitAnswer("items", func(id string) any {
 		return wire.ItemsRequest{Type: wire.TypeItems, ID: id}
 	})
 }
 
 // todoRequest sends one request and waits for the answer of answerKind,
 // as every other awaited request does.
-func (c *Conn) todoRequest(answerKind string, frame func(id string) any) (Event, bool, error) {
+func (c *Conn) awaitAnswer(answerKind string, frame func(id string) any) (Event, bool, error) {
 	corrID, resultCh, cancel, err := c.claimNextAckCorrelated(answerKind, "")
 	if err != nil {
 		return Event{}, false, err

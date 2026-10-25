@@ -147,7 +147,17 @@ func startAccountsLine(accounts []wire.StartAccount) string {
 	for i, a := range accounts {
 		names[i] = accountLabel(a)
 	}
-	return "may start one-to-one conversations (hub_start_conversation) as: " + strings.Join(names, "; ")
+	line := "may start one-to-one conversations (hub_start_conversation) as: " + strings.Join(names, "; ")
+	var groups []string
+	for _, a := range accounts {
+		if a.Groups {
+			groups = append(groups, accountLabel(a))
+		}
+	}
+	if len(groups) > 0 {
+		line += ", and group chats (hub_start_group) as: " + strings.Join(groups, "; ")
+	}
+	return line
 }
 
 // startRefusal says what a refused start means and what to do about it.
@@ -168,6 +178,8 @@ func startRefusal(e *hubconn.SearchError) string {
 	case "start_incomplete":
 		return "not finished: the chat exists, but sharing it did not complete. Calling " +
 			"hub_start_conversation again with the same arguments is safe and finishes it (" + why + ")."
+	case "bad_topic":
+		return "not started: the server refused the topic (" + why + ")."
 	case "start_failed":
 		return "not started: the server could not start it right now; it may be retried (" + why + ")."
 	}

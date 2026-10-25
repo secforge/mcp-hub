@@ -106,6 +106,11 @@ type Event struct {
 	// if the server set one — see wire.Error.
 	Code      string
 	Retryable bool
+	// Added, Skipped and Failed are an addMembersAck's counts, or an
+	// add_failed error's partial result; Failed only on the error.
+	Added   int
+	Skipped int
+	Failed  []string
 	// CorrelationID is the id this client put on the request, echoed back
 	// by a correlating server — see wire.Msg.ID. Empty on live traffic
 	// nobody asked for, on every frame from a server without the feature,
@@ -2674,8 +2679,22 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &e); err != nil {
 			return Event{}, false
 		}
-		return Event{Kind: "error", Text: e.Message, Code: e.Code, Retryable: e.Retryable,
-			CorrelationID: e.ID}, true
+		ev := Event{Kind: "error", Text: e.Message, Code: e.Code, Retryable: e.Retryable,
+			CorrelationID: e.ID, Failed: e.Failed}
+		if e.Added != nil {
+			ev.Added = *e.Added
+		}
+		if e.Skipped != nil {
+			ev.Skipped = *e.Skipped
+		}
+		return ev, true
+	case wire.TypeAddMembersAck:
+		var a wire.AddMembersAck
+		if err := json.Unmarshal(raw, &a); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "addMembersAck", ActionOK: a.OK, ActionOKStated: statesOK(raw),
+			Added: a.Added, Skipped: a.Skipped, CorrelationID: a.ID}, true
 	case wire.TypeRoster:
 		var r wire.Roster
 		if err := json.Unmarshal(raw, &r); err != nil {

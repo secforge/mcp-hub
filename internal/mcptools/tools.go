@@ -2106,6 +2106,8 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool(searchTool(), h.handleSearch)
 	addTool(linkTool(), h.handleLink)
 	addTool(startConversationTool(), h.handleStartConversation)
+	addTool(startGroupTool(), h.handleStartGroup)
+	addTool(addMembersTool(), h.handleAddMembers)
 	addTool(
 		mcp.NewTool("hub_list_connections",
 			mcp.WithDescription("List the links this client has connected to before FROM THIS "+

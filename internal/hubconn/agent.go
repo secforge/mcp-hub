@@ -272,6 +272,13 @@ func (a *Agent) readLoop() {
 				continue
 			}
 			a.answerSearch(f.ID, searchAnswer{started: f})
+		case wire.TypeGroupStarted:
+			var f wire.GroupStarted
+			if err := json.Unmarshal(raw, &f); err != nil || f.Conv == "" {
+				debugf("agent: unreadable groupStarted dropped: %s", raw)
+				continue
+			}
+			a.answerSearch(f.ID, searchAnswer{group: f})
 		case wire.TypeStartAccounts:
 			var f wire.StartAccounts
 			if err := json.Unmarshal(raw, &f); err != nil {
@@ -285,7 +292,7 @@ func (a *Agent) readLoop() {
 		case wire.TypeError:
 			var e wire.Error
 			if json.Unmarshal(raw, &e) == nil && e.ID != "" && a.answerSearch(e.ID, searchAnswer{
-				err: &SearchError{Code: e.Code, Message: e.Message, Retryable: e.Retryable}}) {
+				err: &SearchError{Code: e.Code, Message: e.Message, Retryable: e.Retryable, Conv: e.Conv}}) {
 				continue
 			}
 			ev, ok := decodeEvent(raw)
@@ -697,6 +704,7 @@ var searchWait = 30 * time.Second
 type searchAnswer struct {
 	results wire.SearchResults
 	started wire.ConversationStarted
+	group   wire.GroupStarted
 	err     error
 }
 
@@ -705,6 +713,8 @@ type SearchError struct {
 	Code      string
 	Message   string
 	Retryable bool
+	// Conv is the conversation a refused start is about, where one exists.
+	Conv string
 }
 
 func (e *SearchError) Error() string {
@@ -830,3 +840,55 @@ func (a *Agent) StartConversation(ctx context.Context, account, contact string) 
 			"is shared with this agent now", startWait)
 	}
 }
+
+// StartGroup asks the server to create a new group chat with contacts in
+// account's name and waits for its answer. id is the caller's: repeating
+// it gives the chat already created for it rather than a second one. A
+// refusal comes back as a *SearchError carrying the server's code.
+func (a *Agent) StartGroup(ctx context.Context, id, account string, contacts []string, topic string) (wire.GroupStarted, error) {
+	ch := make(chan searchAnswer, 1)
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return wire.GroupStarted{}, errAgentDown
+	}
+	if _, busy := a.searches[id]; busy {
+		a.mu.Unlock()
+		return wire.GroupStarted{}, fmt.Errorf("a start with request id %q is still waiting for its answer", id)
+	}
+	a.searches[id] = ch
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		if a.searches[id] == ch {
+			delete(a.searches, id)
+		}
+		a.mu.Unlock()
+	}()
+	if err := a.writeFrame(wire.StartGroup{Type: wire.TypeStartGroup, ID: id, Account: account,
+		Contacts: contacts, Topic: topic}); err != nil {
+		return wire.GroupStarted{}, err
+	}
+	timer := time.NewTimer(startWait)
+	defer timer.Stop()
+	select {
+	case ans := <-ch:
+		return ans.group, ans.err
+	case <-a.done:
+		return wire.GroupStarted{}, errAgentDown
+	case <-ctx.Done():
+		return wire.GroupStarted{}, ctx.Err()
+	case <-timer.C:
+		return wire.GroupStarted{}, errStartUnanswered
+	}
+}
+
+// errStartUnanswered is a start the server did not answer in time: it
+// may or may not have happened.
+var errStartUnanswered = fmt.Errorf("the server did not answer within %s", startWait)
+
+// IsStartUnanswered reports whether err is a start left without an answer.
+func IsStartUnanswered(err error) bool { return errors.Is(err, errStartUnanswered) }
+
+// IsAgentDown reports whether err is the agent connection going down.
+func IsAgentDown(err error) bool { return errors.Is(err, errAgentDown) }

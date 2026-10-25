@@ -58,6 +58,8 @@ const (
 	TypeNoMoreMessages  Type = "noMoreMessages"
 	TypeServerStopping  Type = "serverStopping"
 	TypeItems           Type = "items"
+	TypeAddMembers      Type = "addMembers"
+	TypeAddMembersAck   Type = "addMembersAck"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -351,6 +353,15 @@ type Error struct {
 	// Retryable, when Code is set, says whether retrying the operation that
 	// produced this error could succeed. Meaningless without Code.
 	Retryable bool `json:"retryable,omitempty,case:strict"`
+	// Conv names the conversation an answer to an agent's start is about,
+	// where one exists: on start_incomplete, once the share does.
+	Conv string `json:"conv,omitempty,case:strict"`
+	// Added, Skipped and Failed report a partly done addMembers
+	// (add_failed): how many were added, how many were members already,
+	// and the addresses that were not added.
+	Added   *int     `json:"added,omitempty,case:strict"`
+	Skipped *int     `json:"skipped,omitempty,case:strict"`
+	Failed  []string `json:"failed,omitempty,case:strict"`
 }
 
 // MaxCorrelationIDLen bounds a correlation id (see Msg.ID). The value is
@@ -1528,6 +1539,32 @@ func BehindCount(n int) *int { return &n }
 
 // FeatureTodo declares a todo list (§2.8b).
 const FeatureTodo = "todo"
+
+// FeatureAddMembers is declared on a conversation where addMembers would
+// be served right now: a group chat, shared read-write, with a live start
+// grant on its account. It is a hint; the answer to a request decides.
+const FeatureAddMembers = "addMembers"
+
+// AddMembers adds Contacts (1 to MaxGroupContacts email addresses) to the
+// conversation. History says how much of it they see: "none", "all", or
+// {"from": "<ISO-8601 with offset>"}; it is required. Answered with
+// AddMembersAck or an error carrying ID.
+type AddMembers struct {
+	Type     Type            `json:"type,case:strict"`
+	ID       string          `json:"id,omitempty,case:strict"`
+	Contacts []string        `json:"contacts,case:strict"`
+	History  json.RawMessage `json:"history,case:strict"`
+}
+
+// AddMembersAck answers AddMembers. Skipped counts contacts who were
+// members already; they are not in Added.
+type AddMembersAck struct {
+	Type    Type   `json:"type,case:strict"`
+	ID      string `json:"id,omitempty,case:strict"`
+	OK      bool   `json:"ok,case:strict"`
+	Added   int    `json:"added,case:strict"`
+	Skipped int    `json:"skipped,case:strict"`
+}
 
 // TodoFeature is the "todo" feature's parameters: the longest text and
 // notes the server accepts, 0 when it states none.

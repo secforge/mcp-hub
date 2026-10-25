@@ -87,7 +87,7 @@ func (c *Conn) sealedTodoAdd(text string, notes *string, done *bool, at Placemen
 	if err != nil {
 		return Event{}, false, err
 	}
-	return c.todoRequest("sendAck", func(id string) any {
+	return c.awaitAnswer("sendAck", func(id string) any {
 		c.notePendingItem(id, mid, 0, p, ct)
 		return withID(sealed, id)
 	})
@@ -109,7 +109,7 @@ func (c *Conn) sealedTodoUpdate(externalID string, text, notes *string, done *bo
 	if err != nil {
 		return Event{}, false, err
 	}
-	return c.todoRequest("editAck", func(id string) any {
+	return c.awaitAnswer("editAck", func(id string) any {
 		c.notePendingItem(id, mid, rev, p, ct)
 		return withID(sealed, id)
 	})

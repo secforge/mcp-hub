@@ -448,6 +448,17 @@ connection, the sender, the time and a snippet, marked untrusted, with the
 `hub_read` call that reads the whole message. Naming one conversation as
 `connection` searches only that one. Needs a server that declares search.
 
+|`hub_start_group(connection, account, contacts, topic?, requestId?)`
+|Through an agent connection allowed to: create a NEW group chat with 2–249
+people in an account's name, shared with the agent read-write with full
+history. Every call creates a new group; a `requestId` the result offers after
+an unknown outcome repeats that start without creating a second one.
+
+|`hub_add_members(connection, contacts, history)`
+|In a group conversation the agent holds read-write (listed with "can add
+members"): add people, choosing how much history they see (`none`, `all`, or
+from an ISO-8601 moment). Members already in the chat are skipped.
+
 |`hub_start_conversation(connection, account, contact)`
 |Through an agent connection allowed to: open a one-to-one conversation with one
 person (an email address) in an account's name. The server creates the chat or

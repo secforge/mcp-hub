@@ -55,6 +55,11 @@ type Server struct {
 	// conversation first, as a server does, and returns the frame to send
 	// back unwrapped; nil sends nothing.
 	OnStart func(wire.StartConversation) any
+	// OnStartGroup answers a "startGroup" as OnStart answers its 1:1.
+	OnStartGroup func(wire.StartGroup) any
+	// OnFrame answers an inner frame: the frame it returns is sent back
+	// wrapped for that conversation, and nil sends nothing.
+	OnFrame func(Frame) any
 	// encryption is what each encrypted conversation's "joined" declares.
 	encryption map[string]*wire.Encryption
 	// opens counts "open" frames per conversation, over all sockets.
@@ -205,6 +210,18 @@ func (s *Server) handle(ws *websocket.Conn, raw []byte) {
 				s.write(ws, reply)
 			}
 		}
+	case wire.TypeStartGroup:
+		var q wire.StartGroup
+		_ = json.Unmarshal(raw, &q)
+		s.mu.Lock()
+		s.controls = append(s.controls, raw)
+		answer := s.OnStartGroup
+		s.mu.Unlock()
+		if answer != nil {
+			if reply := answer(q); reply != nil {
+				s.write(ws, reply)
+			}
+		}
 	case wire.TypeClose:
 		var f wire.CloseConv
 		_ = json.Unmarshal(raw, &f)
@@ -221,9 +238,15 @@ func (s *Server) handle(ws *websocket.Conn, raw []byte) {
 		}
 		_ = json.Unmarshal(f.Frame, &inner)
 		s.mu.Lock()
-		s.frames[f.Conv] = append(s.frames[f.Conv], Frame{Wrapper: f.Conv, Inner: inner.Conv,
-			Type: inner.Type, Raw: f.Frame})
+		fr := Frame{Wrapper: f.Conv, Inner: inner.Conv, Type: inner.Type, Raw: f.Frame}
+		s.frames[f.Conv] = append(s.frames[f.Conv], fr)
+		answer := s.OnFrame
 		s.mu.Unlock()
+		if answer != nil {
+			if reply := answer(fr); reply != nil {
+				s.Conv(f.Conv, reply)
+			}
+		}
 	default:
 		s.mu.Lock()
 		s.controls = append(s.controls, raw)

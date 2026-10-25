@@ -1066,14 +1066,17 @@ func (ag *agentSession) childLine(s *session) string {
 	conn, _ := s.activeConn()
 	state := "reconnecting"
 	access := it.Access
-	behind := ""
+	extra := ""
 	if conn != nil && conn.Connected() {
 		state = "open"
 		if a := conn.Access(); a != "" {
 			access = a
 		}
 		if conn.Behind() > 0 {
-			behind = fmt.Sprintf(", %d unread at open", conn.Behind())
+			extra = fmt.Sprintf(", %d unread at open", conn.Behind())
+		}
+		if conn.CanAddMembers() {
+			extra += ", can add members (hub_add_members)"
 		}
 	}
 	kind := strings.TrimSpace(it.Channel + " " + it.Kind)
@@ -1083,7 +1086,7 @@ func (ag *agentSession) childLine(s *session) string {
 	if access == wire.AccessRead {
 		access = "READ-ONLY"
 	}
-	return fmt.Sprintf("%s — %q%s, %s, %s%s", s.name, it.Title, kind, access, state, behind)
+	return fmt.Sprintf("%s — %q%s, %s, %s%s", s.name, it.Title, kind, access, state, extra)
 }
 
 // listing describes the agent connection and every conversation on it.

@@ -34,6 +34,8 @@ const (
 	TypeStartAccounts       Type = "startAccounts"
 	TypeStartConversation   Type = "startConversation"
 	TypeConversationStarted Type = "conversationStarted"
+	TypeStartGroup          Type = "startGroup"
+	TypeGroupStarted        Type = "groupStarted"
 )
 
 // Access values of a grant.
@@ -225,6 +227,8 @@ type StartAccount struct {
 	Account string `json:"account,case:strict"`
 	Name    string `json:"name,omitempty,case:strict"`
 	Channel string `json:"channel,omitempty,case:strict"`
+	// Groups says whether group chats may be started in this account too.
+	Groups bool `json:"groups,omitempty,case:strict"`
 }
 
 // StartConversationFeature is agentJoined.features.startConversation:
@@ -260,3 +264,32 @@ type ConversationStarted struct {
 	Conv     string `json:"conv,case:strict"`
 	Existing bool   `json:"existing,case:strict"`
 }
+
+// StartGroup asks the server to create a NEW group chat with Contacts
+// (2 to MaxGroupContacts email addresses) in Account's name, and share it
+// with the agent read-write with full history. ID is required: the server
+// binds a created chat to it for 24 hours, so repeating the same ID gives
+// the same chat and never a second one. Answered unwrapped with
+// GroupStarted or an error, either carrying ID.
+type StartGroup struct {
+	Type     Type     `json:"type,case:strict"`
+	ID       string   `json:"id,case:strict"`
+	Account  string   `json:"account,case:strict"`
+	Contacts []string `json:"contacts,case:strict"`
+	Topic    string   `json:"topic,omitempty,case:strict"`
+}
+
+// GroupStarted answers StartGroup. Conv is the share's handle, already
+// announced by "assigned".
+type GroupStarted struct {
+	Type Type   `json:"type,case:strict"`
+	ID   string `json:"id,omitempty,case:strict"`
+	Conv string `json:"conv,case:strict"`
+}
+
+// Bounds of a group start: Teams holds 250 members, the account being one.
+const (
+	MinGroupContacts = 2
+	MaxGroupContacts = 249
+	MaxGroupTopic    = 250
+)

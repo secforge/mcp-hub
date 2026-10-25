@@ -1109,6 +1109,27 @@ hit whose conversation is not open on its side.
   - `start_failed` (retryable).
 - **The reference client** offers `hub_start_conversation` and returns the started conversation's connection name. Its description restricts starts to a person the user, or an operator instruction, asked to contact.
 
+**Starting a group.** Where an account item carries `groups: true`, the agent may also create group chats in that account's name. A group is its own frame, never a variant of the 1:1.
+
+- **Request.** `startGroup {id, account, contacts: [address, ...], topic?}` with 2 to 249 contacts (Teams holds 250 members, the account being one). The topic is at most 250 characters after trimming, and an empty one counts as absent.
+- **Answer.** `groupStarted {id, conv}`, sent after the group's `assigned`. It has no `existing`: every `startGroup` creates a NEW chat.
+- **`id` is required** (`bad_request` without it). The server binds a created chat to (agent, id) for 24 hours, persisted. A repeat with the same id gets the same `conv` and never a second group. A repeat while the first is still running answers `start_incomplete`. A refusal is not stored: it releases the id, so a retry with the same id tries again. A repeated id must ask for the same group (the same account and topic, the contacts in any order), otherwise `bad_request`.
+- **Refusals** are those of `startConversation`, plus `bad_topic`; `not_allowed` cannot occur. On `start_incomplete`, the error is `error {id, code, message, conv?}`, with `conv` set once the share exists. A repeat with the same id finishes it.
+- **The reference client** offers `hub_start_group` and mints a fresh id per call. It hands the id to the model only after a timeout, a dropped agent socket or `start_incomplete`, and accepts it back as `requestId`.
+
+**Adding members.** `addMembers {id, conv, contacts: [address, ...], history}` is an inner frame in a shared conversation, with 1 to 249 contacts. The inner `conv` is the usual echo (`features.convEcho`).
+
+- **History** is required and applies to everyone in the request: `"none"` (from now on), `"all"` (everything), or `{"from": "<ISO-8601 with offset>"}`. A missing or malformed value, a `from` in the future, or more history than the agent's own share window holds is refused `bad_history`, never defaulted.
+- **Answer.** `addMembersAck {id, ok, added, skipped}`. `skipped` counts contacts who were members already; they are not in `added`.
+- **Refusals:**
+  - `unsupported` also on non-agent links and on one-to-one chats.
+  - `not_permitted`: the agent needs the share read-write AND a live start grant on the conversation's account.
+  - `read_only`, `unsupported` (not a group chat), `bad_contact`, `bad_history`, `not_consented`.
+  - `tenant_locked`: the lock covers new AND existing members; one outside refuses the whole request, and nobody is added.
+  - `add_failed` (retryable): a partial add, as `{id, code, message, added, failed: [address, ...], skipped}`. One refused member does not stop the rest; `failed` lists only the refused addresses.
+- **Declared** as `joined.features.addMembers` only where it would be served right now. No frame is sent when that changes: the flag is a hint, and the answer decides.
+- **The reference client** offers `hub_add_members` and marks such conversations "can add members" in its connection list.
+
 **Refusals** (wrapped when about a conversation): `not_assigned`, `revoked`,
 `bad_conv`, `conv_mismatch`, `read_only`, `not_open`. Revoking the agent
 closes its socket with 4001.
