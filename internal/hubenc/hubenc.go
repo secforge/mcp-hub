@@ -160,10 +160,14 @@ func Open(key []byte, salt, check string) (*Session, error) {
 }
 
 // Field names what a sealed value fills, as it appears in the AAD.
-func FieldText() string          { return "text" }
-func FieldItem() string          { return "item" }
-func FieldFile(i int) string     { return fmt.Sprintf("file:%d", i) }
-func FieldFileMeta(i int) string { return fmt.Sprintf("filemeta:%d", i) }
+func FieldText() string { return "text" }
+
+// FieldTextCount is a v2 message body's field: the text sealed together
+// with how many attachments came with it, so a dropped one fails the body.
+func FieldTextCount(n int) string { return fmt.Sprintf("text:%d", n) }
+func FieldItem() string           { return "item" }
+func FieldFile(i int) string      { return fmt.Sprintf("file:%d", i) }
+func FieldFileMeta(i int) string  { return fmt.Sprintf("filemeta:%d", i) }
 
 // AAD is the associated data binding a sealed value to its place.
 func (s *Session) AAD(sender, mid string, rev int, field string) []byte {

@@ -25,6 +25,9 @@ type encState struct {
 	text  string
 	notes string
 	ct    string
+	// files is how many attachments the message was sent with: a v2 edit
+	// keeps that count and seals its body under it.
+	files int
 }
 
 // encRef locates a sealed attachment in reference form, for when its
@@ -263,6 +266,24 @@ func (c *Conn) openEvent(ev *Event) {
 		ev.Attachments = nil
 		return
 	}
+	// v1 seals the body alone; v2 seals it with the number of attachments
+	// that came with the message, so the reader opens it under the count
+	// that arrived and a dropped attachment fails the body. An edit keeps
+	// the count of the original send.
+	field, files := hubenc.FieldText(), len(ev.Attachments)
+	switch e.V {
+	case 1:
+	case 2:
+		if ev.Kind == "messageEdited" && files == 0 && st != nil {
+			files = st.files
+		}
+		field = hubenc.FieldTextCount(files)
+	default:
+		ev.Text = fmt.Sprintf("[encrypted message in envelope version %d, which this client does not "+
+			"read — update it (hub_self_update)]", e.V)
+		ev.Attachments = nil
+		return
+	}
 	b := hubenc.B64()
 	nonce, err1 := b.DecodeString(e.Nonce)
 	ct, err2 := b.DecodeString(e.Ct)
@@ -271,7 +292,7 @@ func (c *Conn) openEvent(ev *Event) {
 		ev.Attachments = nil
 		return
 	}
-	plain, err := c.enc.OpenValue(nonce, ct, sender, e.Mid, e.Rev, hubenc.FieldText())
+	plain, err := c.enc.OpenValue(nonce, ct, sender, e.Mid, e.Rev, field)
 	if err != nil {
 		ev.Text = "[encrypted message could not be opened: " + err.Error() + "]"
 		ev.Attachments = nil
@@ -284,7 +305,7 @@ func (c *Conn) openEvent(ev *Event) {
 	if ev.ExternalID != "" {
 		c.mu.Lock()
 		if st == nil || e.Rev > st.rev {
-			c.encMsgs[ev.ExternalID] = &encState{sender: sender, mid: e.Mid, rev: e.Rev}
+			c.encMsgs[ev.ExternalID] = &encState{sender: sender, mid: e.Mid, rev: e.Rev, files: files}
 		}
 		c.encMids[e.Mid] = ev.ExternalID
 		c.mu.Unlock()

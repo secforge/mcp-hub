@@ -1,5 +1,5 @@
 {
-  "description": "Encrypted hub sessions v1. See docs/superpowers/specs/2026-10-12-encrypted-hub-sessions-design.md.",
+  "description": "Encrypted hub sessions v1. See docs/superpowers/specs/2026-10-12-encrypted-hub-sessions-design.md. A case with field text:{n} is a v2 message envelope: the body of a message with n attachments.",
   "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
   "salt": "ZGVmZ2hpamtsbW5vcHFycw",
   "encKey": "ixRprPn_l9QTcgk-eatpM-bJnqQqcZtj6y1OBpr3sXg",
@@ -35,6 +35,20 @@
       "aad": "v1|ZGVmZ2hpamtsbW5vcHFycw|039d8443-48fe-4eee-b926-ad617a4a3465|6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b|0|file:0",
       "plaintext": "%PDF-1.4 bytes",
       "ct": "orRQbpfqIoPKe-_S8aN5lM6Ppt-Q4Ib8JgsZVNIA"
+    },
+    {
+      "rev": 0,
+      "field": "item",
+      "aad": "v1|ZGVmZ2hpamtsbW5vcHFycw|039d8443-48fe-4eee-b926-ad617a4a3465|6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b|0|item",
+      "plaintext": "{\u0022text\u0022:\u0022milk\u0022,\u0022notes\u0022:\u00222 litres\u0022}",
+      "ct": "_MZgTcKvLo3IdP_K__KOC8UqQAneStV7xTaOq1-QnUS4yvXs0Tx3q4n2iIR50HrPCm0"
+    },
+    {
+      "rev": 0,
+      "field": "text:2",
+      "aad": "v1|ZGVmZ2hpamtsbW5vcHFycw|039d8443-48fe-4eee-b926-ad617a4a3465|6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b|0|text:2",
+      "plaintext": "two files attached",
+      "ct": "85N7CNyyYNKZOffS4LHBQc4hRW2KCEULj7TXjZkF9pyBag"
     }
   ]
 }
