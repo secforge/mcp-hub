@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -863,11 +865,10 @@ func TestAPiggybackRefusalDoesNotDisableReceiptsOrTheConnection(t *testing.T) {
 
 // Two peers answering to one display name makes every later "as X said"
 // ambiguous, and neither of them can see it: each gets a roster with the
-// other in it and itself removed. So the roster line says so — as an
-// offer, since the name may have been chosen deliberately and the
-// collision is not necessarily this peer's to resolve.
+// other in it and itself removed. The roster line a joiner gets says so,
+// and the joiner — the second to arrive — renames, to the name given.
 func TestTheRosterSaysWhenThisPeersNameIsAlreadyTaken(t *testing.T) {
-	const mine = "Claude Code (mcp-hub)"
+	const mine = "mcp-hub"
 	for _, tc := range []struct {
 		name   string
 		others []PeerInfo
@@ -880,15 +881,18 @@ func TestTheRosterSaysWhenThisPeersNameIsAlreadyTaken(t *testing.T) {
 		{"a peer with no name is not a clash", []PeerInfo{{ID: "a"}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			line := FormatEvent(Event{Kind: "roster", RosterPeers: tc.others,
-				RosterNameTaken: tc.want})
-			said := strings.Contains(line, "already goes by your display name")
+			ev := Event{Kind: "roster", RosterPeers: tc.others, RosterNameTaken: tc.want}
+			if tc.want {
+				ev.RosterRenameTo = hostQualifiedName(mine)
+			}
+			line := FormatEvent(ev)
+			said := strings.Contains(line, "RENAME YOURSELF")
 			if said != tc.want {
 				t.Fatalf("clash mentioned=%v, want %v: %s", said, tc.want, line)
 			}
 			if tc.want {
-				if !strings.Contains(line, "optional") {
-					t.Errorf("the rename reads as an instruction rather than an offer: %s", line)
+				if !strings.Contains(line, strconv.Quote(hostQualifiedName(mine))) {
+					t.Errorf("the notice does not give the name to take: %s", line)
 				}
 				// The roster itself must still be there — the note is an
 				// addition, not a replacement.
@@ -1147,5 +1151,15 @@ func TestCatchUpPushesShareTheLivePushSequence(t *testing.T) {
 	items, _ = c.DrainForPush()
 	if len(items) != 1 || !strings.HasPrefix(items[0].Text, "[#3]") {
 		t.Fatalf("live traffic did not continue past the catch-up push: %+v", items)
+	}
+}
+
+func TestTheNameToTakeOnAClashIsTheNameWithTheShortHostName(t *testing.T) {
+	host, _ := os.Hostname()
+	if i := strings.IndexByte(host, '.'); i > 0 {
+		host = host[:i]
+	}
+	if got := hostQualifiedName("todo"); got != "todo-"+host {
+		t.Fatalf("got %q, want %q", got, "todo-"+host)
 	}
 }

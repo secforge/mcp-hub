@@ -401,7 +401,10 @@ Every tool except `hub_connect`, `hub_list_connections` and
 
 |`hub_connect(link, as, name?, agePublicKey?, keyFile?, createToken?, topic?, projectDir?)`
 |Open a connection. `name` is the display name other peers see (untrusted,
-sanitized server-side). `agePublicKey` is an
+sanitized server-side). It is optional: left out, it is the name this link was
+last connected with, or else the project folder's name. A joiner whose name is
+already taken in the session is told to reconnect as the name plus the host name
+(`todo` → `todo-build`). `agePublicKey` is an
 https://age-encryption.org[age] public key, distributed to peers so they can
 encrypt to you; the hub never uses it, and it is deliberately not an
 identity credential. `createToken` and `topic` are chat-relay extensions for

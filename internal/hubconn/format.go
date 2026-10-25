@@ -270,17 +270,16 @@ func FormatEvent(e Event) string {
 		// first is simply whoever reconnects next, and that is reason
 		// enough to mention it rather than to decide it.
 		//
-		// Not renamed automatically: the name is how this agent has
-		// been addressed all session, a caller may have chosen it
-		// deliberately, and the collision is not necessarily this
-		// peer's to resolve. Stated as a choice with the cost named, so
-		// a reader can weigh it.
+		// The one who finds the name taken is the one who joined second,
+		// and that one renames: the other has been addressed by it all
+		// along. The new name is given, so every agent picks it the same
+		// way.
 		clash := ""
 		if e.RosterNameTaken {
-			clash = " NOTE: somebody here already goes by your display name, so anything either " +
-				"of you says is attributed ambiguously from now on. You may reconnect with a " +
-				"different name if you want to be distinguishable — optional, and only you can " +
-				"judge whether yours is the one that should change."
+			clash = fmt.Sprintf(" RENAME YOURSELF: another peer here already goes by your name, "+
+				"and the one who joins second takes a new one. Call hub_disconnect(connection), "+
+				"then hub_connect with the same link and name %q — your name with this machine's "+
+				"host name. Your identity and read position stay as they are.", e.RosterRenameTo)
 		}
 		return fmt.Sprintf("[hub: %d already here — %s. That is everyone; a join or leave from "+
 			"here on is a real change]%s", len(who), strings.Join(who, ", "), clash)

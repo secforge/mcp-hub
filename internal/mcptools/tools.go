@@ -1925,13 +1925,14 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"authorizes resuming one is a secret this client stores per link and presents "+
 					"for you — there is nothing for you to keep alongside the link")),
 			mcp.WithString("name", mcp.Description(
-				"CHOOSE A NAME FOR YOURSELF and pass it — don't leave this empty. Everyone else "+
-					"in the session sees each other only as a peerId until someone supplies one, "+
-					"and a UUID tells them nothing about who they are talking to. Use the name "+
-					"the user gave you if they gave one; otherwise pick something that identifies "+
-					"which agent you are and what you are working on, e.g. \"Claude Code "+
-					"(customer-portal)\" — the agent, then the project, is the convention here. "+
-					"Something a person reading the roster can place.\n"+
+				"Optional: your display name, as the others in the session see you. Left out, it is "+
+					"the name this link was last connected with, or else the name of this project's "+
+					"folder (e.g. \"customer-portal\") — usually what you want. Pass one when the user "+
+					"gave you a name. If you choose your own, use the project's name and nothing else, "+
+					"not \"Claude Code (customer-portal)\": everyone here is an agent, so saying so "+
+					"tells no one anything. If another peer in the session already has the name, the "+
+					"connect result says so and gives the name to reconnect with: the name plus this "+
+					"machine's host name, e.g. \"customer-portal-build\".\n"+
 					"Untrusted and sanitized server-side (control characters stripped, length "+
 					"capped), so treat whatever comes back in the connect result as the real "+
 					"value. Whether anyone sees it depends on the server: on an ordinary hub "+
@@ -2900,6 +2901,13 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if name == "" {
 		name = stored.Name
 	}
+	// NOTHING STATED AND NOTHING STORED: the project's own name, so a
+	// peer is never just a UUID to the others and no agent has to invent
+	// a name to be recognisable.
+	defaultedName := false
+	if name == "" {
+		name, defaultedName = defaultDisplayName(target.Project), true
+	}
 	// ABOUT TO MINT, AND THIS LINK IS RESUMABLE SOMEWHERE ELSE. Nothing
 	// here can adopt that identity — a Target is {link, project} and
 	// crossing that boundary silently is exactly what the isolation
@@ -3179,10 +3187,14 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	versionNote += releaseNote(conn)
 
 	identityNote := ""
-	if name == "" {
+	switch {
+	case name == "":
 		identityNote = "\nYou connected without a display name, so everyone else in this session " +
 			"sees you only as a peerId — which tells them nothing about who they are talking to. " +
 			"Pass name on your next connect."
+	case defaultedName:
+		identityNote = fmt.Sprintf("\nYour display name is %q, the name of this project's folder, "+
+			"since none was given. Pass name on a connect to choose another.", name)
 	}
 	if name != "" || agePublicKey != "" {
 		var parts []string

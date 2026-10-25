@@ -1120,15 +1120,10 @@ func TestConnectResultSaysTheMembershipArrivesSeparately(t *testing.T) {
 	if !strings.Contains(textOf(res), "arrives as ONE message") {
 		t.Fatalf("expected the connect note to say the membership is stated separately, got: %s", textOf(res))
 	}
-	// Nothing is claimed about what other peers can SEE when neither a
-	// name nor a key was given — there is nothing for them to see. The
-	// missing name is still remarked on, since a peer everyone reads as a
-	// bare UUID is a cost worth naming.
-	if strings.Contains(textOf(res), "can see your") {
-		t.Fatalf("expected no visible-identity note when neither name nor agePublicKey was given, got: %s", textOf(res))
-	}
-	if !strings.Contains(textOf(res), "without a display name") {
-		t.Fatalf("expected the missing name to be remarked on, got: %s", textOf(res))
+	// With no name given, the project folder's name is used, and the
+	// result says so — and that it can be chosen instead.
+	if !strings.Contains(textOf(res), "the name of this project's folder") {
+		t.Fatalf("expected the defaulted name to be remarked on, got: %s", textOf(res))
 	}
 
 	hubB := NewHub()
@@ -1950,8 +1945,8 @@ func TestConnectWithoutANameSaysWhatThatCosts(t *testing.T) {
 		t.Fatalf("connect failed: err=%v result=%+v", err, res)
 	}
 	defer hub.handleDisconnect(ctx, connReqFor(testConn))
-	if !strings.Contains(textOf(res), "without a display name") {
-		t.Fatalf("expected the result to name the cost of connecting anonymously, got: %s", textOf(res))
+	if !strings.Contains(textOf(res), "the name of this project's folder") {
+		t.Fatalf("expected the result to say the name was defaulted to the project folder, got: %s", textOf(res))
 	}
 }
 

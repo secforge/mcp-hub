@@ -133,3 +133,13 @@ func describeAnchor(a wire.Anchor) string {
 	}
 	return "cursor " + a.Cursor
 }
+
+// defaultDisplayName is a connection's display name when none was given
+// or stored: the project folder's own name.
+func defaultDisplayName(project string) string {
+	name := filepath.Base(project)
+	if name == "." || name == "/" {
+		return ""
+	}
+	return name
+}

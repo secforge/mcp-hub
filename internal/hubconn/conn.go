@@ -153,6 +153,9 @@ type Event struct {
 	// this connection's own display name. Set only on a "roster" event,
 	// and only where this connection has a name of its own to collide.
 	RosterNameTaken bool
+	// RosterRenameTo is the name to take instead when RosterNameTaken: this
+	// connection's name with the machine's host name appended.
+	RosterRenameTo string
 	// PushSeq numbers this event within the sequence of pushes this
 	// connection has made, from 1, and is set only on the push path.
 	//
@@ -2385,6 +2388,20 @@ func (c *Conn) UnconfirmedState() (cursor string, count int, since time.Time, ok
 //
 // An empty name cannot collide — a connection that gave none is shown as
 // a bare peerId, which is unambiguous by construction.
+// hostQualifiedName is name with this machine's short host name
+// appended, "todo" becoming "todo-build": what an agent takes when its
+// name is already in use in the session.
+func hostQualifiedName(name string) string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return name + "-2"
+	}
+	if i := strings.IndexByte(host, '.'); i > 0 {
+		host = host[:i]
+	}
+	return name + "-" + host
+}
+
 func nameTaken(mine string, others []PeerInfo) bool {
 	if mine == "" {
 		return false
@@ -2478,6 +2495,9 @@ func (c *Conn) readLoop() {
 			// their own side, since each sees a roster with the other
 			// in it and itself removed.
 			ev.RosterNameTaken = nameTaken(c.name, others)
+			if ev.RosterNameTaken {
+				ev.RosterRenameTo = hostQualifiedName(c.name)
+			}
 			ev.RosterPeers = others
 		}
 		c.buffer = append(c.buffer, ev)

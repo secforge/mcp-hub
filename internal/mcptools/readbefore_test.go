@@ -194,3 +194,15 @@ func TestAReadStoredOutOfTimeOrderIsShownByTimeAndContinuesWhereTheWalkStopped(t
 		t.Fatalf("the reorder or the place to continue is not stated:\n%s", out)
 	}
 }
+
+func TestTheDefaultDisplayNameIsTheProjectFolder(t *testing.T) {
+	for project, want := range map[string]string{
+		"/source/products/customer-portal":   "customer-portal",
+		"/source/private/assistant+notifier": "assistant+notifier",
+		"/":                                  "",
+	} {
+		if got := defaultDisplayName(project); got != want {
+			t.Errorf("defaultDisplayName(%q) = %q, want %q", project, got, want)
+		}
+	}
+}
