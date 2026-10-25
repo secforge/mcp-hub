@@ -51,6 +51,10 @@ type Server struct {
 	// OnSearch answers a "search": the frame it returns is sent back
 	// unwrapped, and nil sends nothing.
 	OnSearch func(wire.Search) any
+	// OnStart answers a "startConversation": it may Assign the new
+	// conversation first, as a server does, and returns the frame to send
+	// back unwrapped; nil sends nothing.
+	OnStart func(wire.StartConversation) any
 	// encryption is what each encrypted conversation's "joined" declares.
 	encryption map[string]*wire.Encryption
 	// opens counts "open" frames per conversation, over all sockets.
@@ -183,6 +187,18 @@ func (s *Server) handle(ws *websocket.Conn, raw []byte) {
 		s.mu.Lock()
 		s.controls = append(s.controls, raw)
 		answer := s.OnSearch
+		s.mu.Unlock()
+		if answer != nil {
+			if reply := answer(q); reply != nil {
+				s.write(ws, reply)
+			}
+		}
+	case wire.TypeStartConversation:
+		var q wire.StartConversation
+		_ = json.Unmarshal(raw, &q)
+		s.mu.Lock()
+		s.controls = append(s.controls, raw)
+		answer := s.OnStart
 		s.mu.Unlock()
 		if answer != nil {
 			if reply := answer(q); reply != nil {

@@ -1096,6 +1096,19 @@ them, and a handle that is no longer live is ignored. Declared as
 `id` and hands an answer only to the search that asked under it; it drops a
 hit whose conversation is not open on its side.
 
+**Starting a conversation.** An agent may be allowed to open one-to-one conversations in an account's name.
+
+- **Accounts.** `agentJoined.features.startConversation = {accounts: [{account, name, channel}]}` lists the accounts (absent when there are none). `account` is an opaque handle per grant. `startAccounts {items: [...]}` replaces the list whenever a grant is added or stopped.
+- **Request.** `startConversation {id, account, contact}`, where `contact` is one email address.
+- **Answer.** `conversationStarted {id, conv, existing}`, sent after the conversation's `assigned` (or naming an existing read-write, full-history share). `existing` says whether the chat existed before.
+- **Refusals,** unwrapped and carrying the `id`:
+  - `not_permitted`: no grant; an unknown handle gets the same answer.
+  - `not_allowed`: a person removed or narrowed the agent's share of that chat, or the share is read-only or withdrawn.
+  - `bad_contact`, `tenant_locked`, `not_consented`.
+  - `start_incomplete` (retryable): the chat exists, and a retry is safe.
+  - `start_failed` (retryable).
+- **The reference client** offers `hub_start_conversation` and returns the started conversation's connection name. Its description restricts starts to a person the user, or an operator instruction, asked to contact.
+
 **Refusals** (wrapped when about a conversation): `not_assigned`, `revoked`,
 `bad_conv`, `conv_mismatch`, `read_only`, `not_open`. Revoking the agent
 closes its socket with 4001.

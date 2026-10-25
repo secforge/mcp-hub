@@ -30,6 +30,10 @@ const (
 	TypeClose         Type = "close"
 	TypeSearch        Type = "search"
 	TypeSearchResults Type = "searchResults"
+
+	TypeStartAccounts       Type = "startAccounts"
+	TypeStartConversation   Type = "startConversation"
+	TypeConversationStarted Type = "conversationStarted"
 )
 
 // Access values of a grant.
@@ -212,4 +216,47 @@ type SearchResults struct {
 // SearchFeature is agentJoined.features.search.
 type SearchFeature struct {
 	MaxLimit int `json:"maxLimit,omitempty,case:strict"`
+}
+
+// StartAccount is one account an agent may start conversations in.
+// Account is an opaque handle the client only repeats; Name is how it is
+// shown.
+type StartAccount struct {
+	Account string `json:"account,case:strict"`
+	Name    string `json:"name,omitempty,case:strict"`
+	Channel string `json:"channel,omitempty,case:strict"`
+}
+
+// StartConversationFeature is agentJoined.features.startConversation:
+// the accounts this agent may start one-to-one conversations in. Absent
+// when it may start none.
+type StartConversationFeature struct {
+	Accounts []StartAccount `json:"accounts,case:strict"`
+}
+
+// StartAccounts replaces the list whenever a grant is added or stopped.
+type StartAccounts struct {
+	Type  Type           `json:"type,case:strict"`
+	Items []StartAccount `json:"items,case:strict"`
+}
+
+// StartConversation asks the server to open a one-to-one conversation
+// with Contact (one email address) in Account's name, and share it with
+// the agent read-write with full history. Answered unwrapped with
+// ConversationStarted or an error, either carrying ID.
+type StartConversation struct {
+	Type    Type   `json:"type,case:strict"`
+	ID      string `json:"id,omitempty,case:strict"`
+	Account string `json:"account,case:strict"`
+	Contact string `json:"contact,case:strict"`
+}
+
+// ConversationStarted answers StartConversation. Conv is the share's
+// handle, already announced by "assigned" (or an existing share's);
+// Existing says whether the chat existed before.
+type ConversationStarted struct {
+	Type     Type   `json:"type,case:strict"`
+	ID       string `json:"id,omitempty,case:strict"`
+	Conv     string `json:"conv,case:strict"`
+	Existing bool   `json:"existing,case:strict"`
 }

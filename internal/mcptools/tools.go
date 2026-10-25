@@ -2105,6 +2105,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	)
 	addTool(searchTool(), h.handleSearch)
 	addTool(linkTool(), h.handleLink)
+	addTool(startConversationTool(), h.handleStartConversation)
 	addTool(
 		mcp.NewTool("hub_list_connections",
 			mcp.WithDescription("List the links this client has connected to before FROM THIS "+
@@ -5195,7 +5196,11 @@ func (h *Hub) handleListConnections(ctx context.Context, req mcp.CallToolRequest
 		openLines = append(openLines, line)
 	}
 	for _, ag := range h.allAgents() {
-		openLines = append(openLines, strings.Join(ag.listing(f), "\n  "))
+		lines := ag.listing(f)
+		if start := startAccountsLine(ag.startAccounts()); start != "" && len(lines) > 0 {
+			lines = append([]string{lines[0], "  this agent " + start}, lines[1:]...)
+		}
+		openLines = append(openLines, strings.Join(lines, "\n  "))
 	}
 	openBlock := "No connection is open. hub_connect opens one and gives it a name.\n\n"
 	if len(openLines) > 0 {

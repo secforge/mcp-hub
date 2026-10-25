@@ -448,6 +448,13 @@ connection, the sender, the time and a snippet, marked untrusted, with the
 `hub_read` call that reads the whole message. Naming one conversation as
 `connection` searches only that one. Needs a server that declares search.
 
+|`hub_start_conversation(connection, account, contact)`
+|Through an agent connection allowed to: open a one-to-one conversation with one
+person (an email address) in an account's name. The server creates the chat or
+finds the existing one, and shares it with the agent read-write with full
+history; the result names its connection. Only for a person the user or an
+operator instruction asked to contact.
+
 |`hub_link(connection, externalId)`
 |The link to one message in the platform it came from (Teams), for a message
 this connection received recently: live, by `hub_catch_up` or by `hub_read`.

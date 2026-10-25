@@ -41,9 +41,13 @@ type Agent struct {
 	// drop that follows it.
 	reconnectAfter int
 	done           chan struct{}
-	// searches holds the searches awaiting an answer, by request id.
+	// searches holds the requests awaiting an answer by id: searches and
+	// conversation starts, each answered by its own id.
 	searches  map[string]chan searchAnswer
 	searchSeq int
+	// startAccounts is the accounts this agent may start conversations
+	// in, as the server last stated them.
+	startAccounts []wire.StartAccount
 
 	// Agent events are queued and handed to one handler in order, on a
 	// goroutine of their own: the read loop must never wait on whatever
@@ -118,6 +122,12 @@ func startAgent(ws *websocket.Conn, raw []byte, snapPongWait, snapWriteWait time
 		convs:     map[string]*agentConv{},
 		done:      make(chan struct{}),
 		searches:  map[string]chan searchAnswer{},
+	}
+	if raw, ok := joined.Features["startConversation"]; ok {
+		var f wire.StartConversationFeature
+		if json.Unmarshal(raw, &f) == nil {
+			a.startAccounts = f.Accounts
+		}
 	}
 	a.evCond = sync.NewCond(&a.evMu)
 	ws.SetReadDeadline(time.Now().Add(snapPongWait))
@@ -255,6 +265,23 @@ func (a *Agent) readLoop() {
 				continue
 			}
 			a.answerSearch(f.ID, searchAnswer{results: f})
+		case wire.TypeConversationStarted:
+			var f wire.ConversationStarted
+			if err := json.Unmarshal(raw, &f); err != nil || f.Conv == "" {
+				debugf("agent: unreadable conversationStarted dropped: %s", raw)
+				continue
+			}
+			a.answerSearch(f.ID, searchAnswer{started: f})
+		case wire.TypeStartAccounts:
+			var f wire.StartAccounts
+			if err := json.Unmarshal(raw, &f); err != nil {
+				debugf("agent: unreadable startAccounts dropped: %s", raw)
+				continue
+			}
+			a.mu.Lock()
+			a.startAccounts = f.Items
+			a.mu.Unlock()
+			a.emit(AgentEvent{Kind: "startAccounts"})
 		case wire.TypeError:
 			var e wire.Error
 			if json.Unmarshal(raw, &e) == nil && e.ID != "" && a.answerSearch(e.ID, searchAnswer{
@@ -669,6 +696,7 @@ var searchWait = 30 * time.Second
 
 type searchAnswer struct {
 	results wire.SearchResults
+	started wire.ConversationStarted
 	err     error
 }
 
@@ -751,4 +779,54 @@ func (a *Agent) answerSearch(id string, ans searchAnswer) bool {
 	}
 	ch <- ans
 	return true
+}
+
+// startWait bounds how long a conversation start waits for its answer:
+// the server creates the chat in the platform first.
+var startWait = 60 * time.Second
+
+// StartAccounts is the accounts this agent may start conversations in.
+func (a *Agent) StartAccounts() []wire.StartAccount {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]wire.StartAccount(nil), a.startAccounts...)
+}
+
+// StartConversation asks the server to open a one-to-one conversation
+// with contact in account's name and waits for its answer. A refusal comes
+// back as a *SearchError carrying the server's code.
+func (a *Agent) StartConversation(ctx context.Context, account, contact string) (wire.ConversationStarted, error) {
+	ch := make(chan searchAnswer, 1)
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return wire.ConversationStarted{}, errAgentDown
+	}
+	a.searchSeq++
+	id := fmt.Sprintf("start-%d", a.searchSeq)
+	a.searches[id] = ch
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.searches, id)
+		a.mu.Unlock()
+	}()
+	if err := a.writeFrame(wire.StartConversation{Type: wire.TypeStartConversation, ID: id,
+		Account: account, Contact: contact}); err != nil {
+		return wire.ConversationStarted{}, err
+	}
+	timer := time.NewTimer(startWait)
+	defer timer.Stop()
+	select {
+	case ans := <-ch:
+		return ans.started, ans.err
+	case <-a.done:
+		return wire.ConversationStarted{}, errAgentDown
+	case <-ctx.Done():
+		return wire.ConversationStarted{}, ctx.Err()
+	case <-timer.C:
+		return wire.ConversationStarted{}, fmt.Errorf("the server did not answer within %s — the "+
+			"conversation may or may not have been started; hub_list_connections shows whether it "+
+			"is shared with this agent now", startWait)
+	}
 }

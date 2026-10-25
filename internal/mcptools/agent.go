@@ -704,6 +704,12 @@ func (ag *agentSession) handleEvent(a *hubconn.Agent, ev hubconn.AgentEvent) {
 	case "error":
 		ag.alert(fmt.Sprintf("The server reported on the agent connection: %s (%s). Nothing was "+
 			"delivered to any conversation by whatever caused it.", ev.Reason, ev.ErrCode))
+	case "startAccounts":
+		if line := startAccountsLine(a.StartAccounts()); line != "" {
+			ag.alert("This agent now " + line + ".")
+		} else {
+			ag.alert("This agent may no longer start conversations in any account.")
+		}
 	}
 }
 
@@ -1003,6 +1009,10 @@ func (ag *agentSession) connectSummary(opened []*session, failed map[string]stri
 	b.WriteString("READ-ONLY conversations refuse every write (send, edit, react, delete, pin) " +
 		"before anything is sent. Conversations are shared, changed and withdrawn at runtime from " +
 		"the server's UI; you are told each time, and a withdrawn one's name stops working.\n")
+	if line := startAccountsLine(ag.startAccounts()); line != "" {
+		b.WriteString("This agent " + line + ". Only when the user or an operator instruction asks " +
+			"you to contact a person.\n")
+	}
 	if len(opened) > 0 && len(opened) <= 20 {
 		b.WriteString("Open conversations:\n")
 		for _, s := range opened {

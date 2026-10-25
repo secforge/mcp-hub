@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -762,5 +763,92 @@ func TestALinkIsRefusedWhereTheServerOffersNone(t *testing.T) {
 	res, _ := h.handleLink(context.Background(), linkReq(childNamed(t, h, "conv-1").name, "x"))
 	if !res.IsError || !strings.Contains(textOf(res), "gives no links") {
 		t.Fatalf("result: %s", textOf(res))
+	}
+}
+
+func startServer(t *testing.T, grants ...wire.Assignment) *agenttest.Server {
+	srv := agenttest.New(t, grants...)
+	srv.AgentFeatures = map[string]json.RawMessage{"startConversation": json.RawMessage(
+		`{"accounts":[{"account":"acc-1","name":"assistant@secforge.de","channel":"teams"}]}`)}
+	return srv
+}
+
+func startReq(conn, account, contact string) mcp.CallToolRequest {
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"connection": conn, "account": account, "contact": contact}
+	return req
+}
+
+func TestAConversationIsStartedAndOpenAsItsOwnConnection(t *testing.T) {
+	srv := startServer(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	var got wire.StartConversation
+	var mu sync.Mutex
+	srv.OnStart = func(q wire.StartConversation) any {
+		mu.Lock()
+		got = q
+		mu.Unlock()
+		srv.Assign(agentGrant("conv-new", "Hasan", wire.AccessReadWrite))
+		return wire.ConversationStarted{Type: wire.TypeConversationStarted, ID: q.ID, Conv: "conv-new"}
+	}
+	h := NewHub()
+	out := connectAgentForTest(t, h, srv)
+	if !strings.Contains(out, "may start one-to-one conversations (hub_start_conversation) as: "+
+		"assistant@secforge.de (teams)") {
+		t.Fatalf("the connect result does not name the account:\n%s", out)
+	}
+	res, _ := h.handleStartConversation(context.Background(), startReq("desk", "assistant@secforge.de", "hasan@example.com"))
+	text := textOf(res)
+	if res.IsError || !strings.Contains(text, "Started: a new chat") || !strings.Contains(text, "open as connection") {
+		t.Fatalf("result: %s", text)
+	}
+	if s := childNamed(t, h, "conv-new"); !strings.Contains(text, strconv.Quote(s.name)) {
+		t.Fatalf("the result does not name the new connection %q: %s", s.name, text)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got.ID == "" || got.Account != "acc-1" || got.Contact != "hasan@example.com" {
+		t.Fatalf("request sent: %+v", got)
+	}
+}
+
+func TestARefusedStartSaysWhyAndAnUnknownAccountSendsNothing(t *testing.T) {
+	srv := startServer(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	srv.OnStart = func(q wire.StartConversation) any {
+		return wire.Error{Type: wire.TypeError, ID: q.ID, Code: "not_allowed", Message: "share narrowed by a person"}
+	}
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	res, _ := h.handleStartConversation(context.Background(), startReq("desk", "acc-1", "hasan@example.com"))
+	if !res.IsError || !strings.Contains(textOf(res), "may not reopen it") {
+		t.Fatalf("refusal: %s", textOf(res))
+	}
+	before := len(srv.Controls())
+	res, _ = h.handleStartConversation(context.Background(), startReq("desk", "someone@else", "hasan@example.com"))
+	if !res.IsError || !strings.Contains(textOf(res), "assistant@secforge.de (teams)") {
+		t.Fatalf("an unknown account: %s", textOf(res))
+	}
+	res, _ = h.handleStartConversation(context.Background(), startReq("desk", "acc-1", "a@x, b@y"))
+	if !res.IsError || !strings.Contains(textOf(res), "one email address") {
+		t.Fatalf("two contacts: %s", textOf(res))
+	}
+	if len(srv.Controls()) != before {
+		t.Fatal("a refused-locally start was sent anyway")
+	}
+}
+
+func TestAChangedAccountListIsAnnounced(t *testing.T) {
+	srv := startServer(t, agentGrant("conv-1", "Alpha", wire.AccessReadWrite))
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	h.takeAutoReconnectNote()
+	srv.Send(wire.StartAccounts{Type: wire.TypeStartAccounts})
+	var note string
+	waitUntil(t, "the notice", func() bool {
+		note += h.takeAutoReconnectNote()
+		return strings.Contains(note, "may no longer start conversations")
+	})
+	res, _ := h.handleStartConversation(context.Background(), startReq("desk", "acc-1", "hasan@example.com"))
+	if !res.IsError || !strings.Contains(textOf(res), "granted it none") {
+		t.Fatalf("a start after the grant stopped: %s", textOf(res))
 	}
 }
