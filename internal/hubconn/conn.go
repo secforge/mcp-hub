@@ -111,6 +111,8 @@ type Event struct {
 	Added   int
 	Skipped int
 	Failed  []string
+	// FileReady is a fileUploadReady answer.
+	FileReady *wire.FileUploadReady
 	// CorrelationID is the id this client put on the request, echoed back
 	// by a correlating server — see wire.Msg.ID. Empty on live traffic
 	// nobody asked for, on every frame from a server without the feature,
@@ -2688,6 +2690,12 @@ func decodeEvent(raw []byte) (Event, bool) {
 			ev.Skipped = *e.Skipped
 		}
 		return ev, true
+	case wire.TypeFileUploadReady:
+		var f wire.FileUploadReady
+		if err := json.Unmarshal(raw, &f); err != nil {
+			return Event{}, false
+		}
+		return Event{Kind: "fileUploadReady", FileReady: &f, CorrelationID: f.ID}, true
 	case wire.TypeAddMembersAck:
 		var a wire.AddMembersAck
 		if err := json.Unmarshal(raw, &a); err != nil {
@@ -3238,19 +3246,17 @@ func (c *Conn) deleteMessageWithID(externalID, corrID string) error {
 	return c.writeJSON(d)
 }
 
-// AckWaitTimeout is how long SendAwaitingAck/ReactAwaitingAck/
-// EditMessageAwaitingAck wait for their own ack (or a generic error)
-// before giving up — generous relative to how fast an ack has actually
-// been observed to arrive against a real teams relay (well under a
-// second), while staying small enough that a caller mistakenly calling
-// one of these against a server that declares no actionAcks wouldn't be
-// worth blocking on for long even without the WantsActionAcks check
-// these methods already do first.
-var AckWaitTimeout = 5 * time.Second
+// AckWaitTimeout is how long a request that expects its own answer — a
+// send, reaction, edit, delete, confirm or history fetch — waits for it
+// before giving up. An answer usually takes well under a second, but the
+// first frame after a quiet spell has been seen to take about five, and a
+// request given up on too early fails without having failed: a confirm
+// moves nothing, and a send it was piggybacked on is not sent.
+var AckWaitTimeout = 15 * time.Second
 
 // AttachmentWaitTimeout is how long RequestAttachment waits, and it is
 // deliberately NOT AckWaitTimeout. An ack is the server saying "yes" to
-// something it has already done, so five seconds is generous. An
+// something it has already done. An
 // attachment reply carries the bytes themselves, and the server may have
 // to fetch them from somewhere else — a relay backed by Teams/Graph goes
 // out to that API on demand — before it can answer at all. Sizing a

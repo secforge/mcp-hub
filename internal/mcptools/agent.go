@@ -152,6 +152,7 @@ func (h *Hub) connectAgent(placeholder *session, a *hubconn.Agent, c agentConnec
 		h.agents = map[string]*agentSession{}
 	}
 	h.agents[as] = ag
+	h.restoredLocked(as)
 	if len(h.lastMeta) > 0 {
 		_ = ag.pusher.Adopt(h.lastMeta)
 	}

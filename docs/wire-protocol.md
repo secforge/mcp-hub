@@ -1139,6 +1139,32 @@ reconnect, each resuming from its own stored position, and presents each as
 its own connection named after the agent connection. A read-only
 conversation's writes are refused in the client before anything is sent.
 
+### 2.13 One-time files (feature `files`)
+
+A side channel for handing over a file of up to 1 GB outside any conversation's history. It is stored encrypted by the client, downloaded once, then deleted. The design is chat-relay's `docs/superpowers/specs/2026-10-26-one-time-files-design.md`, agreed between the two projects.
+
+- **Declared** as `features.files = {maxBytes, maxSeconds}` on every session that may post: hub sessions, links, and agent conversations shared read-write. It is absent on read-only shares.
+- **Reserve.** `fileUpload {id, size, sha256, expiresIn?}`. `size` and `sha256` (hex) describe the stored, encrypted bytes. `expiresIn` is in seconds; absent means 7 days, and the most is `maxSeconds`. The answer is `fileUploadReady {id, ok, fileId, uploadUrl, uploadToken, downloadToken, expiresAt}`. Refusals: `read_only`, `too_large`, `storage_full` (retryable), `bad_request`. Nothing ties the file to the session afterwards.
+- **Upload.** `PUT uploadUrl` with `Authorization: Bearer <uploadToken>` and `Content-Length: size`, as one stream.
+  - The answer is `201` only if exactly `size` bytes arrived and their SHA-256 matches.
+  - Otherwise it is `400` (`incomplete`, `size_mismatch`, `hash_mismatch`) and nothing is kept. Other answers are `409` (`busy`) and `507` (`storage_full`).
+  - The upload token is usable for an hour, until one upload succeeds.
+  - `uploadUrl` is `https://<host>/files/<fileId>` on the host the session is served from. The reference client refuses any other origin.
+- **The link** is `https://<host>/file#<fileId>.<downloadToken>.<key>`. Everything after `#` is a fragment, so no request and no log carries the token or the key.
+- **Download.** `GET /files/<fileId>` with `Authorization: Bearer <downloadToken>`, as one stream, no ranges.
+  - Once the whole body has been sent, the file is `sent` and every further GET answers `404`, even if the transfer broke at the very end.
+  - `DELETE /files/<fileId>` with the same token confirms receipt and deletes the file at once (`204`). An unconfirmed sent file is deleted after 15 minutes.
+  - A download while another runs gets `409` (`busy`). Unknown, expired, wrong token and deleted all answer the same `404`.
+- **The file format** is the client's business; the server treats the bytes as opaque. The reference client's format (`internal/hubfile`):
+  - `"MCPHUBF1"`, then a 4-byte big-endian length and the sealed header `{"name","size"}`, then the sealed data chunks: 64 KiB of plaintext each, the last one shorter or empty.
+  - Everything is AES-256-GCM under a random 256-bit key per file, with the magic as additional data.
+  - The nonce is an 11-byte big-endian counter (0 for the header, data chunks from 1) followed by a byte that is 1 on the last data chunk and 0 elsewhere. A cut, reordered or altered file fails to open.
+  - The key is unpadded base64url (43 characters) in the link.
+  - The format is deterministic per key and input. The client measures `size` and `sha256` in a first pass and streams in a second, without a temporary copy. A file that changes between the passes fails with `hash_mismatch`.
+- **The reference client** offers `hub_file_upload` and `hub_file_download`.
+  - The download saves under the sender's name, reduced to one path element, and never overwrites an existing file. It confirms with `DELETE` after the file opened completely.
+  - It fetches only from a host one of its connections uses, unless the user says to trust another.
+
 ## 3. Ordering and atomicity
 
 - **`joined` → `roster`**: `joined` is always first; the first `roster`

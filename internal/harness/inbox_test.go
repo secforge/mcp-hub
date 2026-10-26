@@ -160,3 +160,39 @@ func TestDetectingTheParentModeNeverGuesses(t *testing.T) {
 		t.Fatalf("detection failed but still produced %q, which would be asserted", mode)
 	}
 }
+
+func receiptFrame(status, detail, id string) *udsmsg.Frame {
+	raw := `{"type":"control","action":"peer_message_status","status":"` + status + `","status_detail":"` +
+		detail + `","reason":"inbound refused by settings","orig_msg_id":"` + id + `"}`
+	return &udsmsg.Frame{Type: "control", Raw: []byte(raw)}
+}
+
+// The session reports a push it does not show to the push's reply address;
+// read, that report is the only way a refused or held push is not mistaken
+// for one that arrived.
+func TestTheSessionsReceiptsSayWhatItWithholds(t *testing.T) {
+	in := &Inbox{parent: 4242}
+	parent := &udsmsg.Peer{PID: 4242, Identified: true}
+	ctx := context.Background()
+
+	in.handleControl(ctx, parent, receiptFrame("held", "", "m1"))
+	in.handleControl(ctx, parent, receiptFrame("held", "", "m2"))
+	if held, refused, _ := in.Withheld(); held != 2 || refused {
+		t.Fatalf("after two holds: held=%d refused=%v", held, refused)
+	}
+	in.handleControl(ctx, parent, receiptFrame("delivered", "", "m1"))
+	if held, _, _ := in.Withheld(); held != 1 {
+		t.Fatalf("an approved push still counts as held: %d", held)
+	}
+	in.handleControl(ctx, parent, receiptFrame("expired", "refused", "m3"))
+	if _, refused, reason := in.Withheld(); !refused || reason != "inbound refused by settings" {
+		t.Fatalf("a refusal: refused=%v reason=%q", refused, reason)
+	}
+
+	other := &Inbox{parent: 4242}
+	other.handleControl(ctx, &udsmsg.Peer{PID: 9999, Identified: true}, receiptFrame("expired", "refused", "x"))
+	other.handleControl(ctx, parent, &udsmsg.Frame{Type: "control", Raw: []byte(`{"type":"control","action":"other"}`)})
+	if held, refused, _ := other.Withheld(); held != 0 || refused {
+		t.Fatal("a receipt from another process, or another control frame, was taken as the session's")
+	}
+}

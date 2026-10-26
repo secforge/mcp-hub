@@ -126,6 +126,9 @@ func (h *Hub) reportAbandoned(project string, waitForPredecessor bool) {
 		return
 	}
 	sort.Strings(abandoned)
+	h.mu.Lock()
+	h.previousRun = append(h.previousRun, abandoned...)
+	h.mu.Unlock()
 	// CLEARED once reported, which is what makes "said once" true across
 	// restarts rather than only within one.
 	//

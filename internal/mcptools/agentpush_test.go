@@ -107,3 +107,19 @@ func TestAConversationReopenedAfterAServerRestartIsPushed(t *testing.T) {
 		return in.has("after the restart") && in.has("also after the restart")
 	})
 }
+
+// The agent connects holding no conversation at all; the only one is
+// shared afterwards, read-only, as a one-to-one.
+func TestTheOnlyConversationSharedAfterAnEmptyConnectIsPushed(t *testing.T) {
+	in := newHarnessInbox(t)
+	srv := agenttest.New(t)
+	h := NewHub()
+	connectAgentForTest(t, h, srv)
+	g := agentGrant("conv-only", "Hasan", wire.AccessRead)
+	g.Kind = "oneOnOne"
+	srv.Assign(g)
+	waitUntil(t, "the conversation open", func() bool { return srv.IsOpen("conv-only") })
+	waitUntil(t, "the notice that it was shared", func() bool { return in.has("conv-only") || in.has("Hasan") })
+	srv.Msg("conv-only", agentPeer, "first message after the share", "o-1")
+	waitUntil(t, "the push", func() bool { return in.has("first message after the share") })
+}

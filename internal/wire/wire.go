@@ -60,6 +60,8 @@ const (
 	TypeItems           Type = "items"
 	TypeAddMembers      Type = "addMembers"
 	TypeAddMembersAck   Type = "addMembersAck"
+	TypeFileUpload      Type = "fileUpload"
+	TypeFileUploadReady Type = "fileUploadReady"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -1539,6 +1541,42 @@ func BehindCount(n int) *int { return &n }
 
 // FeatureTodo declares a todo list (§2.8b).
 const FeatureTodo = "todo"
+
+// FeatureFiles is declared where one-time files may be uploaded: a session
+// that may post. Its value is FilesFeature.
+const FeatureFiles = "files"
+
+// FilesFeature bounds a one-time file: its stored (encrypted) size, and
+// how long it may be kept.
+type FilesFeature struct {
+	MaxBytes   int64 `json:"maxBytes,omitempty,case:strict"`
+	MaxSeconds int64 `json:"maxSeconds,omitempty,case:strict"`
+}
+
+// FileUpload reserves room for one one-time file. Size and SHA256 (hex)
+// describe the bytes that will be stored, which are the encrypted file;
+// ExpiresIn is in seconds, absent for the server's default.
+type FileUpload struct {
+	Type      Type   `json:"type,case:strict"`
+	ID        string `json:"id,omitempty,case:strict"`
+	Size      int64  `json:"size,case:strict"`
+	SHA256    string `json:"sha256,case:strict"`
+	ExpiresIn int64  `json:"expiresIn,omitempty,case:strict"`
+}
+
+// FileUploadReady answers FileUpload: the bytes go to UploadURL with
+// UploadToken as bearer, and the file is fetched once from the same URL
+// with DownloadToken.
+type FileUploadReady struct {
+	Type          Type   `json:"type,case:strict"`
+	ID            string `json:"id,omitempty,case:strict"`
+	OK            bool   `json:"ok,case:strict"`
+	FileID        string `json:"fileId,case:strict"`
+	UploadURL     string `json:"uploadUrl,case:strict"`
+	UploadToken   string `json:"uploadToken,case:strict"`
+	DownloadToken string `json:"downloadToken,case:strict"`
+	ExpiresAt     string `json:"expiresAt,omitempty,case:strict"`
+}
 
 // FeatureAddMembers is declared on a conversation where addMembers would
 // be served right now: a group chat, shared read-write, with a live start

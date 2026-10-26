@@ -293,6 +293,7 @@ func (h *Hub) registerLocked(name string, agent *agentSession, conv string) *ses
 		h.sessions = map[string]*session{}
 	}
 	s := &session{name: name, hub: h, agent: agent, conv: conv}
+	h.restoredLocked(name)
 	// Built HERE, before anything can run against this session. Assigning
 	// it later raced the connection's own goroutines, which read it to
 	// decide whether an arriving event can be delivered.
@@ -366,12 +367,32 @@ func (h *Hub) session(name string) (*session, error) {
 	if ag, ok := h.agents[name]; ok {
 		return nil, ag.notAConversation()
 	}
+	// SAID HERE as well as pushed at startup: a session whose harness does
+	// not show pushes learns of the restart only from a call that fails.
+	if len(h.previousRun) > 0 {
+		return nil, fmt.Errorf("no connection named %q — this client was RESTARTED, and the previous "+
+			"run held %s, which this one has not restored. Reconnect what you still want with "+
+			"hub_connect (hub_list_connections shows each link and the name it was opened as; for "+
+			"a conversation of an agent connection, reconnect the agent), then hub_catch_up", name,
+			strings.Join(h.previousRun, ", "))
+	}
 	if len(h.sessions) == 0 && len(h.agents) == 0 {
 		return nil, fmt.Errorf("no connection named %q — not connected to anything; hub_connect "+
 			"opens a connection and gives it a name", name)
 	}
 	return nil, fmt.Errorf("no connection named %q — open: %s. hub_list_connections lists every "+
 		"conversation by name", name, h.summaryLocked())
+}
+
+// restoredLocked takes a name off the previous run's list once a
+// connection is open under it again. Caller holds h.mu.
+func (h *Hub) restoredLocked(name string) {
+	for i, n := range h.previousRun {
+		if n == name {
+			h.previousRun = append(h.previousRun[:i], h.previousRun[i+1:]...)
+			return
+		}
+	}
 }
 
 // rememberMeta keeps the most recent request's _meta so a connection

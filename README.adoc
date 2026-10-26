@@ -448,6 +448,18 @@ connection, the sender, the time and a snippet, marked untrusted, with the
 `hub_read` call that reads the whole message. Naming one conversation as
 `connection` searches only that one. Needs a server that declares search.
 
+|`hub_file_upload(connection, path, keepDays?)`
+|Where the server offers one-time files: encrypt a local file (up to 1 GB) with a
+fresh key, upload it, and return a link that works for ONE download. The server
+never sees the key, which travels only in the link's fragment. The file is
+deleted after its download, or when its storage time (default 7 days) ends.
+
+|`hub_file_download(link, directory?, trustHost?)`
+|Download a one-time file link to a local file, decrypting and checking it on the
+way. It never overwrites an existing file, and confirms receipt so the server
+deletes the file. It only fetches from hosts this client's connections use,
+unless the user says to trust another.
+
 |`hub_start_group(connection, account, contacts, topic?, requestId?)`
 |Through an agent connection allowed to: create a NEW group chat with 2–249
 people in an account's name, shared with the agent read-write with full
@@ -618,6 +630,17 @@ way still learns that delivery stopped. Pushes are also paced below the
 receiving session's rate limit (Claude Code drops a sender's messages past
 a burst of 30 and one every 2 seconds): after a burst of 20, one leaves
 every 2.5 seconds.
+
+A Claude Code session can keep pushes from the model: it refuses them under
+`crossSessionInbound: "refuse"` in its user, project or local settings, and
+holds them for the user's approval where its permission posture and the
+sender's differ. It reports either to the push's reply address, which is
+the connection's own inbox. The client reads those reports, and while
+pushes are refused or held, every tool result begins with a notice saying
+so, naming the cause and pointing to `hub_read`, because a pushed notice
+would be kept back the same way. A tool naming a connection that a
+previous run of the client held, and this run has not restored, is told
+the client restarted and how to reconnect, for the same reason.
 
 A conversation of an agent connection does not push its member list when
 it arrives. The current one goes out in front of the conversation's first

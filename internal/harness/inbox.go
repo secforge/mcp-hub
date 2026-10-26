@@ -2,10 +2,12 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/secforge/harness-transport/udsmsg"
 )
@@ -52,6 +54,13 @@ type Inbox struct {
 	// this process already receives, and inferring it from absences
 	// instead costs hours.
 	diagnostic string
+	// held is the pushes the session reported holding for the user's
+	// approval, by message id, until it reports them delivered.
+	held map[string]bool
+	// refusedAt is when the session last reported a push refused or
+	// dropped, and refusal what it said.
+	refusedAt time.Time
+	refusal   string
 }
 
 // EnvClaudeSocketName is the harness session's inbox path, which also
@@ -103,7 +112,8 @@ func OpenInbox() (*Inbox, error) {
 	in := &Inbox{parent: int32(pid)}
 	srv, err := udsmsg.Listen(udsmsg.Config{
 		Handler: udsmsg.Handler{
-			OnUser: in.handleUser,
+			OnUser:    in.handleUser,
+			OnUnknown: in.handleControl,
 		},
 		// Auth is required and the key is published so a reply from the
 		// model's own session can present a token at all. Neither decides
@@ -220,6 +230,75 @@ func (i *Inbox) handleUser(_ context.Context, p *udsmsg.Peer, f *udsmsg.Frame) {
 	if text := frameText(f); text != "" {
 		fn(text)
 	}
+}
+
+// receipt is the session's report on a message it was handed, sent to
+// that message's reply address.
+type receipt struct {
+	Type         string `json:"type"`
+	Action       string `json:"action"`
+	Status       string `json:"status"`
+	StatusDetail string `json:"status_detail"`
+	Reason       string `json:"reason"`
+	DropReason   string `json:"drop_reason"`
+	OrigMsgID    string `json:"orig_msg_id"`
+}
+
+// handleControl reads the session's receipts for pushes it did not show
+// at once: held for approval, refused, dropped, or released later.
+// Without them a push the session takes and never shows looks exactly
+// like one that arrived.
+func (i *Inbox) handleControl(_ context.Context, p *udsmsg.Peer, f *udsmsg.Frame) {
+	if p == nil || !p.Identified || p.PID != i.parent || f == nil {
+		return
+	}
+	var r receipt
+	if err := json.Unmarshal(f.Raw, &r); err != nil || r.Type != "control" || r.Action != "peer_message_status" {
+		return
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	switch {
+	case r.Status == "held":
+		if i.held == nil {
+			i.held = map[string]bool{}
+		}
+		i.held[r.OrigMsgID] = true
+	case r.Status == "delivered":
+		delete(i.held, r.OrigMsgID)
+	case r.Status == "dropped" || r.StatusDetail == "refused":
+		delete(i.held, r.OrigMsgID)
+		i.refusedAt = time.Now()
+		i.refusal = firstNonEmpty(r.Reason, r.DropReason, r.StatusDetail, r.Status)
+	case r.Status == "expired":
+		delete(i.held, r.OrigMsgID)
+	}
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// refusalWindow is how long a refusal is still reported: the session
+// refuses every push alike, so a recent one says the next will be too.
+const refusalWindow = 15 * time.Minute
+
+// Withheld reports what the session is keeping from the model: how many
+// pushes it holds for approval, and whether it recently refused or
+// dropped one, with what it said.
+func (i *Inbox) Withheld() (held int, refused bool, reason string) {
+	if i == nil {
+		return 0, false, ""
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	refused = !i.refusedAt.IsZero() && time.Since(i.refusedAt) < refusalWindow
+	return len(i.held), refused, i.refusal
 }
 
 // TakeDiagnostic returns the last wire fact worth reporting and clears

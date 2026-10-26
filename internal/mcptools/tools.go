@@ -43,6 +43,10 @@ type Hub struct {
 	// run's connections, because the scope was not yet known; the first
 	// tool call reports them instead. See reportAbandonedConnections.
 	abandonedPending atomic.Bool
+	// previousRun is the connections a previous run of this client held
+	// and this one has not restored, by the name they were opened under.
+	// Guarded by mu.
+	previousRun []string
 	// shuttingDown is set while Shutdown closes every connection, so the
 	// closes are not reported as drops with a reconnect that will never
 	// happen: this process is ending, and the next one reports what it held.
@@ -1662,6 +1666,9 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 				"hub_confirm(connection, cursor) with the last message you have read COMPLETE, or "+
 				"hub_confirm() with no arguments once you have taken in everything delivered so far.", queued))
 		}
+		if withheld := withheldNotice(h.allSessions()); withheld != "" {
+			h.noteAutoReconnect(withheld)
+		}
 		note := h.takeAutoReconnectNote()
 		if note == "" || res == nil {
 			return res, err
@@ -2108,6 +2115,8 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool(startConversationTool(), h.handleStartConversation)
 	addTool(startGroupTool(), h.handleStartGroup)
 	addTool(addMembersTool(), h.handleAddMembers)
+	addTool(fileUploadTool(), h.handleFileUpload)
+	addTool(fileDownloadTool(), h.handleFileDownload)
 	addTool(
 		mcp.NewTool("hub_list_connections",
 			mcp.WithDescription("List the links this client has connected to before FROM THIS "+
@@ -2755,6 +2764,15 @@ func actionsNote(conn *hubconn.Conn) string {
 	}
 	if len(no) > 0 {
 		note += "\nNOT supported here, refused before sending: " + strings.Join(no, "; ") + "."
+	}
+	if limits, ok := conn.FilesLimits(); ok {
+		size := ""
+		if limits.MaxBytes > 0 {
+			size = " of up to " + byteText(limits.MaxBytes)
+		}
+		note += "\nOne-time files: hub_file_upload uploads a local file" + size + " and gives a link " +
+			"that works for one download, for files too large for an attachment or that must not " +
+			"stay in the history; hub_file_download fetches such a link."
 	}
 	return note
 }
