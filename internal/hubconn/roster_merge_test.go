@@ -24,6 +24,8 @@ func TestMemberListsInsideTheWindowAreMergedWithWhatChanged(t *testing.T) {
 	c.holdRosterLocked(Event{Kind: "roster", RosterPeers: []PeerInfo{a, x}})
 	c.holdRosterLocked(Event{Kind: "roster", RosterPeers: []PeerInfo{a, y}})
 	c.holdRosterLocked(Event{Kind: "roster", RosterPeers: []PeerInfo{a, y}})
+	c.holdRosterLocked(Event{Kind: "roster", RosterPeers: []PeerInfo{y}})
+	c.holdRosterLocked(Event{Kind: "roster", RosterPeers: []PeerInfo{a, y}})
 	if len(c.buffer) != 1 {
 		t.Fatalf("a change inside the window went out on its own: %d buffered", len(c.buffer))
 	}
@@ -32,7 +34,7 @@ func TestMemberListsInsideTheWindowAreMergedWithWhatChanged(t *testing.T) {
 	}
 	got := FormatEvent(c.buffer[1])
 	for _, want := range []string{"membership changed", "xavier (x): joined → left", "yvonne (y): joined",
-		"Now 2 here"} {
+		"alpha (a): left → reconnected", "Now 2 here"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("lacks %q: %s", want, got)
 		}

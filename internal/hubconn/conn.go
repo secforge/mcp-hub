@@ -4234,7 +4234,14 @@ func (c *Conn) holdRosterLocked(ev Event) {
 		}
 		for _, p := range ev.RosterPeers {
 			if _, was := c.rosterShown[p.ID]; !was {
-				note(p.ID, "joined")
+				// A peer id comes back only with its own identity, so one
+				// seen here before has reconnected — the word the
+				// server's history uses for the same event.
+				if _, seen := c.rosterNamed[p.ID]; seen {
+					note(p.ID, "reconnected")
+				} else {
+					note(p.ID, "joined")
+				}
 			}
 		}
 	}
