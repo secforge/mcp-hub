@@ -450,10 +450,14 @@ type Msg struct {
 	// platform it was mirrored from (Teams' webUrl), where the server
 	// declares features.externalLinks. Absent when it has none.
 	ExternalLink string `json:"externalLink,omitempty,case:strict"`
-	Text         string `json:"text,case:strict"`
-	TS           string `json:"ts,omitempty,case:strict"`
-	To           string `json:"to,omitempty,case:strict"`      // set by the client to request directed (private) delivery
-	Private      bool   `json:"private,omitempty,case:strict"` // set by the server on a delivered directed message
+	// Presence, server->client, marks a history entry that records a peer
+	// joining, reconnecting or leaving, where the server declares
+	// features.presenceEntries. Text says the same in words.
+	Presence *Presence `json:"presence,omitempty,case:strict"`
+	Text     string    `json:"text,case:strict"`
+	TS       string    `json:"ts,omitempty,case:strict"`
+	To       string    `json:"to,omitempty,case:strict"`      // set by the client to request directed (private) delivery
+	Private  bool      `json:"private,omitempty,case:strict"` // set by the server on a delivered directed message
 	// Historical marks a msg delivered in answer to a History request
 	// rather than live traffic — additive, so a client that doesn't know
 	// the field just renders it as an ordinary message. mcp-hub-server
@@ -1541,6 +1545,29 @@ func BehindCount(n int) *int { return &n }
 
 // FeatureTodo declares a todo list (§2.8b).
 const FeatureTodo = "todo"
+
+// FeaturePresenceEntries is declared where history entries for joins,
+// reconnects and leaves carry Msg.Presence.
+const FeaturePresenceEntries = "presenceEntries"
+
+// Presence values of Presence.Event and Presence.Cause.
+const (
+	PresenceJoined      = "joined"
+	PresenceReconnected = "reconnected"
+	PresenceLeft        = "left"
+
+	PresenceCauseServerRestart = "serverRestart"
+	PresenceCauseRemoved       = "removed"
+)
+
+// Presence is what a presence entry records: who, what, and for a leave
+// that was not the peer's own, why.
+type Presence struct {
+	Event  string `json:"event,case:strict"`
+	PeerID string `json:"peerId,case:strict"`
+	Name   string `json:"name,omitempty,case:strict"`
+	Cause  string `json:"cause,omitempty,case:strict"`
+}
 
 // FeatureFiles is declared where one-time files may be uploaded: a session
 // that may post. Its value is FilesFeature.

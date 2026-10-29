@@ -18,6 +18,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
+	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/selfupdate"
 	"github.com/secforge/mcp-hub/internal/version"
 	"github.com/secforge/mcp-hub/internal/wire"
@@ -736,6 +737,7 @@ func TestHubWaitBlocksUntilMessageArrives(t *testing.T) {
 }
 
 func TestHubWaitNewCallSupersedesInFlightOne(t *testing.T) {
+	defer hubconn.SetRosterMergeWindowForTesting(10 * time.Millisecond)()
 	url := startTestServer(t)
 	sessionID := "550e8400-e29b-41d4-a716-446655440000"
 	ctx := context.Background()

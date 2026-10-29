@@ -78,11 +78,14 @@ func (w catchUpWant) limits() (messages, bytes int) {
 
 // catchUpResult is what one push run did, for the closing message.
 type catchUpResult struct {
-	Delivered int
-	Bytes     int
-	CaughtUp  bool
-	StoppedBy string
-	Err       error
+	// Delivered counts messages, and Deliveries what they went out as: a
+	// run of presence entries is several messages in one delivery.
+	Delivered  int
+	Deliveries int
+	Bytes      int
+	CaughtUp   bool
+	StoppedBy  string
+	Err        error
 }
 
 // runCatchUpPush walks the backlog and pushes each message, stopping at
@@ -121,28 +124,35 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 		maxBytes, gated = freeBytes, true
 	}
 
-	// ONE MESSAGE IS HELD BACK until the next fetch answers, because only
+	// ONE DELIVERY IS HELD BACK until the next fetch answers, because only
 	// that answer says whether anything follows it: each delivery's trailer
 	// states "more is waiting" only when another message really is, and the
 	// last one before "caught up" says nothing of the kind.
-	var held *hubconn.Event
+	//
+	// A delivery is one message, or a run of consecutive presence entries
+	// merged into one: a reconnect leaves many of them in a row, and one
+	// delivery per join or leave would fill the window with them. The run
+	// carries the cursor of its last entry, and every entry in it is
+	// recorded as handed over, so none is skipped.
+	var held []hubconn.Event
 	heldText := ""
 	release := func(more bool) {
-		ev := *held
+		run := held
 		held = nil
-		if err := s.pushCatchUpMessage(conn, id, ev, heldText, more); err != nil {
+		if err := s.pushCatchUpMessage(conn, id, run, heldText, more); err != nil {
 			if res.Err == nil {
 				res.Err = err
 			}
 			return
 		}
-		res.Delivered++
+		res.Delivered += len(run)
+		res.Deliveries++
 		res.Bytes += len(heldText)
 	}
 
 	for {
-		count, bytes := res.Delivered, res.Bytes
-		if held != nil {
+		count, bytes := res.Deliveries, res.Bytes
+		if len(held) > 0 {
 			count, bytes = count+1, bytes+len(heldText)
 		}
 		if count >= maxMessages || bytes >= maxBytes {
@@ -189,19 +199,29 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			continue
 		}
 
-		if held != nil {
+		if ev.Presence != nil && len(held) > 0 && held[0].Presence != nil {
+			held = append(held, ev)
+			heldText = hubconn.FormatPresenceRun(held, conn.PeerID())
+			anchor = wire.Anchor{Cursor: ev.Cursor}
+			continue
+		}
+		if len(held) > 0 {
 			if release(true); res.Err != nil {
 				break
 			}
-		} else if res.Delivered == 0 {
+		} else if res.Deliveries == 0 {
 			s.pushRosterIfDue(conn)
 		}
-		text := conn.ShapeForPush(ev)
-		text += s.saveReceivedAttachments(conn, []hubconn.Event{ev})
-		held, heldText = &ev, text
+		if ev.Presence != nil {
+			held, heldText = []hubconn.Event{ev}, hubconn.FormatPresenceRun([]hubconn.Event{ev}, conn.PeerID())
+		} else {
+			text := conn.ShapeForPush(ev)
+			text += s.saveReceivedAttachments(conn, []hubconn.Event{ev})
+			held, heldText = []hubconn.Event{ev}, text
+		}
 		anchor = wire.Anchor{Cursor: ev.Cursor}
 	}
-	if held != nil {
+	if len(held) > 0 {
 		release(false)
 	}
 
@@ -216,8 +236,9 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 	return res
 }
 
-// pushCatchUpMessage pushes one walked message and records what the
-// transport observed.
+// pushCatchUpMessage pushes one walked delivery — a message, or a run of
+// presence entries — under the cursor of its last entry, and records what
+// the transport observed for every entry in it.
 //
 // A PUSH IS NOT A HAND-OVER unless the transport says more than "the bytes
 // left": a nil error with ObservedNothing means the write succeeded and
@@ -226,24 +247,27 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 // into the "delivered, not confirmed" set instead, which an explicit
 // hub_confirm turns into position. A failed push leaves the message on the
 // server with the position unmoved.
-func (s *session) pushCatchUpMessage(conn *hubconn.Conn, id connstore.Target, ev hubconn.Event,
+func (s *session) pushCatchUpMessage(conn *hubconn.Conn, id connstore.Target, run []hubconn.Event,
 	text string, more bool) error {
-	if !s.hub.gate().budget.Take(s.name, ev.Cursor, len(text)) {
+	last := run[len(run)-1]
+	if !s.hub.gate().budget.Take(s.name, last.Cursor, len(text)) {
 		return fmt.Errorf("the delivery window filled up while this run was delivering")
 	}
-	receipt, err := s.pusher.Push(ev.Cursor, text, more)
+	receipt, err := s.pusher.Push(last.Cursor, text, more)
 	if err != nil {
 		return err
 	}
-	conn.NoteHandedOver([]hubconn.Event{ev})
+	conn.NoteHandedOver(run)
 	if receipt.Observation > deliver.ObservedNothing {
 		s.mu.Lock()
-		s.lastHandedOverCursor = ev.Cursor
+		s.lastHandedOverCursor = last.Cursor
 		s.mu.Unlock()
-		setCatchUpCursor(id, ev.Cursor)
-		s.noteDelivered(ev.Cursor)
+		setCatchUpCursor(id, last.Cursor)
+		for _, ev := range run {
+			s.noteDelivered(ev.Cursor)
+		}
 	} else {
-		s.recordHandedOver([]hubconn.Event{ev})
+		s.recordHandedOver(run)
 	}
 	return nil
 }

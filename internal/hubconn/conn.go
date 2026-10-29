@@ -163,6 +163,10 @@ type Event struct {
 	// RosterRenameTo is the name to take instead when RosterNameTaken: this
 	// connection's name with the machine's host name appended.
 	RosterRenameTo string
+	// RosterChanges, on a "roster" event, says who came and went since
+	// the member list delivered before it, one line per peer with what it
+	// did in order. Empty on the first list a connection delivers.
+	RosterChanges []string
 	// PushSeq numbers this event within the sequence of pushes this
 	// connection has made, from 1, and is set only on the push path.
 	//
@@ -238,6 +242,9 @@ type Event struct {
 	// writing in Teams themselves, say. Own stays false: this connection
 	// did not send it.
 	OwnAccount bool
+	// Presence marks a history entry recording a peer joining,
+	// reconnecting or leaving.
+	Presence *wire.Presence
 	// Reaction, ReactionLabel, and ReactionAction carry a "reactionChanged"
 	// event's payload — see wire.ReactionChanged. PeerID may be empty for
 	// an unattributed removal (see wire.ReactionChanged.PeerID).
@@ -593,8 +600,19 @@ type Conn struct {
 	// PushRosterBeforeMessages.
 	rosterBeforeMessages bool
 	rosterQuiet          time.Duration
-	lastPushedMsg        time.Time
-	rosterStale          bool
+	// A member list is held for rosterMergeWindow before it is delivered,
+	// and merged with the lists that follow it inside that time.
+	// rosterHeld is the latest list held, rosterShown the membership last
+	// delivered or held (nil before the first), and rosterChanges the
+	// comings and goings since the last delivered list, per peer.
+	rosterHeld        *Event
+	rosterShown       map[string]PeerInfo
+	rosterChangeOrder []string
+	rosterChanges     map[string][]string
+	rosterTimer       *time.Timer
+	rosterNamed       map[string]PeerInfo
+	lastPushedMsg     time.Time
+	rosterStale       bool
 	// pushSeq counts pushes made on this connection, so each carries a
 	// position a reader can check for gaps — see Event.PushSeq.
 	pushSeq int
@@ -2507,7 +2525,12 @@ func (c *Conn) readLoop() {
 			}
 			ev.RosterPeers = others
 		}
-		c.buffer = append(c.buffer, ev)
+		if ev.Kind == "roster" && !c.rosterBeforeMessages {
+			c.holdRosterLocked(ev)
+		} else {
+			c.flushRosterLocked()
+			c.buffer = append(c.buffer, ev)
+		}
 		// A buffer nobody is draining is a reader that has stopped, and
 		// past a point the honest thing is to stop pretending to be
 		// connected — see maxBufferedEvents. Recorded here, acted on
@@ -2658,7 +2681,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &m); err != nil || (m.PeerID != "" && !wire.IsValidID(m.PeerID)) {
 			return Event{}, false
 		}
-		return Event{Kind: "msg", PeerID: m.PeerID, SenderName: m.Name, ExternalLink: m.ExternalLink, Text: m.Text, TS: m.TS, Private: m.Private,
+		return Event{Kind: "msg", PeerID: m.PeerID, SenderName: m.Name, ExternalLink: m.ExternalLink, Presence: m.Presence, Text: m.Text, TS: m.TS, Private: m.Private,
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,
@@ -4180,4 +4203,102 @@ func (c *Conn) AckDisabled() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ackDisabled
+}
+
+// rosterMergeWindow is how long a member list waits for the next one: a
+// reconnect, or several peers coming and going, sends lists seconds apart,
+// and one delivery saying who came and went reads better than several.
+var rosterMergeWindow = 5 * time.Second
+
+// holdRosterLocked holds a member list, noting who joined and left since
+// the list before it, and (re)starts the wait. Caller holds c.mu.
+func (c *Conn) holdRosterLocked(ev Event) {
+	next := make(map[string]PeerInfo, len(ev.RosterPeers))
+	for _, p := range ev.RosterPeers {
+		next[p.ID] = p
+	}
+	if c.rosterShown != nil {
+		note := func(id, what string) {
+			if c.rosterChanges == nil {
+				c.rosterChanges = map[string][]string{}
+			}
+			if _, seen := c.rosterChanges[id]; !seen {
+				c.rosterChangeOrder = append(c.rosterChangeOrder, id)
+			}
+			c.rosterChanges[id] = append(c.rosterChanges[id], what)
+		}
+		for id := range c.rosterShown {
+			if _, still := next[id]; !still {
+				note(id, "left")
+			}
+		}
+		for _, p := range ev.RosterPeers {
+			if _, was := c.rosterShown[p.ID]; !was {
+				note(p.ID, "joined")
+			}
+		}
+	}
+	for _, p := range ev.RosterPeers {
+		c.rosterNames(p.ID, p)
+	}
+	first := c.rosterShown == nil
+	c.rosterShown = next
+	if first {
+		// Who is here goes out at once: there is nothing to merge it with.
+		c.buffer = append(c.buffer, ev)
+		return
+	}
+	if len(c.rosterChanges) == 0 && !ev.RosterNameTaken {
+		// Nothing changed since the list last delivered or held.
+		return
+	}
+	c.rosterHeld = &ev
+	if c.rosterTimer != nil {
+		c.rosterTimer.Stop()
+	}
+	c.rosterTimer = time.AfterFunc(rosterMergeWindow, func() {
+		c.mu.Lock()
+		flushed := c.flushRosterLocked()
+		c.mu.Unlock()
+		if flushed {
+			c.signalActivity()
+		}
+	})
+}
+
+// rosterNames remembers how each peer that came or went was called, for
+// the change lines of a peer no longer in the list.
+func (c *Conn) rosterNames(id string, p PeerInfo) {
+	if c.rosterNamed == nil {
+		c.rosterNamed = map[string]PeerInfo{}
+	}
+	c.rosterNamed[id] = p
+}
+
+// flushRosterLocked delivers the held member list, with what changed, and
+// reports whether there was one. Caller holds c.mu.
+func (c *Conn) flushRosterLocked() bool {
+	if c.rosterHeld == nil {
+		return false
+	}
+	ev := *c.rosterHeld
+	for _, id := range c.rosterChangeOrder {
+		ev.RosterChanges = append(ev.RosterChanges,
+			rosterName(c.rosterNamed[id])+": "+strings.Join(c.rosterChanges[id], " → "))
+	}
+	c.rosterHeld, c.rosterChanges, c.rosterChangeOrder = nil, nil, nil
+	if c.rosterTimer != nil {
+		c.rosterTimer.Stop()
+		c.rosterTimer = nil
+	}
+	c.buffer = append(c.buffer, ev)
+	return true
+}
+
+// SetRosterMergeWindowForTesting sets how long a member list waits for the
+// next one and returns a function restoring it.
+func SetRosterMergeWindowForTesting(d time.Duration) func() {
+	prev := rosterMergeWindow
+	rosterMergeWindow = d
+	return func() { rosterMergeWindow = prev }
 }

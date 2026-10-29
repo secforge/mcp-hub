@@ -254,13 +254,24 @@ func FormatEvent(e Event) string {
 		// worth its space: "the roster is complete" says nothing a reader
 		// can act on. The server states the whole membership in one
 		// message, so there is no partial form and nothing to hedge.
+		changed := ""
+		if len(e.RosterChanges) > 0 {
+			changed = "membership changed — " + strings.Join(e.RosterChanges, "; ") + ". "
+		}
 		if len(e.RosterPeers) == 0 {
+			if changed != "" {
+				return "[hub: " + changed + "Nobody else is here now]"
+			}
 			return "[hub: you are alone in this session for now — nobody else is here. A join " +
 				"from here on is someone actually arriving]"
 		}
 		who := make([]string, 0, len(e.RosterPeers))
 		for _, p := range e.RosterPeers {
 			who = append(who, rosterName(p))
+		}
+		if changed != "" {
+			return fmt.Sprintf("[hub: %sNow %d here: %s]%s", changed, len(who), strings.Join(who, ", "),
+				rosterClash(e))
 		}
 		// OFFERED, NOT DEMANDED. Somebody here already answers to this
 		// connection's display name, which makes every later "as X
@@ -274,15 +285,8 @@ func FormatEvent(e Event) string {
 		// and that one renames: the other has been addressed by it all
 		// along. The new name is given, so every agent picks it the same
 		// way.
-		clash := ""
-		if e.RosterNameTaken {
-			clash = fmt.Sprintf(" RENAME YOURSELF: another peer here already goes by your name, "+
-				"and the one who joins second takes a new one. Call hub_disconnect(connection), "+
-				"then hub_connect with the same link and name %q — your name with this machine's "+
-				"host name. Your identity and read position stay as they are.", e.RosterRenameTo)
-		}
 		return fmt.Sprintf("[hub: %d already here — %s. That is everyone; a join or leave from "+
-			"here on is a real change]%s", len(who), strings.Join(who, ", "), clash)
+			"here on is a real change]%s", len(who), strings.Join(who, ", "), rosterClash(e))
 	case "confirmReminder":
 		// SAYS WHOSE VOICE THIS IS. A notice arrives through the same
 		// channel as a peer's message and in a similar shape, so the
@@ -750,4 +754,16 @@ func rosterName(p PeerInfo) string {
 		return fmt.Sprintf("%s (%s)", p.Name, p.ID)
 	}
 	return p.ID
+}
+
+// rosterClash is the rename notice for a member list in which another peer
+// already goes by this connection's name, empty otherwise.
+func rosterClash(e Event) string {
+	if !e.RosterNameTaken {
+		return ""
+	}
+	return fmt.Sprintf(" RENAME YOURSELF: another peer here already goes by your name, "+
+		"and the one who joins second takes a new one. Call hub_disconnect(connection), "+
+		"then hub_connect with the same link and name %q — your name with this machine's "+
+		"host name. Your identity and read position stay as they are.", e.RosterRenameTo)
 }

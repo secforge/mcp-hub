@@ -1139,6 +1139,10 @@ reconnect, each resuming from its own stored position, and presents each as
 its own connection named after the agent connection. A read-only
 conversation's writes are refused in the client before anything is sent.
 
+### 2.12a Presence entries (feature `presenceEntries`)
+
+Where declared, a history `msg` recording a peer joining, reconnecting or leaving carries `presence: {event: "joined" | "reconnected" | "left", peerId, name?, cause?}`. `name` is the name at the time of the entry. `cause` is `"serverRestart"` for a leave written when the server restarted, and `"removed"` for a guest an operator removed; it is absent otherwise, and on entries written before the server stored it. The text says the same in words, for clients that do not read the field. These entries are history only: live, membership arrives as `roster` (§2.3). The reference client merges a run of consecutive presence entries in a catch-up into one delivery under the last entry's cursor.
+
 ### 2.13 One-time files (feature `files`)
 
 A side channel for handing over a file of up to 1 GB outside any conversation's history. It is stored encrypted by the client, downloaded once, then deleted. The design is chat-relay's `docs/superpowers/specs/2026-10-26-one-time-files-design.md`, agreed between the two projects.
