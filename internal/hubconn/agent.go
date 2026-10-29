@@ -386,7 +386,7 @@ func (a *Agent) Open(conv string, key []byte) (*Conn, error) {
 	case a.closed:
 		a.mu.Unlock()
 		return nil, errAgentDown
-	case a.convs[conv] != nil:
+	case a.convs[conv] != nil && !a.convs[conv].ended():
 		a.mu.Unlock()
 		return nil, fmt.Errorf("conversation %q is already open on this agent connection", conv)
 	}
@@ -564,6 +564,22 @@ func (v *agentConv) deliver(frame []byte) {
 	}
 }
 
+// timedOut ends a session whose keepalive deadline passed, as the read
+// that noticed reports it: off the agent, so the conversation can be
+// opened again, and closed at the server, which still holds it open.
+func (v *agentConv) timedOut() error {
+	v.agent.forget(v)
+	v.finish(agentConvTimeout{}, true)
+	return agentConvTimeout{}
+}
+
+// ended reports whether this session is over.
+func (v *agentConv) ended() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.err != nil
+}
+
 // pop takes the oldest queued frame, if there is one.
 func (v *agentConv) pop() ([]byte, bool) {
 	v.mu.Lock()
@@ -631,7 +647,7 @@ func (v *agentConv) ReadMessage() (int, []byte, error) {
 		if !deadline.IsZero() {
 			wait := time.Until(deadline)
 			if wait <= 0 {
-				return 0, nil, agentConvTimeout{}
+				return 0, nil, v.timedOut()
 			}
 			timer = time.NewTimer(wait)
 			timeout = timer.C
@@ -664,7 +680,7 @@ func (v *agentConv) await(timeout <-chan time.Time) (raw []byte, err error, agai
 		v.mu.Unlock()
 		return nil, err, false
 	case <-timeout:
-		return nil, agentConvTimeout{}, false
+		return nil, v.timedOut(), false
 	case <-v.kick:
 		return nil, nil, true
 	}

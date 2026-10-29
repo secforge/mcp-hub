@@ -6153,9 +6153,11 @@ func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest
 		s.teardownIfCurrent(conn)
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
-	cursor, err := req.RequireString("cursor")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	cursor := req.GetString("cursor", "")
+	if cursor == "" {
+		return mcp.NewToolResultError("a cursor is needed with a connection: it names the message " +
+			"whose position to keep. To free the delivery window without moving any position — " +
+			"for notices that carry no cursor — call hub_confirm with NEITHER connection nor cursor."), nil
 	}
 	behind, err := s.confirmCursor(conn, cursor)
 	var notPersisted errNotPersisted
