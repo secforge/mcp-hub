@@ -61,10 +61,13 @@ fi
 }
 
 echo "==> testing with GOEXPERIMENT=$GOEXPERIMENT"
-go test ./... >/dev/null || {
-	echo "refusing: the suite does not pass under GOEXPERIMENT=$GOEXPERIMENT" >&2
+TEST_LOG="$(mktemp)"
+go test ./... >"$TEST_LOG" 2>&1 || {
+	grep -E '^(--- FAIL|FAIL|panic)|_test\.go:[0-9]+:' "$TEST_LOG" | head -40 >&2
+	echo "refusing: the suite does not pass under GOEXPERIMENT=$GOEXPERIMENT (full output: $TEST_LOG)" >&2
 	exit 1
 }
+rm -f "$TEST_LOG"
 
 echo "==> fetching tags"
 git fetch --tags --quiet
