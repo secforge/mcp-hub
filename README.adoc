@@ -644,7 +644,7 @@ the client restarted and how to reconnect, for the same reason.
 
 Joins and leaves are merged rather than delivered one by one. Live, the
 first member list after connecting goes out at once; every later change is
-held for 5 seconds and merged with any change after it, then delivered as
+held for 10 seconds and merged with any change after it, then delivered as
 one notice naming who came and went, in order, and who is here now. It goes
 out sooner when anything else arrives, so it never overtakes a message. In
 a catch-up, consecutive history entries for joins, reconnects and leaves

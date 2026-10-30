@@ -4238,7 +4238,7 @@ func (c *Conn) AckDisabled() bool {
 // rosterMergeWindow is how long a member list waits for the next one: a
 // reconnect, or several peers coming and going, sends lists seconds apart,
 // and one delivery saying who came and went reads better than several.
-var rosterMergeWindow = 5 * time.Second
+var rosterMergeWindow = 10 * time.Second
 
 // holdRosterLocked holds a member list, noting who joined and left since
 // the list before it, and (re)starts the wait. Caller holds c.mu.

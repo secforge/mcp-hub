@@ -3932,7 +3932,9 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 				// is overdue; see quietrestart.go.
 				continue
 			case "roster":
-				if s.restartAdd(strings.TrimSuffix(strings.TrimPrefix(hubconn.FormatEvent(it.Event), "[hub: "), "]"), "") {
+				// Who is here goes into the notice once, as it stands
+				// when the notice is sent; see restartFlush.
+				if s.restartActive() {
 					continue
 				}
 			case "msg":

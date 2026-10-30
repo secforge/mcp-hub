@@ -1147,7 +1147,7 @@ Where declared, a message recording peers joining, reconnecting or leaving carri
 - **Links:** the platform's own membership messages, live and in history — Slack's channel joins and leaves, Teams members added, joined, removed or left. One Teams event can name several members, and `by` names who acted when that was someone else.
 - **`name`** is the name at the time of the entry.
 
-The reference client delivers a run of consecutive presence entries as one delivery under the last entry's cursor, in a catch-up and live (held for 5 seconds); it holds a live leave for a minute and says nothing if the peer is back by then.
+The reference client delivers a run of consecutive presence entries as one delivery under the last entry's cursor, in a catch-up and live (held for 10 seconds); it holds a live leave for a minute and says nothing if the peer is back by then.
 
 ### 2.13 One-time files (feature `files`)
 

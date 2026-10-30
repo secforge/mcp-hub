@@ -40,7 +40,7 @@ func downHold(delay time.Duration) time.Duration {
 }
 
 // restartQuiet is how long the after-reconnect notice waits for more.
-var restartQuiet = 5 * time.Second
+var restartQuiet = 10 * time.Second
 
 // The catch-up after an automatic reconnect runs by itself only for a
 // short outage with a small backlog: past either bound, what arrived is
@@ -147,6 +147,10 @@ func (s *session) restartAct(line string) bool {
 // it asks something of the reader, in front of the next tool result when
 // it does not.
 func (s *session) restartFlush() {
+	// WHO IS HERE, as it stands now: one state, the same point the joins
+	// and leaves above it end at, never a member list from the moment of
+	// reconnecting beside changes that ran on past it.
+	here := s.hereNow()
 	n := &s.restart
 	n.mu.Lock()
 	if !n.active {
@@ -158,7 +162,11 @@ func (s *session) restartFlush() {
 		n.mu.Unlock()
 		return
 	}
-	body := strings.Join(n.lines, "\n")
+	lines := n.lines
+	if here != "" {
+		lines = append(lines, here)
+	}
+	body := strings.Join(lines, "\n")
 	cursor, act := n.cursor, n.act
 	n.active, n.lines, n.cursor, n.act = false, nil, "", false
 	if n.timer != nil {
@@ -277,4 +285,28 @@ func textOfResult(res *mcp.CallToolResult) string {
 		}
 	}
 	return ""
+}
+
+// hereNow says who else is in the conversation now, by this connection's
+// own current state.
+func (s *session) hereNow() string {
+	conn, _ := s.activeConn()
+	if conn == nil {
+		return ""
+	}
+	var names []string
+	for _, p := range conn.Peers() {
+		if p.ID == conn.PeerID() {
+			continue
+		}
+		name := noticeText(p.Name)
+		if name == "" {
+			name = "a peer"
+		}
+		names = append(names, name+" ("+noticeText(p.ID)+")")
+	}
+	if len(names) == 0 {
+		return "Nobody else is here now."
+	}
+	return fmt.Sprintf("Now %d here: %s.", len(names), strings.Join(names, ", "))
 }

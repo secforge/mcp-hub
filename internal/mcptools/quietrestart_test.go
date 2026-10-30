@@ -21,7 +21,7 @@ import (
 // and leaves meanwhile, wakes nobody: nothing is pushed, and what it
 // brought waits in front of the next tool result.
 func TestARestartThatComesBackInTimeIsNotPushed(t *testing.T) {
-	testQuietRestart(t, 2, false, []string{"other (6ba7b810-9dad-11d1-80b4-00c04fd430c8): left at the server restart → reconnected",
+	testQuietRestart(t, 2, false, []string{"Now 1 here: other (6ba7b810-9dad-11d1-80b4-00c04fd430c8).", "other (6ba7b810-9dad-11d1-80b4-00c04fd430c8): left at the server restart → reconnected",
 		"Nothing else arrived meanwhile", "p2"})
 }
 
