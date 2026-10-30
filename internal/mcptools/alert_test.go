@@ -77,8 +77,16 @@ func TestOutOfCallNoticesArePushedNotOnlyQueued(t *testing.T) {
 		`RECONNECTED AUTOMATICALLY`,
 		`Automatic reconnect dialled successfully but could`,
 	} {
-		re := regexp.MustCompile(`s\.(alert|note)\(fmt\.Sprintf\("(?:[^"\\]|\\.)*` + phrase)
+		re := regexp.MustCompile(`(?:s\.(alert|note)\(|down := )fmt\.Sprintf\("(?:[^"\\]|\\.)*` + phrase)
 		m := re.FindStringSubmatch(string(src))
+		if m != nil && m[1] == "" {
+			// Built first, then pushed now or once the reconnect is
+			// overdue — both through s.alert.
+			if !strings.Contains(string(src), "s.alert(down)") || !strings.Contains(string(src), "s.downLater(delay, gen, down)") {
+				t.Errorf("the %q notice is built but not pushed", phrase)
+			}
+			continue
+		}
 		if m == nil {
 			t.Errorf("no notice matching %q found", phrase)
 			continue

@@ -64,6 +64,9 @@ type agentSession struct {
 	remindEvery  time.Duration
 	leaving      bool
 	reconnecting bool
+	// downNotified says the agent's drop was said: in push mode it is
+	// said only once the reconnect is overdue (see quietrestart.go).
+	downNotified bool
 	reconnectAt  time.Time
 	gen          int
 }
@@ -178,7 +181,7 @@ func (ag *agentSession) install(a *hubconn.Agent) (opened []*session, failed map
 	items := a.Assignments()
 	ag.mu.Lock()
 	ag.agent = a
-	ag.reconnecting, ag.reconnectAt = false, time.Time{}
+	ag.reconnecting, ag.reconnectAt, ag.downNotified = false, time.Time{}, false
 	listed := map[string]bool{}
 	for _, it := range items {
 		listed[it.Conv] = true
@@ -815,11 +818,26 @@ func (ag *agentSession) scheduleReconnect(prev *hubconn.Agent) {
 	if scheduled {
 		why = "The server announced a restart"
 	}
-	ag.alert(fmt.Sprintf("Agent connection %q is DOWN, and with it all %d of its conversations. %s. "+
+	down := fmt.Sprintf("Agent connection %q is DOWN, and with it all %d of its conversations. %s. "+
 		"Reconnecting automatically, first attempt in about %s, and retrying until it succeeds — you "+
 		"will be told when it does. Nothing is lost: each conversation's reading position only moves "+
 		"on a confirm. hub_disconnect(connection: %q) stops the retrying.",
-		ag.name, n, why, delay.Round(time.Second), ag.name))
+		ag.name, n, why, delay.Round(time.Second), ag.name)
+	if pushOnly() {
+		time.AfterFunc(downHold(delay), func() {
+			ag.mu.Lock()
+			still := ag.reconnecting && ag.gen == gen && !ag.leaving
+			if still {
+				ag.downNotified = true
+			}
+			ag.mu.Unlock()
+			if still {
+				ag.alert(down)
+			}
+		})
+	} else {
+		ag.alert(down)
+	}
 	go ag.reconnectLoop(delay, scheduled, gen)
 }
 
@@ -859,8 +877,12 @@ func (ag *agentSession) reconnectLoop(interval time.Duration, scheduled bool, ge
 		}
 		ag.mu.Lock()
 		ag.reconnectAt = time.Now().Add(interval)
+		told := ag.downNotified
 		ag.mu.Unlock()
 		ag.markChildrenReconnecting(time.Now().Add(interval))
+		if pushOnly() && !told {
+			continue
+		}
 		ag.alert(fmt.Sprintf("Automatic reconnect attempt %d of agent connection %q FAILED: %v. "+
 			"Another attempt follows in about %s. Either WAIT — you will be told when it succeeds — "+
 			"or call hub_disconnect(connection: %q) to stop trying.",

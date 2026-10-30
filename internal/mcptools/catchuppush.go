@@ -82,10 +82,13 @@ type catchUpResult struct {
 	// run of presence entries is several messages in one delivery.
 	Delivered  int
 	Deliveries int
-	Bytes      int
-	CaughtUp   bool
-	StoppedBy  string
-	Err        error
+	// Presence counts joins and leaves folded into the notice about an
+	// automatic reconnect rather than delivered on their own.
+	Presence  int
+	Bytes     int
+	CaughtUp  bool
+	StoppedBy string
+	Err       error
 }
 
 // runCatchUpPush walks the backlog and pushes each message, stopping at
@@ -99,7 +102,22 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 	if s.agent != nil {
 		s.agent.announcedBefore(s)
 	}
-	s.pushCatchUpSummary(s.walkCatchUpPush(conn, id, anchor, want))
+	res := s.walkCatchUpPush(conn, id, anchor, want)
+	if res.CaughtUp && res.Err == nil && res.Delivered == res.Presence &&
+		s.restartAdd(caughtUpQuietly(res), "") {
+		return
+	}
+	s.restartFlush()
+	s.pushCatchUpSummary(res)
+}
+
+// caughtUpQuietly is the catch-up's line in the notice about an automatic
+// reconnect, when nothing but joins and leaves arrived meanwhile.
+func caughtUpQuietly(res catchUpResult) string {
+	if res.Presence == 0 {
+		return "Nothing arrived meanwhile."
+	}
+	return "Nothing else arrived meanwhile; confirm the cursor below to mark these read."
 }
 
 // walkCatchUpPush is the walk itself, separated from the reporting so a
@@ -139,6 +157,17 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 	release := func(more bool) {
 		run := held
 		held = nil
+		// Joins and leaves after an automatic reconnect go into the one
+		// notice about it rather than out on their own; a real message
+		// sends that notice first. See quietrestart.go.
+		if run[0].Presence != nil && s.restartAdd(heldText, run[len(run)-1].Cursor) {
+			conn.NoteHandedOver(run)
+			s.recordHandedOver(run)
+			res.Delivered += len(run)
+			res.Presence += len(run)
+			return
+		}
+		s.restartFlush()
 		if err := s.pushCatchUpMessage(conn, id, run, heldText, more); err != nil {
 			if res.Err == nil {
 				res.Err = err

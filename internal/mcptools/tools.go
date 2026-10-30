@@ -1122,11 +1122,25 @@ func (s *session) scheduleReconnect(conn *hubconn.Conn) {
 	if scheduled {
 		why = "The server announced a restart"
 	}
-	s.alert(fmt.Sprintf("Connection %q is DOWN. %s. Reconnecting automatically, first attempt in "+
+	down := fmt.Sprintf("Connection %q is DOWN. %s. Reconnecting automatically, first attempt in "+
 		"about %s, and retrying until it succeeds — you will be told when it does. Nothing is "+
 		"lost: your reading position only moves on a confirm, so the server still holds "+
 		"anything sent meanwhile. hub_disconnect stops the retrying.",
-		s.name, why, delay.Round(time.Second)))
+		s.name, why, delay.Round(time.Second))
+	if s.quietRestarts() {
+		down = fmt.Sprintf("Connection %q is DOWN and has not come back within the expected %s. "+
+			"%s. It keeps retrying until it succeeds — you will be told when it does. Nothing is "+
+			"lost: your reading position only moves on a confirm, so the server still holds "+
+			"anything sent meanwhile. hub_disconnect stops the retrying.",
+			s.name, downHold(delay).Round(time.Second), why)
+		s.mu.Lock()
+		s.downSince = time.Now()
+		s.mu.Unlock()
+		s.downLater(delay, gen, down)
+		s.restartArm()
+	} else {
+		s.alert(down)
+	}
 
 	go s.reconnectLoop(link, name, delay, scheduled, gen)
 }
@@ -1423,6 +1437,10 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	if scheduled {
 		because = "after the server's announced restart"
 	}
+	if s.quietRestarts() {
+		s.reconnectedQuietly(conn, because)
+		return reconnectDone
+	}
 	s.alert(fmt.Sprintf("RECONNECTED AUTOMATICALLY %s, having waited %s. You are connected again "+
 		"as peer %s. Messages may have arrived while you were away and while this client was "+
 		"waiting — call hub_catch_up() now, the same as after any reconnect. %s",
@@ -1446,6 +1464,14 @@ func (s *session) reportFailedAttempt(attempt int, interval time.Duration, err e
 		"Another attempt follows in about %s, and it will keep retrying at that interval. Either "+
 		"WAIT — you will be told when it succeeds — or %s",
 		attempt, err, interval.Round(time.Second), stop))
+	s.mu.Lock()
+	told := s.downNotified
+	s.mu.Unlock()
+	if s.quietRestarts() && !told {
+		// The drop itself has not been said yet: it is within the
+		// expected time, and a failed attempt inside it is not news.
+		return
+	}
 	s.alert(msg)
 	if w := s.hub.currentWaiter(); w != nil {
 		w.Announce("[connection: " + s.name + "]\n[hub: " + msg + "]")
@@ -3895,7 +3921,22 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		s.agent.announcedBefore(s)
 	}
 	budget := s.hub.gate().budget
+	quiet := s.quietRestarts()
 	for i, it := range items {
+		if quiet {
+			switch it.Event.Kind {
+			case "serverStopping":
+				// The drop it announces is said only if the reconnect
+				// is overdue; see quietrestart.go.
+				continue
+			case "roster":
+				if s.restartAdd(strings.TrimSuffix(strings.TrimPrefix(it.Text, "[hub: "), "]"), "") {
+					continue
+				}
+			default:
+				s.restartFlush()
+			}
+		}
 		// An image or a file on a pushed message has to be saved here, by
 		// the same path hub_receive uses. Push mode does not offer
 		// hub_receive, so if this did not run there would be no second

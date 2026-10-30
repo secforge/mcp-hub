@@ -159,6 +159,16 @@ type session struct {
 	pusher *harness.Pusher
 	inbox  *harness.Inbox
 
+	// restart gathers what an automatic reconnect brings that is not a
+	// message into one notice; downTimer says the connection is down once
+	// the reconnect is overdue, and downNotified that it was said. Both
+	// timer fields are guarded by mu. See quietrestart.go.
+	restart      restartNote
+	downTimer    *time.Timer
+	downNotified bool
+	// downSince is when the connection dropped, for how long it was away.
+	downSince time.Time
+
 	// attachMu guards attachDir/attachSeq — the local temp directory
 	// received attachments are saved into and a counter for unique
 	// filenames within it. Separate from mu since the paths that touch it
