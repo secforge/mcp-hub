@@ -652,19 +652,21 @@ a catch-up, consecutive history entries for joins, reconnects and leaves
 the cursor of the last of them, each peer once with what it did in order,
 and a leave at a server restart marked as such.
 
-In push mode a restart is not news unless it lasts. The server's
-announcement and the drop are not delivered while the reconnect is still
-within the announced delay plus 15 seconds, and never within the drop's
-first minute; only an overdue reconnect is
-said, together with its failed attempts. After an automatic reconnect the
-client catches up by itself when the connection was down for less than an
-hour and the server reports at most 100 messages waiting; otherwise the
-notice says what is waiting and leaves `hub_catch_up` to the reader. The
-reconnect, the new member list and the
-joins and leaves found meanwhile go out as ONE notice, 5 seconds after the
-last addition or at once in front of the first real message, under the
-cursor of the last join or leave in it. A restart that brought nothing but
-joins and leaves therefore costs the reader one delivery rather than six.
+In push mode a restart is not news unless it lasts or asks something of the
+reader. The server's announcement and the drop are not delivered while the
+reconnect is within the announced delay plus 15 seconds, and never within
+the drop's first minute; only an overdue reconnect is said, together with
+its failed attempts. After an automatic reconnect — of a connection, or of
+an agent connection and each of its conversations — the client catches up
+by itself, at most 100 messages, when the connection was down for less than
+an hour and the server does not report more than 100 waiting. The
+reconnect, the new member list and the joins and leaves found meanwhile are
+gathered into one notice. Where nothing in it asks for anything, it is not
+pushed at all: it goes in front of the next tool result, naming the cursor
+of the last join or leave so a later confirm covers them. It is pushed when
+it does ask — more waiting than is walked by itself, or a catch-up that
+could not start — and real messages are pushed as always, the notice in
+front of the first. A routine restart therefore wakes nobody.
 
 A conversation of an agent connection does not push its member list when
 it arrives. The current one goes out in front of the conversation's first

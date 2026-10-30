@@ -59,6 +59,10 @@ type restartNote struct {
 	// notice covers them.
 	cursor string
 	timer  *time.Timer
+	// act says something in the notice asks the reader to do something.
+	// A notice without it is not pushed at all: it goes in front of the
+	// next tool result instead, so a routine restart wakes nobody.
+	act bool
 }
 
 // quietRestarts reports whether restarts are kept quiet here: in push
@@ -81,16 +85,18 @@ func (s *session) restartArm() {
 		n.timer.Stop()
 		n.timer = nil
 	}
-	n.active, n.lines, n.cursor = true, nil, ""
+	n.active, n.lines, n.cursor, n.act = true, nil, "", false
 }
 
 // restartLead puts the line saying what happened at the top of the
-// gathering notice.
+// gathering notice; an empty line adds nothing and only starts the wait.
 func (s *session) restartLead(line string) {
 	n := &s.restart
 	n.mu.Lock()
 	n.active = true
-	n.lines = append([]string{line}, n.lines...)
+	if line != "" {
+		n.lines = append([]string{line}, n.lines...)
+	}
 	if n.timer != nil {
 		n.timer.Stop()
 	}
@@ -127,7 +133,19 @@ func (s *session) restartAdd(line, cursor string) bool {
 	return true
 }
 
-// restartFlush sends the gathered notice, if one is gathering.
+// restartAct adds a line that asks the reader to do something, which
+// makes the notice worth a push.
+func (s *session) restartAct(line string) bool {
+	n := &s.restart
+	n.mu.Lock()
+	n.act = n.act || n.active
+	n.mu.Unlock()
+	return s.restartAdd(line, "")
+}
+
+// restartFlush sends the gathered notice, if one is gathering: pushed when
+// it asks something of the reader, in front of the next tool result when
+// it does not.
 func (s *session) restartFlush() {
 	n := &s.restart
 	n.mu.Lock()
@@ -140,14 +158,23 @@ func (s *session) restartFlush() {
 		n.mu.Unlock()
 		return
 	}
-	text := "[hub: on " + s.name + ": " + strings.Join(n.lines, "\n") + "]"
-	cursor := n.cursor
-	n.active, n.lines, n.cursor = false, nil, ""
+	body := strings.Join(n.lines, "\n")
+	cursor, act := n.cursor, n.act
+	n.active, n.lines, n.cursor, n.act = false, nil, "", false
 	if n.timer != nil {
 		n.timer.Stop()
 		n.timer = nil
 	}
 	n.mu.Unlock()
+	if !act {
+		if cursor != "" {
+			body += "\nThese joins and leaves end at cursor " + cursor + "; confirm it with hub_confirm " +
+				"along with whatever you confirm next."
+		}
+		s.note(body)
+		return
+	}
+	text := "[hub: on " + s.name + ": " + body + "]"
 	pusher := s.pusher
 	s.hub.gate().budget.Deliver(hubconn.Delivery{
 		Owner: s.name, Cursor: cursor, Bytes: len(text),
@@ -186,6 +213,9 @@ func (s *session) downLater(delay time.Duration, gen int, text string) {
 // reconnectedQuietly gathers the reconnect into one notice and walks what
 // arrived meanwhile without being asked: the reader is told about the
 // restart once, together with what it brought.
+//
+// because says why for a connection of its own; a conversation of an agent
+// connection passes "", and its agent says it once for all of them.
 func (s *session) reconnectedQuietly(conn *hubconn.Conn, because string) {
 	s.mu.Lock()
 	if s.downTimer != nil {
@@ -195,36 +225,40 @@ func (s *session) reconnectedQuietly(conn *hubconn.Conn, because string) {
 	s.downNotified = false
 	away := time.Since(s.downSince)
 	s.mu.Unlock()
-	s.restartLead("Reconnected " + because + ", away " + away.Round(time.Second).String() + ".")
+	lead := ""
+	if because != "" {
+		lead = "Reconnected " + because + ", away " + away.Round(time.Second).String() + "."
+	}
+	s.restartLead(lead)
 	switch {
+	case conn.BehindStated() && conn.Behind() == 0:
+		return
 	case away >= autoCatchUpMaxDown:
-		s.restartAdd(fmt.Sprintf("It was down for more than %s, so what arrived meanwhile was not "+
-			"walked by itself: call hub_catch_up when you are ready to read it.", autoCatchUpMaxDown), "")
+		s.restartAct(fmt.Sprintf("It was down for more than %s, so what arrived meanwhile was not "+
+			"walked by itself: call hub_catch_up when you are ready to read it.", autoCatchUpMaxDown))
 		return
-	case !conn.BehindStated():
-		s.restartAdd("The server did not say how much arrived meanwhile, so it was not walked by "+
-			"itself: call hub_catch_up to read it.", "")
-		return
-	case conn.Behind() > autoCatchUpMaxMessages:
-		s.restartAdd(fmt.Sprintf("%d messages arrived meanwhile, more than the %d walked by "+
+	case conn.BehindStated() && conn.Behind() > autoCatchUpMaxMessages:
+		s.restartAct(fmt.Sprintf("%d messages arrived meanwhile, more than the %d walked by "+
 			"themselves: call hub_catch_up when you are ready to read them.",
-			conn.Behind(), autoCatchUpMaxMessages), "")
+			conn.Behind(), autoCatchUpMaxMessages))
 		return
 	}
 	go func() {
 		req := mcp.CallToolRequest{}
-		req.Params.Arguments = map[string]any{"connection": s.name}
+		// Capped, so a server that did not say how much is waiting cannot
+		// make the walk deliver more than the bound either.
+		req.Params.Arguments = map[string]any{"connection": s.name, "limit": autoCatchUpMaxMessages}
 		res, err := s.hub.handleCatchUp(context.Background(), req)
 		switch {
 		case err != nil:
-			s.restartAdd("Catching up on what arrived meanwhile could not start ("+noticeText(err.Error())+
-				") — call hub_catch_up.", "")
+			s.restartAct("Catching up on what arrived meanwhile could not start (" + noticeText(err.Error()) +
+				") — call hub_catch_up.")
 		case res != nil && res.IsError:
-			s.restartAdd("Catching up on what arrived meanwhile could not start ("+noticeText(textOfResult(res))+
-				") — call hub_catch_up.", "")
+			s.restartAct("Catching up on what arrived meanwhile could not start (" + noticeText(textOfResult(res)) +
+				") — call hub_catch_up.")
 		case res != nil && strings.Contains(textOfResult(res), "hub_catch_up(gap: true)"):
-			s.restartAdd("More arrived than is walked one by one, so the catch-up skipped to recent "+
-				"context; hub_catch_up(gap: true) retrieves the rest.", "")
+			s.restartAct("More arrived than is walked one by one, so the catch-up skipped to recent " +
+				"context; hub_catch_up(gap: true) retrieves the rest.")
 		}
 	}()
 }

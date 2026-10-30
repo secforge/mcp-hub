@@ -814,6 +814,23 @@ func (ag *agentSession) scheduleReconnect(prev *hubconn.Agent) {
 	n := len(ag.children)
 	ag.mu.Unlock()
 	ag.markChildrenReconnecting(time.Now().Add(delay))
+	if pushOnly() {
+		// What each conversation's reopening brings is gathered from
+		// here on, and said only where it asks something; see
+		// quietrestart.go.
+		ag.mu.Lock()
+		children := make([]*session, 0, len(ag.children))
+		for _, s := range ag.children {
+			children = append(children, s)
+		}
+		ag.mu.Unlock()
+		for _, s := range children {
+			s.mu.Lock()
+			s.downSince = time.Now()
+			s.mu.Unlock()
+			s.restartArm()
+		}
+	}
 	why := "The connection dropped without warning" + prev.DisconnectNote()
 	if scheduled {
 		why = "The server announced a restart"
@@ -947,6 +964,25 @@ func (ag *agentSession) reconnectOnce(gen int, waited time.Duration) (done bool,
 	}
 	if len(failed) > 0 {
 		text += fmt.Sprintf(" %d could not be opened; hub_list_connections says why.", len(failed))
+	}
+	if pushOnly() {
+		// Each conversation catches up by itself and says only what asks
+		// something of the reader; the agent's own reconnect is pushed
+		// only when a conversation could not be reopened.
+		for _, s := range opened {
+			if c, _ := s.activeConn(); c != nil {
+				s.reconnectedQuietly(c, "")
+			}
+		}
+		quiet := fmt.Sprintf("Agent connection %q reconnected by itself after %s; %d conversation(s) "+
+			"are open again, and each caught up on what arrived meanwhile.", ag.name,
+			waited.Round(time.Second), len(opened))
+		if len(failed) > 0 {
+			ag.alert(quiet + fmt.Sprintf(" %d could not be opened; hub_list_connections says why.", len(failed)))
+		} else {
+			ag.hub.noteAutoReconnect("on agent " + ag.name + ": " + quiet)
+		}
+		return true, nil
 	}
 	ag.alert(text)
 	return true, nil

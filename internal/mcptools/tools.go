@@ -3930,7 +3930,7 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 				// is overdue; see quietrestart.go.
 				continue
 			case "roster":
-				if s.restartAdd(strings.TrimSuffix(strings.TrimPrefix(it.Text, "[hub: "), "]"), "") {
+				if s.restartAdd(strings.TrimSuffix(strings.TrimPrefix(hubconn.FormatEvent(it.Event), "[hub: "), "]"), "") {
 					continue
 				}
 			default:

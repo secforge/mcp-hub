@@ -13,24 +13,25 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
 // An announced restart that comes back in time, with nothing but joins
-// and leaves meanwhile, reaches the reader as ONE notice: no announcement,
-// no drop, no separate reconnect, member list or catch-up summary.
-func TestARestartThatComesBackInTimeIsOneNotice(t *testing.T) {
-	testQuietRestart(t, 2, []string{"other (6ba7b810-9dad-11d1-80b4-00c04fd430c8): left at the server restart → reconnected",
+// and leaves meanwhile, wakes nobody: nothing is pushed, and what it
+// brought waits in front of the next tool result.
+func TestARestartThatComesBackInTimeIsNotPushed(t *testing.T) {
+	testQuietRestart(t, 2, false, []string{"other (6ba7b810-9dad-11d1-80b4-00c04fd430c8): left at the server restart → reconnected",
 		"Nothing else arrived meanwhile", "p2"})
 }
 
 // A backlog past the bound is not walked by itself: the one notice says
 // what is waiting instead.
 func TestARestartWithALargeBacklogLeavesTheCatchUpToTheReader(t *testing.T) {
-	testQuietRestart(t, 150, []string{"150 messages arrived meanwhile", "call hub_catch_up"})
+	testQuietRestart(t, 150, true, []string{"150 messages arrived meanwhile", "call hub_catch_up"})
 }
 
-func testQuietRestart(t *testing.T, behindAfterRestart int, wants []string) {
+func testQuietRestart(t *testing.T, behindAfterRestart int, pushed bool, wants []string) {
 	in := newHarnessInbox(t)
 	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
 	prevQuiet := restartQuiet
@@ -114,15 +115,28 @@ func testQuietRestart(t *testing.T, behindAfterRestart int, wants []string) {
 	before := len(in.got)
 	in.mu.Unlock()
 
-	waitUntil(t, "the notice about the restart", func() bool { return in.has("Reconnected after the server") })
+	var note string
+	waitUntil(t, "the notice about the restart", func() bool {
+		if pushed {
+			return in.has("Reconnected after the server")
+		}
+		note += h.takeAutoReconnectNote()
+		return strings.Contains(note, "Reconnected after the server") && strings.Contains(note, wants[len(wants)-1])
+	})
 	time.Sleep(time.Second)
 	in.mu.Lock()
 	after := append([]string(nil), in.got[before:]...)
 	in.mu.Unlock()
-	if len(after) != 1 {
-		t.Fatalf("a restart reached the reader as %d deliveries, want 1:\n%s", len(after), strings.Join(after, "\n---\n"))
+	want := 0
+	if pushed {
+		want = 1
 	}
-	note := after[0]
+	if len(after) != want {
+		t.Fatalf("a restart reached the reader as %d deliveries, want %d:\n%s", len(after), want, strings.Join(after, "\n---\n"))
+	}
+	if pushed {
+		note = after[0]
+	}
 	for _, want := range append([]string{"Reconnected after the server's announced restart, away"}, wants...) {
 		if !strings.Contains(note, want) {
 			t.Fatalf("the notice lacks %q:\n%s", want, note)
@@ -162,5 +176,14 @@ func TestAnOverdueReconnectSaysTheConnectionIsDown(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if back.downNotified || strings.Contains(h.takeAutoReconnectNote(), "DOWN") {
 		t.Fatal("a reconnect in time still said the connection was down")
+	}
+}
+
+// The member list inside the notice is the list itself, not a delivery
+// with its own number and brackets.
+func TestTheMemberListInTheRestartNoticeIsBare(t *testing.T) {
+	got := strings.TrimSuffix(strings.TrimPrefix(hubconn.FormatEvent(hubconn.Event{Kind: "roster"}), "[hub: "), "]")
+	if strings.HasPrefix(got, "[") || strings.HasSuffix(got, "]") || !strings.Contains(got, "alone") {
+		t.Fatalf("line: %q", got)
 	}
 }

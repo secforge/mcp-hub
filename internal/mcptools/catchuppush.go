@@ -4,6 +4,7 @@ import (
 	"github.com/secforge/harness-transport/deliver"
 
 	"fmt"
+	"strings"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/hubconn"
@@ -307,6 +308,9 @@ func (s *session) pushCatchUpMessage(conn *hubconn.Conn, id connstore.Target, ru
 func (s *session) pushRosterIfDue(conn *hubconn.Conn) {
 	r, ok := conn.RosterDue()
 	if !ok {
+		return
+	}
+	if s.restartAdd(strings.TrimSuffix(strings.TrimPrefix(hubconn.FormatEvent(r), "[hub: "), "]"), "") {
 		return
 	}
 	text := conn.ShapeForPush(r)
