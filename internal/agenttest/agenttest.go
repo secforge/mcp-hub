@@ -68,7 +68,10 @@ type Server struct {
 	refuse map[string]string
 	// RefuseDial makes the next dials fail with this HTTP status.
 	RefuseDial int
-	changed    chan struct{}
+	// PingEvery, when set, pings the agent socket at that interval, as the
+	// real server does.
+	PingEvery time.Duration
+	changed   chan struct{}
 }
 
 // New starts a server holding grants, in that order.
@@ -143,6 +146,19 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.write(ws, wire.AgentJoined{Type: wire.TypeAgentJoined, AgentID: AgentID, Name: "test agent",
 		ServerVersion: wire.ProtocolVersion, Features: agentFeatures})
 	s.write(ws, wire.Assignments{Type: wire.TypeAssignments, Items: items})
+	if every := s.PingEvery; every > 0 {
+		go func() {
+			for {
+				time.Sleep(every)
+				s.writeMu.Lock()
+				err := ws.WriteControl(websocket.PingMessage, []byte("p"), time.Now().Add(time.Second))
+				s.writeMu.Unlock()
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
 	for {
 		_, raw, err := ws.ReadMessage()
 		if err != nil {

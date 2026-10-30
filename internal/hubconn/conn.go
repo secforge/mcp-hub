@@ -342,8 +342,10 @@ type transport interface {
 }
 
 type Conn struct {
-	ws     transport
-	peerID string
+	// endReason is why reading ended, set once when it did.
+	endReason string
+	ws        transport
+	peerID    string
 	// access and historyFrom describe a conversation carried by an agent
 	// connection (see wire.Joined.Access); empty and nil everywhere else.
 	access        string
@@ -798,6 +800,14 @@ var relayCloseNotes = map[int]string{
 // other close code the server sent that isn't one of the relay-specific
 // ones (e.g. 1006 for an abnormal closure the OS/network layer detected).
 // Empty only when the disconnect carried no signal at all beyond "gone".
+// EndReason says why the connection's reading ended, as the read that
+// noticed reported it; empty while it is open.
+func (c *Conn) EndReason() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.endReason
+}
+
 func (c *Conn) DisconnectNote() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2456,6 +2466,9 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			c.mu.Lock()
 			c.closed = true
+			c.endReason = fmt.Sprintf("%v; last frame %q %s before", err, c.lastFrameKind,
+				time.Since(c.lastFrameAt).Round(time.Second))
+			debugf("readLoop: connection %q ended: %s", c.name, c.endReason)
 			if ce, ok := err.(*websocket.CloseError); ok {
 				c.closeCode = ce.Code
 			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -4496,4 +4509,12 @@ func SetRosterLeaveHoldForTesting(d time.Duration) func() {
 	prev := rosterLeaveHold
 	rosterLeaveHold = d
 	return func() { rosterLeaveHold = prev }
+}
+
+// SetPongWaitForTesting sets how long a connection waits without a frame
+// or ping before it counts as dead, and returns a function restoring it.
+func SetPongWaitForTesting(d time.Duration) func() {
+	prev := pongWait
+	pongWait = d
+	return func() { pongWait = prev }
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -749,8 +750,31 @@ func (v *agentConv) SetPingHandler(h func(string) error) {
 // delivering it; the grant stays.
 func (v *agentConv) Close() error {
 	v.agent.forget(v)
-	v.finish(&websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "client disconnect"}, true)
+	// Who closed it is part of the reason, so an unexpected close can be
+	// traced to the code that did it.
+	v.finish(&websocket.CloseError{Code: websocket.CloseNormalClosure,
+		Text: "client disconnect by " + callers(2, 6)}, true)
 	return nil
+}
+
+// callers names the functions that called into this one, innermost
+// first, skipping skip frames.
+func callers(skip, n int) string {
+	pcs := make([]uintptr, n)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(skip+1, pcs)])
+	var names []string
+	for {
+		f, more := frames.Next()
+		name := f.Function
+		if i := strings.LastIndex(name, "/"); i >= 0 {
+			name = name[i+1:]
+		}
+		names = append(names, name)
+		if !more {
+			break
+		}
+	}
+	return strings.Join(names, " < ")
 }
 
 // searchWait bounds how long a search waits for its answer.

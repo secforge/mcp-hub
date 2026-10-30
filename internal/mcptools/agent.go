@@ -560,7 +560,7 @@ func (ag *agentSession) childEnded(s *session, conn *hubconn.Conn) {
 		a := ag.agent
 		ag.mu.Unlock()
 		if a != nil && a.Connected() {
-			go ag.retryReopen(a, s, 1)
+			go ag.retryReopen(a, s, 1, conn.EndReason())
 		}
 	}
 }
@@ -666,7 +666,7 @@ func (ag *agentSession) handleEvent(a *hubconn.Agent, ev hubconn.AgentEvent) {
 		// flux (a hub session being deleted closes with 1001 until its
 		// revoked arrives), and a "revoked" in the meantime ends the
 		// retrying.
-		go ag.retryReopen(a, s, 1)
+		go ag.retryReopen(a, s, 1, closeText(ev.Code, ev.Reason))
 	case "revoked":
 		ag.mu.Lock()
 		s := ag.children[ev.Conv]
@@ -1338,13 +1338,24 @@ const maxReopenAttempts = 6
 // retryReopen reopens a conversation the server closed without ending its
 // grant, backing off between attempts, until it is open, its grant ends,
 // or the attempts run out.
-func (ag *agentSession) retryReopen(a *hubconn.Agent, s *session, attempt int) {
+//
+// why is what ended it, said in the notice so an unexpected close can be
+// traced.
+func (ag *agentSession) retryReopen(a *hubconn.Agent, s *session, attempt int, why string) {
 	delay := reconnectBackoff(attempt)
 	s.mu.Lock()
 	if s.conn == nil {
 		s.reconnectAt = time.Now().Add(delay)
 	}
+	if attempt == 1 {
+		s.downSince = time.Now()
+	}
 	s.mu.Unlock()
+	if attempt == 1 && pushOnly() {
+		// What the reopen brings is gathered from here on, as after a
+		// restart; see quietrestart.go.
+		s.restartArm()
+	}
 	time.Sleep(delay)
 	ag.opMu.Lock()
 	defer ag.opMu.Unlock()
@@ -1362,9 +1373,16 @@ func (ag *agentSession) retryReopen(a *hubconn.Agent, s *session, attempt int) {
 	}
 	_, err := ag.openChild(a, it, nil, nil, nil)
 	switch {
+	case err == nil && pushOnly():
+		// Not news: it catches up by itself and says only what asks
+		// something of the reader.
+		if c, _ := s.activeConn(); c != nil {
+			s.reconnectedQuietly(c, "")
+			s.restartAdd("Closed ("+noticeText(why)+") and reopened.", "")
+		}
 	case err == nil:
-		ag.alert(fmt.Sprintf("Conversation %q is open again after it briefly closed. "+
-			"Call hub_catch_up(connection: %q) for anything said meanwhile.", s.name, s.name))
+		ag.alert(fmt.Sprintf("Conversation %q is open again after it briefly closed (%s). "+
+			"Call hub_catch_up(connection: %q) for anything said meanwhile.", s.name, noticeText(why), s.name))
 	case attempt >= maxReopenAttempts:
 		ag.mu.Lock()
 		if ag.children[s.conv] == s {
@@ -1375,7 +1393,7 @@ func (ag *agentSession) retryReopen(a *hubconn.Agent, s *session, attempt int) {
 			"it is still shared and is opened again when the agent connection next reconnects",
 			attempt, err), false)
 	default:
-		go ag.retryReopen(a, s, attempt+1)
+		go ag.retryReopen(a, s, attempt+1, why)
 	}
 }
 
