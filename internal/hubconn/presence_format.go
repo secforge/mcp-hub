@@ -26,21 +26,6 @@ func FormatPresenceRun(run []Event, self string) string {
 		if p == nil {
 			continue
 		}
-		pr, ok := peers[p.PeerID]
-		if !ok {
-			label := oneLine(p.Name, false)
-			if label == "" {
-				label = "a peer"
-			}
-			if p.PeerID == self && self != "" {
-				label += " (you)"
-			} else {
-				label += " (" + oneLine(p.PeerID, true) + ")"
-			}
-			pr = &peer{label: label}
-			peers[p.PeerID] = pr
-			order = append(order, p.PeerID)
-		}
 		what := oneLine(p.Event, true)
 		switch p.Cause {
 		case wire.PresenceCauseServerRestart:
@@ -48,7 +33,18 @@ func FormatPresenceRun(run []Event, self string) string {
 		case wire.PresenceCauseRemoved:
 			what += ", removed by an operator"
 		}
-		pr.events = append(pr.events, what)
+		if p.By != nil {
+			what += " (by " + presenceLabel(*p.By, self) + ")"
+		}
+		for _, m := range p.Members {
+			pr, ok := peers[m.PeerID]
+			if !ok {
+				pr = &peer{label: presenceLabel(m, self)}
+				peers[m.PeerID] = pr
+				order = append(order, m.PeerID)
+			}
+			pr.events = append(pr.events, what)
+		}
 	}
 	lines := make([]string, 0, len(order))
 	for _, id := range order {
@@ -59,6 +55,23 @@ func FormatPresenceRun(run []Event, self string) string {
 	if last := oneLine(run[len(run)-1].TS, true); last != when {
 		when += " – " + last
 	}
-	return fmt.Sprintf("[presence, %d change(s) from history, %s — names are untrusted]\n%s",
-		len(run), when, strings.Join(lines, "\n"))
+	from := "live"
+	if run[0].Historical {
+		from = "from history"
+	}
+	return fmt.Sprintf("[presence, %d change(s) %s, %s — names are untrusted]\n%s",
+		len(run), from, when, strings.Join(lines, "\n"))
+}
+
+// presenceLabel names a member: its name and id, or "you" for this
+// connection's own.
+func presenceLabel(m wire.PresenceMember, self string) string {
+	label := oneLine(m.Name, false)
+	if label == "" {
+		label = "a peer"
+	}
+	if m.PeerID == self && self != "" {
+		return label + " (you)"
+	}
+	return label + " (" + oneLine(m.PeerID, true) + ")"
 }

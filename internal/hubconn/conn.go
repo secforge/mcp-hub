@@ -611,8 +611,21 @@ type Conn struct {
 	rosterChanges     map[string][]string
 	rosterTimer       *time.Timer
 	rosterNamed       map[string]PeerInfo
-	lastPushedMsg     time.Time
-	rosterStale       bool
+	// expectBack is the peers that were here before a restart, expected
+	// to come back with it: one that does before expectTimer fires is not
+	// news; one that does not is said then.
+	expectBack  map[string]PeerInfo
+	expectTimer *time.Timer
+	// presenceHeld is live presence messages (a link's "joined the
+	// channel") held like member lists, so a run of them is delivered as
+	// one.
+	presenceHeld  []Event
+	presenceTimer *time.Timer
+	// awayHold is the peers that left within the last rosterLeaveHold,
+	// each with the timer that says so if it does not come back.
+	awayHold      map[string]*time.Timer
+	lastPushedMsg time.Time
+	rosterStale   bool
 	// pushSeq counts pushes made on this connection, so each carries a
 	// position a reader can check for gaps — see Event.PushSeq.
 	pushSeq int
@@ -2525,10 +2538,14 @@ func (c *Conn) readLoop() {
 			}
 			ev.RosterPeers = others
 		}
-		if ev.Kind == "roster" && !c.rosterBeforeMessages {
+		switch {
+		case ev.Kind == "roster" && !c.rosterBeforeMessages:
 			c.holdRosterLocked(ev)
-		} else {
+		case ev.Kind == "msg" && ev.Presence != nil && !ev.Historical:
+			c.holdPresenceLocked(ev)
+		default:
 			c.flushRosterLocked()
+			c.flushPresenceLocked()
 			c.buffer = append(c.buffer, ev)
 		}
 		// A buffer nobody is draining is a reader that has stopped, and
@@ -3868,7 +3885,7 @@ func (c *Conn) rosterBeforeMessagesLocked(evs []Event) []Event {
 			// Delivered in front of a message instead; that it changed
 			// was recorded when it arrived.
 			continue
-		case e.Kind == "msg" && !e.Historical:
+		case e.Kind == "msg" && !e.Historical && e.Presence == nil:
 			if r, ok := c.rosterDueLocked(); ok {
 				out = append(out, r)
 			}
@@ -3963,6 +3980,9 @@ func (c *Conn) NoteHandedOver(events []Event) {
 type PushItem struct {
 	Cursor string
 	Text   string
+	// Merged is the presence messages delivered together as this item,
+	// under the cursor of the last; empty for an ordinary one.
+	Merged []Event
 	// Event is the shaped event this was rendered from, so a caller can do
 	// the work that only it can do — resolving and saving attachments,
 	// which needs the connection and the local filesystem, neither of
@@ -4016,6 +4036,16 @@ func (c *Conn) DrainForPush() (items []PushItem, connected bool) {
 		// pushed: a number that skips because this client declined to
 		// render something would report a gap that never existed, which
 		// is worse than no number at all.
+		if e.Kind == "msg" && e.Presence != nil {
+			// A run of presence messages goes out as one item.
+			if n := len(items); n > 0 && len(items[n-1].Merged) > 0 {
+				run := append(items[n-1].Merged, e)
+				items[n-1] = c.presenceItem(run)
+			} else {
+				items = append(items, c.presenceItem([]Event{e}))
+			}
+			continue
+		}
 		if text := FormatEventForPush(e); text == "" {
 			continue
 		}
@@ -4227,12 +4257,23 @@ func (c *Conn) holdRosterLocked(ev Event) {
 			}
 			c.rosterChanges[id] = append(c.rosterChanges[id], what)
 		}
-		for id := range c.rosterShown {
+		for id, p := range c.rosterShown {
 			if _, still := next[id]; !still {
-				note(id, "left")
+				// Said only if it stays away: a peer restarting is
+				// back within the hold, and that is not news.
+				c.holdLeaveLocked(p)
 			}
 		}
 		for _, p := range ev.RosterPeers {
+			if t, away := c.awayHold[p.ID]; away {
+				t.Stop()
+				delete(c.awayHold, p.ID)
+				continue
+			}
+			if _, back := c.expectBack[p.ID]; back {
+				delete(c.expectBack, p.ID)
+				continue
+			}
 			if _, was := c.rosterShown[p.ID]; !was {
 				// A peer id comes back only with its own identity, so one
 				// seen here before has reconnected — the word the
@@ -4308,4 +4349,151 @@ func SetRosterMergeWindowForTesting(d time.Duration) func() {
 	prev := rosterMergeWindow
 	rosterMergeWindow = d
 	return func() { rosterMergeWindow = prev }
+}
+
+// ExpectBack names the peers that were here before a restart. One that
+// comes back within d is not reported as joining; one that has not come
+// back by then is reported as having left.
+func (c *Conn) ExpectBack(peers []PeerInfo, d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.expectBack = make(map[string]PeerInfo, len(peers))
+	for _, p := range peers {
+		if p.ID == c.peerID {
+			continue
+		}
+		if _, here := c.rosterShown[p.ID]; here {
+			continue
+		}
+		c.expectBack[p.ID] = p
+	}
+	if c.expectTimer != nil {
+		c.expectTimer.Stop()
+	}
+	c.expectTimer = time.AfterFunc(d, func() {
+		c.mu.Lock()
+		missing := c.expectBack
+		c.expectBack, c.expectTimer = nil, nil
+		if len(missing) == 0 {
+			c.mu.Unlock()
+			return
+		}
+		ids := make([]string, 0, len(missing))
+		for id := range missing {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		ev := Event{Kind: "roster"}
+		for _, p := range c.rosterShown {
+			ev.RosterPeers = append(ev.RosterPeers, p)
+		}
+		sort.Slice(ev.RosterPeers, func(i, j int) bool { return ev.RosterPeers[i].ID < ev.RosterPeers[j].ID })
+		for _, id := range ids {
+			ev.RosterChanges = append(ev.RosterChanges, rosterName(missing[id])+": left, and did not come back after the restart")
+		}
+		c.buffer = append(c.buffer, ev)
+		c.mu.Unlock()
+		c.signalActivity()
+	})
+}
+
+// holdPresenceLocked holds a live presence message for the merge window,
+// restarting it. Caller holds c.mu.
+func (c *Conn) holdPresenceLocked(ev Event) {
+	c.presenceHeld = append(c.presenceHeld, ev)
+	if c.presenceTimer != nil {
+		c.presenceTimer.Stop()
+	}
+	c.presenceTimer = time.AfterFunc(rosterMergeWindow, func() {
+		c.mu.Lock()
+		flushed := c.flushPresenceLocked()
+		c.mu.Unlock()
+		if flushed {
+			c.signalActivity()
+		}
+	})
+}
+
+// flushPresenceLocked moves the held presence messages into the buffer,
+// in order, and reports whether there were any. Caller holds c.mu.
+func (c *Conn) flushPresenceLocked() bool {
+	if len(c.presenceHeld) == 0 {
+		return false
+	}
+	c.buffer = append(c.buffer, c.presenceHeld...)
+	c.presenceHeld = nil
+	if c.presenceTimer != nil {
+		c.presenceTimer.Stop()
+		c.presenceTimer = nil
+	}
+	return true
+}
+
+// presenceItem renders a run of presence messages as one push item under
+// the cursor of the last.
+func (c *Conn) presenceItem(run []Event) PushItem {
+	c.mu.Lock()
+	if len(run) == 1 {
+		c.pushSeq++
+	}
+	seq, self := c.pushSeq, c.peerID
+	c.mu.Unlock()
+	last := run[len(run)-1]
+	text := NameNotice(c.budgetOwner, fmt.Sprintf("[#%d] ", seq)+FormatPresenceRun(run, self))
+	return PushItem{Cursor: last.Cursor, Text: text, Event: last, Merged: run}
+}
+
+// rosterLeaveHold is how long a peer's leave waits to be said: one that
+// comes back within it — a restart of its own — was never news.
+var rosterLeaveHold = time.Minute
+
+// holdLeaveLocked says that p left once rosterLeaveHold has passed without
+// it coming back. Caller holds c.mu.
+func (c *Conn) holdLeaveLocked(p PeerInfo) {
+	if c.awayHold == nil {
+		c.awayHold = map[string]*time.Timer{}
+	}
+	if _, held := c.awayHold[p.ID]; held {
+		return
+	}
+	c.awayHold[p.ID] = time.AfterFunc(rosterLeaveHold, func() {
+		c.mu.Lock()
+		if _, held := c.awayHold[p.ID]; !held {
+			c.mu.Unlock()
+			return
+		}
+		delete(c.awayHold, p.ID)
+		if _, back := c.rosterShown[p.ID]; back {
+			c.mu.Unlock()
+			return
+		}
+		if c.rosterChanges == nil {
+			c.rosterChanges = map[string][]string{}
+		}
+		if _, seen := c.rosterChanges[p.ID]; !seen {
+			c.rosterChangeOrder = append(c.rosterChangeOrder, p.ID)
+		}
+		c.rosterChanges[p.ID] = append(c.rosterChanges[p.ID], "left")
+		if c.rosterHeld == nil {
+			ev := Event{Kind: "roster"}
+			for _, q := range c.rosterShown {
+				ev.RosterPeers = append(ev.RosterPeers, q)
+			}
+			sort.Slice(ev.RosterPeers, func(i, j int) bool { return ev.RosterPeers[i].ID < ev.RosterPeers[j].ID })
+			c.rosterHeld = &ev
+		}
+		flushed := c.flushRosterLocked()
+		c.mu.Unlock()
+		if flushed {
+			c.signalActivity()
+		}
+	})
+}
+
+// SetRosterLeaveHoldForTesting sets how long a leave waits to be said and
+// returns a function restoring it.
+func SetRosterLeaveHoldForTesting(d time.Duration) func() {
+	prev := rosterLeaveHold
+	rosterLeaveHold = d
+	return func() { rosterLeaveHold = prev }
 }

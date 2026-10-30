@@ -168,6 +168,11 @@ type session struct {
 	downNotified bool
 	// downSince is when the connection dropped, for how long it was away.
 	downSince time.Time
+	// restartPeers is who was here when the connection dropped, and
+	// restartDelay the reconnect the server announced: peers coming back
+	// within the restart are not news.
+	restartPeers []hubconn.PeerInfo
+	restartDelay time.Duration
 
 	// attachMu guards attachDir/attachSeq — the local temp directory
 	// received attachments are saved into and a counter for unique

@@ -8,12 +8,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/harness"
+	"github.com/secforge/mcp-hub/internal/hubconn"
 	"github.com/secforge/mcp-hub/internal/wire"
 )
 
@@ -26,7 +28,7 @@ func TestARunOfPresenceEntriesIsDeliveredAsOne(t *testing.T) {
 	const self = "550e8400-e29b-41d4-a716-446655440000"
 	const other = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 	presence := func(event, peer, name, cause string) *wire.Presence {
-		return &wire.Presence{Event: event, PeerID: peer, Name: name, Cause: cause}
+		return &wire.Presence{Event: event, Members: []wire.PresenceMember{{PeerID: peer, Name: name}}, Cause: cause}
 	}
 	history := []wire.Msg{
 		{PeerID: other, Text: "before"},
@@ -102,5 +104,64 @@ func TestARunOfPresenceEntriesIsDeliveredAsOne(t *testing.T) {
 	}
 	if strings.Contains(run, "before") || strings.Contains(run, "after") {
 		t.Fatalf("a real message went into the run:\n%s", run)
+	}
+}
+
+// A link's live "joined the channel" messages are merged into one push,
+// and a real message after them is pushed as itself.
+func TestLiveJoinMessagesArePushedAsOne(t *testing.T) {
+	in := newHarnessInbox(t)
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	defer hubconn.SetRosterMergeWindowForTesting(300 * time.Millisecond)()
+	const self = "550e8400-e29b-41d4-a716-446655440000"
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		raw, _ := json.Marshal(wire.Joined{Type: wire.TypeJoined, PeerID: self,
+			ServerVersion: wire.ProtocolVersion, Features: teamsTestFeatures(), ConversationKind: "group"})
+		conn.WriteMessage(websocket.TextMessage, raw)
+		time.Sleep(200 * time.Millisecond)
+		for i, name := range []string{"Leon", "Mikhail"} {
+			id := fmt.Sprintf("6ba7b810-9dad-11d1-80b4-00c04fd430c%d", i)
+			conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: id, Cursor: fmt.Sprintf("j%d", i),
+				Text: name + " joined the channel", TS: "2026-10-30T16:26:14Z",
+				Presence: &wire.Presence{Event: "joined", Members: []wire.PresenceMember{{PeerID: id, Name: name}}}})
+			time.Sleep(50 * time.Millisecond)
+		}
+		time.Sleep(600 * time.Millisecond)
+		conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c9",
+			Cursor: "m1", Text: "a real question", TS: "2026-10-30T16:27:00Z"})
+		time.Sleep(2 * time.Second)
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#live-presence"
+	h := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"as": testConn, "link": link, "name": "t"}
+	if res, err := h.handleConnect(context.Background(), req); err != nil || res.IsError {
+		t.Fatalf("connect: %v %s", err, textOf(res))
+	}
+	defer h.handleDisconnect(context.Background(), connReqFor(testConn))
+	waitUntil(t, "the real message", func() bool { return in.has("a real question") })
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	var joins, real int
+	for _, g := range in.got {
+		if strings.Contains(g, "joined") {
+			joins++
+			if !strings.Contains(g, "2 change(s) live") || !strings.Contains(g, "Leon") || !strings.Contains(g, "Mikhail") {
+				t.Fatalf("the joins were not merged: %s", g)
+			}
+		}
+		if strings.Contains(g, "a real question") {
+			real++
+		}
+	}
+	if joins != 1 || real != 1 {
+		t.Fatalf("%d join pushes and %d message pushes, want 1 and 1:\n%s", joins, real, strings.Join(in.got, "\n---\n"))
 	}
 }

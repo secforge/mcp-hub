@@ -1546,8 +1546,9 @@ func BehindCount(n int) *int { return &n }
 // FeatureTodo declares a todo list (§2.8b).
 const FeatureTodo = "todo"
 
-// FeaturePresenceEntries is declared where history entries for joins,
-// reconnects and leaves carry Msg.Presence.
+// FeaturePresenceEntries is declared where messages recording joins,
+// reconnects and leaves carry Msg.Presence: a hub session's own entries,
+// and a link's platform messages for members joining or leaving.
 const FeaturePresenceEntries = "presenceEntries"
 
 // Presence values of Presence.Event and Presence.Cause.
@@ -1560,13 +1561,21 @@ const (
 	PresenceCauseRemoved       = "removed"
 )
 
-// Presence is what a presence entry records: who, what, and for a leave
-// that was not the peer's own, why.
+// Presence is what a presence entry records: what happened, to whom, who
+// did it where that was someone else (a Teams member adding others), and
+// for a hub leave that was not the peer's own, why.
 type Presence struct {
-	Event  string `json:"event,case:strict"`
+	Event   string           `json:"event,case:strict"`
+	Members []PresenceMember `json:"members,case:strict"`
+	By      *PresenceMember  `json:"by,omitempty,case:strict"`
+	Cause   string           `json:"cause,omitempty,case:strict"`
+}
+
+// PresenceMember is one peer a presence entry names, with the name it had
+// then.
+type PresenceMember struct {
 	PeerID string `json:"peerId,case:strict"`
 	Name   string `json:"name,omitempty,case:strict"`
-	Cause  string `json:"cause,omitempty,case:strict"`
 }
 
 // FeatureFiles is declared where one-time files may be uploaded: a session

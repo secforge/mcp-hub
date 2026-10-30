@@ -41,8 +41,8 @@ func testQuietRestart(t *testing.T, behindAfterRestart int, pushed bool, wants [
 	const self = "550e8400-e29b-41d4-a716-446655440000"
 	const other = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 	history := []wire.Msg{
-		{PeerID: other, Text: "other left", Presence: &wire.Presence{Event: "left", PeerID: other, Name: "other", Cause: "serverRestart"}},
-		{PeerID: other, Text: "other reconnected", Presence: &wire.Presence{Event: "reconnected", PeerID: other, Name: "other"}},
+		{PeerID: other, Text: "other left", Presence: &wire.Presence{Event: "left", Members: []wire.PresenceMember{{PeerID: other, Name: "other"}}, Cause: "serverRestart"}},
+		{PeerID: other, Text: "other reconnected", Presence: &wire.Presence{Event: "reconnected", Members: []wire.PresenceMember{{PeerID: other, Name: "other"}}}},
 	}
 	var mu sync.Mutex
 	joins := 0

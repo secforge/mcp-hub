@@ -224,7 +224,13 @@ func (s *session) reconnectedQuietly(conn *hubconn.Conn, because string) {
 	}
 	s.downNotified = false
 	away := time.Since(s.downSince)
+	peers, delay := s.restartPeers, s.restartDelay
+	s.restartPeers = nil
 	s.mu.Unlock()
+	if len(peers) > 0 {
+		// The others restart too, each a little later than this one.
+		conn.ExpectBack(peers, downHold(delay))
+	}
 	lead := ""
 	if because != "" {
 		lead = "Reconnected " + because + ", away " + away.Round(time.Second).String() + "."

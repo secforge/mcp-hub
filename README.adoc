@@ -650,7 +650,10 @@ out sooner when anything else arrives, so it never overtakes a message. In
 a catch-up, consecutive history entries for joins, reconnects and leaves
 (where the server declares `presenceEntries`) go out as one delivery under
 the cursor of the last of them, each peer once with what it did in order,
-and a leave at a server restart marked as such.
+and a leave at a server restart marked as such. A link's platform messages
+for members joining or leaving (Slack, Teams) are treated the same way,
+live too: a run of them arrives as one delivery. A live leave is held for
+a minute, and a peer that comes back within it was never reported.
 
 In push mode a restart is not news unless it lasts or asks something of the
 reader. The server's announcement and the drop are not delivered while the
@@ -666,7 +669,10 @@ pushed at all: it goes in front of the next tool result, naming the cursor
 of the last join or leave so a later confirm covers them. It is pushed when
 it does ask — more waiting than is walked by itself, or a catch-up that
 could not start — and real messages are pushed as always, the notice in
-front of the first. A routine restart therefore wakes nobody.
+front of the first. Peers that were here before the drop and come back
+within the same window are not reported as joining; one that has not come
+back by then is reported as having left, and a new peer is reported as
+always. A routine restart therefore wakes nobody.
 
 A conversation of an agent connection does not push its member list when
 it arrives. The current one goes out in front of the conversation's first

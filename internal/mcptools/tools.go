@@ -1133,8 +1133,10 @@ func (s *session) scheduleReconnect(conn *hubconn.Conn) {
 			"lost: your reading position only moves on a confirm, so the server still holds "+
 			"anything sent meanwhile. hub_disconnect stops the retrying.",
 			s.name, downHold(delay).Round(time.Second), why)
+		peers := conn.Peers()
 		s.mu.Lock()
 		s.downSince = time.Now()
+		s.restartPeers, s.restartDelay = peers, delay
 		s.mu.Unlock()
 		s.downLater(delay, gen, down)
 		s.restartArm()
@@ -3933,6 +3935,16 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 				if s.restartAdd(strings.TrimSuffix(strings.TrimPrefix(hubconn.FormatEvent(it.Event), "[hub: "), "]"), "") {
 					continue
 				}
+			case "msg":
+				if len(it.Merged) > 0 &&
+					s.restartAdd(hubconn.FormatPresenceRun(it.Merged, conn.PeerID()), it.Cursor) {
+					for _, ev := range it.Merged {
+						s.noteDelivered(ev.Cursor)
+						s.noteLive(ev.Cursor)
+					}
+					continue
+				}
+				s.restartFlush()
 			default:
 				s.restartFlush()
 			}
@@ -3947,7 +3959,7 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		// that wants to act on a burst knows to wait for the rest of it
 		// rather than treating each arrival as the whole of the news.
 		more := i < len(items)-1
-		cursor, text := it.Cursor, it.Text
+		cursor, text, merged := it.Cursor, it.Text, it.Merged
 		// Sent now, or queued behind whatever already waits — one queue
 		// for every connection and kind, see hubconn.Budget.Deliver.
 		budget.Deliver(hubconn.Delivery{
@@ -3965,6 +3977,10 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 				// pushed live, and must not skip what failed.
 				s.noteDelivered(cursor)
 				s.noteLive(cursor)
+				for _, ev := range merged {
+					s.noteDelivered(ev.Cursor)
+					s.noteLive(ev.Cursor)
+				}
 			},
 			Pause: func(paused string) { _, _ = s.pusher.Push("", paused, false) },
 		})

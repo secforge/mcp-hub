@@ -1141,7 +1141,13 @@ conversation's writes are refused in the client before anything is sent.
 
 ### 2.12a Presence entries (feature `presenceEntries`)
 
-Where declared, a history `msg` recording a peer joining, reconnecting or leaving carries `presence: {event: "joined" | "reconnected" | "left", peerId, name?, cause?}`. `name` is the name at the time of the entry. `cause` is `"serverRestart"` for a leave written when the server restarted, and `"removed"` for a guest an operator removed; it is absent otherwise, and on entries written before the server stored it. The text says the same in words, for clients that do not read the field. These entries are history only: live, membership arrives as `roster` (§2.3). The reference client merges a run of consecutive presence entries in a catch-up into one delivery under the last entry's cursor.
+Where declared, a message recording peers joining, reconnecting or leaving carries `presence: {event: "joined" | "reconnected" | "left", members: [{peerId, name?}], by?: {peerId, name?}, cause?}`. The text says the same in words.
+
+- **Hub sessions:** their own entries, one member each, in history only; live, membership arrives as `roster` (§2.3). `cause` is `"serverRestart"` for a leave written when the server restarted and `"removed"` for a guest an operator removed; `reconnected` and `cause` occur only here.
+- **Links:** the platform's own membership messages, live and in history — Slack's channel joins and leaves, Teams members added, joined, removed or left. One Teams event can name several members, and `by` names who acted when that was someone else.
+- **`name`** is the name at the time of the entry.
+
+The reference client delivers a run of consecutive presence entries as one delivery under the last entry's cursor, in a catch-up and live (held for 5 seconds); it holds a live leave for a minute and says nothing if the peer is back by then.
 
 ### 2.13 One-time files (feature `files`)
 
