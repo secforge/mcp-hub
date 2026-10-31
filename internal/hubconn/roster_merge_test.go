@@ -34,7 +34,7 @@ func TestMemberListsInsideTheWindowAreMergedWithWhatChanged(t *testing.T) {
 		t.Fatal("the held list was not delivered")
 	}
 	got := FormatEvent(c.buffer[1])
-	for _, want := range []string{"membership changed", "xavier (x): joined", "yvonne (y): joined", "Now 2 here"} {
+	for _, want := range []string{"membership changed", "xavier (x): joined", "yvonne (y): joined", "Now 3 here"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("lacks %q: %s", want, got)
 		}
@@ -111,5 +111,27 @@ func TestALeaveIsSaidOnlyIfThePeerStaysAway(t *testing.T) {
 	got := FormatEvent(c.buffer[n])
 	if !strings.Contains(got, "bravo (b): left") || strings.Contains(got, "alpha (a):") {
 		t.Fatalf("change: %s", got)
+	}
+}
+
+// While a leave is held, the list in a notice still counts that peer: the
+// notice has not said it left.
+func TestAPeerWhoseLeaveIsHeldIsStillListed(t *testing.T) {
+	defer SetRosterMergeWindowForTesting(time.Hour)()
+	defer SetRosterLeaveHoldForTesting(time.Hour)()
+	a := PeerInfo{ID: "a", Name: "alpha"}
+	b := PeerInfo{ID: "b", Name: "bravo"}
+	c := &Conn{activity: make(chan struct{}, 1)}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.holdRosterLocked(Event{Kind: "roster", RosterPeers: []PeerInfo{a}})
+	c.holdRosterLocked(Event{Kind: "roster", RosterPeers: []PeerInfo{}})
+	c.holdRosterLocked(Event{Kind: "roster", RosterPeers: []PeerInfo{b}})
+	if !c.flushRosterLocked() {
+		t.Fatal("the join was not delivered")
+	}
+	got := FormatEvent(c.buffer[len(c.buffer)-1])
+	if !strings.Contains(got, "bravo (b): joined") || !strings.Contains(got, "Now 2 here") || !strings.Contains(got, "alpha (a)") {
+		t.Fatalf("notice: %s", got)
 	}
 }

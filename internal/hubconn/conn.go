@@ -4343,6 +4343,18 @@ func (c *Conn) flushRosterLocked() bool {
 		return false
 	}
 	ev := *c.rosterHeld
+	// A peer whose leave is still held is still counted here: the
+	// notice has not said it left, so the list may not say so either.
+	if len(c.awayHold) > 0 {
+		peers := append([]PeerInfo(nil), ev.RosterPeers...)
+		for id := range c.awayHold {
+			if p, ok := c.rosterNamed[id]; ok {
+				peers = append(peers, p)
+			}
+		}
+		sort.Slice(peers, func(i, j int) bool { return peers[i].ID < peers[j].ID })
+		ev.RosterPeers = peers
+	}
 	for _, id := range c.rosterChangeOrder {
 		ev.RosterChanges = append(ev.RosterChanges,
 			rosterName(c.rosterNamed[id])+": "+strings.Join(c.rosterChanges[id], " → "))
