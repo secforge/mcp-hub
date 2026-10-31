@@ -176,7 +176,7 @@ func (s *session) restartFlush() {
 	n.mu.Unlock()
 	if !act {
 		if cursor != "" {
-			body += "\nThese joins and leaves end at cursor " + cursor + "; confirm it with hub_confirm " +
+			body += "\nThese end at cursor " + cursor + "; confirm it with hub_confirm " +
 				"along with whatever you confirm next."
 		}
 		s.note(body)

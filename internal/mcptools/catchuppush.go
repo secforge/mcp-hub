@@ -4,6 +4,7 @@ import (
 	"github.com/secforge/harness-transport/deliver"
 
 	"fmt"
+	"strings"
 
 	"github.com/secforge/mcp-hub/internal/connstore"
 	"github.com/secforge/mcp-hub/internal/hubconn"
@@ -82,9 +83,9 @@ type catchUpResult struct {
 	// run of presence entries is several messages in one delivery.
 	Delivered  int
 	Deliveries int
-	// Presence counts joins and leaves folded into the notice about an
+	// Folded counts joins, leaves and own messages folded into the notice about an
 	// automatic reconnect rather than delivered on their own.
-	Presence  int
+	Folded    int
 	Bytes     int
 	CaughtUp  bool
 	StoppedBy string
@@ -103,7 +104,7 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 		s.agent.announcedBefore(s)
 	}
 	res := s.walkCatchUpPush(conn, id, anchor, want)
-	if res.CaughtUp && res.Err == nil && res.Delivered == res.Presence &&
+	if res.CaughtUp && res.Err == nil && res.Delivered == res.Folded &&
 		s.restartAdd(caughtUpQuietly(res), "") {
 		return
 	}
@@ -111,10 +112,20 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 	s.pushCatchUpSummary(res)
 }
 
+// ownMessageLine is one of this connection's own messages, as a line in
+// the notice about an automatic reconnect: when, and how it began.
+func ownMessageLine(ev hubconn.Event) string {
+	text := []rune(strings.Join(strings.Fields(ev.Text), " "))
+	if len(text) > 80 {
+		text = append(text[:80], '…')
+	}
+	return "Your own message at " + noticeText(ev.TS) + ": " + noticeText(string(text))
+}
+
 // caughtUpQuietly is the catch-up's line in the notice about an automatic
 // reconnect, when nothing but joins and leaves arrived meanwhile.
 func caughtUpQuietly(res catchUpResult) string {
-	if res.Presence == 0 {
+	if res.Folded == 0 {
 		return "Nothing arrived meanwhile."
 	}
 	return "Nothing else arrived meanwhile; confirm the cursor below to mark these read."
@@ -160,11 +171,16 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 		// Joins and leaves after an automatic reconnect go into the one
 		// notice about it rather than out on their own; a real message
 		// sends that notice first. See quietrestart.go.
-		if run[0].Presence != nil && s.restartAdd(heldText, run[len(run)-1].Cursor) {
+		// So do this connection's own messages: the reader wrote them.
+		line := heldText
+		if run[0].Presence == nil && run[0].Own {
+			line = ownMessageLine(run[0])
+		}
+		if (run[0].Presence != nil || run[0].Own) && s.restartAdd(line, run[len(run)-1].Cursor) {
 			conn.NoteHandedOver(run)
 			s.recordHandedOver(run)
 			res.Delivered += len(run)
-			res.Presence += len(run)
+			res.Folded += len(run)
 			return
 		}
 		s.restartFlush()

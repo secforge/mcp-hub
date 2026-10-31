@@ -21,8 +21,8 @@ import (
 // and leaves meanwhile, wakes nobody: nothing is pushed, and what it
 // brought waits in front of the next tool result.
 func TestARestartThatComesBackInTimeIsNotPushed(t *testing.T) {
-	testQuietRestart(t, 2, false, []string{"Now 1 here: other (6ba7b810-9dad-11d1-80b4-00c04fd430c8).", "other (6ba7b810-9dad-11d1-80b4-00c04fd430c8): left at the server restart → reconnected",
-		"Nothing else arrived meanwhile", "p2"})
+	testQuietRestart(t, 3, false, []string{"Your own message at 2026-10-30T12:00:00Z: my note while the server restarted", "p3", "Now 1 here: other (6ba7b810-9dad-11d1-80b4-00c04fd430c8).", "other (6ba7b810-9dad-11d1-80b4-00c04fd430c8): left at the server restart → reconnected",
+		"Nothing else arrived meanwhile"})
 }
 
 // A backlog past the bound is not walked by itself: the one notice says
@@ -43,6 +43,7 @@ func testQuietRestart(t *testing.T, behindAfterRestart int, pushed bool, wants [
 	history := []wire.Msg{
 		{PeerID: other, Text: "other left", Presence: &wire.Presence{Event: "left", Members: []wire.PresenceMember{{PeerID: other, Name: "other"}}, Cause: "serverRestart"}},
 		{PeerID: other, Text: "other reconnected", Presence: &wire.Presence{Event: "reconnected", Members: []wire.PresenceMember{{PeerID: other, Name: "other"}}}},
+		{PeerID: self, Own: true, Text: "my note while the server restarted"},
 	}
 	var mu sync.Mutex
 	joins := 0
@@ -86,6 +87,8 @@ func testQuietRestart(t *testing.T, behindAfterRestart int, pushed bool, wants [
 				next = 1
 			case "p2":
 				next = 2
+			case "p3":
+				next = 3
 			}
 			if m.Cursor == "" && m.At == "" {
 				next = 0
@@ -95,7 +98,7 @@ func testQuietRestart(t *testing.T, behindAfterRestart int, pushed bool, wants [
 				continue
 			}
 			h := history[next]
-			h.Type, h.Cursor, h.TS, h.Historical = wire.TypeMsg, []string{"p1", "p2"}[next], "2026-10-30T12:00:00Z", true
+			h.Type, h.Cursor, h.TS, h.Historical = wire.TypeMsg, []string{"p1", "p2", "p3"}[next], "2026-10-30T12:00:00Z", true
 			h.Answers = &wire.Anchor{At: m.At, Cursor: m.Cursor}
 			conn.WriteJSON(h)
 		}

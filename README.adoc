@@ -663,10 +663,11 @@ its failed attempts. After an automatic reconnect — of a connection, or of
 an agent connection and each of its conversations — the client catches up
 by itself, at most 100 messages, when the connection was down for less than
 an hour and the server does not report more than 100 waiting. The
-reconnect, the new member list and the joins and leaves found meanwhile are
+reconnect, the new member list, the joins and leaves found meanwhile and this
+connection's own messages among them (the reader wrote those) are
 gathered into one notice. Where nothing in it asks for anything, it is not
 pushed at all: it goes in front of the next tool result, naming the cursor
-of the last join or leave so a later confirm covers them. It is pushed when
+of the last of them so a later confirm covers them. It is pushed when
 it does ask — more waiting than is walked by itself, or a catch-up that
 could not start — and real messages are pushed as always, the notice in
 front of the first. Peers that were here before the drop and come back
