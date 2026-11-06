@@ -465,3 +465,105 @@ func TestThePauseIsSaidAgainWhilePushesWait(t *testing.T) {
 		t.Fatal("the pause was still repeated after a confirm freed the window")
 	}
 }
+
+// A conversation given up on purpose takes its waiting pushes and its share
+// of the window with it, so the others are delivered at once.
+func TestDroppingAnOwnerFreesItsQueueAndItsWindowShare(t *testing.T) {
+	b := testBudget(t)
+	var sent []string
+	deliver := func(owner, cursor string) {
+		b.Deliver(Delivery{Owner: owner, Cursor: cursor, Bytes: 10,
+			Send: func() { sent = append(sent, cursor) }, Pause: func(string) {}})
+	}
+	for i := 0; i < pushWindowCount-1; i++ {
+		deliver("flood", fmt.Sprintf("f%d", i))
+	}
+	for i := 0; i < 100; i++ {
+		deliver("flood", fmt.Sprintf("q%d", i))
+	}
+	deliver("office", "o1")
+	if top, n := b.TopQueued(); top != "flood" || n != 100 {
+		t.Fatalf("top queued = %q/%d, want flood/100", top, n)
+	}
+	if got := b.DropOwner("flood"); got != 100 {
+		t.Fatalf("dropped %d queued pushes, want 100", got)
+	}
+	if sent[len(sent)-1] != "o1" {
+		t.Fatalf("the other connection's push did not go out once the flood was dropped: last sent %q", sent[len(sent)-1])
+	}
+	if q := b.Queued(); q != 0 {
+		t.Fatalf("%d pushes still queued", q)
+	}
+	if n, _ := b.Free(); n != pushWindowCount-3 { // o1 and the pause notice
+		t.Fatalf("free = %d, want %d: the dropped owner's window share was kept", n, pushWindowCount-3)
+	}
+}
+
+func TestTheStillPausedNoticeNamesAFlood(t *testing.T) {
+	text := DeliveryStillPausedText(1800, "Alle", 1790)
+	if !strings.Contains(text, `hub_disconnect("Alle")`) {
+		t.Fatalf("the notice does not name the flooding connection: %s", text)
+	}
+	if strings.Contains(DeliveryStillPausedText(30, "office", 10), "hub_disconnect") {
+		t.Fatal("a small, mixed queue was called a flood")
+	}
+}
+
+// One flooding conversation cannot keep another out: once a confirm frees
+// the window, the other's waiting push goes out after at most half of it,
+// and each connection's pushes keep their own order.
+func TestAFloodTakesAtMostHalfTheWindowWhileOthersWait(t *testing.T) {
+	b := testBudget(t)
+	var sent []string
+	deliver := func(owner, cursor string) {
+		b.Deliver(Delivery{Owner: owner, Cursor: cursor, Bytes: 10,
+			Send: func() { sent = append(sent, owner+":"+cursor) }, Pause: func(string) {}})
+	}
+	for i := 0; i < 200; i++ {
+		deliver("flood", fmt.Sprintf("f%03d", i))
+	}
+	deliver("office", "o1")
+	deliver("office", "o2")
+	sent = nil
+	b.ReleaseAll()
+	share := (pushWindowCount - 1) / 2
+	pos := map[string]int{}
+	for i, x := range sent {
+		pos[x] = i
+	}
+	o1, ok1 := pos["office:o1"]
+	o2, ok2 := pos["office:o2"]
+	if !ok1 || !ok2 {
+		t.Fatalf("office's pushes did not go out after the confirm: %v", sent)
+	}
+	if o1 > share || o2 > share+1 || o2 < o1 {
+		t.Fatalf("office went out at %d and %d, want within the first %d and in order: %v", o1, o2, share+2, sent)
+	}
+	last := -1
+	for _, x := range sent {
+		if strings.HasPrefix(x, "flood:") {
+			var n int
+			fmt.Sscanf(x, "flood:f%d", &n)
+			if n <= last {
+				t.Fatalf("flood's pushes went out of order: %v", sent)
+			}
+			last = n
+		}
+	}
+	if len(sent) != pushWindowCount-1 {
+		t.Fatalf("%d sent after the confirm, want the whole window (%d): the flood stopped at its share with nobody else waiting", len(sent), pushWindowCount-1)
+	}
+}
+
+// Alone, a connection still has the whole window.
+func TestAConnectionAloneHasTheWholeWindow(t *testing.T) {
+	b := testBudget(t)
+	n := 0
+	for i := 0; i < 100; i++ {
+		b.Deliver(Delivery{Owner: "flood", Cursor: fmt.Sprintf("f%d", i), Bytes: 10,
+			Send: func() { n++ }, Pause: func(string) {}})
+	}
+	if n != pushWindowCount-1 {
+		t.Fatalf("%d sent, want %d", n, pushWindowCount-1)
+	}
+}

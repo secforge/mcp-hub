@@ -85,7 +85,9 @@ type catchUpResult struct {
 	Deliveries int
 	// Folded counts joins, leaves and own messages folded into the notice about an
 	// automatic reconnect rather than delivered on their own.
-	Folded    int
+	Folded int
+	// Repeated counts those of them an earlier notice already showed.
+	Repeated  int
 	Bytes     int
 	CaughtUp  bool
 	StoppedBy string
@@ -125,8 +127,15 @@ func ownMessageLine(ev hubconn.Event) string {
 // caughtUpQuietly is the catch-up's line in the notice about an automatic
 // reconnect, when nothing but joins and leaves arrived meanwhile.
 func caughtUpQuietly(res catchUpResult) string {
-	if res.Folded == 0 {
+	switch {
+	case res.Folded == 0:
 		return "Nothing arrived meanwhile."
+	case res.Repeated == res.Folded:
+		return "Nothing new arrived meanwhile. What an earlier notice showed is still unconfirmed; " +
+			"confirm the cursor below to mark it read."
+	case res.Repeated > 0:
+		return "Nothing else arrived meanwhile; confirm the cursor below to mark these, and what an " +
+			"earlier notice showed, read."
 	}
 	return "Nothing else arrived meanwhile; confirm the cursor below to mark these read."
 }
@@ -175,6 +184,24 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 		line := heldText
 		if run[0].Presence == nil && run[0].Own {
 			line = ownMessageLine(run[0])
+		}
+		// What an earlier notice already showed, unconfirmed, is not
+		// shown again: only its cursor is carried, so one confirm still
+		// covers it.
+		if run[0].Presence != nil || run[0].Own {
+			var fresh []hubconn.Event
+			for _, ev := range run {
+				if !s.handedOver(ev.Cursor) {
+					fresh = append(fresh, ev)
+				}
+			}
+			res.Repeated += len(run) - len(fresh)
+			switch {
+			case len(fresh) == 0:
+				line = ""
+			case len(fresh) < len(run) && run[0].Presence != nil:
+				line = hubconn.FormatPresenceRun(fresh, conn.PeerID())
+			}
 		}
 		if (run[0].Presence != nil || run[0].Own) && s.restartAdd(line, run[len(run)-1].Cursor) {
 			conn.NoteHandedOver(run)

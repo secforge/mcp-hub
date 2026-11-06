@@ -33,8 +33,11 @@ import (
 //     the reader took something in.
 //   - QUEUE: a push that does not fit joins one queue, in arrival order
 //     across every connection and kind, and while anything waits there
-//     every new push joins behind it — so nothing overtakes anything. A
-//     confirm drains it from the front as far as the window allows.
+//     every new push joins behind it. A confirm drains it from the front
+//     as far as the window allows, with one exception: while another
+//     connection has pushes waiting, no connection takes more than half
+//     the window, so one flooding conversation cannot keep the others
+//     out. One connection's own pushes never overtake each other.
 //
 // Budget is exported so one process holds a SINGLE window across all its
 // connections, and so the code that pushes this client's own notices can
@@ -267,8 +270,11 @@ func (b *budget) Deliver(d Delivery) (queued bool) {
 	}
 	b.queue = append(b.queue, d)
 	if len(b.queue) > maxQueued {
+		// Taken from the connection with the most waiting, so a flood
+		// pays for its own overflow.
+		top, _ := b.topQueuedLocked()
 		for i, w := range b.queue {
-			if w.Cursor != "" {
+			if w.Cursor != "" && w.Owner == top {
 				b.queue = append(b.queue[:i], b.queue[i+1:]...)
 				b.dropped++
 				break
@@ -322,8 +328,9 @@ func (b *budget) repeatPause() {
 		send := b.pauseSend
 		b.pauseSaid = time.Now()
 		waiting := len(b.queue)
+		top, topN := b.topQueuedLocked()
 		b.mu.Unlock()
-		send(DeliveryStillPausedText(waiting))
+		send(DeliveryStillPausedText(waiting, top, topN))
 	}
 }
 
@@ -362,7 +369,8 @@ func (b *budget) flush() {
 			b.mu.Unlock()
 			return
 		}
-		d := b.queue[0]
+		i := b.nextLocked()
+		d := b.queue[i]
 		if !b.takeLocked(d.Owner, d.Cursor, d.Bytes) {
 			paused := DeliveryPausedText()
 			announce := d.Pause != nil && b.pauseLocked(len(paused))
@@ -375,10 +383,99 @@ func (b *budget) flush() {
 			}
 			return
 		}
-		b.queue = b.queue[1:]
+		b.queue = append(b.queue[:i], b.queue[i+1:]...)
 		b.mu.Unlock()
 		d.Send()
 	}
+}
+
+// nextLocked picks the queued push to send next: the first one whose
+// connection holds less than its share of the window, or holds more but
+// is the only one waiting. Each connection's pushes keep their order.
+func (b *budget) nextLocked() int {
+	share := max((b.windowCount-1)/2, 1)
+	held := map[string]int{}
+	for _, ch := range b.outstanding {
+		if ch.counted {
+			held[ch.owner]++
+		}
+	}
+	queued := map[string]int{}
+	for _, d := range b.queue {
+		queued[d.Owner]++
+	}
+	over := map[string]bool{}
+	for i, d := range b.queue {
+		if over[d.Owner] {
+			continue
+		}
+		if d.Owner == "" || held[d.Owner] < share || len(b.queue) == queued[d.Owner] {
+			return i
+		}
+		// Over its share while others wait: its later pushes wait too,
+		// behind this one.
+		over[d.Owner] = true
+	}
+	return 0
+}
+
+// DropOwner lets go of everything owner still holds: its queued pushes
+// and its share of the window. For a connection given up on purpose,
+// whose pushes nobody wants any more and whose unread messages the server
+// still holds. It reports how many queued pushes were dropped.
+func (b *budget) DropOwner(owner string) int {
+	if owner == "" {
+		return 0
+	}
+	b.sendMu.Lock()
+	b.mu.Lock()
+	kept := b.queue[:0]
+	dropped := 0
+	for _, d := range b.queue {
+		if d.Owner == owner {
+			dropped++
+			continue
+		}
+		kept = append(kept, d)
+	}
+	clear(b.queue[len(kept):])
+	b.queue = kept
+	ledger := b.outstanding[:0]
+	for _, ch := range b.outstanding {
+		if ch.owner == owner {
+			if ch.counted {
+				b.count--
+				b.bytes -= ch.bytes
+			}
+			continue
+		}
+		ledger = append(ledger, ch)
+	}
+	b.outstanding = ledger
+	b.sendMu.Unlock()
+	b.afterFreeLocked()
+	return dropped
+}
+
+// TopQueued names the owner with the most queued pushes, and how many.
+func (b *budget) TopQueued() (owner string, n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.topQueuedLocked()
+}
+
+func (b *budget) topQueuedLocked() (owner string, n int) {
+	counts := map[string]int{}
+	for _, d := range b.queue {
+		if d.Owner == "" {
+			continue
+		}
+		counts[d.Owner]++
+		if counts[d.Owner] > n {
+			owner, n = d.Owner, counts[d.Owner]
+		}
+	}
+	return owner, n
 }
 
 // Pause reports whether the pause notice is due — the window is full and

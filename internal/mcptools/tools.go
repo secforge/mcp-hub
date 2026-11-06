@@ -1689,10 +1689,15 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 		// notice can be lost on the way, and a reader who does not know that
 		// delivery stopped never confirms; a tool result cannot be lost.
 		if queued, paused := h.gate().budget.Waiting(); paused && queued > 0 {
+			flood := ""
+			if top, n := h.gate().budget.TopQueued(); top != "" && hubconn.IsFlood(queued, n) {
+				flood = hubconn.FloodHint(top, n)
+			}
 			h.noteAutoReconnect(fmt.Sprintf("DELIVERY IS PAUSED — %d push(es) are waiting because 25 "+
 				"deliveries (or 500 KB) are unconfirmed, and nothing reaches you until you confirm: "+
 				"hub_confirm(connection, cursor) with the last message you have read COMPLETE, or "+
-				"hub_confirm() with no arguments once you have taken in everything delivered so far.", queued))
+				"hub_confirm() with no arguments once you have taken in everything delivered so far.%s",
+				queued, flood))
 		}
 		if withheld := withheldNotice(h.allSessions()); withheld != "" {
 			h.noteAutoReconnect(withheld)
@@ -2092,7 +2097,11 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool(
 		mcp.NewTool("hub_disconnect",
 			connectionParam(),
-			mcp.WithDescription("Disconnect from the current hub session"),
+			mcp.WithDescription("Disconnect from the current hub session. Pushes of this "+
+				"connection still waiting for the delivery window are dropped — the way to stop one "+
+				"flooding conversation without a restart; the server keeps them unread for a later "+
+				"hub_connect or hub_catch_up. On one conversation of an agent connection, only that "+
+				"conversation is closed"),
 			mcp.WithBoolean("remove", mcp.Description(
 				"Optional, default false. NOT for messages — to withdraw a message, use hub_delete. "+
 					"Also deletes this connection's stored entry — its "+
@@ -2418,7 +2427,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 		mcp.NewTool("hub_confirm",
 			mcp.WithString("connection", mcp.Description(
 				"Which connection the cursor belongs to — the name you gave it at hub_connect. "+
-					"Required with cursor; leave both out to free the delivery window only.")),
+					"Required with cursor or latest; leave all out to free the delivery window only.")),
 			mcp.WithDescription("Explicitly confirm you received a message INTACT, by its cursor — "+
 				confirmWhyNote()+
 				" Advances this session's persisted catch-up position to cursor and "+
@@ -2432,7 +2441,8 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				" On a server that "+
 				"reports it, the result also states how many messages remain after the position "+
 				"you confirmed. Errors if not connected.\n\nDELIVERY WINDOW: this client keeps at most 25 "+
-				"deliveries (or 500 KB) for you unconfirmed, across every connection and every kind. "+
+				"deliveries (or 500 KB) for you unconfirmed, across every connection and every kind; "+
+				"while another connection has pushes waiting, no connection takes more than half of it. "+
 				"A confirm frees everything delivered up to the cursor you name, from every connection. "+
 				"Called with NO arguments it frees the whole window without moving any read position — "+
 				"for when you have taken in everything delivered so far, including notices that carry no "+
@@ -2442,6 +2452,13 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"that message's own \"cursor=...\" field, rendered inline wherever a message is "+
 					"delivered. Everything at or before this position is marked confirmed handed "+
 					"over; never construct, guess, or advance this value yourself.")),
+			mcp.WithBoolean("latest", mcp.Description(
+				"Optional, with connection and no cursor: mark EVERYTHING unread on this connection "+
+					"as read WITHOUT reading it — the server moves the position to its newest message "+
+					"and this connection's waiting pushes are dropped. Never to get through a backlog "+
+					"you are meant to read: only when your user asks for it, or when what is unread is "+
+					"plainly not for you (an imported history, a flood of old messages) — and then say "+
+					"in your reply that you skipped it. Only where the server declares it can")),
 		),
 		h.handleConfirmReceived,
 	)
@@ -4232,6 +4249,14 @@ func (s *session) confirmLiveDelivery(events []hubconn.Event) {
 // only ever reached via resultWithReceivedAttachments, i.e. a
 // SYNCHRONOUS tool result, which — unlike wait --follow's async
 // notification path — IS the delivery, not a best-effort guess at one.
+// handedOver reports whether cursor was handed over and not yet covered
+// by a confirm.
+func (s *session) handedOver(cursor string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cursor != "" && s.handedOverAhead[cursor]
+}
+
 func (s *session) recordHandedOver(events []hubconn.Event) {
 	for _, e := range events {
 		s.noteDelivered(e.Cursor)
@@ -4458,6 +4483,10 @@ func (h *Hub) handleDisconnect(ctx context.Context, req mcp.CallToolRequest) (*m
 	defer func() {
 		s.closeReturnPath()
 		h.close(name)
+		// What still waits for the delivery window is not wanted any
+		// more, and holding it there would keep every other connection
+		// waiting behind it; the server keeps it unread.
+		h.gate().budget.DropOwner(name)
 	}()
 
 	conn, w, target := s.clearActiveConn()
@@ -6199,6 +6228,10 @@ walk:
 // itself closes that gap by construction: the call can only originate
 // once the model has actually seen cursor.
 func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if req.GetBool("latest", false) && req.GetString("connection", "") == "" {
+		return mcp.NewToolResultError("latest needs a connection: it marks one connection's " +
+			"unread messages read"), nil
+	}
 	if req.GetString("cursor", "") == "" && req.GetString("connection", "") == "" {
 		h.gate().budget.ReleaseAll()
 		return mcp.NewToolResultText("the delivery window is free again — whatever was waiting " +
@@ -6213,6 +6246,12 @@ func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultText(disconnectedText(conn)), nil
 	}
 	cursor := req.GetString("cursor", "")
+	if req.GetBool("latest", false) {
+		if cursor != "" {
+			return mcp.NewToolResultError("pass either cursor or latest, not both"), nil
+		}
+		return s.confirmLatest(conn), nil
+	}
 	if cursor == "" {
 		return mcp.NewToolResultError("a cursor is needed with a connection: it names the message " +
 			"whose position to keep. To free the delivery window without moving any position — " +
@@ -6251,6 +6290,31 @@ func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest
 		"confirmed handed over up to %q — persisted; a future hub_catch_up or reconnect resumes "+
 			"from here instead of re-walking anything at or before it%s", cursor, formatBehindNote(behind),
 	)), nil
+}
+
+// confirmLatest is hub_confirm(latest: true): everything unread on this
+// connection is marked read without being read.
+func (s *session) confirmLatest(conn *hubconn.Conn) *mcp.CallToolResult {
+	cursor, behind, err := conn.ConfirmLatest()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("nothing was marked read: %v. Your read "+
+			"position has NOT moved.", err))
+	}
+	if cursor == "" {
+		return mcp.NewToolResultText(fmt.Sprintf("there is nothing on %q to mark read; no position "+
+			"moved. Pushes of it still waiting here are dropped", s.name))
+	}
+	var notPersisted errNotPersisted
+	if err := s.adoptConfirmed(cursor); errors.As(err, &notPersisted) {
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"everything up to %q is marked read on the server, but NOT persisted here: %v. A "+
+				"restart here resumes from the older position on disk", cursor, notPersisted.err))
+	}
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"everything on %q up to its newest message is marked read without being read — position "+
+			"%q, persisted. Pushes of it still waiting here are dropped. Nothing newer is affected: "+
+			"what arrives from now on is delivered as usual%s",
+		s.name, cursor, formatBehindNote(behind)))
 }
 
 // formatBehindNote renders a standalone ack's reported Behind count, if
@@ -6321,6 +6385,12 @@ func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error)
 	if err != nil {
 		return nil, err
 	}
+	return behind, s.adoptConfirmed(cursor)
+}
+
+// adoptConfirmed records cursor as the position the reader has confirmed,
+// here and on disk.
+func (s *session) adoptConfirmed(cursor string) error {
 	s.mu.Lock()
 	s.lastHandedOverCursor = cursor
 	// handedOverAhead's entries exist to dedup a walk that hasn't reached
@@ -6341,9 +6411,9 @@ func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error)
 	s.mu.Unlock()
 	saveHandedOverAhead(id, nil)
 	if err := setCatchUpCursor(id, cursor); err != nil {
-		return behind, errNotPersisted{err}
+		return errNotPersisted{err}
 	}
-	return behind, nil
+	return nil
 }
 
 func (h *Hub) handleReact(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

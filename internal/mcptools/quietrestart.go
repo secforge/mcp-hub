@@ -122,7 +122,9 @@ func (s *session) restartAdd(line, cursor string) bool {
 	if !n.active {
 		return false
 	}
-	n.lines = append(n.lines, line)
+	if line != "" {
+		n.lines = append(n.lines, line)
+	}
 	if cursor != "" {
 		n.cursor = cursor
 	}
@@ -157,7 +159,7 @@ func (s *session) restartFlush() {
 		n.mu.Unlock()
 		return
 	}
-	if len(n.lines) == 0 {
+	if len(n.lines) == 0 && n.cursor == "" {
 		n.active = false
 		n.mu.Unlock()
 		return

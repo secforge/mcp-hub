@@ -1024,6 +1024,11 @@ func (ag *agentSession) end(why string) {
 		}
 		s.closeReturnPath()
 		ag.hub.close(s.name)
+		if why == "" {
+			// Ended on request: what still waits for the window is not
+			// wanted any more; the server keeps it unread.
+			ag.hub.gate().budget.DropOwner(s.name)
+		}
 	}
 	ag.hub.mu.Lock()
 	if ag.hub.agents[ag.name] == ag {

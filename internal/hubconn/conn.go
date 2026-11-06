@@ -2319,6 +2319,69 @@ func (c *Conn) ConfirmReceived(cursor string) (*int, error) {
 	}
 }
 
+// ErrNoAckLatest refuses ConfirmLatest on a server that does not declare
+// it can do this.
+var ErrNoAckLatest = errors.New("this server does not declare " + wire.FeatureAckLatest +
+	", so it cannot mark everything read; read what is unread, or hub_disconnect this " +
+	"connection to stop its delivery")
+
+// ConfirmLatest moves the read position to the newest message the server
+// holds, without reading what lies between, and returns the cursor it
+// landed on. Only on a server declaring wire.FeatureAckLatest, which
+// answers it; everything delivered from this connection is then read, so
+// its share of the delivery window and its waiting pushes are let go.
+func (c *Conn) ConfirmLatest() (string, *int, error) {
+	if !c.HasFeature(wire.FeatureAckLatest) {
+		return "", nil, ErrNoAckLatest
+	}
+	corrID, resultCh, cancel, err := c.claimNextAckCorrelated("ack", "")
+	if err != nil {
+		return "", nil, err
+	}
+	defer cancel()
+	frame := wire.Ack{Type: wire.TypeAck, ID: corrID, Latest: true}
+	if err := c.writeJSON(frame); err != nil {
+		return "", nil, err
+	}
+	select {
+	case ev := <-resultCh:
+		if ev.Kind == "error" {
+			code := ev.Code
+			if code == "" {
+				code = "no code"
+			}
+			return "", nil, fmt.Errorf("the server REFUSED this confirm (%s): %s", code, ev.Text)
+		}
+		if ev.Cursor == "" {
+			if ev.ActionOKStated && ev.ActionOK {
+				// Nothing to read: accepted, and no position to move to.
+				if c.budget != nil {
+					c.budget.DropOwner(c.budgetOwner)
+				}
+				return "", ev.Behind, nil
+			}
+			return "", nil, errors.New("the server answered without naming the position it moved to")
+		}
+		// ok:false is a refusal; a position already at the newest is
+		// answered ok:true.
+		if ev.ActionOKStated && !ev.ActionOK {
+			return "", nil, errors.New("the server REFUSED to mark everything read")
+		}
+		c.mu.Lock()
+		c.lastConsumed, c.lastAckSent, c.lastConfirmed = ev.Cursor, ev.Cursor, ev.Cursor
+		c.mu.Unlock()
+		if c.budget != nil {
+			c.budget.DropOwner(c.budgetOwner)
+		}
+		return ev.Cursor, ev.Behind, nil
+	case <-c.gone:
+		return "", nil, errors.New("the connection dropped before the server answered this confirm")
+	case <-time.After(AckWaitTimeout):
+		c.expectLateAnswer("ack")
+		return "", nil, ErrConfirmUnanswered
+	}
+}
+
 // ConfirmCoveredError reports a confirm the server did not need: the
 // cursor is at or before the position it already holds for this peer,
 // typically a message delivered after a later one was confirmed.

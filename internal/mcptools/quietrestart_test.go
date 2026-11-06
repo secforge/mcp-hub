@@ -190,3 +190,111 @@ func TestTheMemberListInTheRestartNoticeIsBare(t *testing.T) {
 		t.Fatalf("line: %q", got)
 	}
 }
+
+// A second restart before anything was confirmed does not show again what
+// the first notice showed: it names the same cursor and says nothing new
+// arrived.
+func TestASecondRestartDoesNotRepeatTheFirstNotice(t *testing.T) {
+	_ = newHarnessInbox(t)
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	prevQuiet := restartQuiet
+	restartQuiet = 300 * time.Millisecond
+	defer func() { restartQuiet = prevQuiet }()
+
+	const self = "550e8400-e29b-41d4-a716-446655440000"
+	const other = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	history := []wire.Msg{
+		{PeerID: other, Text: "other left", Presence: &wire.Presence{Event: "left", Members: []wire.PresenceMember{{PeerID: other, Name: "other"}}, Cause: "serverRestart"}},
+		{PeerID: other, Text: "other reconnected", Presence: &wire.Presence{Event: "reconnected", Members: []wire.PresenceMember{{PeerID: other, Name: "other"}}}},
+	}
+	cursors := []string{"p1", "p2"}
+	var mu sync.Mutex
+	joins := 0
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		mu.Lock()
+		joins++
+		n := joins
+		mu.Unlock()
+		behind := 0
+		if n > 1 {
+			behind = len(history)
+		}
+		raw, _ := json.Marshal(wire.Joined{Type: wire.TypeJoined, PeerID: self, ServerVersion: wire.ProtocolVersion,
+			Features: teamsTestFeatures(), Behind: &behind})
+		conn.WriteMessage(websocket.TextMessage, raw)
+		conn.WriteJSON(wire.Roster{Type: wire.TypeRoster, Members: []wire.RosterMember{{PeerID: self, Name: "t"}, {PeerID: other, Name: "other"}}})
+		restart := func() {
+			conn.WriteJSON(wire.ServerStopping{Type: wire.TypeServerStopping, ReconnectAfter: 1})
+			conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "restarting"))
+			time.Sleep(30 * time.Millisecond)
+		}
+		if n == 1 {
+			time.Sleep(400 * time.Millisecond)
+			restart()
+			return
+		}
+		done := make(chan struct{})
+		go func() {
+			for {
+				var m wire.MessageAfter
+				if err := conn.ReadJSON(&m); err != nil {
+					close(done)
+					return
+				}
+				if m.Type != wire.TypeMessageAfter {
+					continue
+				}
+				next := 0
+				for i, c := range cursors {
+					if m.Cursor == c {
+						next = i + 1
+					}
+				}
+				if next >= len(history) {
+					conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+					continue
+				}
+				h := history[next]
+				h.Type, h.Cursor, h.TS, h.Historical = wire.TypeMsg, cursors[next], "2026-10-30T12:00:00Z", true
+				h.Answers = &wire.Anchor{At: m.At, Cursor: m.Cursor}
+				conn.WriteJSON(h)
+			}
+		}()
+		if n == 2 {
+			time.Sleep(1500 * time.Millisecond)
+			restart()
+			return
+		}
+		<-done
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#quiet2"
+
+	h := NewHub()
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"as": testConn, "link": link, "name": "t"}
+	if res, err := h.handleConnect(context.Background(), req); err != nil || res.IsError {
+		t.Fatalf("connect: %v %s", err, textOf(res))
+	}
+	defer h.handleDisconnect(context.Background(), connReqFor(testConn))
+
+	var note string
+	waitUntil(t, "two notices about restarts", func() bool {
+		note += h.takeAutoReconnectNote()
+		return strings.Count(note, "Reconnected after the server") == 2 &&
+			strings.Count(note, "These end at cursor p2") == 2
+	})
+	second := note[strings.LastIndex(note, "Reconnected after the server"):]
+	if strings.Contains(second, "left at the server restart") {
+		t.Fatalf("the second notice repeats what the first showed:\n%s", note)
+	}
+	if !strings.Contains(second, "Nothing new arrived meanwhile") {
+		t.Fatalf("the second notice does not say nothing new arrived:\n%s", note)
+	}
+}

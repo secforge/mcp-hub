@@ -1172,7 +1172,16 @@ type Ack struct {
 	// server that simply doesn't send the field at all. Nil means
 	// unknown/unsupported, not zero.
 	Behind *int `json:"behind,omitempty,case:strict"`
+	// Latest, on a standalone ack to a server declaring FeatureAckLatest,
+	// asks it to move the read position to the newest message there is,
+	// with no AckCursor. The reply's AckCursor names where it landed.
+	Latest bool `json:"latest,omitempty,case:strict"`
 }
+
+// FeatureAckLatest declares that a standalone ack may carry latest:true
+// instead of a cursor: the read position moves to the newest message at
+// that moment, never backwards, and the reply names it (§2.7).
+const FeatureAckLatest = "ackLatest"
 
 func NewAck(ackCursor string) Ack {
 	return Ack{Type: TypeAck, AckCursor: ackCursor}

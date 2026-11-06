@@ -198,6 +198,7 @@ client, and a server must not send one to request client behaviour.
 | `serverStopping` | — | Sends `serverStopping` before a deliberate shutdown (§2.10). |
 | `clientRelease` | — | Sends `joined.clientRelease` when it has verified a release. |
 | `encryption` | `versions` array of int | Supports end-to-end encrypted sessions (§2.11). |
+| `ackLatest` | — | Accepts a standalone `ack` with `latest: true` instead of a cursor: the read position moves to the newest message (§2.7). |
 
 Adding a feature needs no version bump — a client at protocol 3 or above
 already knows to look. A feature name is removed in the same change that
@@ -742,6 +743,31 @@ was confirmed.
 
 Malformed input never gets an `ack` reply — see §2.5's `bad_ack`/
 `bad_ack_cursor`.
+
+**Mark everything read** (feature `ackLatest`): a standalone ack may carry
+`latest: true` instead of `ackCursor`:
+
+```json
+{"type": "ack", "id": "...", "latest": true}
+```
+
+The server moves the read position to the newest message the conversation
+holds at that moment and answers with where it landed:
+
+```json
+{"type": "ack", "id": "...", "ackCursor": "<newest position>", "ok": true, "behind": 0}
+```
+
+It never moves the position backwards. Where the position held is already
+the newest, the answer is the same: `ok: true`, that position, `behind: 0`
+— an accepted no-op. With nothing to read at all, the answer is `ok: true`,
+`behind: 0` and no `ackCursor`. `ackCursor` is the newest position the
+reader's own walk would reach, never outside what its share lets it see.
+`ok: false` is a refusal, and nothing moved. Nothing
+is lost: a message newer than the landing position stays
+unread. A client offers this only as an explicit act of the reader (in
+`mcp-hub-client`, `hub_confirm(connection, latest: true)`), never to work
+through a backlog the reader has not read.
 
 **Monotonicity is a server-side invariant you must enforce**: never let
 a stored read-position move backward. A client is allowed to send a

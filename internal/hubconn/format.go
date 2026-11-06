@@ -629,12 +629,32 @@ func DeliveryPausedText() string {
 		"with no arguments once you have taken in everything delivered so far]"
 }
 
+// FloodHint names the connection holding most of a large queue and the
+// two ways to let it go without reading it one message at a time.
+func FloodHint(top string, topN int) string {
+	return fmt.Sprintf(" %d of them are from %q. If you are not meant to read those one by one: "+
+		"hub_disconnect(%q) drops every push of it waiting here and the server keeps them unread; "+
+		"or, only if your user asks you to skip them or they are plainly not for you, "+
+		"hub_confirm(connection: %q, latest: true) marks all of it read where the server can.",
+		topN, top, top, top)
+}
+
+// IsFlood says whether top's share of waiting pushes is worth naming.
+func IsFlood(waiting, topN int) bool { return topN >= 25 && topN > waiting/2 }
+
 // DeliveryStillPausedText repeats the pause notice while pushes wait.
-func DeliveryStillPausedText(waiting int) string {
+// top and topN name the connection with the most of them, so a reader
+// flooded by one conversation can see which one and let it go.
+func DeliveryStillPausedText(waiting int, top string, topN int) string {
+	flood := ""
+	if top != "" && IsFlood(waiting, topN) {
+		flood = FloodHint(top, topN)
+	}
 	return fmt.Sprintf("[hub: DELIVERY IS STILL PAUSED — %d push(es) are waiting because 25 "+
-		"deliveries (or 500 KB) are unconfirmed. Nothing reaches you until you confirm: "+
+		"deliveries (or 500 KB) are unconfirmed.%s Nothing reaches you until you confirm: "+
 		"hub_confirm(connection, cursor) with the last message you have read COMPLETE, or "+
-		"hub_confirm() with no arguments once you have taken in everything delivered so far]", waiting)
+		"hub_confirm() with no arguments once you have taken in everything delivered so far]",
+		waiting, flood)
 }
 
 func FormatEventsBatch(events []Event) []string {
