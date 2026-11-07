@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -34,10 +35,10 @@ import (
 //   - QUEUE: a push that does not fit joins one queue, in arrival order
 //     across every connection and kind, and while anything waits there
 //     every new push joins behind it. A confirm drains it from the front
-//     as far as the window allows, with one exception: while another
-//     connection has pushes waiting, no connection takes more than half
-//     the window, so one flooding conversation cannot keep the others
-//     out. One connection's own pushes never overtake each other.
+//     as far as the window allows, with one exception: while other
+//     connections have pushes waiting, each takes at most an equal share
+//     of the window (half of it at most), so busy conversations cannot
+//     keep the others out. One connection's own pushes never overtake each other.
 //
 // Budget is exported so one process holds a SINGLE window across all its
 // connections, and so the code that pushes this client's own notices can
@@ -328,9 +329,9 @@ func (b *budget) repeatPause() {
 		send := b.pauseSend
 		b.pauseSaid = time.Now()
 		waiting := len(b.queue)
-		top, topN := b.topQueuedLocked()
+		by := b.queuedByLocked()
 		b.mu.Unlock()
-		send(DeliveryStillPausedText(waiting, top, topN))
+		send(DeliveryStillPausedText(waiting, by))
 	}
 }
 
@@ -391,9 +392,11 @@ func (b *budget) flush() {
 
 // nextLocked picks the queued push to send next: the first one whose
 // connection holds less than its share of the window, or holds more but
-// is the only one waiting. Each connection's pushes keep their order.
+// is the only one waiting. The share is the window divided among the
+// connections waiting, at most half of it, so two busy conversations —
+// two copies of one channel, say — cannot fill it between them either.
+// Each connection's pushes keep their order.
 func (b *budget) nextLocked() int {
-	share := max((b.windowCount-1)/2, 1)
 	held := map[string]int{}
 	for _, ch := range b.outstanding {
 		if ch.counted {
@@ -404,6 +407,13 @@ func (b *budget) nextLocked() int {
 	for _, d := range b.queue {
 		queued[d.Owner]++
 	}
+	owners := 0
+	for o := range queued {
+		if o != "" {
+			owners++
+		}
+	}
+	share := max((b.windowCount-1)/max(owners, 2), 1)
 	over := map[string]bool{}
 	for i, d := range b.queue {
 		if over[d.Owner] {
@@ -457,11 +467,32 @@ func (b *budget) DropOwner(owner string) int {
 	return dropped
 }
 
-// TopQueued names the owner with the most queued pushes, and how many.
-func (b *budget) TopQueued() (owner string, n int) {
+// QueuedBy says how many pushes each connection has waiting, the busiest
+// first.
+func (b *budget) QueuedBy() []OwnerCount {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.topQueuedLocked()
+	return b.queuedByLocked()
+}
+
+func (b *budget) queuedByLocked() []OwnerCount {
+	counts := map[string]int{}
+	for _, d := range b.queue {
+		if d.Owner != "" {
+			counts[d.Owner]++
+		}
+	}
+	by := make([]OwnerCount, 0, len(counts))
+	for o, n := range counts {
+		by = append(by, OwnerCount{o, n})
+	}
+	sort.Slice(by, func(i, j int) bool {
+		if by[i].N != by[j].N {
+			return by[i].N > by[j].N
+		}
+		return by[i].Owner < by[j].Owner
+	})
+	return by
 }
 
 func (b *budget) topQueuedLocked() (owner string, n int) {

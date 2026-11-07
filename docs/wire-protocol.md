@@ -145,6 +145,7 @@ bump — see §6.
 | `canSend` | bool | no | Whether sending is currently permitted — a snapshot, not a guarantee (re-checked per send). |
 | `conversationKind` | string | no | e.g. `"oneOnOne"`, `"group"`, `"meeting"`, `"channel"` — free text, not a closed enum. Send it only for a conversation mirrored from a real chat platform; omit it entirely for an ordinary hub session, so its presence alone distinguishes the two. |
 | `topic` | string\|null | no | Display name/topic of what was joined, if applicable. |
+| `thread` | string | whenever `threadIdentity` is declared and a platform thread is behind the conversation | Opaque, and identical in every copy of the same platform thread (one copy per account that follows it), stable across reconnects, restarts and deploys. Absent on hub sessions, todo lists and bridges with one account. A message's identity across copies is (`thread`, `externalId`): `externalId` alone is unique only within its thread. |
 | `features` | object | no | This server's declared capabilities — see §2.1a. |
 | `behind` | int | no | How many messages this peer's own last-acked position trails the newest message in this conversation, computed once at connect. `0` states "caught up" as a fact, distinct from omitted (no such concept — including every mcp-hub-server, and a first-ever connection with no prior position to compare). See §2.6a. |
 | `behindSince` | string (RFC 3339, explicit UTC offset) | no, but required alongside `behind` when `behind` is set to a positive value | The timestamp of this peer's last-acked position — what a `messageAfter{at:...}` seek is computed from when the gap is too large to walk. Omitted under the same conditions as `behind`. |
@@ -198,6 +199,7 @@ client, and a server must not send one to request client behaviour.
 | `serverStopping` | — | Sends `serverStopping` before a deliberate shutdown (§2.10). |
 | `clientRelease` | — | Sends `joined.clientRelease` when it has verified a release. |
 | `encryption` | `versions` array of int | Supports end-to-end encrypted sessions (§2.11). |
+| `threadIdentity` | — | Sends `joined.thread` (§2.1), so a client holding several copies of one platform thread can deliver a message once. |
 | `ackLatest` | — | Accepts a standalone `ack` with `latest: true` instead of a cursor: the read position moves to the newest message (§2.7). |
 
 Adding a feature needs no version bump — a client at protocol 3 or above

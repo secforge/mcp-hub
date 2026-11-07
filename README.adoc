@@ -617,10 +617,25 @@ not confirmed: every kind (messages, member lists, its own notices,
 catch-up deliveries, operator messages and mentions) across every
 connection, pushed or written to a follower. The 25th is a notice that
 more is waiting. What does not fit waits, in order, and nothing is lost.
-While another connection has pushes waiting, no connection takes more than
-half the window, so one busy conversation cannot keep the others out; each
-connection's own pushes keep their order. `hub_disconnect` drops a
+While other connections have pushes waiting, each takes at most an equal
+share of the window, half of it at most, so busy conversations cannot keep
+the others out; each connection's own pushes keep their order. `hub_disconnect` drops a
 connection's waiting pushes; the server keeps them unread.
+
+A link to Teams, Slack, WhatsApp or Signal echoes every message this
+connection sends back to it, marked as its own. Those echoes, and the
+echoes of its own reactions, edits and deletes, are not delivered unless
+`hub_connect` was given `ownEchoes: true`; an echo arriving with nothing
+unconfirmed before it is confirmed by the client. Messages written under
+the same account some other way are always delivered.
+
+One platform thread can be followed from several accounts, each copy its
+own connection, so that the agent can answer from either. Where the server
+names the thread (`joined.thread`), a message both copies receive is
+delivered once, on the connection it reached first, and confirming it
+there confirms it on the other copy as well, wherever that moves nothing
+past an unconfirmed message. The reader is told once which connections are
+copies of one thread.
 Only `hub_confirm` frees room: with a cursor it frees everything delivered
 up to that message, from every connection, and moves that connection's
 read position; with no arguments it frees everything delivered so far and

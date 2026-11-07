@@ -153,8 +153,13 @@ type Joined struct {
 	// "oneOnOne"/"group"/"meeting", and a display name where one exists)
 	// without needing a History request first. Empty/nil when not
 	// applicable or not set by the server.
-	ConversationKind string  `json:"conversationKind,omitempty,case:strict"`
-	Topic            *string `json:"topic,omitempty,case:strict"`
+	ConversationKind string `json:"conversationKind,omitempty,case:strict"`
+	// Thread, on a server declaring FeatureThreadIdentity, names the
+	// platform thread behind this conversation: the same opaque value in
+	// every copy of it, one per account that follows it, and stable across
+	// reconnects. Absent where no platform thread is behind it.
+	Thread string  `json:"thread,omitempty,case:strict"`
+	Topic  *string `json:"topic,omitempty,case:strict"`
 	// Behind is how many messages this peer's persisted position (its
 	// own last-acked cursor, server-side) trails the newest message in
 	// this conversation, computed once at connect. Only the server can
@@ -1177,6 +1182,10 @@ type Ack struct {
 	// with no AckCursor. The reply's AckCursor names where it landed.
 	Latest bool `json:"latest,omitempty,case:strict"`
 }
+
+// FeatureThreadIdentity declares that joined.thread names the platform
+// thread behind a conversation, the same in every copy of it (§2.1).
+const FeatureThreadIdentity = "threadIdentity"
 
 // FeatureAckLatest declares that a standalone ack may carry latest:true
 // instead of a cursor: the read position moves to the newest message at

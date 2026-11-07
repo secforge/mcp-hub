@@ -482,8 +482,8 @@ func TestDroppingAnOwnerFreesItsQueueAndItsWindowShare(t *testing.T) {
 		deliver("flood", fmt.Sprintf("q%d", i))
 	}
 	deliver("office", "o1")
-	if top, n := b.TopQueued(); top != "flood" || n != 100 {
-		t.Fatalf("top queued = %q/%d, want flood/100", top, n)
+	if by := b.QueuedBy(); len(by) != 2 || by[0] != (OwnerCount{"flood", 100}) {
+		t.Fatalf("queued by = %v, want flood/100 first", by)
 	}
 	if got := b.DropOwner("flood"); got != 100 {
 		t.Fatalf("dropped %d queued pushes, want 100", got)
@@ -499,13 +499,16 @@ func TestDroppingAnOwnerFreesItsQueueAndItsWindowShare(t *testing.T) {
 	}
 }
 
-func TestTheStillPausedNoticeNamesAFlood(t *testing.T) {
-	text := DeliveryStillPausedText(1800, "Alle", 1790)
-	if !strings.Contains(text, `hub_disconnect("Alle")`) {
-		t.Fatalf("the notice does not name the flooding connection: %s", text)
+func TestTheStillPausedNoticeNamesTheConnectionsWaiting(t *testing.T) {
+	text := DeliveryStillPausedText(31, []OwnerCount{{"monit-a", 15}, {"monit-b", 15}, {"steffen", 1}})
+	for _, want := range []string{`"monit-a" 15`, `"monit-b" 15`, `"steffen" 1`, "hub_disconnect(<its name>)",
+		"moves NO read position"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("the notice lacks %q: %s", want, text)
+		}
 	}
-	if strings.Contains(DeliveryStillPausedText(30, "office", 10), "hub_disconnect") {
-		t.Fatal("a small, mixed queue was called a flood")
+	if strings.Contains(DeliveryStillPausedText(3, []OwnerCount{{"office", 3}}), "Waiting by connection") {
+		t.Fatal("a small queue was broken down")
 	}
 }
 
@@ -566,4 +569,32 @@ func TestAConnectionAloneHasTheWholeWindow(t *testing.T) {
 	if n != pushWindowCount-1 {
 		t.Fatalf("%d sent, want %d", n, pushWindowCount-1)
 	}
+}
+
+// Two busy conversations — two copies of one channel — cannot fill the
+// window between them: the share is divided among everyone waiting.
+func TestTwoFloodsLeaveRoomForAThirdConnection(t *testing.T) {
+	b := testBudget(t)
+	var sent []string
+	deliver := func(owner, cursor string) {
+		b.Deliver(Delivery{Owner: owner, Cursor: cursor, Bytes: 10,
+			Send: func() { sent = append(sent, owner+":"+cursor) }, Pause: func(string) {}})
+	}
+	for i := 0; i < 16; i++ {
+		deliver("copy-a", fmt.Sprintf("a%d", i))
+		deliver("copy-b", fmt.Sprintf("b%d", i))
+	}
+	deliver("office", "o1")
+	sent = nil
+	b.ReleaseAll()
+	share := (pushWindowCount - 1) / 3
+	for i, x := range sent {
+		if x == "office:o1" {
+			if i > 2*share {
+				t.Fatalf("office went out at %d, want within %d: %v", i, 2*share, sent)
+			}
+			return
+		}
+	}
+	t.Fatalf("office did not go out after the confirm: %v", sent)
 }

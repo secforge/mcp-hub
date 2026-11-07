@@ -21,7 +21,7 @@ import (
 // and leaves meanwhile, wakes nobody: nothing is pushed, and what it
 // brought waits in front of the next tool result.
 func TestARestartThatComesBackInTimeIsNotPushed(t *testing.T) {
-	testQuietRestart(t, 3, false, []string{"Your own message at 2026-10-30T12:00:00Z: my note while the server restarted", "p3", "Now 1 here: other (6ba7b810-9dad-11d1-80b4-00c04fd430c8).", "other (6ba7b810-9dad-11d1-80b4-00c04fd430c8): left at the server restart → reconnected",
+	testQuietRestart(t, 3, false, []string{"p3", "UTC: other (6ba7b810-9dad-11d1-80b4-00c04fd430c8).", "Now 1 here at ", "other (6ba7b810-9dad-11d1-80b4-00c04fd430c8): left at the server restart → reconnected",
 		"Nothing else arrived meanwhile"})
 }
 
@@ -145,7 +145,8 @@ func testQuietRestart(t *testing.T, behindAfterRestart int, pushed bool, wants [
 			t.Fatalf("the notice lacks %q:\n%s", want, note)
 		}
 	}
-	for _, unwanted := range []string{"DOWN", "shutting down", "RECONNECTED AUTOMATICALLY"} {
+	for _, unwanted := range []string{"DOWN", "shutting down", "RECONNECTED AUTOMATICALLY",
+		"my note while the server restarted"} {
 		if strings.Contains(note, unwanted) {
 			t.Fatalf("the notice still says %q:\n%s", unwanted, note)
 		}

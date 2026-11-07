@@ -626,35 +626,56 @@ func DeliveryPausedText() string {
 		"that you have not confirmed, across every connection and every kind. More is waiting, in " +
 		"order, and nothing is lost. To receive it: hub_confirm(connection, cursor) with the last " +
 		"message you have read COMPLETE frees everything delivered up to it, or hub_confirm() " +
-		"with no arguments once you have taken in everything delivered so far]"
+		"with no arguments once you have taken in everything delivered so far. " + confirmFreesText + "]"
 }
 
-// FloodHint names the connection holding most of a large queue and the
-// two ways to let it go without reading it one message at a time.
-func FloodHint(top string, topN int) string {
-	return fmt.Sprintf(" %d of them are from %q. If you are not meant to read those one by one: "+
-		"hub_disconnect(%q) drops every push of it waiting here and the server keeps them unread; "+
-		"or, only if your user asks you to skip them or they are plainly not for you, "+
-		"hub_confirm(connection: %q, latest: true) marks all of it read where the server can.",
-		topN, top, top, top)
+// confirmFreesText says what a reader who holds back its confirms has
+// wrong: holding back blocks every connection and saves nothing.
+const confirmFreesText = "hub_confirm() with no arguments moves NO read position and marks " +
+	"nothing read: it only says you took in what was delivered, so it is safe whatever those " +
+	"messages are. Confirming fetches nothing and makes no backlog grow: it only frees room. " +
+	"Holding confirms back keeps EVERY connection blocked and saves nothing — the unread " +
+	"messages wait on the server either way."
+
+// ConfirmFreesText is confirmFreesText, for notices built elsewhere.
+func ConfirmFreesText() string { return confirmFreesText }
+
+// OwnerCount is how many pushes one connection has waiting.
+type OwnerCount struct {
+	Owner string
+	N     int
 }
 
-// IsFlood says whether top's share of waiting pushes is worth naming.
-func IsFlood(waiting, topN int) bool { return topN >= 25 && topN > waiting/2 }
-
-// DeliveryStillPausedText repeats the pause notice while pushes wait.
-// top and topN name the connection with the most of them, so a reader
-// flooded by one conversation can see which one and let it go.
-func DeliveryStillPausedText(waiting int, top string, topN int) string {
-	flood := ""
-	if top != "" && IsFlood(waiting, topN) {
-		flood = FloodHint(top, topN)
+// QueueBreakdown says which connections the waiting pushes are from, the
+// busiest first, and how to let a connection's go without reading them
+// one by one. Empty for a queue too small to be worth it.
+func QueueBreakdown(waiting int, by []OwnerCount) string {
+	if waiting < 10 || len(by) == 0 {
+		return ""
 	}
+	parts := make([]string, 0, 3)
+	for i, oc := range by {
+		if i == 3 {
+			parts = append(parts, fmt.Sprintf("%d more connection(s)", len(by)-3))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%q %d", oc.Owner, oc.N))
+	}
+	return " Waiting by connection: " + strings.Join(parts, ", ") + ". If you are not meant to " +
+		"read a connection's pushes one by one: hub_disconnect(<its name>) drops every push of it " +
+		"waiting here and the server keeps them unread; or, only if your user asks you to skip " +
+		"them or they are plainly not for you, hub_confirm(connection: <its name>, latest: true) " +
+		"marks all of it read where the server can."
+}
+
+// DeliveryStillPausedText repeats the pause notice while pushes wait,
+// saying which connections they are from.
+func DeliveryStillPausedText(waiting int, by []OwnerCount) string {
 	return fmt.Sprintf("[hub: DELIVERY IS STILL PAUSED — %d push(es) are waiting because 25 "+
 		"deliveries (or 500 KB) are unconfirmed.%s Nothing reaches you until you confirm: "+
 		"hub_confirm(connection, cursor) with the last message you have read COMPLETE, or "+
-		"hub_confirm() with no arguments once you have taken in everything delivered so far]",
-		waiting, flood)
+		"hub_confirm() with no arguments once you have taken in everything delivered so far. %s]",
+		waiting, QueueBreakdown(waiting, by), confirmFreesText)
 }
 
 func FormatEventsBatch(events []Event) []string {

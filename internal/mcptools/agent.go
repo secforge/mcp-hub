@@ -32,8 +32,10 @@ import (
 // bringing all of them back after the socket drops — so a conversation's
 // session never dials or reconnects on its own.
 type agentSession struct {
-	hub     *Hub
-	name    string
+	hub *Hub
+	// ownEchoes is hub_connect's choice for every conversation it carries.
+	ownEchoes bool
+	name      string
 	link    string
 	display string
 	target  connstore.Target
@@ -130,6 +132,7 @@ func (h *Hub) connectAgent(placeholder *session, a *hubconn.Agent, c agentConnec
 	}
 	ag := &agentSession{
 		hub: h, name: as, link: c.link, display: c.display, target: c.target,
+		ownEchoes:   placeholder.ownEchoes,
 		pusher:      harness.OpenAs(as),
 		agent:       a,
 		grants:      map[string]wire.Assignment{},
@@ -389,6 +392,7 @@ func (ag *agentSession) openChild(a *hubconn.Agent, it wire.Assignment, preloade
 		}
 	}
 	conn.ShareDeliveryBudget(ag.hub.budget, s.name)
+	conn.ShareSentIDs(s.sentIDs)
 	conn.SetDeliveryBudget(ag.hub.spillDir, 0, 0, 0)
 	conn.PushRosterBeforeMessages(rosterQuiet)
 	conn.RemindElsewhere()
@@ -1521,6 +1525,8 @@ func (ag *agentSession) remindLoop() {
 		}
 		ag.alert(fmt.Sprintf("CONFIRM what you have read: %s. hub_confirm(connection, cursor) for "+
 			"each, once you have the message whole; until then a reconnect delivers them again and "+
-			"they hold room in the delivery window.", strings.Join(lines, "; ")))
+			"they hold room in the delivery window. Only to free that room, hub_confirm() with no "+
+			"arguments moves no read position and is safe whatever the messages are.",
+			strings.Join(lines, "; ")))
 	}
 }

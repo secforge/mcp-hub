@@ -357,7 +357,12 @@ type Conn struct {
 	// wire.Joined) — zero-valued for every mcp-hub-server connection.
 	canSend          bool
 	conversationKind string
-	topic            *string
+	// thread is joined.thread: the platform thread behind this
+	// conversation, the same in every copy of it.
+	thread string
+	// sent holds the externalIds this connection's sends were given.
+	sent *SentIDs
+	topic  *string
 	// behind is nil when the server did not state it — a server with no
 	// such concept, or a connection with no prior position. Distinct from
 	// a stated 0, which asserts "you are caught up" as a fact.
@@ -1290,6 +1295,7 @@ func startConn(ws transport, raw []byte, snapPongWait, snapWriteWait, snapConfir
 		todoItems:               itemsOf(joined.Items),
 		todoCursor:              joined.ItemsCursor,
 		topic:                   joined.Topic,
+		thread:                  joined.Thread,
 		behind:                  joined.Behind,
 		behindSince:             joined.BehindSince,
 		pinnedAtConnect:         pinnedOrNil(joined.Pinned),
@@ -1437,6 +1443,69 @@ func (c *Conn) VerifiedClientRelease() (wire.ClientRelease, bool) {
 // HasFeature reports whether the server explicitly declared support for
 // the named feature — meaningless (always false) when FeaturesDeclared
 // is false, since a pre-v3 server has said nothing either way.
+// SentIDs remembers the externalIds a connection's sends were given, so
+// their echoes are known as its own. Shared by every Conn one connection
+// goes through, so a reconnect does not forget them.
+type SentIDs struct {
+	mu    sync.Mutex
+	m     map[string]bool
+	order []string
+}
+
+// maxSentIDs bounds how many sent ids are remembered.
+const maxSentIDs = 2000
+
+// NewSentIDs makes an empty set.
+func NewSentIDs() *SentIDs { return &SentIDs{m: map[string]bool{}} }
+
+func (s *SentIDs) add(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m[id] {
+		return
+	}
+	s.m[id] = true
+	s.order = append(s.order, id)
+	for len(s.order) > maxSentIDs {
+		delete(s.m, s.order[0])
+		s.order = s.order[1:]
+	}
+}
+
+func (s *SentIDs) has(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m[id]
+}
+
+// ShareSentIDs makes this connection remember its sends in ids. Caller
+// does not hold c.mu.
+func (c *Conn) ShareSentIDs(ids *SentIDs) {
+	if ids == nil {
+		return
+	}
+	c.mu.Lock()
+	c.sent = ids
+	c.mu.Unlock()
+}
+
+// sentIDs is this connection's set. Caller holds c.mu.
+func (c *Conn) sentIDs() *SentIDs {
+	if c.sent == nil {
+		c.sent = NewSentIDs()
+	}
+	return c.sent
+}
+
+// Thread names the platform thread behind this conversation, the same in
+// every copy of it; "" where the server names none.
+func (c *Conn) Thread() string {
+	if !c.HasFeature(wire.FeatureThreadIdentity) {
+		return ""
+	}
+	return c.thread
+}
+
 func (c *Conn) HasFeature(name string) bool {
 	_, ok := c.features[name]
 	return ok
@@ -2556,6 +2625,16 @@ func (c *Conn) readLoop() {
 			ev.IsOperator = true
 		}
 		c.mu.Lock()
+		// What this connection sent, by the id its sendAck named: a
+		// server that remembers that only per socket sends the echo
+		// unmarked after a reconnect.
+		if ev.Kind == "sendAck" && ev.ExternalID != "" && (ev.ActionOK || !ev.ActionOKStated) {
+			c.sentIDs().add(ev.ExternalID)
+		}
+		if ev.Kind == "msg" && !ev.Own && ev.Presence == nil && ev.ExternalID != "" &&
+			c.sentIDs().has(ev.ExternalID) {
+			ev.Own = true
+		}
 		ev.OwnAccount = ev.Kind == "msg" && !ev.Own && ev.PeerID != "" && ev.PeerID == c.peerID
 		if ev.Kind == "msg" {
 			c.links.record(ev.ExternalID, ev.ExternalLink)

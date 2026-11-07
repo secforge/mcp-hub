@@ -39,6 +39,9 @@ type Hub struct {
 	// mu guards the session map and nothing else. Each session guards its
 	// own state — see session.mu for the lock order.
 	mu sync.Mutex
+	// copies remembers, for a message that reaches several copies of one
+	// platform thread, which connection delivered it; see copies.go.
+	copies copyLedger
 	// abandonedPending is set when startup could not report a previous
 	// run's connections, because the scope was not yet known; the first
 	// tool call reports them instead. See reportAbandonedConnections.
@@ -1312,6 +1315,7 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	// directory is the same one received attachments use, and dies with
 	// the connection for the same reason.
 	conn.ShareDeliveryBudget(s.hub.budget, s.name)
+	conn.ShareSentIDs(s.sentIDs)
 	conn.SetDeliveryBudget(s.hub.spillDir, 0, 0, 0)
 	// What a reconnect needs is recorded BEFORE the callback that reads
 	// it is registered. willAutoReconnect answers from redialLink, so a
@@ -1689,15 +1693,12 @@ func (h *Hub) withReconnectNote(handler server.ToolHandlerFunc) server.ToolHandl
 		// notice can be lost on the way, and a reader who does not know that
 		// delivery stopped never confirms; a tool result cannot be lost.
 		if queued, paused := h.gate().budget.Waiting(); paused && queued > 0 {
-			flood := ""
-			if top, n := h.gate().budget.TopQueued(); top != "" && hubconn.IsFlood(queued, n) {
-				flood = hubconn.FloodHint(top, n)
-			}
+			flood := hubconn.QueueBreakdown(queued, h.gate().budget.QueuedBy())
 			h.noteAutoReconnect(fmt.Sprintf("DELIVERY IS PAUSED — %d push(es) are waiting because 25 "+
 				"deliveries (or 500 KB) are unconfirmed, and nothing reaches you until you confirm: "+
 				"hub_confirm(connection, cursor) with the last message you have read COMPLETE, or "+
-				"hub_confirm() with no arguments once you have taken in everything delivered so far.%s",
-				queued, flood))
+				"hub_confirm() with no arguments once you have taken in everything delivered so far.%s %s",
+				queued, flood, hubconn.ConfirmFreesText()))
 		}
 		if withheld := withheldNotice(h.allSessions()); withheld != "" {
 			h.noteAutoReconnect(withheld)
@@ -1995,6 +1996,13 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 					"put a key into a tool argument or a message. The file must be readable by its "+
 					"owner only. With createToken it creates the session encrypted. The path is "+
 					"remembered for reconnects; the key is not stored")),
+			mcp.WithBoolean("ownEchoes", mcp.Description(
+				"Optional, default false. A link to Teams, Slack, WhatsApp or Signal sends every "+
+					"message this connection sends back to it, marked as your own. By default those "+
+					"echoes are not delivered to you — you know what you sent — and reactions, edits "+
+					"and deletes you made are not either. true delivers them. Messages someone wrote "+
+					"under the same account some other way are always delivered; hub_read shows "+
+					"everything either way. On an agent connection it applies to every conversation")),
 			mcp.WithString("createToken", mcp.Description(
 				"Optional, server-specific: a capability for creating and claiming a brand-new "+
 					"session in this same handshake, for a server that refuses an unknown session "+
@@ -2442,7 +2450,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 				"reports it, the result also states how many messages remain after the position "+
 				"you confirmed. Errors if not connected.\n\nDELIVERY WINDOW: this client keeps at most 25 "+
 				"deliveries (or 500 KB) for you unconfirmed, across every connection and every kind; "+
-				"while another connection has pushes waiting, no connection takes more than half of it. "+
+				"while other connections have pushes waiting, each takes at most an equal share of it. "+
 				"A confirm frees everything delivered up to the cursor you name, from every connection. "+
 				"Called with NO arguments it frees the whole window without moving any read position — "+
 				"for when you have taken in everything delivered so far, including notices that carry no "+
@@ -2896,6 +2904,9 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	s.mu.Lock()
+	s.ownEchoes = req.GetBool("ownEchoes", false)
+	s.mu.Unlock()
 	// Every failure from here on releases the name again. A name held by
 	// a connection that was never established is a name nobody can use
 	// and nothing can explain.
@@ -3114,6 +3125,7 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// directory is the same one received attachments use, and dies with
 	// the connection for the same reason.
 	conn.ShareDeliveryBudget(s.hub.budget, s.name)
+	conn.ShareSentIDs(s.sentIDs)
 	conn.SetDeliveryBudget(s.hub.spillDir, 0, 0, 0)
 	// What a reconnect needs is recorded BEFORE the callback that reads
 	// it is registered. willAutoReconnect answers from redialLink, so a
@@ -3936,6 +3948,8 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		return
 	}
 	items, _ := conn.DrainForPush()
+	items = s.withoutOwnEchoes(conn, items)
+	items = s.withoutCopies(conn, items)
 	if s.agent != nil && len(items) > 0 {
 		s.agent.announcedBefore(s)
 	}
@@ -6391,6 +6405,7 @@ func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error)
 // adoptConfirmed records cursor as the position the reader has confirmed,
 // here and on disk.
 func (s *session) adoptConfirmed(cursor string) error {
+	defer s.hub.copiesConfirmed(s, cursor)
 	s.mu.Lock()
 	s.lastHandedOverCursor = cursor
 	// handedOverAhead's entries exist to dedup a walk that hasn't reached

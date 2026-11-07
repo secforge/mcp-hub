@@ -87,11 +87,13 @@ type catchUpResult struct {
 	// automatic reconnect rather than delivered on their own.
 	Folded int
 	// Repeated counts those of them an earlier notice already showed.
-	Repeated  int
-	Bytes     int
-	CaughtUp  bool
-	StoppedBy string
-	Err       error
+	Repeated int
+	// OwnSkipped counts echoes of this connection\'s own sends left out.
+	OwnSkipped int
+	Bytes      int
+	CaughtUp   bool
+	StoppedBy  string
+	Err        error
 }
 
 // runCatchUpPush walks the backlog and pushes each message, stopping at
@@ -128,6 +130,9 @@ func ownMessageLine(ev hubconn.Event) string {
 // reconnect, when nothing but joins and leaves arrived meanwhile.
 func caughtUpQuietly(res catchUpResult) string {
 	switch {
+	case res.Folded == 0 && res.OwnSkipped > 0:
+		return "Nothing arrived meanwhile but echoes of what you sent; confirm the cursor below " +
+			"to mark them read."
 	case res.Folded == 0:
 		return "Nothing arrived meanwhile."
 	case res.Repeated == res.Folded:
@@ -172,6 +177,7 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 	// delivery per join or leave would fill the window with them. The run
 	// carries the cursor of its last entry, and every entry in it is
 	// recorded as handed over, so none is skipped.
+	wantOwn := s.wantsOwnEchoes()
 	var held []hubconn.Event
 	heldText := ""
 	release := func(more bool) {
@@ -263,6 +269,33 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			// re-fetch this same message forever.
 			res.StoppedBy = "a message arrived with no cursor, so the walk could not continue"
 			break
+		}
+		if !wantOwn && isOwnEcho(ev) {
+			// Not asked for: recorded as handed over so no later walk
+			// offers it, and carried by the restart notice's cursor if
+			// one is gathering.
+			if len(held) > 0 {
+				if release(true); res.Err != nil {
+					break
+				}
+			}
+			s.recordHandedOver([]hubconn.Event{ev})
+			s.restartAdd("", ev.Cursor)
+			res.OwnSkipped++
+			anchor = wire.Anchor{Cursor: ev.Cursor}
+			continue
+		}
+		if first, dup := s.copyOf(conn, ev); dup {
+			// Delivered first on another copy of this thread.
+			if len(held) > 0 {
+				if release(true); res.Err != nil {
+					break
+				}
+			}
+			s.holdCopy(ev, first)
+			s.restartAdd("", ev.Cursor)
+			anchor = wire.Anchor{Cursor: ev.Cursor}
+			continue
 		}
 		if s.pushedLive(ev.Cursor) {
 			// Already pushed live since this connection came up: the

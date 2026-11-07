@@ -32,6 +32,14 @@ import (
 // derived, and never reused while a connection holds it — see Hub.open.
 type session struct {
 	name string
+	// ownEchoes says the reader asked, at hub_connect, to be delivered a
+	// link's echo of what this connection itself sent.
+	ownEchoes bool
+	// sentIDs outlives each Conn of this connection; see hubconn.SentIDs.
+	sentIDs *hubconn.SentIDs
+	// copiesHeld are messages this connection received that another copy
+	// of its thread delivered first, in arrival order; see copies.go.
+	copiesHeld []heldCopy
 	// hub is the process this connection belongs to, for the things that
 	// are genuinely process-wide: the queued notes (one reader), the
 	// harness push target, the delivery budget.
@@ -307,7 +315,7 @@ func (h *Hub) registerLocked(name string, agent *agentSession, conv string) *ses
 	if h.sessions == nil {
 		h.sessions = map[string]*session{}
 	}
-	s := &session{name: name, hub: h, agent: agent, conv: conv}
+	s := &session{name: name, hub: h, agent: agent, conv: conv, sentIDs: hubconn.NewSentIDs()}
 	h.restoredLocked(name)
 	// Built HERE, before anything can run against this session. Assigning
 	// it later raced the connection's own goroutines, which read it to

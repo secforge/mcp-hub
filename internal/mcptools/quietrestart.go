@@ -177,6 +177,16 @@ func (s *session) restartFlush() {
 	}
 	n.mu.Unlock()
 	if !act {
+		// Read only with the next tool result, which can be much later:
+		// the member list says when it was true.
+		if here != "" {
+			at := time.Now().UTC().Format("15:04 UTC")
+			dated := strings.Replace(here, " here:", " here at "+at+":", 1)
+			if dated == here {
+				dated = "Nobody else was here at " + at + "."
+			}
+			body = strings.Replace(body, here, dated, 1)
+		}
 		if cursor != "" {
 			body += "\nThese end at cursor " + cursor + "; confirm it with hub_confirm " +
 				"along with whatever you confirm next."
