@@ -29,12 +29,21 @@ func isOwnEcho(ev hubconn.Event) bool {
 	return false
 }
 
+// skipEcho records an echo the reader did not ask for: handed over, so no
+// walk offers it again, and settled, so it never holds the read position
+// back. Where nothing unconfirmed precedes it, the position moves past it.
+func (s *session) skipEcho(ev hubconn.Event) {
+	if ev.Cursor == "" {
+		return
+	}
+	s.recordHandedOver([]hubconn.Event{ev})
+	s.mark(ev.Cursor, func(h *handed) { h.echo = true })
+	s.settleFront()
+}
+
 // withoutOwnEchoes takes out of items the echoes the reader did not ask
-// for. One that carries a cursor, arriving when nothing before it is left
-// unconfirmed, is confirmed here: the reader wrote it, and leaving it
-// unread would keep the read position behind the reader's own message
-// until something else arrived.
-func (s *session) withoutOwnEchoes(conn *hubconn.Conn, items []hubconn.PushItem) []hubconn.PushItem {
+// for.
+func (s *session) withoutOwnEchoes(items []hubconn.PushItem) []hubconn.PushItem {
 	if s.wantsOwnEchoes() {
 		return items
 	}
@@ -44,14 +53,7 @@ func (s *session) withoutOwnEchoes(conn *hubconn.Conn, items []hubconn.PushItem)
 			kept = append(kept, it)
 			continue
 		}
-		s.noteDelivered(it.Cursor)
-		if it.Cursor == "" {
-			continue
-		}
-		if _, count, _, ok := conn.UnconfirmedState(); ok && count == 1 {
-			cursor := it.Cursor
-			go func() { _, _ = s.confirmCursor(conn, cursor) }()
-		}
+		s.skipEcho(it.Event)
 	}
 	return kept
 }

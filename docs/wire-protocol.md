@@ -1090,8 +1090,12 @@ agreed between the two projects; this section is what a client implements.
 is below 5, naming v5 in the reason. A client never decides from the link
 which kind it is dialling; the first frame says which kind answered: `agentJoined {agentId, name, features}` instead of `joined`,
 followed by `assignments {items: [{conv, title, kind, channel, access,
-historyFrom, behind}]}`. `access` is `read` or `readwrite`; `historyFrom`
-absent means all history. The `Agent-Secret` authenticates the agent on this
+historyFrom, behind, account}]}`. `access` is `read` or `readwrite`; `historyFrom`
+absent means all history. `account {id, name, channel}` is the platform
+account the conversation acts as, on `assigned` and `changed` too: `id` is
+opaque, stable per agent and account, and the same value
+`features.startConversation` lists; `name` is its display name. Absent where
+no platform account is behind a conversation (hub sessions, todo lists). The `Agent-Secret` authenticates the agent on this
 socket only.
 
 **Framing.** Every frame about one conversation travels both ways as

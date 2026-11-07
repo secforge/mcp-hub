@@ -634,8 +634,9 @@ own connection, so that the agent can answer from either. Where the server
 names the thread (`joined.thread`), a message both copies receive is
 delivered once, on the connection it reached first, and confirming it
 there confirms it on the other copy as well, wherever that moves nothing
-past an unconfirmed message. The reader is told once which connections are
-copies of one thread.
+past anything handed over there and not confirmed. A delivered message says
+which other conversations it is also in, with the account each acts as, and
+the conversation list names every conversation's account.
 Only `hub_confirm` frees room: with a cursor it frees everything delivered
 up to that message, from every connection, and moves that connection's
 read position; with no arguments it frees everything delivered so far and

@@ -569,12 +569,27 @@ func TestOneReminderCoversEveryConversationOfTheAgent(t *testing.T) {
 	connectAgentForTest(t, h, srv)
 	srv.Msg("conv-1", agentPeer, "one", "c-1")
 	srv.Msg("conv-2", agentPeer, "two", "c-2")
+	a, b := childNamed(t, h, "conv-1"), childNamed(t, h, "conv-2")
+	// Both unconfirmed before a reminder is looked for: under load the
+	// second message can arrive after a reminder for the first went out.
+	waitUntil(t, "both messages unconfirmed", func() bool {
+		for _, s := range []*session{a, b} {
+			conn, _ := s.activeConn()
+			if conn == nil {
+				return false
+			}
+			if _, _, _, ok := conn.UnconfirmedState(); !ok {
+				return false
+			}
+		}
+		return true
+	})
+	h.takeAutoReconnectNote()
 	var note string
 	waitUntil(t, "the reminder", func() bool {
 		note += h.takeAutoReconnectNote()
 		return strings.Contains(note, "CONFIRM what you have read")
 	})
-	a, b := childNamed(t, h, "conv-1"), childNamed(t, h, "conv-2")
 	if !strings.Contains(note, a.name) || !strings.Contains(note, b.name) {
 		t.Fatalf("one reminder does not cover both conversations: %s", note)
 	}

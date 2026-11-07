@@ -3948,8 +3948,14 @@ func (s *session) pushToHarness(conn *hubconn.Conn, w *waiter.Waiter) {
 		return
 	}
 	items, _ := conn.DrainForPush()
-	items = s.withoutOwnEchoes(conn, items)
+	s.handedInOrder(items)
+	items = s.withoutOwnEchoes(items)
 	items = s.withoutCopies(conn, items)
+	for i := range items {
+		if len(items[i].Merged) == 0 {
+			items[i].Text = s.alsoOn(conn, items[i].Event) + items[i].Text
+		}
+	}
 	if s.agent != nil && len(items) > 0 {
 		s.agent.announcedBefore(s)
 	}
@@ -6314,6 +6320,7 @@ func (s *session) confirmLatest(conn *hubconn.Conn) *mcp.CallToolResult {
 		return mcp.NewToolResultError(fmt.Sprintf("nothing was marked read: %v. Your read "+
 			"position has NOT moved.", err))
 	}
+	s.confirmedHere("", true)
 	if cursor == "" {
 		return mcp.NewToolResultText(fmt.Sprintf("there is nothing on %q to mark read; no position "+
 			"moved. Pushes of it still waiting here are dropped", s.name))
@@ -6405,6 +6412,8 @@ func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error)
 // adoptConfirmed records cursor as the position the reader has confirmed,
 // here and on disk.
 func (s *session) adoptConfirmed(cursor string) error {
+	s.confirmedHere(cursor, false)
+	defer s.settleFront()
 	defer s.hub.copiesConfirmed(s, cursor)
 	s.mu.Lock()
 	s.lastHandedOverCursor = cursor

@@ -36,10 +36,10 @@ type agentSession struct {
 	// ownEchoes is hub_connect's choice for every conversation it carries.
 	ownEchoes bool
 	name      string
-	link    string
-	display string
-	target  connstore.Target
-	pusher  *harness.Pusher
+	link      string
+	display   string
+	target    connstore.Target
+	pusher    *harness.Pusher
 
 	// opMu serializes everything that opens or ends conversations: agent
 	// events, a reconnect reopening everything, a disconnect. Two of them
@@ -1166,6 +1166,13 @@ func (ag *agentSession) childLine(s *session) string {
 	if access == wire.AccessRead {
 		access = "READ-ONLY"
 	}
+	if a := it.Account; a != nil {
+		name := noticeText(a.Name)
+		if name == "" {
+			name = noticeText(a.ID)
+		}
+		kind += ", as " + name
+	}
 	return fmt.Sprintf("%s — %q%s, %s, %s%s", s.name, it.Title, kind, access, state, extra)
 }
 
@@ -1467,6 +1474,10 @@ func (ag *agentSession) flushNew() {
 	lines := make([]string, 0, len(pending))
 	for _, n := range pending {
 		line := fmt.Sprintf("%q as connection %q (%s)", n.title, n.s.name, accessText(n.s))
+		if acct := n.s.accountName(); acct != "" {
+			line = fmt.Sprintf("%q as connection %q (%s, as %s)", n.title, n.s.name, accessText(n.s),
+				noticeText(acct))
+		}
 		if n.note != "" {
 			line += ", which " + n.note
 		}

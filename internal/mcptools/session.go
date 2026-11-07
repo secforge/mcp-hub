@@ -37,9 +37,17 @@ type session struct {
 	ownEchoes bool
 	// sentIDs outlives each Conn of this connection; see hubconn.SentIDs.
 	sentIDs *hubconn.SentIDs
-	// copiesHeld are messages this connection received that another copy
-	// of its thread delivered first, in arrival order; see copies.go.
-	copiesHeld []heldCopy
+	// sinceConfirm is everything this connection handed over since its
+	// last confirm, in order; see copies.go.
+	sinceConfirm []handed
+	// unordered says sinceConfirm is incomplete, so nothing is confirmed
+	// on the reader's behalf until a confirm of its own empties it.
+	unordered bool
+	// walkAt is where a running catch-up walk inserts into sinceConfirm:
+	// what it walks arrived while this client was away, after what was
+	// handed over before and before what arrives live meanwhile. -1 when
+	// no walk runs.
+	walkAt int
 	// hub is the process this connection belongs to, for the things that
 	// are genuinely process-wide: the queued notes (one reader), the
 	// harness push target, the delivery budget.
@@ -315,7 +323,7 @@ func (h *Hub) registerLocked(name string, agent *agentSession, conv string) *ses
 	if h.sessions == nil {
 		h.sessions = map[string]*session{}
 	}
-	s := &session{name: name, hub: h, agent: agent, conv: conv, sentIDs: hubconn.NewSentIDs()}
+	s := &session{name: name, hub: h, agent: agent, conv: conv, sentIDs: hubconn.NewSentIDs(), walkAt: -1}
 	h.restoredLocked(name)
 	// Built HERE, before anything can run against this session. Assigning
 	// it later raced the connection's own goroutines, which read it to
@@ -683,6 +691,7 @@ func (s *session) noteDelivered(cursor string) {
 	}
 	s.delivered[cursor] = true
 	s.deliveredOrder = append(s.deliveredOrder, cursor)
+	s.handedLocked(cursor)
 	for len(s.deliveredOrder) > maxRecentCursors {
 		delete(s.delivered, s.deliveredOrder[0])
 		s.deliveredOrder = s.deliveredOrder[1:]

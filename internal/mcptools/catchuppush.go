@@ -177,6 +177,8 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 	// delivery per join or leave would fill the window with them. The run
 	// carries the cursor of its last entry, and every entry in it is
 	// recorded as handed over, so none is skipped.
+	s.walkStart()
+	defer s.walkEnd()
 	wantOwn := s.wantsOwnEchoes()
 	var held []hubconn.Event
 	heldText := ""
@@ -217,6 +219,9 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			return
 		}
 		s.restartFlush()
+		if len(run) == 1 {
+			heldText = s.alsoOn(conn, run[0]) + heldText
+		}
 		if err := s.pushCatchUpMessage(conn, id, run, heldText, more); err != nil {
 			if res.Err == nil {
 				res.Err = err
@@ -270,6 +275,9 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 			res.StoppedBy = "a message arrived with no cursor, so the walk could not continue"
 			break
 		}
+		if !s.pushedLive(ev.Cursor) {
+			s.handedWalk(ev.Cursor)
+		}
 		if !wantOwn && isOwnEcho(ev) {
 			// Not asked for: recorded as handed over so no later walk
 			// offers it, and carried by the restart notice's cursor if
@@ -279,7 +287,7 @@ func (s *session) walkCatchUpPush(conn *hubconn.Conn, id connstore.Target, ancho
 					break
 				}
 			}
-			s.recordHandedOver([]hubconn.Event{ev})
+			s.skipEcho(ev)
 			s.restartAdd("", ev.Cursor)
 			res.OwnSkipped++
 			anchor = wire.Anchor{Cursor: ev.Cursor}

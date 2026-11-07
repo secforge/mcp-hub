@@ -95,6 +95,18 @@ type Assignment struct {
 	// HistoryFrom is where visible history starts; nil means all of it.
 	HistoryFrom *string `json:"historyFrom,omitempty,case:strict"`
 	Behind      *int    `json:"behind,omitempty,case:strict"`
+	// Account is the platform account this conversation acts as; absent
+	// where there is none, as on a hub session or a todo list.
+	Account *GrantAccount `json:"account,omitempty,case:strict"`
+}
+
+// GrantAccount names the account a shared conversation acts as. ID is
+// opaque, stable per agent and account, and the same value
+// startConversation's accounts carry.
+type GrantAccount struct {
+	ID      string `json:"id,case:strict"`
+	Name    string `json:"name,omitempty,case:strict"`
+	Channel string `json:"channel,omitempty,case:strict"`
 }
 
 // Writable reports whether the grant allows writing.

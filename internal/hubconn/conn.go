@@ -361,8 +361,8 @@ type Conn struct {
 	// conversation, the same in every copy of it.
 	thread string
 	// sent holds the externalIds this connection's sends were given.
-	sent *SentIDs
-	topic  *string
+	sent  *SentIDs
+	topic *string
 	// behind is nil when the server did not state it — a server with no
 	// such concept, or a connection with no prior position. Distinct from
 	// a stated 0, which asserts "you are caught up" as a fact.
