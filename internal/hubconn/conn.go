@@ -1591,6 +1591,15 @@ func (c *Conn) RosterComplete() bool {
 // roster on join (see the server's "roster on join" behavior), this is
 // complete from shortly after Dial returns, not just for peers who joined
 // after this connection did.
+// AwayHeld reports whether peer id left and is still listed because its
+// return is expected; see awayHold.
+func (c *Conn) AwayHeld(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, held := c.awayHold[id]
+	return held
+}
+
 func (c *Conn) Peers() []PeerInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2926,7 +2935,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if r.PeerID != "" && !wire.IsValidID(r.PeerID) {
 			return Event{}, false
 		}
-		return Event{Kind: "reactionChanged", PeerID: r.PeerID, ExternalID: r.ExternalID,
+		return Event{Kind: "reactionChanged", PeerID: r.PeerID, SenderName: r.Name, ExternalID: r.ExternalID,
 			Reaction: r.Reaction, ReactionLabel: r.Label, ReactionAction: r.Action, TS: r.TS, Own: r.Own}, true
 	case wire.TypeMessageEdited:
 		var m wire.MessageEdited

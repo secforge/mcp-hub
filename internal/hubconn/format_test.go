@@ -694,3 +694,18 @@ func TestADeliveredMessageNamesItsConnection(t *testing.T) {
 		}
 	}
 }
+
+// A reaction by someone not in the roster says who it was where the
+// server knows the name.
+func TestAReactionNamesItsReactor(t *testing.T) {
+	e := Event{Kind: "reactionChanged", PeerID: "00000000-0000-0000-0000-000000000000", SenderName: "Steffen Heil",
+		Reaction: "❤️", ReactionAction: "add", ExternalID: "m1"}
+	got := FormatEvent(e)
+	if !strings.Contains(got, `"Steffen Heil" (00000000-0000-0000-0000-000000000000) added`) {
+		t.Fatalf("the reaction does not name its reactor: %s", got)
+	}
+	e.SenderName = ""
+	if got := FormatEvent(e); !strings.Contains(got, "00000000-0000-0000-0000-000000000000 added") {
+		t.Fatalf("without a name the id alone is shown: %s", got)
+	}
+}

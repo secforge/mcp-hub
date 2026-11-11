@@ -359,6 +359,12 @@ func FormatEvent(e Event) string {
 		return fmt.Sprintf("[hub: send NOT acknowledged (externalId=%s) — do not assume it went through]", e.ExternalID)
 	case "reactionChanged":
 		who := e.PeerID
+		if name := strings.ReplaceAll(sanitize.Text(e.SenderName, 80), "]", ")"); name != "" {
+			who = fmt.Sprintf("%q (%s)", name, e.PeerID)
+			if e.PeerID == "" {
+				who = fmt.Sprintf("%q", name)
+			}
+		}
 		if who == "" {
 			who = "someone (unattributed)"
 		}

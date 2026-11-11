@@ -833,7 +833,7 @@ Fan-out to *other* connections (server → client, not something a
 receiving client requested):
 
 ```json
-{"type": "reactionChanged", "externalId": "...", "peerId": "...", "reaction": "...", "label": "...", "action": "add", "ts": "...", "own": false}
+{"type": "reactionChanged", "externalId": "...", "peerId": "...", "name": "...", "reaction": "...", "label": "...", "action": "add", "ts": "...", "own": false}
 {"type": "messageEdited", "externalId": "...", "text": "...", "ts": "...", "own": false, "attachments": [...], "format": "...", "replyTo": "...", "replyPreview": "...", "mentions": [...], "mentionedMe": false}
 {"type": "messageDeleted", "externalId": "...", "cursor": "...", "ts": "...", "own": false}
 ```
@@ -845,6 +845,9 @@ Notes:
   `attachments` and so left them unchanged — a receiving client should
   keep whatever attachments it already had for this `externalId`, not
   treat an absent field as "now has none."
+- `reactionChanged.name` is the reactor's display name, from the same
+  source as `msg.name`, so a reaction by someone not in the roster can be
+  attributed. Absent when the reaction is unattributed or the name unknown.
 - `reactionChanged.peerId` may be **absent** — if a removal is detected
   by diffing a message's reaction set and the remover isn't identifiable
   from that diff, still send the event (the removal is real information)

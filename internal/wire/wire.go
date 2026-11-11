@@ -1237,8 +1237,11 @@ type ReactionChanged struct {
 	Type       Type   `json:"type,case:strict"`
 	ExternalID string `json:"externalId,case:strict"`
 	PeerID     string `json:"peerId,omitempty,case:strict"`
-	Reaction   string `json:"reaction,case:strict"`
-	Label      string `json:"label,omitempty,case:strict"`
+	// Name is the reactor's display name, where the server knows it;
+	// absent when the reaction is unattributed or the name unknown.
+	Name     string `json:"name,omitempty,case:strict"`
+	Reaction string `json:"reaction,case:strict"`
+	Label    string `json:"label,omitempty,case:strict"`
 	// Action is "add" or "remove".
 	Action string `json:"action,case:strict"`
 	TS     string `json:"ts,omitempty,case:strict"`

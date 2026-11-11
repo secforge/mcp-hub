@@ -315,7 +315,11 @@ func (s *session) hereNow() string {
 		if name == "" {
 			name = "a peer"
 		}
-		names = append(names, name+" ("+noticeText(p.ID)+")")
+		label := name + " (" + noticeText(p.ID) + ")"
+		if conn.AwayHeld(p.ID) {
+			label += " — left, expected back"
+		}
+		names = append(names, label)
 	}
 	if len(names) == 0 {
 		return "Nobody else is here now."

@@ -134,4 +134,10 @@ func TestAPeerWhoseLeaveIsHeldIsStillListed(t *testing.T) {
 	if !strings.Contains(got, "bravo (b): joined") || !strings.Contains(got, "Now 2 here") || !strings.Contains(got, "alpha (a)") {
 		t.Fatalf("notice: %s", got)
 	}
+	if _, held := c.awayHold["a"]; !held {
+		t.Fatal("alpha's leave is not held")
+	}
+	if _, held := c.awayHold["b"]; held {
+		t.Fatal("bravo, who is here, is marked away")
+	}
 }
