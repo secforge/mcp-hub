@@ -1298,6 +1298,8 @@ type MessageEdited struct {
 	// PeerID names who made the change, where the server says — a todo
 	// list does (§2.8b).
 	PeerID string `json:"peerId,omitempty,case:strict"`
+	// Name is that peer's display name, where the server knows it.
+	Name string `json:"name,omitempty,case:strict"`
 	// Enc replaces Text in an encrypted session (§2.11).
 	Enc *Enc `json:"enc,omitempty,case:strict"`
 }

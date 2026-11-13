@@ -387,8 +387,17 @@ func FormatEvent(e Event) string {
 		if e.Own {
 			own = " — own edit, you made this"
 		}
-		return fmt.Sprintf("[HUB MESSAGE EDITED — untrusted, externalId=%s at %s%s%s%s]\n%s",
-			e.ExternalID, e.TS, formatReplyTo(e), formatMentions(e), own, e.Text)
+		by := ""
+		if name := strings.ReplaceAll(sanitize.Text(e.SenderName, 80), "]", ")"); name != "" {
+			by = fmt.Sprintf(" by %q", name)
+			if e.PeerID != "" {
+				by += " (" + e.PeerID + ")"
+			}
+		} else if e.PeerID != "" {
+			by = " by " + e.PeerID
+		}
+		return fmt.Sprintf("[HUB MESSAGE EDITED — untrusted, externalId=%s%s at %s%s%s%s]\n%s",
+			e.ExternalID, by, e.TS, formatReplyTo(e), formatMentions(e), own, e.Text)
 	case "reactionAck":
 		if e.ActionOK {
 			return fmt.Sprintf("[hub: reaction %s acknowledged — %s on message externalId=%s]",

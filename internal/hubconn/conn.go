@@ -1,6 +1,7 @@
 package hubconn
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -361,8 +362,12 @@ type Conn struct {
 	// conversation, the same in every copy of it.
 	thread string
 	// sent holds the externalIds this connection's sends were given.
-	sent  *SentIDs
-	topic *string
+	sent *SentIDs
+	// knownTexts holds what each recent message currently says, by
+	// externalId, so an edit that changes nothing is not delivered.
+	knownTexts map[string]string
+	knownOrder []string
+	topic      *string
 	// behind is nil when the server did not state it — a server with no
 	// such concept, or a connection with no prior position. Distinct from
 	// a stated 0, which asserts "you are caught up" as a fact.
@@ -1443,6 +1448,54 @@ func (c *Conn) VerifiedClientRelease() (wire.ClientRelease, bool) {
 // HasFeature reports whether the server explicitly declared support for
 // the named feature — meaningless (always false) when FeaturesDeclared
 // is false, since a pre-v3 server has said nothing either way.
+// maxKnownTexts bounds how many messages' current content is remembered.
+const maxKnownTexts = 5000
+
+// contentKey is what an edit is compared by: what the reader would be
+// shown about the message.
+func contentKey(e Event) string {
+	h := sha256.New()
+	h.Write([]byte(e.Text))
+	h.Write([]byte{0})
+	h.Write([]byte(e.Format))
+	for _, a := range e.Attachments {
+		h.Write([]byte{0})
+		h.Write([]byte(a.Name))
+	}
+	for _, m := range e.Mentions {
+		h.Write([]byte{0})
+		h.Write([]byte(m.PeerID))
+	}
+	return string(h.Sum(nil))
+}
+
+// unchangedEditLocked remembers what a message says, from the message and
+// from every edit of it, and reports whether ev is an edit that says the
+// same again. Caller holds c.mu.
+func (c *Conn) unchangedEditLocked(ev Event) bool {
+	if ev.ExternalID == "" || ev.Historical || ev.Enc != nil || ev.Presence != nil ||
+		(ev.Kind != "msg" && ev.Kind != "messageEdited") {
+		return false
+	}
+	key := contentKey(ev)
+	if c.knownTexts == nil {
+		c.knownTexts = map[string]string{}
+	}
+	prev, known := c.knownTexts[ev.ExternalID]
+	if ev.Kind == "messageEdited" && known && prev == key {
+		return true
+	}
+	if !known {
+		c.knownOrder = append(c.knownOrder, ev.ExternalID)
+		for len(c.knownOrder) > maxKnownTexts {
+			delete(c.knownTexts, c.knownOrder[0])
+			c.knownOrder = c.knownOrder[1:]
+		}
+	}
+	c.knownTexts[ev.ExternalID] = key
+	return false
+}
+
 // SentIDs remembers the externalIds a connection's sends were given, so
 // their echoes are known as its own. Shared by every Conn one connection
 // goes through, so a reconnect does not forget them.
@@ -2702,6 +2755,14 @@ func (c *Conn) readLoop() {
 			}
 			ev.RosterPeers = others
 		}
+		// AN EDIT THAT CHANGES NOTHING IS NOT NEWS. A link that notices
+		// some other change to a message (a reaction, a platform-side
+		// touch) can report it as an edit with the same text again, over
+		// and over; the reader is told what a message now says once.
+		if c.unchangedEditLocked(ev) {
+			c.mu.Unlock()
+			continue
+		}
 		switch {
 		case ev.Kind == "roster" && !c.rosterBeforeMessages:
 			c.holdRosterLocked(ev)
@@ -2945,7 +3006,8 @@ func decodeEvent(raw []byte) (Event, bool) {
 		return Event{Kind: "messageEdited", ExternalID: m.ExternalID, Text: m.Text, TS: m.TS, Own: m.Own,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Cursor: m.Cursor, Historical: m.Historical,
-			Answers: m.Answers, CorrelationID: m.ID, Todo: todoFields(m.TodoFields), PeerID: m.PeerID, Enc: m.Enc}, true
+			Answers: m.Answers, CorrelationID: m.ID, Todo: todoFields(m.TodoFields), PeerID: m.PeerID,
+			SenderName: m.Name, Enc: m.Enc}, true
 	case wire.TypeReactionAck:
 		var a wire.ReactionAck
 		if err := json.Unmarshal(raw, &a); err != nil {

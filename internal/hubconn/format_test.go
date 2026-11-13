@@ -709,3 +709,42 @@ func TestAReactionNamesItsReactor(t *testing.T) {
 		t.Fatalf("without a name the id alone is shown: %s", got)
 	}
 }
+
+// An edit that says what the message already says is not delivered again;
+// one that changes it is, and so is the first edit of a message this
+// connection never saw.
+func TestAnEditThatChangesNothingIsDropped(t *testing.T) {
+	c := &Conn{}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msg := Event{Kind: "msg", ExternalID: "m1", Text: "hello"}
+	if c.unchangedEditLocked(msg) {
+		t.Fatal("a message was taken for an edit")
+	}
+	same := Event{Kind: "messageEdited", ExternalID: "m1", Text: "hello"}
+	if !c.unchangedEditLocked(same) {
+		t.Fatal("an edit with the same text was delivered")
+	}
+	changed := Event{Kind: "messageEdited", ExternalID: "m1", Text: "hello, world"}
+	if c.unchangedEditLocked(changed) {
+		t.Fatal("an edit that changes the text was dropped")
+	}
+	if !c.unchangedEditLocked(changed) {
+		t.Fatal("the same edit again was delivered")
+	}
+	unseen := Event{Kind: "messageEdited", ExternalID: "old", Text: "from before"}
+	if c.unchangedEditLocked(unseen) {
+		t.Fatal("the first edit of a message never seen was dropped")
+	}
+	if !c.unchangedEditLocked(unseen) {
+		t.Fatal("its repeat was delivered")
+	}
+}
+
+func TestAnEditSaysWhoMadeIt(t *testing.T) {
+	e := Event{Kind: "messageEdited", ExternalID: "m1", Text: "x", SenderName: "Mikhail",
+		PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", TS: "2026-11-12T18:08:07Z"}
+	if got := FormatEvent(e); !strings.Contains(got, `by "Mikhail" (6ba7b810-9dad-11d1-80b4-00c04fd430c8)`) {
+		t.Fatalf("the edit does not name its editor: %s", got)
+	}
+}

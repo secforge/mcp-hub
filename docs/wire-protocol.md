@@ -834,7 +834,7 @@ receiving client requested):
 
 ```json
 {"type": "reactionChanged", "externalId": "...", "peerId": "...", "name": "...", "reaction": "...", "label": "...", "action": "add", "ts": "...", "own": false}
-{"type": "messageEdited", "externalId": "...", "text": "...", "ts": "...", "own": false, "attachments": [...], "format": "...", "replyTo": "...", "replyPreview": "...", "mentions": [...], "mentionedMe": false}
+{"type": "messageEdited", "externalId": "...", "peerId": "...", "name": "...", "text": "...", "ts": "...", "own": false, "attachments": [...], "format": "...", "replyTo": "...", "replyPreview": "...", "mentions": [...], "mentionedMe": false}
 {"type": "messageDeleted", "externalId": "...", "cursor": "...", "ts": "...", "own": false}
 ```
 
@@ -845,6 +845,11 @@ Notes:
   `attachments` and so left them unchanged — a receiving client should
   keep whatever attachments it already had for this `externalId`, not
   treat an absent field as "now has none."
+- `messageEdited.peerId` and `name` are the author's: only the author edits,
+  so the author is the editor. `name` comes from the same source as
+  `msg.name` and is absent where unknown. A server sends `messageEdited`
+  only when the body, attachments or mentions changed; a client may drop an
+  edit whose content it already knows.
 - `reactionChanged.name` is the reactor's display name, from the same
   source as `msg.name`, so a reaction by someone not in the roster can be
   attributed. Absent when the reaction is unattributed or the name unknown.
