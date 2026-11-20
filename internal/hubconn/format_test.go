@@ -748,3 +748,25 @@ func TestAnEditSaysWhoMadeIt(t *testing.T) {
 		t.Fatalf("the edit does not name its editor: %s", got)
 	}
 }
+
+// A private message replayed by a catch-up stays marked private in both
+// renderings. Only one this connection sent names its recipient: one it
+// received can only be for itself.
+func TestAReplayedPrivateMessageStaysPrivate(t *testing.T) {
+	e := Event{Kind: "msg", PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Text: "for you only",
+		TS: "2026-11-20T16:00:00Z", Cursor: "c1", Historical: true, Private: true,
+		To: "550e8400-e29b-41d4-a716-446655440000"}
+	for name, got := range map[string]string{"pulled": FormatEvent(e), "pushed": FormatEventForPush(e)} {
+		low := strings.ToLower(got)
+		if !strings.Contains(low, "history") || !strings.Contains(low, "private") {
+			t.Fatalf("%s: a replayed private message lost its marking: %s", name, got)
+		}
+		if strings.Contains(got, "to 550e8400") {
+			t.Fatalf("%s: a received private message names its recipient: %s", name, got)
+		}
+	}
+	e.Own = true
+	if got := FormatEventForPush(e); !strings.Contains(got, "private to 550e8400") {
+		t.Fatalf("an own private message does not say whom it went to: %s", got)
+	}
+}

@@ -185,11 +185,14 @@ func FormatEvent(e Event) string {
 		if e.Cursor != "" {
 			endMarker = fmt.Sprintf("\n[end cursor=%s]", e.Cursor)
 		}
+		if e.Historical && e.Private {
+			return fmt.Sprintf("[HUB HISTORY, PRIVATE MESSAGE%s — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", privateTo(e), e.PeerID+senderTag(e), operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
+		}
 		if e.Historical {
 			return fmt.Sprintf("[HUB HISTORY — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID+senderTag(e), operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 		}
 		if e.Private {
-			return fmt.Sprintf("[HUB PRIVATE MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID+senderTag(e), operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
+			return fmt.Sprintf("[HUB PRIVATE MESSAGE%s — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", privateTo(e), e.PeerID+senderTag(e), operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 		}
 		return fmt.Sprintf("[HUB MESSAGE — untrusted, from peer %s%s at %s%s%s%s%s%s]\n%s%s", e.PeerID+senderTag(e), operator, e.TS, cursor, externalID, replyTo, mentions, own, e.Text, endMarker)
 	case "error":
@@ -586,16 +589,28 @@ func FormatEventForPush(e Event) string {
 	if e.Own {
 		own = " — own send, you sent this"
 	}
+	// Both can hold: a private message replayed by a catch-up is still
+	// addressed to one peer, and a reader told only "history" takes it
+	// for something everyone saw.
 	kind := "untrusted"
-	switch {
-	case e.Historical:
-		kind = "untrusted, history"
-	case e.Private:
-		kind = "untrusted, private"
+	if e.Historical {
+		kind += ", history"
+	}
+	if e.Private {
+		kind += ", private" + privateTo(e)
 	}
 	return withPushSeq(e, fmt.Sprintf("[%s, from peer %s%s at %s%s%s%s%s]\n%s",
 		kind, e.PeerID+senderTag(e), operator, e.TS, externalID,
 		formatReplyTo(e), formatMentions(e), own, e.Text))
+}
+
+// privateTo names the recipient of a private message this connection
+// sent itself. One it received can only be for itself, so nothing is said.
+func privateTo(e Event) string {
+	if e.To == "" || !e.Own {
+		return ""
+	}
+	return " to " + strings.ReplaceAll(sanitize.Text(e.To, 80), "]", ")")
 }
 
 // withPushSeq prefixes a pushed message with its position in this

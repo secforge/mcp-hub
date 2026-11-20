@@ -93,11 +93,14 @@ var (
 )
 
 type Event struct {
-	Kind         string
-	PeerID       string
-	Text         string
-	TS           string
-	Private      bool
+	Kind    string
+	PeerID  string
+	Text    string
+	TS      string
+	Private bool
+	// To is the recipient a private "msg" was addressed to, where the
+	// server says.
+	To           string
 	Name         string
 	AgePublicKey string
 	// Historical marks a "msg" delivered in answer to RequestMessageAfterAwaiting
@@ -2923,7 +2926,7 @@ func decodeEvent(raw []byte) (Event, bool) {
 		if err := json.Unmarshal(raw, &m); err != nil || (m.PeerID != "" && !wire.IsValidID(m.PeerID)) {
 			return Event{}, false
 		}
-		return Event{Kind: "msg", PeerID: m.PeerID, SenderName: m.Name, ExternalLink: m.ExternalLink, Presence: m.Presence, Text: m.Text, TS: m.TS, Private: m.Private,
+		return Event{Kind: "msg", PeerID: m.PeerID, SenderName: m.Name, ExternalLink: m.ExternalLink, Presence: m.Presence, Text: m.Text, TS: m.TS, Private: m.Private, To: m.To,
 			Historical: m.Historical, ExternalID: m.ExternalID, Own: m.Own, Cursor: m.Cursor,
 			Attachments: m.Attachments, Format: m.Format, ReplyTo: m.ReplyTo, ReplyPreview: m.ReplyPreview,
 			Mentions: m.Mentions, MentionedMe: m.MentionedMe, Answers: m.Answers,
