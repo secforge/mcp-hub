@@ -52,3 +52,12 @@ func (p *pacer) wait() {
 		time.Sleep(short)
 	}
 }
+
+// SetPaceForTesting replaces the process's pacer and returns what puts it
+// back. A test package that pushes a lot would otherwise share one bucket
+// across its tests, so one test's leftover pushes delay the next.
+func SetPaceForTesting(capacity int, every time.Duration) (restore func()) {
+	prev := pace
+	pace = newPacer(capacity, every)
+	return func() { pace = prev }
+}

@@ -3,6 +3,7 @@ package mcptools
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/secforge/mcp-hub/internal/harness"
 	"github.com/secforge/mcp-hub/internal/hubconn"
@@ -32,6 +33,10 @@ import (
 func TestMain(m *testing.M) {
 	restoreHarness := harness.ClearEnvForTesting()
 	defer restoreHarness()
+	// Pacing is tested in harness; here it would only make one test wait
+	// for the pushes an earlier one left queued.
+	restorePace := harness.SetPaceForTesting(1000, time.Millisecond)
+	defer restorePace()
 	// The generic scope override would otherwise decide every scope a
 	// test means to take from MCP_HUB_PROJECT_DIR, roots or the cwd.
 	os.Unsetenv("MCP_PROJECT_DIR")
