@@ -32,7 +32,9 @@ func TestAFullDeliveryWindowDoesNotEndConversations(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		srv.Msg(fmt.Sprintf("conv-%d", i%20), agentPeer, fmt.Sprintf("message %d", i), fmt.Sprintf("m-%d", i))
 	}
-	waitUntil(t, "the first push", func() bool { return in.has("message 0") })
+	// Any conversation's: with twenty waiting, each gets an equal share
+	// of the window, so which message goes first depends on timing.
+	waitUntil(t, "the first push", func() bool { return in.has("message ") })
 	time.Sleep(4 * time.Second)
 	for _, g := range grants {
 		c, _ := childNamed(t, h, g.Conv).activeConn()
