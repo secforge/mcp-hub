@@ -35,6 +35,9 @@ type session struct {
 	// ownEchoes says the reader asked, at hub_connect, to be delivered a
 	// link's echo of what this connection itself sent.
 	ownEchoes bool
+	// failSaid is the last reconnect failure pushed, and failSaidAt when.
+	failSaid   string
+	failSaidAt time.Time
 	// sentIDs outlives each Conn of this connection; see hubconn.SentIDs.
 	sentIDs *hubconn.SentIDs
 	// sinceConfirm is everything this connection handed over since its

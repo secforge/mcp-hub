@@ -1454,12 +1454,16 @@ func (s *session) reconnectOnce(link, name string, waited time.Duration, attempt
 	return reconnectDone
 }
 
+// failRepeatEvery is how often an unchanged failure is said again where
+// every notice starts a turn.
+var failRepeatEvery = 10 * time.Minute
+
 // reportFailedAttempt says an attempt failed and that another is coming,
-// to the model and to anyone following. Said EVERY time rather than once:
-// the caller is choosing to keep waiting, and a choice made on stale
-// information is not really being made. It always names the way out,
+// to the model and to anyone following. It always names the way out,
 // because an automatic retry with no visible exit is indistinguishable
-// from being stuck.
+// from being stuck. Where every notice starts a turn, the same failure is
+// said again only every failRepeatEvery: a new reason is news, the
+// twentieth identical 502 is not.
 func (s *session) reportFailedAttempt(attempt int, interval time.Duration, err error) {
 	stop := "call hub_disconnect to stop trying, which also releases the follower being held " +
 		"open for it."
@@ -1477,6 +1481,18 @@ func (s *session) reportFailedAttempt(attempt int, interval time.Duration, err e
 		// The drop itself has not been said yet: it is within the
 		// expected time, and a failed attempt inside it is not news.
 		return
+	}
+	if s.quietRestarts() {
+		reason := err.Error()
+		s.mu.Lock()
+		same := reason == s.failSaid && time.Since(s.failSaidAt) < failRepeatEvery
+		if !same {
+			s.failSaid, s.failSaidAt = reason, time.Now()
+		}
+		s.mu.Unlock()
+		if same {
+			return
+		}
 	}
 	s.alert(msg)
 	if w := s.hub.currentWaiter(); w != nil {

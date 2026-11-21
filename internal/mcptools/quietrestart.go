@@ -243,6 +243,7 @@ func (s *session) reconnectedQuietly(conn *hubconn.Conn, because string) {
 		s.downTimer = nil
 	}
 	s.downNotified = false
+	s.failSaid, s.failSaidAt = "", time.Time{}
 	away := time.Since(s.downSince)
 	peers, delay := s.restartPeers, s.restartDelay
 	s.restartPeers = nil
