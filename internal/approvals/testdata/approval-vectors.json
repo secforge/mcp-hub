@@ -1,0 +1,97 @@
+{
+  "note": "TEST KEYS ONLY. Ed25519 seed = bytes 1..32; age identity below. Regenerate with x/approvals/vectors.ts.",
+  "ed25519SeedHex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "ageIdentity": "AGE-SECRET-KEY-13ALZQQXXTTSZYUS24960G30JTHQDCG57WWLPE7E73KGLDF7WGPPS3TPEHM",
+  "keyLine": "chat-relay-approver v1 Test-Phone ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t",
+  "fingerprint": "5s3w8ZbPBmOuQFpOSMyhpm",
+  "request": {
+    "plain": {
+      "v": 1,
+      "requestId": "req-0001",
+      "asker": {
+        "name": "finance",
+        "ageRecipient": "age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t"
+      },
+      "text": "Delete invoice **844** (Hetzner, 27.82 EUR)? <b>&amp;</b> next line 👍",
+      "choices": [
+        "yes",
+        "no"
+      ],
+      "actors": [
+        "finance"
+      ],
+      "createdAt": "2026-11-23T07:00:00Z",
+      "expiresAt": "2026-11-23T08:00:00Z"
+    },
+    "exact": "{\"actors\":[\"finance\"],\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"choices\":[\"yes\",\"no\"],\"createdAt\":\"2026-11-23T07:00:00Z\",\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestId\":\"req-0001\",\"text\":\"Delete invoice **844** (Hetzner, 27.82 EUR)? <b>&amp;</b> next line 👍\",\"v\":1}",
+    "plainBase64url": "eyJhY3RvcnMiOlsiZmluYW5jZSJdLCJhc2tlciI6eyJhZ2VSZWNpcGllbnQiOiJhZ2UxNHp1bGZ6aGZzdDI1azg2MGQycWt5ZHV1Mjg1YTA1YXI3ZTN0bGVzYTQyOXFjbGQ3N3Fzc2YwZjYzdCIsIm5hbWUiOiJmaW5hbmNlIn0sImNob2ljZXMiOlsieWVzIiwibm8iXSwiY3JlYXRlZEF0IjoiMjAyNi0xMS0yM1QwNzowMDowMFoiLCJleHBpcmVzQXQiOiIyMDI2LTExLTIzVDA4OjAwOjAwWiIsInJlcXVlc3RJZCI6InJlcS0wMDAxIiwidGV4dCI6IkRlbGV0ZSBpbnZvaWNlICoqODQ0KiogKEhldHpuZXIsIDI3LjgyIEVVUik_IDxiPiZhbXA7PC9iPuKAqG5leHQgbGluZSDwn5GNIiwidiI6MX0",
+    "hash": "oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo"
+  },
+  "statements": [
+    {
+      "statement": "{\"answer\":\"yes\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"v\":1}",
+      "signature": "bglZTJrXzK7hGmubA5rHUv5V4U6-g-rHje2yqoUWbayZQYvlKUVqvOLcbdLtEfsNJL3CK-nfw1VwcBG-LXKNDQ",
+      "signedBytesBase64url": "Y2hhdC1yZWxheS1hcHByb3ZhbCB2MQp7ImFuc3dlciI6InllcyIsImFwcHJvdmVyIjp7ImxhYmVsIjoiVGVzdC1QaG9uZSIsInNpZ25LZXkiOiJlYlZXTG9fbVZQbEFlTEVTNkttTHA1QWZoVHJtbGI3WDRPT1JDNjBFbG1RIn0sImFza2VyIjp7ImFnZVJlY2lwaWVudCI6ImFnZTE0enVsZnpoZnN0MjVrODYwZDJxa3lkdXUyODVhMDVhcjdlM3RsZXNhNDI5cWNsZDc3cXNzZjBmNjN0IiwibmFtZSI6ImZpbmFuY2UifSwiZXhwaXJlc0F0IjoiMjAyNi0xMS0yM1QwODowMDowMFoiLCJyZXF1ZXN0SGFzaCI6Im9PXzlWbVlfQjd0VG5uVnM2Z3lWelhkZFVtdnkyWkk5WWVhT2tUZklKWm8iLCJyZXF1ZXN0SWQiOiJyZXEtMDAwMSIsInNpZ25lZEF0IjoiMjAyNi0xMS0yM1QwNzowMjowMFoiLCJ2IjoxfQ"
+    },
+    {
+      "statement": "{\"answer\":\"no\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"v\":1}",
+      "signature": "CUvnsZISfhzrP8SJ_UxicBwHQD9gqSChhAZ78dJlI48S23rJ-338qL3DhzOMvuJHJV3h_bjgusWNlCSq6hzyCg",
+      "signedBytesBase64url": "Y2hhdC1yZWxheS1hcHByb3ZhbCB2MQp7ImFuc3dlciI6Im5vIiwiYXBwcm92ZXIiOnsibGFiZWwiOiJUZXN0LVBob25lIiwic2lnbktleSI6ImViVldMb19tVlBsQWVMRVM2S21McDVBZmhUcm1sYjdYNE9PUkM2MEVsbVEifSwiYXNrZXIiOnsiYWdlUmVjaXBpZW50IjoiYWdlMTR6dWxmemhmc3QyNWs4NjBkMnFreWR1dTI4NWEwNWFyN2UzdGxlc2E0MjlxY2xkNzdxc3NmMGY2M3QiLCJuYW1lIjoiZmluYW5jZSJ9LCJleHBpcmVzQXQiOiIyMDI2LTExLTIzVDA4OjAwOjAwWiIsInJlcXVlc3RIYXNoIjoib09fOVZtWV9CN3RUbm5WczZneVZ6WGRkVW12eTJaSTlZZWFPa1RmSUpabyIsInJlcXVlc3RJZCI6InJlcS0wMDAxIiwic2lnbmVkQXQiOiIyMDI2LTExLTIzVDA3OjAyOjAwWiIsInYiOjF9"
+    },
+    {
+      "statement": "{\"answer\":\"text\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"text\":\"Only after the DATEV export <x> &   👍, please.\",\"v\":1}",
+      "signature": "a3O7P2tgua1fpi8Pg6h6Q8bJO8KEYsJlTlUoVnOQuWVYATprEowH0e1w8vG864jpkvkpg2pt4m6bPvduDgf0Bw",
+      "signedBytesBase64url": "Y2hhdC1yZWxheS1hcHByb3ZhbCB2MQp7ImFuc3dlciI6InRleHQiLCJhcHByb3ZlciI6eyJsYWJlbCI6IlRlc3QtUGhvbmUiLCJzaWduS2V5IjoiZWJWV0xvX21WUGxBZUxFUzZLbUxwNUFmaFRybWxiN1g0T09SQzYwRWxtUSJ9LCJhc2tlciI6eyJhZ2VSZWNpcGllbnQiOiJhZ2UxNHp1bGZ6aGZzdDI1azg2MGQycWt5ZHV1Mjg1YTA1YXI3ZTN0bGVzYTQyOXFjbGQ3N3Fzc2YwZjYzdCIsIm5hbWUiOiJmaW5hbmNlIn0sImV4cGlyZXNBdCI6IjIwMjYtMTEtMjNUMDg6MDA6MDBaIiwicmVxdWVzdEhhc2giOiJvT185Vm1ZX0I3dFRublZzNmd5VnpYZGRVbXZ5MlpJOVllYU9rVGZJSlpvIiwicmVxdWVzdElkIjoicmVxLTAwMDEiLCJzaWduZWRBdCI6IjIwMjYtMTEtMjNUMDc6MDI6MDBaIiwidGV4dCI6Ik9ubHkgYWZ0ZXIgdGhlIERBVEVWIGV4cG9ydCA8eD4gJiDigKgg8J-RjSwgcGxlYXNlLiIsInYiOjF9"
+    }
+  ],
+  "negatives": [
+    {
+      "case": "statement altered by one byte",
+      "statement": "{\"answer\":\"yez\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"v\":1}",
+      "signature": "bglZTJrXzK7hGmubA5rHUv5V4U6-g-rHje2yqoUWbayZQYvlKUVqvOLcbdLtEfsNJL3CK-nfw1VwcBG-LXKNDQ",
+      "reason": "bad_signature"
+    },
+    {
+      "case": "signature without the domain prefix",
+      "statement": "{\"answer\":\"yes\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"v\":1}",
+      "signature": "CvHMjDrJndt-ZvH8GyPoY_RMxEtnvvucCaS0LMgFp-K_yqzYDsM3Wruh-CAz-vhn9psueZ7ynOFu2g6ySXvsBg",
+      "reason": "bad_signature"
+    },
+    {
+      "case": "answer not among choices",
+      "statement": "{\"answer\":\"maybe\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"v\":1}",
+      "signature": "LK-xKTIvnTRUa-V3Xw3JcfyCQOp0Msg1pYp4iAHas_Wg8y8RIDPJr1g2i8I5Bfd1x27kBqg1NxYUqwghymj1BQ",
+      "reason": "answer_not_offered"
+    },
+    {
+      "case": "answer text with empty text",
+      "statement": "{\"answer\":\"text\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"text\":\"\",\"v\":1}",
+      "signature": "PMqAQulAXUYkgqOWb6qV-28skacyk2hTceXwxams7UayNTYeH3k2WaHJTarb4XWp2UlfsuWEufc9-LVzsfgcDA",
+      "reason": "answer_not_offered"
+    },
+    {
+      "case": "wrong requestHash",
+      "statement": "{\"answer\":\"yes\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"AO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"v\":1}",
+      "signature": "OAaPPPfCJUP9jeBMHhCUBiOik2eUSjFPz7M2FoS6UtTf7wveq5DSD-VuaMP0B6TzDFVCivxYgWi6fOkotjuXAA",
+      "reason": "wrong_request_hash"
+    },
+    {
+      "case": "signedAt after expiresAt",
+      "statement": "{\"answer\":\"yes\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T08:00:01Z\",\"v\":1}",
+      "signature": "M5oCxKiT71UA3TnfvElZ_f_1cc0n3znVplVh1oYr7QwjWaVi-ARvCNmbUMHelSY-XVVmSeoOvpc2Kr3OsDqKCA",
+      "reason": "signed_after_expiry"
+    },
+    {
+      "case": "statement names another approver key",
+      "statement": "{\"answer\":\"yes\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0001\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"v\":1}",
+      "signature": "oM7oN2rc3lAyrUrdrfnwk_-fM54vZKjvBk3EBB7JbapmxzxCoHn3bwU20Mf4PnAXAbB-1L47r6-GIfCgOKQaBg",
+      "reason": "bad_signature"
+    },
+    {
+      "case": "requestId differs from the request",
+      "statement": "{\"answer\":\"yes\",\"approver\":{\"label\":\"Test-Phone\",\"signKey\":\"ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ\"},\"asker\":{\"ageRecipient\":\"age14zulfzhfst25k860d2qkyduu285a05ar7e3tlesa429qcld77qssf0f63t\",\"name\":\"finance\"},\"expiresAt\":\"2026-11-23T08:00:00Z\",\"requestHash\":\"oO_9VmY_B7tTnnVs6gyVzXddUmvy2ZI9YeaOkTfIJZo\",\"requestId\":\"req-0002\",\"signedAt\":\"2026-11-23T07:02:00Z\",\"v\":1}",
+      "signature": "vr76JntNejRvjPbCkrtCy8KjPIWKJun2qZ3EX6t-Qt5fP5ax1Vn_vMpbwM58nuJ9O9t-bDDqS4ncGY7jfgHABA",
+      "reason": "wrong_request"
+    }
+  ]
+}

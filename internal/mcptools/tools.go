@@ -2178,6 +2178,10 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool(addMembersTool(), h.handleAddMembers)
 	addTool(fileUploadTool(), h.handleFileUpload)
 	addTool(fileDownloadTool(), h.handleFileDownload)
+	addTool(approvalRequestTool(), h.handleApprovalRequest)
+	addTool(approvalWithdrawTool(), h.handleApprovalWithdraw)
+	addTool(approvalsTool(), h.handleApprovals)
+	addTool(approvalVerifyTool(), h.handleApprovalVerify)
 	addTool(
 		mcp.NewTool("hub_list_connections",
 			mcp.WithDescription("List the links this client has connected to before FROM THIS "+
@@ -2842,6 +2846,10 @@ func actionsNote(conn *hubconn.Conn) string {
 		note += "\nOne-time files: hub_file_upload uploads a local file" + size + " and gives a link " +
 			"that works for one download, for files too large for an attachment or that must not " +
 			"stay in the history; hub_file_download fetches such a link."
+	}
+	if _, ok := conn.ApprovalsLimits(); ok {
+		note += "\nApprovals: hub_approval_request asks a person for a signed approval on their " +
+			"phone; the verified answer arrives later as a delivered message."
 	}
 	return note
 }

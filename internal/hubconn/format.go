@@ -147,6 +147,9 @@ func FormatEvent(e Event) string {
 	if text, ok := formatTodoEvent(e, true); ok {
 		return text
 	}
+	if text, ok := formatApprovalEvent(e); ok {
+		return text
+	}
 	switch e.Kind {
 	case "msg":
 		// own/cursor/externalId are appended, not prepended, so a reader

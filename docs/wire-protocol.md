@@ -1215,6 +1215,45 @@ A side channel for handing over a file of up to 1 GB outside any conversation's 
   - The download saves under the sender's name, reduced to one path element, and never overwrites an existing file. It confirms with `DELETE` after the file opened completely.
   - It fetches only from a host one of its connections uses, unless the user says to trust another.
 
+### 2.14 Signed approvals (feature `approvals`)
+
+An agent asks a PERSON for approval. The person answers on a paired phone, and the answer is signed with an Ed25519 key that exists only on that phone. The asking CLIENT verifies it against phone keys copied onto its machine by hand. The server carries requests and answers but can neither read nor forge them. The design and test vectors are chat-relay's `docs/approvals-wire.adoc` and `docs/approval-vectors.json`, agreed between the two projects. The vectors are copied to `internal/approvals/testdata`.
+
+- **Declared** as `features.approvals = {maxEnvelopeBytes, maxLifetimeSeconds}` on hub sessions and on agent conversations of hub sessions that may write. It is absent on read-only shares and on reply-only (WhatsApp, Signal) conversations.
+- **Keys.** A phone shows one line: `chat-relay-approver v1 <label> <signKey> <ageRecipient>`.
+  - The reference client keeps these in `<config>/approvers/<approver>.keys`, one line per phone, with `#` comments. `<config>` is `~/.config/mcp-hub`, or `$MCP_HUB_CONNSTORE_DIR`.
+  - A malformed line makes the whole file unusable rather than being skipped.
+  - A phone's fingerprint is the first 22 characters of `base64url(SHA-256("v1 " + signKey + " " + ageRecipient))`.
+- **Ask.** `approvalRequest {id, requestId, approvers, envelope, expiresAt}`:
+  - `approvers` holds the fingerprints of every phone in the approver's file.
+  - `envelope` is the request plaintext, age-encrypted to every phone and armored.
+  - The answer is `approvalRequestAck {id, ok, requestId, state}`.
+  - Refusals are `not_allowed`, `unknown_approver`, `ambiguous_approver`, `duplicate_request`, `too_many` (at most 20 open per identity and 50 per approver per conversation), `bad_request` and `read_only`.
+  - An answer reaches only the asking identity, so a client must reclaim its peer id on every reconnect. The reference client always does.
+- **Withdraw.** `approvalWithdraw {id, requestId}` is answered with `approvalWithdrawAck {id, ok, state}`.
+- **Answer.** `approvalAnswer {requestId, envelope, answeredAt}` goes to the asking identity only. It is sent again on every connect until `approvalAnswerAck {requestId}`, which has no reply.
+  - The client acks only after recording the outcome. That includes an invalid answer, an unknown request and a late answer.
+  - `approvalClosed {requestId, state}` reports a close the client did not cause: `withdrawn` or `expired`.
+- **Plaintexts.**
+  - The request is `{actors?, asker: {ageRecipient, name}, choices, createdAt, expiresAt, requestId, text, v: 1}`, with its keys sorted.
+  - The answer envelope holds `{signature, statement}`, where `statement` is the exact string the phone signed.
+  - The signature is Ed25519 over `"chat-relay-approval v1\n" + statement`.
+  - The statement holds `answer`, `approver {label, signKey}`, `asker`, `expiresAt`, `requestHash` (base64url SHA-256 of the exact request bytes), `requestId`, `signedAt`, `text?` and `v`.
+  - Nothing is re-serialised before it is checked.
+  - Every signed or hashed JSON text is parsed strictly. Keys must match exactly in case, appear once each, and be known for that object; anything else is refused. `choices` must be non-empty strings, never `text`. A phone reads JSON case-sensitively and takes the last of a duplicate key, while Go's decoder matches keys case-insensitively. Without this rule, one signed byte string could say one thing to the person and another to the verifying client.
+- **Verification** is the client's job. An answer counts only if ALL of these hold:
+  - the signature verifies with a key from the approver's file, and the statement names that key;
+  - it names an open request of this client, with its hash, id, expiry and asker;
+  - the answer is one of `choices`, or `text` with non-empty text;
+  - it was signed and arrived before expiry.
+  
+  The first valid answer wins. A different later one is reported as a conflict.
+- **Proofs.** A proof `{request, statement, signature}` passes an answer on, with the strings exact. A receiving client checks it against its own key files, the expiry and `actors`, and accepts each request id only once.
+- **The reference client** (`internal/approvals`) offers four tools:
+  - `hub_approval_request`, `hub_approval_withdraw`, `hub_approvals` (state and proofs) and `hub_approval_verify`.
+  - An answer is delivered as a notice: `APPROVAL ANSWERED`, `INVALID APPROVAL ANSWER`, `CONFLICTING APPROVAL ANSWER` or `APPROVAL CLOSED`.
+  - Its own age identity, its open requests and the proofs it used are kept per project scope in `<config>/approvals/`, owner-only.
+
 ## 3. Ordering and atomicity
 
 - **`joined` → `roster`**: `joined` is always first; the first `roster`

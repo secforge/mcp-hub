@@ -117,6 +117,9 @@ type Event struct {
 	Failed  []string
 	// FileReady is a fileUploadReady answer.
 	FileReady *wire.FileUploadReady
+	// Approval is an approval frame's content: an answer, a close, or the
+	// ack of a request or withdraw.
+	Approval *ApprovalFrame
 	// CorrelationID is the id this client put on the request, echoed back
 	// by a correlating server — see wire.Msg.ID. Empty on live traffic
 	// nobody asked for, on every frame from a server without the feature,
@@ -2683,6 +2686,9 @@ func (c *Conn) readLoop() {
 			continue
 		}
 		c.openEvent(&ev)
+		if (ev.Kind == "approvalAnswer" || ev.Kind == "approvalClosed") && !c.handleApproval(&ev) {
+			continue
+		}
 		// Before any routing: a catch-up answer is diverted to its waiting
 		// request below, and an operator's message must be marked there
 		// exactly as it is when it arrives live.
@@ -2964,6 +2970,9 @@ func decodeEvent(raw []byte) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: "fileUploadReady", FileReady: &f, CorrelationID: f.ID}, true
+	case wire.TypeApprovalRequestAck, wire.TypeApprovalWithdrawAck, wire.TypeApprovalAnswer,
+		wire.TypeApprovalClosed:
+		return decodeApproval(typ, raw)
 	case wire.TypeAddMembersAck:
 		var a wire.AddMembersAck
 		if err := json.Unmarshal(raw, &a); err != nil {

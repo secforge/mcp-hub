@@ -356,6 +356,10 @@ func CurrentProject() string {
 	return NormalizeProject(wd)
 }
 
+// Dir is this client's configuration directory, where state.json lives
+// and other per-machine files sit beside it.
+func Dir() string { return dir() }
+
 func dir() string {
 	if d := os.Getenv("MCP_HUB_CONNSTORE_DIR"); d != "" {
 		return d

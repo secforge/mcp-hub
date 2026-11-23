@@ -62,6 +62,14 @@ const (
 	TypeAddMembersAck   Type = "addMembersAck"
 	TypeFileUpload      Type = "fileUpload"
 	TypeFileUploadReady Type = "fileUploadReady"
+
+	TypeApprovalRequest     Type = "approvalRequest"
+	TypeApprovalRequestAck  Type = "approvalRequestAck"
+	TypeApprovalWithdraw    Type = "approvalWithdraw"
+	TypeApprovalWithdrawAck Type = "approvalWithdrawAck"
+	TypeApprovalAnswer      Type = "approvalAnswer"
+	TypeApprovalAnswerAck   Type = "approvalAnswerAck"
+	TypeApprovalClosed      Type = "approvalClosed"
 )
 
 // ProtocolVersion identifies the wire protocol's schema. Bump it only for a
@@ -1773,4 +1781,76 @@ type Enc struct {
 type EncValue struct {
 	Nonce string `json:"nonce,case:strict"`
 	Ct    string `json:"ct,case:strict"`
+}
+
+// FeatureApprovals is declared where this connection may ask a person for
+// a signed approval. Its value is ApprovalsFeature.
+const FeatureApprovals = "approvals"
+
+// ApprovalsFeature bounds a request: the largest envelope, and how far
+// ahead its expiry may be.
+type ApprovalsFeature struct {
+	MaxEnvelopeBytes   int   `json:"maxEnvelopeBytes,omitempty,case:strict"`
+	MaxLifetimeSeconds int64 `json:"maxLifetimeSeconds,omitempty,case:strict"`
+}
+
+// ApprovalRequest asks the phones named by Approvers (fingerprints) for
+// an answer. Envelope is the request plaintext, age-encrypted to those
+// phones and armored. Answered with ApprovalRequestAck or an error.
+type ApprovalRequest struct {
+	Type      Type     `json:"type,case:strict"`
+	ID        string   `json:"id,omitempty,case:strict"`
+	RequestID string   `json:"requestId,case:strict"`
+	Approvers []string `json:"approvers,case:strict"`
+	Envelope  string   `json:"envelope,case:strict"`
+	ExpiresAt string   `json:"expiresAt,case:strict"`
+}
+
+// ApprovalRequestAck answers ApprovalRequest.
+type ApprovalRequestAck struct {
+	Type      Type   `json:"type,case:strict"`
+	ID        string `json:"id,omitempty,case:strict"`
+	OK        bool   `json:"ok,case:strict"`
+	RequestID string `json:"requestId,case:strict"`
+	State     string `json:"state,omitempty,case:strict"`
+}
+
+// ApprovalWithdraw takes back an open request. Answered with
+// ApprovalWithdrawAck, whose State is the request's state when it was
+// already closed.
+type ApprovalWithdraw struct {
+	Type      Type   `json:"type,case:strict"`
+	ID        string `json:"id,omitempty,case:strict"`
+	RequestID string `json:"requestId,case:strict"`
+}
+
+// ApprovalWithdrawAck answers ApprovalWithdraw.
+type ApprovalWithdrawAck struct {
+	Type  Type   `json:"type,case:strict"`
+	ID    string `json:"id,omitempty,case:strict"`
+	OK    bool   `json:"ok,case:strict"`
+	State string `json:"state,omitempty,case:strict"`
+}
+
+// ApprovalAnswer carries a person's answer, encrypted to the asker. It is
+// delivered again on every connect until ApprovalAnswerAck names it.
+type ApprovalAnswer struct {
+	Type       Type   `json:"type,case:strict"`
+	RequestID  string `json:"requestId,case:strict"`
+	Envelope   string `json:"envelope,case:strict"`
+	AnsweredAt string `json:"answeredAt,omitempty,case:strict"`
+}
+
+// ApprovalAnswerAck stops an answer's redelivery. It has no reply.
+type ApprovalAnswerAck struct {
+	Type      Type   `json:"type,case:strict"`
+	RequestID string `json:"requestId,case:strict"`
+}
+
+// ApprovalClosed says a request was closed by something other than this
+// client: State is "withdrawn" or "expired".
+type ApprovalClosed struct {
+	Type      Type   `json:"type,case:strict"`
+	RequestID string `json:"requestId,case:strict"`
+	State     string `json:"state,case:strict"`
 }

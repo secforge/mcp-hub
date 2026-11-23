@@ -460,6 +460,24 @@ way. It never overwrites an existing file, and confirms receipt so the server
 deletes the file. It only fetches from hosts this client's connections use,
 unless the user says to trust another.
 
+|`hub_approval_request(connection, approver, text, expiresInMinutes?, actors?)`
+|Where the server offers approvals: ask a person for a signed approval on their
+paired phone. Returns at once; the answer arrives later as a delivered notice.
+That happens only after this client has verified the phone's Ed25519 signature
+against the approver's key file in `~/.config/mcp-hub/approvers/<approver>.keys`.
+
+|`hub_approval_withdraw(connection, requestId)`
+|Take back an open approval request.
+
+|`hub_approvals(requestId?)`
+|This client's approval requests and their verified answers, the approvers it
+has key files for, and for one request the proof to pass on.
+
+|`hub_approval_verify(proof)`
+|Check an approval proof another agent passed on, against this machine's own
+key files. Valid only before expiry, only for an agent the request names, and
+only once.
+
 |`hub_start_group(connection, account, contacts, topic?, requestId?)`
 |Through an agent connection allowed to: create a NEW group chat with 2–249
 people in an account's name, shared with the agent read-write with full
