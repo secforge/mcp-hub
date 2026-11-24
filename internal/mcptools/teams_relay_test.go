@@ -5585,3 +5585,57 @@ func TestGapRetrievalFoldsPresence(t *testing.T) {
 		t.Fatalf("not folded:\n%s", text)
 	}
 }
+
+// A conversation this peer has never confirmed in: the server states no
+// backlog, the client seeks to recent context, and the earlier history
+// is recorded as a gap that gap retrieval reaches — not left unread
+// behind a "caught up".
+func TestEarlierHistoryWithoutAPositionIsRecordedAsAGap(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion})
+		old := wire.Msg{Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440077", Name: "steffen",
+			Text: "the task from last week", Historical: true, TS: "2026-11-16T09:00:00Z", Cursor: "old-1"}
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			a := wire.Anchor{At: m.At, Cursor: m.Cursor}
+			if m.At == historyStart {
+				msg := old
+				msg.Answers = &a
+				conn.WriteJSON(msg)
+				continue
+			}
+			conn.WriteJSON(wire.NewNoMoreMessages(a))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect: %v %s", err, textOf(res))
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+	res, err := hub.handleCatchUp(ctx, connReqFor(testConn))
+	if err != nil || res.IsError || !strings.Contains(textOf(res), "recorded as a gap") {
+		t.Fatalf("seek: %v %s", err, textOf(res))
+	}
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"connection": testConn, "gap": true, "limit": 10}
+	res, err = hub.handleCatchUp(ctx, req)
+	if err != nil || res.IsError || !strings.Contains(textOf(res), "the task from last week") {
+		t.Fatalf("gap: %v %s", err, textOf(res))
+	}
+}

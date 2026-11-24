@@ -63,6 +63,11 @@ const (
 type catchUpWant struct {
 	Messages int
 	KB       int
+	// OlderBefore, when set, is where a seek with no position started;
+	// the closing message says the history before it was not read.
+	OlderBefore string
+	// OlderIsGap says that history was recorded as a gap.
+	OlderIsGap bool
 }
 
 // limits resolves a request against the hard caps.
@@ -92,8 +97,11 @@ type catchUpResult struct {
 	OwnSkipped int
 	Bytes      int
 	CaughtUp   bool
-	StoppedBy  string
-	Err        error
+	// OlderBefore and OlderIsGap are want's, for the closing message.
+	OlderBefore string
+	OlderIsGap  bool
+	StoppedBy   string
+	Err         error
 }
 
 // runCatchUpPush walks the backlog and pushes each message, stopping at
@@ -108,6 +116,7 @@ func (s *session) runCatchUpPush(conn *hubconn.Conn, id connstore.Target, anchor
 		s.agent.announcedBefore(s)
 	}
 	res := s.walkCatchUpPush(conn, id, anchor, want)
+	res.OlderBefore, res.OlderIsGap = want.OlderBefore, want.OlderIsGap
 	if res.CaughtUp && res.Err == nil && res.Delivered == res.Folded &&
 		s.restartAdd(caughtUpQuietly(res), "") {
 		return
@@ -419,7 +428,8 @@ func (s *session) pushCatchUpSummary(res catchUpResult) {
 	case res.CaughtUp:
 		text = fmt.Sprintf("[hub: caught up on %s — %d message(s) delivered, nothing further on the "+
 			"server. Confirm the last one you have COMPLETE with hub_confirm, or piggyback it on "+
-			"your next send; until you do, a reconnect re-walks them]", s.name, res.Delivered)
+			"your next send; until you do, a reconnect re-walks them%s]", s.name, res.Delivered,
+			olderUnread(res.OlderBefore, res.OlderIsGap))
 	default:
 		text = fmt.Sprintf("[hub: catch-up on %s PAUSED after %d message(s), %d KB — %s. More remains. "+
 			"Call hub_catch_up again for the next batch; confirm what you have read first so the "+
@@ -432,4 +442,18 @@ func (s *session) pushCatchUpSummary(res catchUpResult) {
 		s.note(fmt.Sprintf("a catch-up run finished but its summary could not be "+
 			"delivered (%v): %d message(s) were pushed.", err, res.Delivered))
 	}
+}
+
+// olderUnread is the closing message's reminder that a seek with no
+// position left the earlier history unread.
+func olderUnread(before string, gap bool) string {
+	if before == "" {
+		return ""
+	}
+	if gap {
+		return fmt.Sprintf(". \"Nothing further\" means after %s only: what came before it was "+
+			"never read here and is recorded as a gap — hub_catch_up(gap: true) retrieves it", before)
+	}
+	return fmt.Sprintf(". \"Nothing further\" means after %s only: what came before it was not "+
+		"walked here — hub_read(before: %q, limit: …) reads it", before, before)
 }

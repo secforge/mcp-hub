@@ -3881,7 +3881,7 @@ func (s *session) sendFromInbox(text string) {
 		return
 	}
 	if header.Confirm != "" {
-		if _, err := s.confirmCursor(conn, header.Confirm); err != nil && !confirmCovered(err) {
+		if _, err := s.readerConfirm(conn, header.Confirm); err != nil && !confirmCovered(err) {
 			s.note(fmt.Sprintf("a reply asked to confirm %s and that failed (%v); "+
 				"the message itself is still being sent.", header.Confirm, err))
 		}
@@ -4461,7 +4461,7 @@ func (h *Hub) handleSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	}
 	behindNote := ""
 	if confirmCursor := req.GetString("confirmCursor", ""); confirmCursor != "" {
-		behind, err := s.confirmCursor(conn, confirmCursor)
+		behind, err := s.readerConfirm(conn, confirmCursor)
 		if err != nil && !confirmCovered(err) {
 			return mcp.NewToolResultError(fmt.Sprintf("confirmCursor failed: %v", err)), nil
 		}
@@ -5637,6 +5637,34 @@ const catchUpSeekThreshold = 20
 // stays a handful of calls.
 const catchUpSeekWindow = 10 * time.Minute
 
+// historyStart is the start of a gap that covers a conversation's whole
+// earlier history: no message is older, and the server answers a read
+// from it with the first message there is.
+const historyStart = "2000-01-01T00:00:00Z"
+
+// recordEarlierHistory records what lies before a seek that had no
+// position to start from as a gap — from where this connection's
+// visible history starts, else from the beginning — so that
+// hub_catch_up(gap: true) reaches it. It returns the note saying so.
+func (s *session) recordEarlierHistory(conn *hubconn.Conn, seekAt string) string {
+	from := historyStart
+	switch {
+	case conn.BehindSince() != "":
+		from = conn.BehindSince()
+	case conn.HistoryFrom() != nil && *conn.HistoryFrom() != "":
+		from = *conn.HistoryFrom()
+	}
+	s.mu.Lock()
+	id := s.catchUpID
+	s.seekedSinceConnect = true
+	s.knownContiguous = false
+	s.mu.Unlock()
+	setCatchUpGapFromAt(id, from, seekAt)
+	return fmt.Sprintf("Everything before %s is this conversation's earlier history, which this "+
+		"connection has never read: it is recorded as a gap, and hub_catch_up(gap: true) "+
+		"retrieves it (hub_catch_up(discardGap: true) writes it off if it does not matter).", seekAt)
+}
+
 // handleCatchUp implements the bound=1 "read the next message" pull
 // primitive — see wire.MessageAfter's doc comment for the full protocol
 // contract, and session.lastHandedOverCursor's for why the bound is exactly
@@ -5798,6 +5826,11 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	// message. The link never is: it carries its secret in the fragment.
 	var anchor wire.Anchor
 	var seekNote, branch string
+	// olderBefore is where a seek with no position to record a gap from
+	// started: what came before it is history this connection never saw,
+	// read with hub_read rather than walked.
+	var olderBefore string
+	var olderGap bool
 	switch {
 	// A large backlog is seeked past rather than walked, whether or not a
 	// position is known: walking is cheap for a short gap, but a peer back
@@ -5878,8 +5911,22 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		branch = "seek (no stored position)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
+		// The server holds a position here (it counts what is behind it),
+		// so only what lies after that position is unread: recorded from
+		// where the server says it starts, and pointed at otherwise —
+		// never the whole history, most of which this peer has read.
+		var older string
+		if conn.BehindSince() != "" {
+			older = s.recordEarlierHistory(conn, seekAt)
+			olderBefore, olderGap = seekAt, true
+		} else {
+			olderBefore = seekAt
+			older = fmt.Sprintf("The server counts %d unread but not from where, so nothing before "+
+				"%s is recorded as skipped: hub_read(before: %q, limit: %d) reads what lies just "+
+				"before it.", conn.Behind(), seekAt, seekAt, min(conn.Behind(), 200))
+		}
 		seekNote = "No prior position recorded for this session — seeking to recent context " +
-			"instead of walking from the start.\n\n"
+			"instead of walking from the start. " + older + "\n\n"
 	case !conn.BehindStated():
 		// ABSENT IS NOT ZERO. The count is omitted when the server holds
 		// no acked cursor for this peer, which says "I have no idea where
@@ -5897,11 +5944,12 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		branch = "seek (the server holds no read position for this peer)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
+		olderBefore, olderGap = seekAt, true
 		seekNote = "The server stated no backlog for this session — which means it holds no read " +
 			"position for this peer, NOT that you are caught up. The two are different answers " +
 			"and only a confirm turns the first into the second. Seeking to recent context; " +
 			"confirm what you read (hub_confirm) so the next reconnect can be answered " +
-			"precisely.\n\n"
+			"precisely. " + s.recordEarlierHistory(conn, seekAt) + "\n\n"
 	default:
 		branch = "nothing to do"
 		s.mu.Lock()
@@ -5962,8 +6010,10 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			go func() {
 				defer func() { <-h.catchUpSlot }()
 				s.runCatchUpPush(conn, id, anchor, catchUpWant{
-					Messages: req.GetInt("limit", 0),
-					KB:       req.GetInt("maxKB", 0),
+					Messages:    req.GetInt("limit", 0),
+					KB:          req.GetInt("maxKB", 0),
+					OlderBefore: olderBefore,
+					OlderIsGap:  olderGap,
 				})
 			}()
 		default:
@@ -5974,8 +6024,10 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				h.catchUpSlot <- struct{}{}
 				defer func() { <-h.catchUpSlot }()
 				s.runCatchUpPush(conn, id, anchor, catchUpWant{
-					Messages: req.GetInt("limit", 0),
-					KB:       req.GetInt("maxKB", 0),
+					Messages:    req.GetInt("limit", 0),
+					KB:          req.GetInt("maxKB", 0),
+					OlderBefore: olderBefore,
+					OlderIsGap:  olderGap,
 				})
 			}()
 		}
@@ -6317,7 +6369,7 @@ func (h *Hub) handleConfirmReceived(ctx context.Context, req mcp.CallToolRequest
 			"whose position to keep. To free the delivery window without moving any position — " +
 			"for notices that carry no cursor — call hub_confirm with NEITHER connection nor cursor."), nil
 	}
-	behind, err := s.confirmCursor(conn, cursor)
+	behind, err := s.readerConfirm(conn, cursor)
 	var notPersisted errNotPersisted
 	var covered hubconn.ConfirmCoveredError
 	switch {
@@ -6391,6 +6443,24 @@ func formatBehindNote(behind *int) string {
 		return " — you are fully caught up from this position"
 	}
 	return fmt.Sprintf(" — %d message(s) remain after this position", *behind)
+}
+
+// readerConfirm is a confirm the reader asked for. A cursor this
+// connection has never handed over is refused once it has handed over
+// anything: a mistyped or remembered-wrong cursor would otherwise move
+// the stored position somewhere nobody read up to — backwards included —
+// and both sides would accept it, since cursors are opaque.
+func (s *session) readerConfirm(conn *hubconn.Conn, cursor string) (*int, error) {
+	s.mu.Lock()
+	known := len(s.delivered) == 0 || s.delivered[cursor] || cursor == s.lastHandedOverCursor
+	s.mu.Unlock()
+	if !known && cursor != conn.ConfirmedCursor() {
+		return nil, fmt.Errorf("%q was never delivered on %q, so it is not a position you read up "+
+			"to — copy the cursor verbatim from the last message you have complete; nothing was "+
+			"confirmed. To free the delivery window without moving a position, call hub_confirm() "+
+			"with no arguments", cursor, s.name)
+	}
+	return s.confirmCursor(conn, cursor)
 }
 
 // confirmCursor is hub_confirm's actual effect, factored out so
@@ -6573,7 +6643,7 @@ func (h *Hub) handleEdit(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 	}
 	behindNote := ""
 	if confirmCursor := req.GetString("confirmCursor", ""); confirmCursor != "" {
-		behind, err := s.confirmCursor(conn, confirmCursor)
+		behind, err := s.readerConfirm(conn, confirmCursor)
 		if err != nil && !confirmCovered(err) {
 			return mcp.NewToolResultError(fmt.Sprintf("confirmCursor failed: %v", err)), nil
 		}

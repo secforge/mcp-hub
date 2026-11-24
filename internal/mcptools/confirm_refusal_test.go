@@ -139,3 +139,22 @@ func TestAnOkFalseConfirmIsAlreadyCovered(t *testing.T) {
 		t.Errorf("the held position is missing or the sentence is mangled: %s", text)
 	}
 }
+
+// A cursor this connection never handed over is refused once it has
+// handed over anything, and nothing moves.
+func TestAMistypedCursorIsRefused(t *testing.T) {
+	s := &session{name: "relay"}
+	s.noteDelivered("639311350572005000.127303")
+	conn := &hubconn.Conn{}
+	if _, err := s.readerConfirm(conn, "639310350572005000.127303"); err == nil ||
+		!strings.Contains(err.Error(), "never delivered") {
+		t.Fatalf("err %v", err)
+	}
+	fresh := &session{name: "fresh"}
+	fresh.mu.Lock()
+	known := len(fresh.delivered) == 0
+	fresh.mu.Unlock()
+	if !known {
+		t.Fatal("a connection that handed over nothing cannot judge a cursor")
+	}
+}
