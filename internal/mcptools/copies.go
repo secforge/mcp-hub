@@ -223,6 +223,28 @@ func (s *session) settledUpTo() string {
 	return last
 }
 
+// settledAfter counts the settled entries that directly follow cursor:
+// the ones a confirm of cursor carries along.
+func (s *session) settledAfter(cursor string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unordered {
+		return 0
+	}
+	n, after := 0, false
+	for _, h := range s.sinceConfirm {
+		if !after {
+			after = h.cursor == cursor
+			continue
+		}
+		if !h.settled() {
+			break
+		}
+		n++
+	}
+	return n
+}
+
 // holdCopy records ev as held here: handed over, so no walk offers it
 // again, and waiting for its first delivery to be confirmed.
 func (s *session) holdCopy(ev hubconn.Event, first copyFirst) {

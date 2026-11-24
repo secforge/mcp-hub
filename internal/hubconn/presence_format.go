@@ -75,3 +75,28 @@ func presenceLabel(m wire.PresenceMember, self string) string {
 	}
 	return label + " (" + oneLine(m.PeerID, true) + ")"
 }
+
+// FoldPresenceRuns replaces each run of consecutive presence entries in a
+// read with one "presenceRun" event, rendered as FormatPresenceRun does
+// for delivery, so a read of history shows joins and leaves the way they
+// arrived live. The folded event keeps the run's last cursor.
+func FoldPresenceRuns(events []Event, self string) []Event {
+	out := make([]Event, 0, len(events))
+	for i := 0; i < len(events); {
+		if events[i].Kind != "msg" || events[i].Presence == nil {
+			out = append(out, events[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(events) && events[j].Kind == "msg" && events[j].Presence != nil {
+			j++
+		}
+		run := events[i:j]
+		last := run[len(run)-1]
+		out = append(out, Event{Kind: "presenceRun", Text: FormatPresenceRun(run, self),
+			Cursor: last.Cursor, TS: last.TS, Historical: last.Historical})
+		i = j
+	}
+	return out
+}

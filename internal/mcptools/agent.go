@@ -1510,16 +1510,22 @@ func (ag *agentSession) remindLoop() {
 		}
 		ag.mu.Unlock()
 		sort.Slice(children, func(i, j int) bool { return children[i].name < children[j].name })
+		// Due once any delivery has waited a whole interval; then it names
+		// every conversation with something unconfirmed, so one notice
+		// covers them all instead of a second following an interval later.
 		var lines []string
-		more := 0
+		more, due := 0, false
 		for _, s := range children {
 			conn, _ := s.activeConn()
 			if conn == nil {
 				continue
 			}
 			cursor, count, since, ok := conn.UnconfirmedState()
-			if !ok || time.Since(since) < ag.remindEvery {
+			if !ok {
 				continue
+			}
+			if time.Since(since) >= ag.remindEvery {
+				due = true
 			}
 			if len(lines) == 20 {
 				more++
@@ -1528,7 +1534,7 @@ func (ag *agentSession) remindLoop() {
 			lines = append(lines, fmt.Sprintf("%s: %d unconfirmed since %s, last cursor %s",
 				s.name, count, since.UTC().Format("15:04 UTC"), cursor))
 		}
-		if len(lines) == 0 {
+		if !due || len(lines) == 0 {
 			continue
 		}
 		if more > 0 {

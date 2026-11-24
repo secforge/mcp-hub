@@ -224,7 +224,14 @@ func (c *Conn) openEvent(ev *Event) {
 		ev.AttachmentContentBytes = ""
 		ev.AttachmentName = "[unsealed attachment in an encrypted session refused]"
 		return
+	case ev.Enc == nil && encrypted && ev.Kind == "msg" && validPresence(ev.Presence):
+		// Server-authored by design, so nothing the server wrote freely is
+		// kept: the text is rebuilt from the structured entry alone.
+		ev.Text = FormatPresenceRun([]Event{*ev}, c.peerID)
+		ev.Attachments = nil
+		return
 	case ev.Enc == nil && encrypted && ev.Kind == "msg":
+		ev.Presence = nil
 		ev.Text = "[UNSEALED — written by the server, not by any participant] " + ev.Text
 		ev.Attachments = nil
 		return
@@ -420,4 +427,17 @@ func NewEncryptionHeader(key []byte) (string, error) {
 	}
 	raw, _ := json.Marshal(map[string]any{"v": hubenc.Version, "salt": salt, "check": check})
 	return string(raw), nil
+}
+
+// validPresence reports whether p is a presence entry this client knows:
+// a known event naming at least one member.
+func validPresence(p *wire.Presence) bool {
+	if p == nil || len(p.Members) == 0 {
+		return false
+	}
+	switch p.Event {
+	case wire.PresenceJoined, wire.PresenceReconnected, wire.PresenceLeft:
+		return true
+	}
+	return false
 }

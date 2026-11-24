@@ -151,6 +151,11 @@ func FormatEvent(e Event) string {
 		return text
 	}
 	switch e.Kind {
+	case "presenceRun":
+		if e.Cursor == "" {
+			return e.Text
+		}
+		return fmt.Sprintf("%s\n[cursor: %s]", e.Text, e.Cursor)
 	case "msg":
 		// own/cursor/externalId are appended, not prepended, so a reader
 		// scanning the fixed "[HUB ..." prefix isn't slowed down by a

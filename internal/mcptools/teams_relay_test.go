@@ -5431,3 +5431,87 @@ func TestPastGapEndComparesTimesNotText(t *testing.T) {
 		}
 	}
 }
+
+// The server's backlog count is measured from the position IT acked for
+// this peer. When the client can measure from its own stored cursor and
+// finds only a few messages, those are walked: seeking past them on the
+// server's stale figure recorded a gap after every automatic reconnect.
+func TestAShortMeasuredBacklogIsWalkedDespiteALargeServerCount(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	var mu sync.Mutex
+	var anchors []wire.Anchor
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		features := teamsTestFeatures()
+		features["ackReplies"] = json.RawMessage("{}")
+		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Features: features,
+			Behind: wire.BehindCount(22), BehindSince: "2026-11-23T19:28:22Z"})
+		for {
+			var f map[string]any
+			if err := conn.ReadJSON(&f); err != nil {
+				return
+			}
+			switch f["type"] {
+			case "ack":
+				behind := 1
+				conn.WriteJSON(wire.Ack{Type: wire.TypeAck, AckCursor: "cursor-known", OK: wire.OK(true), Behind: &behind})
+			case "messageAfter":
+				a := wire.Anchor{}
+				if v, ok := f["cursor"].(string); ok {
+					a.Cursor = v
+				}
+				if v, ok := f["at"].(string); ok {
+					a.At = v
+				}
+				mu.Lock()
+				anchors = append(anchors, a)
+				mu.Unlock()
+				conn.WriteJSON(wire.NoMoreMessages{Type: wire.TypeNoMoreMessages, Answers: &a})
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
+	ctx := context.Background()
+
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect failed: err=%v result=%+v", err, res)
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+	sess := sole(t, hub)
+	sess.mu.Lock()
+	sess.lastHandedOverCursor = "cursor-known"
+	sess.mu.Unlock()
+
+	res, err := hub.handleCatchUp(ctx, connReqFor(testConn))
+	if err != nil || res.IsError {
+		t.Fatalf("catch-up failed: err=%v result=%+v", err, res)
+	}
+	if strings.Contains(textOf(res), "seeking to recent context") || strings.Contains(textOf(res), "gap: true") {
+		t.Fatalf("expected a walk from the stored position, got: %s", textOf(res))
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(anchors)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(anchors) == 0 || anchors[0].Cursor != "cursor-known" || anchors[0].At != "" {
+		t.Fatalf("expected the walk to start at the stored cursor, got %+v", anchors)
+	}
+}

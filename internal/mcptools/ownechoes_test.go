@@ -94,3 +94,24 @@ func TestAnUnmarkedEchoOfASendIsKnownByItsId(t *testing.T) {
 		})
 	}
 }
+
+// A confirm carries the echoes right behind it along, so they are not
+// reported as still to read.
+func TestEchoesBehindAConfirmAreNotCountedAsRemaining(t *testing.T) {
+	s := &session{sinceConfirm: []handed{
+		{cursor: "a"}, {cursor: "b", echo: true}, {cursor: "c", echo: true}, {cursor: "d"}, {cursor: "e", echo: true},
+	}}
+	if n := s.settledAfter("a"); n != 2 {
+		t.Fatalf("after a: %d", n)
+	}
+	if n := s.settledAfter("d"); n != 1 {
+		t.Fatalf("after d: %d", n)
+	}
+	if n := s.settledAfter("zz"); n != 0 {
+		t.Fatalf("unknown cursor: %d", n)
+	}
+	s.unordered = true
+	if n := s.settledAfter("a"); n != 0 {
+		t.Fatalf("unordered: %d", n)
+	}
+}

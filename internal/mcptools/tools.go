@@ -5074,9 +5074,10 @@ func (h *Hub) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.Cal
 		reached = " The server said there is nothing beyond where this read stopped: you have " +
 			"reached the " + edge + ", so this is everything there was."
 	}
-	body := hubconn.FormatEventsOn(s.name, events)
+	shown := hubconn.FoldPresenceRuns(events, conn.PeerID())
+	body := hubconn.FormatEventsOn(s.name, shown)
 	if compact {
-		body = compactReadText(s.name, events)
+		body = compactReadText(s.name, shown)
 	}
 	direction := fmt.Sprintf(" Read FORWARD from %s, %d message(s), shown sorted by time, oldest first.",
 		describeAnchor(start), len(events))
@@ -5747,7 +5748,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	project := s.catchUpID.Project
 	s.mu.Unlock()
 
-	measuredBehind := 0
+	measuredBehind, measured := 0, false
 	// NOT WHILE SOMETHING NEWER HAS BEEN CONFIRMED. This measuring ack
 	// names the STORED cursor, and sending it is also what repairs the
 	// server's own position — but if this connection has since consumed
@@ -5766,7 +5767,7 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	if cursor != "" && conn.HasFeature("ackReplies") &&
 		(conn.ConfirmedCursor() == "" || conn.ConfirmedCursor() == cursor) {
 		if behind, err := conn.ConfirmReceived(cursor); err == nil && behind != nil {
-			measuredBehind = *behind
+			measuredBehind, measured = *behind, true
 		}
 	}
 
@@ -5835,7 +5836,11 @@ func (h *Hub) handleCatchUp(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 				"call at a time. Nothing is lost: the skipped range is recorded and "+
 				"hub_catch_up(gap: true) retrieves it.\n\n",
 			why, measuredBehind, seekAt)
-	case !alreadySeeked && conn.Behind() > catchUpSeekThreshold && conn.BehindSince() != "":
+	// The server's own count is measured from the position IT acked for
+	// this peer, which can sit far behind what this client confirmed; a
+	// measurement from the stored cursor, when there is one, is the
+	// answer, and a short one is walked.
+	case !alreadySeeked && !measured && conn.Behind() > catchUpSeekThreshold && conn.BehindSince() != "":
 		branch = "seek (the server reported the backlog)"
 		seekAt := time.Now().UTC().Add(-catchUpSeekWindow).Format(time.RFC3339)
 		anchor = wire.Anchor{At: seekAt}
@@ -6426,9 +6431,17 @@ func (s *session) confirmCursor(conn *hubconn.Conn, cursor string) (*int, error)
 			"would move %q's read position past messages nothing has read. Confirm it against "+
 			"%q instead", other, s.name, s.name, other)
 	}
+	settled := s.settledAfter(cursor)
 	behind, err := conn.ConfirmReceived(cursor)
 	if err != nil {
 		return nil, err
+	}
+	// What follows the cursor and needs no reading (echoes of this
+	// connection's own sends, copies read elsewhere) is confirmed along
+	// with it, so it is not counted as remaining.
+	if behind != nil && settled > 0 {
+		left := max(*behind-settled, 0)
+		behind = &left
 	}
 	return behind, s.adoptConfirmed(cursor)
 }
