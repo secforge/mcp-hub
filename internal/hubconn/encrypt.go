@@ -208,6 +208,13 @@ func (c *Conn) sealEdit(e wire.Edit) (any, error) {
 // since the server could otherwise put words or files in anyone's name.
 func (c *Conn) openEvent(ev *Event) {
 	encrypted := c.encParams != nil
+	// A presence entry is the server's own record, never a sealed
+	// participant message, and only a known shape counts as one: anything
+	// else carrying the field is read as the message it is, so the field
+	// cannot fold a participant's words away as a join or leave.
+	if ev.Presence != nil && (ev.Kind != "msg" || ev.Enc != nil || !validPresence(ev.Presence)) {
+		ev.Presence = nil
+	}
 	if ev.Kind == "items" {
 		ev.TodoItems = c.openItems(ev.TodoItems)
 		return

@@ -76,6 +76,11 @@ func presenceLabel(m wire.PresenceMember, self string) string {
 	return label + " (" + oneLine(m.PeerID, true) + ")"
 }
 
+// isPresenceEntry is a server presence entry: unsealed, of a known shape.
+func isPresenceEntry(e Event) bool {
+	return e.Kind == "msg" && e.Enc == nil && validPresence(e.Presence)
+}
+
 // FoldPresenceRuns replaces each run of consecutive presence entries in a
 // read with one "presenceRun" event, rendered as FormatPresenceRun does
 // for delivery, so a read of history shows joins and leaves the way they
@@ -83,13 +88,13 @@ func presenceLabel(m wire.PresenceMember, self string) string {
 func FoldPresenceRuns(events []Event, self string) []Event {
 	out := make([]Event, 0, len(events))
 	for i := 0; i < len(events); {
-		if events[i].Kind != "msg" || events[i].Presence == nil {
+		if !isPresenceEntry(events[i]) {
 			out = append(out, events[i])
 			i++
 			continue
 		}
 		j := i
-		for j < len(events) && events[j].Kind == "msg" && events[j].Presence != nil {
+		for j < len(events) && isPresenceEntry(events[j]) {
 			j++
 		}
 		run := events[i:j]

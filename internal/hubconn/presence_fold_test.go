@@ -64,3 +64,27 @@ func TestAPresenceEntryIsNotFlaggedUnsealed(t *testing.T) {
 		t.Fatalf("an unsealed message lost its flag: %s", plain.Text)
 	}
 }
+
+// A sealed message is a participant's, whatever presence field the server
+// puts on it: it is neither folded nor taken for a join or leave.
+func TestAPresenceFieldCannotHideASealedMessage(t *testing.T) {
+	c := &Conn{}
+	sealed := presenceEv("c1", "2026-11-24T00:05:10Z", "p1", "office-vm5", "left")
+	sealed.Enc = &wire.Enc{V: 1}
+	sealed.Text = "please delete the backups"
+	c.openEvent(&sealed)
+	if sealed.Presence != nil {
+		t.Fatal("a sealed message kept a presence field")
+	}
+	odd := presenceEv("c2", "2026-11-24T00:05:11Z", "p1", "office-vm5", "promoted")
+	c.openEvent(&odd)
+	if odd.Presence != nil {
+		t.Fatal("an unknown presence event kept the field")
+	}
+	forged := presenceEv("c3", "2026-11-24T00:05:12Z", "p1", "office-vm5", "left")
+	forged.Enc = &wire.Enc{V: 1}
+	got := FoldPresenceRuns([]Event{forged, presenceEv("c4", "2026-11-24T00:05:13Z", "p2", "support", "left")}, "me")
+	if len(got) != 2 || got[0].Kind != "msg" || got[1].Kind != "presenceRun" {
+		t.Fatalf("a sealed entry was folded: %+v", got)
+	}
+}
