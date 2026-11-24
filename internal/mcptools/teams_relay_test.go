@@ -5515,3 +5515,73 @@ func TestAShortMeasuredBacklogIsWalkedDespiteALargeServerCount(t *testing.T) {
 		t.Fatalf("expected the walk to start at the stored cursor, got %+v", anchors)
 	}
 }
+
+// Retrieving a recorded gap folds joins and leaves into one block, as
+// delivery and hub_read do.
+func TestGapRetrievalFoldsPresence(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: "550e8400-e29b-41d4-a716-446655440000",
+			ServerVersion: wire.ProtocolVersion, Behind: wire.BehindCount(3000), BehindSince: "2026-09-01T09:12:00Z"})
+		gap := []wire.Msg{}
+		for i, ev := range []string{"left", "reconnected", "left"} {
+			gap = append(gap, wire.Msg{Type: wire.TypeMsg, PeerID: "550e8400-e29b-41d4-a716-446655440077",
+				Name: "office", Text: "office " + ev, Historical: true, TS: fmt.Sprintf("2026-09-01T09:1%d:00Z", 3+i),
+				Cursor: fmt.Sprintf("g-%d", i), Presence: &wire.Presence{Event: ev,
+					Members: []wire.PresenceMember{{PeerID: "550e8400-e29b-41d4-a716-446655440077", Name: "office"}}}})
+		}
+		for {
+			var m wire.MessageAfter
+			if err := conn.ReadJSON(&m); err != nil {
+				return
+			}
+			a := wire.Anchor{At: m.At, Cursor: m.Cursor}
+			next := -1
+			switch {
+			case m.At == "2026-09-01T09:12:00Z":
+				next = 0
+			case strings.HasPrefix(m.Cursor, "g-"):
+				fmt.Sscanf(m.Cursor, "g-%d", &next)
+				next++
+			}
+			if next >= 0 && next < len(gap) {
+				msg := gap[next]
+				msg.Answers = &a
+				conn.WriteJSON(msg)
+				continue
+			}
+			conn.WriteJSON(wire.NewNoMoreMessages(a))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	link := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay/join?c=abc-" + uniqueConvID() + "#the-link-secret"
+	ctx := context.Background()
+	hub := NewHub()
+	connReq := mcp.CallToolRequest{}
+	connReq.Params.Arguments = map[string]any{"as": testConn, "link": link}
+	if res, err := hub.handleConnect(ctx, connReq); err != nil || res.IsError {
+		t.Fatalf("connect: %v %s", err, textOf(res))
+	}
+	defer hub.handleDisconnect(ctx, connReqFor(testConn))
+	if res, err := hub.handleCatchUp(ctx, connReqFor(testConn)); err != nil || res.IsError {
+		t.Fatalf("seek: %v %s", err, textOf(res))
+	}
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"connection": testConn, "gap": true, "limit": 10}
+	res, err := hub.handleCatchUp(ctx, req)
+	if err != nil || res.IsError {
+		t.Fatalf("gap: %v %s", err, textOf(res))
+	}
+	text := textOf(res)
+	if !strings.Contains(text, "[presence, 3 change(s) from history") ||
+		!strings.Contains(text, "office (550e8400-e29b-41d4-a716-446655440077): left → reconnected → left") ||
+		strings.Contains(text, "delivering 3 events") {
+		t.Fatalf("not folded:\n%s", text)
+	}
+}

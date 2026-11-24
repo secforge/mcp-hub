@@ -731,3 +731,24 @@ func TestTheProjectOverrideFallsBackToMCPProjectDir(t *testing.T) {
 		}
 	}
 }
+
+// Forgetting an agent connection forgets the conversations stored under
+// it, and nothing else.
+func TestForgettingAnAgentForgetsItsConversations(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	agent := Target{Project: "/p", Link: "wss://h/agent/join#cred"}
+	other := Target{Project: "/p", Link: "wss://h/hub/join#x"}
+	if err := Upsert(agent, Entry{Agent: true, PeerID: "3", ReconnectSecret: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	Upsert(AgentConvTarget(agent, "ag_1"), Entry{PeerID: "p1"})
+	Upsert(AgentConvTarget(agent, "ag_2"), Entry{PeerID: "p2"})
+	Upsert(other, Entry{PeerID: "o", ReconnectSecret: "t"})
+	if ok, err := Delete(agent); !ok || err != nil {
+		t.Fatalf("delete: %v %v", ok, err)
+	}
+	entries, _ := ListForProject("/p")
+	if len(entries) != 1 || entries[0].Target.Link != other.Link {
+		t.Fatalf("left: %+v", entries)
+	}
+}

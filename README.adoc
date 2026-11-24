@@ -424,6 +424,14 @@ as well (see `hub_forget_connection`). The client also disconnects every open
 connection when it shuts down on `SIGTERM`/`SIGINT` or when its stdio pipe
 closes — without removing anything.
 
+|`hub_rename(connection, as)`
+|Give an open connection a new local name. It reconnects under the new name
+with the same identity, key file and read position.
+- An agent connection (at most 16 characters): its conversations follow the
+new name.
+- A single conversation of an agent connection: its chosen name is stored and
+kept when it reopens, and also when the agent is renamed.
+
 |`hub_forget_connection(connection? \| link?)`
 |Delete a stored entry — its secret, peer id and read position. A
 `connection` name that is open means that connection, as it does for every
@@ -432,6 +440,7 @@ under, exactly as `hub_disconnect(remove: true)` would. A name that is not
 open, or a `link`, is looked up among this project's stored entries (a name
 by what it was last opened as, refused if more than one entry matches); an
 entry an open connection holds is disconnected and removed the same way.
+Forgetting an agent connection forgets its conversations too.
 *Irreversible*: the next connect to that link gets a new identity, which the
 other peers see as a new participant, and nothing to catch up from. Both
 tools tell the model to do this only when the user asks.

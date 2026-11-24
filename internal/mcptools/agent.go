@@ -365,7 +365,7 @@ func (ag *agentSession) openChild(a *hubconn.Agent, it wire.Assignment, preloade
 			return nil, fmt.Errorf("its key file could not be read: %w", err)
 		}
 	}
-	s, err := ag.childSession(it, stored.LocalName)
+	s, err := ag.childSession(it, stored.LocalName, stored.NameChosen)
 	if err != nil {
 		return nil, err
 	}
@@ -427,10 +427,12 @@ func (ag *agentSession) openChild(a *hubconn.Agent, it wire.Assignment, preloade
 	if t := conn.Topic(); t != nil && *t != "" {
 		topic = *t
 	}
-	if !found || stored.PeerID != conn.PeerID() || stored.LocalName != s.name || stored.Topic != topic {
+	chosen := stored.NameChosen && stored.LocalName == s.name
+	if !found || stored.PeerID != conn.PeerID() || stored.LocalName != s.name || stored.Topic != topic ||
+		stored.NameChosen != chosen {
 		record(target, connstore.Entry{
-			PeerID: conn.PeerID(), Topic: topic, LocalName: s.name, KeyFile: stored.KeyFile,
-			LastConnectedAt: time.Now().UTC(),
+			PeerID: conn.PeerID(), Topic: topic, LocalName: s.name, NameChosen: chosen,
+			KeyFile: stored.KeyFile, LastConnectedAt: time.Now().UTC(),
 		})
 	}
 	if !conn.Connected() {
@@ -443,7 +445,7 @@ func (ag *agentSession) openChild(a *hubconn.Agent, it wire.Assignment, preloade
 // a name that is unique among everything open: the stored one when it is
 // still free, otherwise one derived from the agent's name, the title and
 // the handle.
-func (ag *agentSession) childSession(it wire.Assignment, storedName string) (*session, error) {
+func (ag *agentSession) childSession(it wire.Assignment, storedName string, chosen bool) (*session, error) {
 	h := ag.hub
 	ag.mu.Lock()
 	if s := ag.children[it.Conv]; s != nil {
@@ -458,7 +460,7 @@ func (ag *agentSession) childSession(it wire.Assignment, storedName string) (*se
 		return s || a
 	}
 	name := storedName
-	if name == "" || !strings.HasPrefix(name, ag.name+"-") || validSessionName(name) != nil || taken(name) {
+	if name == "" || (!chosen && !strings.HasPrefix(name, ag.name+"-")) || validSessionName(name) != nil || taken(name) {
 		name = childName(ag.name, it.Title, it.Conv, taken)
 	}
 	if name == "" {
@@ -1546,4 +1548,58 @@ func (ag *agentSession) remindLoop() {
 			"arguments moves no read position and is safe whatever the messages are.",
 			strings.Join(lines, "; ")))
 	}
+}
+
+// rename gives one conversation a name of its own: it is recorded as
+// chosen, so reopening keeps it, and the conversation is reopened under
+// it — the same identity and read position, stored under its handle.
+func (ag *agentSession) rename(s *session, to string) error {
+	target := ag.childTarget(s.conv)
+	stored, _, err := connstore.Get(target)
+	if err != nil {
+		return fmt.Errorf("its stored entry could not be read (%v)", err)
+	}
+	prev, prevChosen := stored.LocalName, stored.NameChosen
+	stored.LocalName, stored.NameChosen = to, true
+	if err := connstore.Upsert(target, stored); err != nil {
+		return fmt.Errorf("the name could not be recorded (%v)", err)
+	}
+	restore := func() {
+		stored.LocalName, stored.NameChosen = prev, prevChosen
+		_ = connstore.Upsert(target, stored)
+	}
+	ag.opMu.Lock()
+	defer ag.opMu.Unlock()
+	ag.mu.Lock()
+	a := ag.agent
+	it, granted := ag.grants[s.conv]
+	ag.mu.Unlock()
+	if a == nil || !a.Connected() || !granted {
+		restore()
+		return fmt.Errorf("it is not open now (the agent connection is down, or it is no longer shared)")
+	}
+	if conn, w, _ := s.clearActiveConn(); conn != nil {
+		s.teardown(conn, true)
+		conn.Close()
+		if w != nil {
+			w.Detach(s.name, "it was renamed to "+to)
+		}
+	}
+	s.closeReturnPath()
+	ag.hub.gate().budget.DropOwner(s.name)
+	ag.hub.close(s.name)
+	ag.mu.Lock()
+	if ag.children[s.conv] == s {
+		delete(ag.children, s.conv)
+	}
+	ag.mu.Unlock()
+	ns, err := ag.openChild(a, it, nil, nil, nil)
+	if err != nil {
+		return fmt.Errorf("it was closed for the rename, but reopening it failed (%v); it is "+
+			"reopened when the agent reconnects", err)
+	}
+	if ns.name != to {
+		return fmt.Errorf("it reopened as %q, because %q could not be used", ns.name, to)
+	}
+	return nil
 }

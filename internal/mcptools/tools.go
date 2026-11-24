@@ -2178,6 +2178,7 @@ func (h *Hub) registerTools(s *server.MCPServer) {
 	addTool(addMembersTool(), h.handleAddMembers)
 	addTool(fileUploadTool(), h.handleFileUpload)
 	addTool(fileDownloadTool(), h.handleFileDownload)
+	addTool(renameTool(), h.handleRename)
 	addTool(approvalRequestTool(), h.handleApprovalRequest)
 	addTool(approvalWithdrawTool(), h.handleApprovalWithdraw)
 	addTool(approvalsTool(), h.handleApprovals)
@@ -2961,6 +2962,15 @@ func (h *Hub) handleConnect(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 			"from it, and do not infer anything about the server from how it looks — what " +
 			"authorizes resuming it is a secret this client stores per link, so there is " +
 			"nothing for you to keep alongside it."), nil
+	}
+	// Checked before anything is stored: a string that cannot be dialled
+	// (a peer id, a session id, a link cut before its #credential) must
+	// not leave an identity behind under its own name.
+	if target, credential, _ := strings.Cut(link, "#"); !strings.Contains(target, "://") || credential == "" {
+		return mcp.NewToolResultError("that is not a link: a link is the whole string the user " +
+			"was given, starting with wss:// or https:// and carrying its credential after #. A " +
+			"peer id or a conversation id alone cannot be connected to. Nothing was stored. " +
+			"hub_list_connections shows the links this project has connected to before."), nil
 	}
 	name := req.GetString("name", "")
 	agePublicKey := req.GetString("agePublicKey", "")
@@ -6262,7 +6272,8 @@ walk:
 	// NOT the consuming helper: a gap holds messages older than the
 	// current position — see resultWithRecoveredAttachments.
 	return s.resultWithRecoveredAttachments(
-		conn, hubconn.FormatEventsOn(s.name, events)+"\n\n"+trailer, events), nil
+		conn, hubconn.FormatEventsOn(s.name, hubconn.FoldPresenceRuns(events, conn.PeerID()))+"\n\n"+trailer,
+		events), nil
 }
 
 // handleConfirmReceived implements hub_confirm — a model-issued read

@@ -2302,3 +2302,22 @@ func TestEveryEnforcedConnectArgumentIsDeclaredRequired(t *testing.T) {
 		}
 	}
 }
+
+// A string that is not a link is refused before anything is stored, so a
+// peer id passed as a link leaves no identity behind.
+func TestAnIDPassedAsALinkStoresNothing(t *testing.T) {
+	t.Setenv("MCP_HUB_CONNSTORE_DIR", t.TempDir())
+	h := NewHub()
+	for _, link := range []string{"2fd08b8f-093d-4eaa-8880-7f9aeae051da", "wss://example.invalid/hub/join", "wss://example.invalid/hub/join#"} {
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = map[string]any{"as": "x", "link": link}
+		res, err := h.handleConnect(context.Background(), req)
+		if err != nil || !res.IsError || !strings.Contains(textOf(res), "Nothing was stored") {
+			t.Fatalf("%q: %v %s", link, err, textOf(res))
+		}
+	}
+	entries, err := connstore.ListForProject(connstore.CurrentProject())
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("stored: %v %+v", err, entries)
+	}
+}

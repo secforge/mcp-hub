@@ -193,6 +193,10 @@ type Entry struct {
 	// project used last, rather than the caller having to remember it or
 	// invent a second one for the same conversation.
 	LocalName string `json:"localName,omitempty"`
+	// NameChosen marks a conversation of an agent connection whose
+	// LocalName was given with hub_rename rather than derived from the
+	// agent's name, so it is kept when the conversation reopens.
+	NameChosen bool `json:"nameChosen,omitempty"`
 	// KeyFile is the path of an encrypted session's key file, so a
 	// reconnect can read the key again. Only the path is stored, never
 	// the key.
@@ -785,10 +789,21 @@ func Delete(target Target) (bool, error) {
 		if err != nil {
 			return err
 		}
-		if _, existed = getEntry(s, target.Project, target.Link); !existed {
+		e, ok := getEntry(s, target.Project, target.Link)
+		if existed = ok; !existed {
 			return nil
 		}
 		setEntry(&s, target.Project, target.Link, Entry{})
+		// An agent connection's conversations are stored under its link
+		// and reached only through it: forgetting it forgets them too.
+		if e.Agent {
+			prefix := target.Link + "#"
+			for key := range s[NormalizeProject(target.Project)] {
+				if strings.HasPrefix(key, prefix) {
+					setEntry(&s, target.Project, key, Entry{})
+				}
+			}
+		}
 		return save(d, s)
 	})
 	return existed, err
