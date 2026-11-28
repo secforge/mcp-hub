@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"filippo.io/age"
@@ -313,6 +314,11 @@ func ValidateChoices(choices []string) error {
 			return fmt.Errorf(`"text" cannot be a choice: it names a free-text answer`)
 		case utf8.RuneCountInString(c) > MaxChoiceLength:
 			return fmt.Errorf("choice %q is longer than %d characters", c, MaxChoiceLength)
+		case strings.IndexFunc(c, unprintable) >= 0:
+			// A choice is echoed into notices and proof checks other agents
+			// read: no line breaks, control or invisible format characters
+			// that could forge a line there (security review, 2026-11-28).
+			return fmt.Errorf("choice %q holds a control or invisible character", c)
 		case seen[c]:
 			return fmt.Errorf("choice %q twice", c)
 		}
@@ -328,11 +334,23 @@ func AnswerText(st Statement) string {
 	if st.Answer == "text" {
 		return fmt.Sprintf("free text: %q", st.Text)
 	}
+	// Only yes and no stand bare; any other choice is the agent's own and is
+	// quoted, so it can never read as a bare yes.
+	answer := st.Answer
+	if answer != "yes" && answer != "no" {
+		answer = fmt.Sprintf("%q", answer)
+	}
 	if st.Text != "" {
 		// A comment beside a choice (revision 3): reported with it, never dropped.
-		return fmt.Sprintf("%s, comment: %q", st.Answer, st.Text)
+		return fmt.Sprintf("%s, comment: %q", answer, st.Text)
 	}
-	return st.Answer
+	return answer
+}
+
+// unprintable: control characters (line breaks included) and invisible
+// format characters (zero-width, bidi overrides).
+func unprintable(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
 }
 
 // ParseSigned reads an answer envelope's plaintext strictly.
