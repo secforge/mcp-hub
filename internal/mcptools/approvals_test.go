@@ -319,3 +319,41 @@ func answerArrivedFor(t *testing.T, rq approvals.Request, plain []byte, answer s
 	})
 	return notice, ack
 }
+
+// Wire revision 3 (2026-11-28): the agent's own choices reach the phone with
+// "comments": true, and a comment beside the chosen one reaches the agent.
+func TestOwnChoicesAndAComment(t *testing.T) {
+	as := newApprovalServer(t)
+	as.answer = func(rq approvals.Request, plain []byte) []approvals.Signed {
+		return []approvals.Signed{sign(statementFor(rq, plain, "morgen", "erst nach 10 Uhr"))}
+	}
+	h := connectApprovals(t, as)
+	res := fileCall(t, h.handleApprovalRequest, map[string]any{"connection": testConn, "approver": "steffen",
+		"text": "Wann?", "choices": []any{"heute", "morgen"}})
+	if res.IsError {
+		t.Fatalf("request: %s", textOf(res))
+	}
+	got := received(t, h, "APPROVAL ANSWERED")
+	if !strings.Contains(got, `answered "morgen", comment: "erst nach 10 Uhr"`) {
+		t.Fatalf("notice: %s", got)
+	}
+	as.mu.Lock()
+	q := as.requests[0]
+	as.mu.Unlock()
+	phone, _ := age.ParseX25519Identity(phoneIdentity)
+	plain, err := approvals.Open(q.Envelope, phone, 1<<16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rq approvals.Request
+	json.Unmarshal(plain, &rq)
+	if !rq.Comments || strings.Join(rq.Choices, ",") != "heute,morgen" {
+		t.Fatalf("request: %+v", rq)
+	}
+
+	res = fileCall(t, h.handleApprovalRequest, map[string]any{"connection": testConn, "approver": "steffen",
+		"text": "Wann?", "choices": []any{"heute", "text"}})
+	if !res.IsError || !strings.Contains(textOf(res), `"text" cannot be a choice`) {
+		t.Fatalf("bad choices: %s", textOf(res))
+	}
+}

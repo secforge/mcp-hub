@@ -43,8 +43,13 @@ func TestAMessageOnTwoCopiesOfAThreadIsDeliveredOnce(t *testing.T) {
 		conn.WriteJSON(wire.Joined{Type: wire.TypeJoined, PeerID: self, ServerVersion: wire.ProtocolVersion,
 			Features: f, Behind: &zero, Thread: "thread-1"})
 		conn.WriteJSON(wire.Roster{Type: wire.TypeRoster, Members: []wire.RosterMember{{PeerID: self, Name: "t"}}})
+		// One writer at a time: this push and the ack replies below share the
+		// socket, and gorilla/websocket allows a single concurrent writer.
+		var writing sync.Mutex
 		go func() {
 			time.Sleep(300 * time.Millisecond)
+			writing.Lock()
+			defer writing.Unlock()
 			conn.WriteJSON(wire.Msg{Type: wire.TypeMsg, PeerID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 				Text: "the same message", ExternalID: "m1", Cursor: "cur-" + key + "-1", TS: "2026-11-07T12:00:00Z"})
 		}()
@@ -62,7 +67,9 @@ func TestAMessageOnTwoCopiesOfAThreadIsDeliveredOnce(t *testing.T) {
 			acks[key] = append(acks[key], c)
 			mu.Unlock()
 			ok := true
+			writing.Lock()
 			conn.WriteJSON(wire.Ack{Type: wire.TypeAck, ID: id, AckCursor: c, OK: &ok})
+			writing.Unlock()
 		}
 	}))
 	t.Cleanup(srv.Close)

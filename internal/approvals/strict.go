@@ -26,11 +26,11 @@ var (
 	askerShape    = &shape{keys: keys("ageRecipient", "name")}
 	approverShape = &shape{keys: keys("label", "signKey")}
 	requestShape  = &shape{
-		keys:    keys("actors", "asker", "choices", "createdAt", "expiresAt", "requestId", "text", "v"),
+		keys:    keys("actors", "asker", "choices", "comments", "createdAt", "expiresAt", "requestId", "text", "v"),
 		objects: map[string]*shape{"asker": askerShape},
 	}
 	statementShape = &shape{
-		keys: keys("answer", "approver", "asker", "expiresAt", "requestHash", "requestId", "signedAt", "text", "v"),
+		keys:    keys("answer", "approver", "asker", "expiresAt", "requestHash", "requestId", "signedAt", "text", "v"),
 		objects: map[string]*shape{"asker": askerShape, "approver": approverShape},
 	}
 	signedShape = &shape{keys: keys("signature", "statement")}

@@ -1235,19 +1235,20 @@ An agent asks a PERSON for approval. The person answers on a paired phone, and t
   - The client acks only after recording the outcome. That includes an invalid answer, an unknown request and a late answer.
   - `approvalClosed {requestId, state}` reports a close the client did not cause: `withdrawn` or `expired`.
 - **Plaintexts.**
-  - The request is `{actors?, asker: {ageRecipient, name}, choices, createdAt, expiresAt, requestId, text, v: 1}`, with its keys sorted.
+  - The request is `{actors?, asker: {ageRecipient, name}, choices, comments?, createdAt, expiresAt, requestId, text, v: 1}`, with its keys sorted.
+  - `choices` are the agent's own (revision 3, 2026-11-28): 1 to 8 distinct strings of 1 to 60 characters, never `text`; yes and no when the agent names none. `comments: true` says this client reports a comment beside a choice; this client always sends it.
   - The answer envelope holds `{signature, statement}`, where `statement` is the exact string the phone signed.
   - The signature is Ed25519 over `"chat-relay-approval v1\n" + statement`.
-  - The statement holds `answer`, `approver {label, signKey}`, `asker`, `expiresAt`, `requestHash` (base64url SHA-256 of the exact request bytes), `requestId`, `signedAt`, `text?` and `v`.
+  - The statement holds `answer`, `approver {label, signKey}`, `asker`, `expiresAt`, `requestHash` (base64url SHA-256 of the exact request bytes), `requestId`, `signedAt`, `text?` and `v`. `text` is the free text when `answer` is `text`, and otherwise the person's comment beside the choice -- only where the request had `comments: true`.
   - Nothing is re-serialised before it is checked.
-  - Every signed or hashed JSON text is parsed strictly. Keys must match exactly in case, appear once each, and be known for that object; anything else is refused. `choices` must be non-empty strings, never `text`. A phone reads JSON case-sensitively and takes the last of a duplicate key, while Go's decoder matches keys case-insensitively. Without this rule, one signed byte string could say one thing to the person and another to the verifying client.
+  - Every signed or hashed JSON text is parsed strictly. Keys must match exactly in case, appear once each, and be known for that object; anything else is refused. `choices` must be as above, `comments` a boolean. A phone reads JSON case-sensitively and takes the last of a duplicate key, while Go's decoder matches keys case-insensitively. Without this rule, one signed byte string could say one thing to the person and another to the verifying client.
 - **Verification** is the client's job. An answer counts only if ALL of these hold:
   - the signature verifies with a key from the approver's file, and the statement names that key;
   - it names an open request of this client, with its hash, id, expiry and asker;
-  - the answer is one of `choices`, or `text` with non-empty text;
+  - the answer is one of `choices` (with a non-empty comment only where the request had `comments: true`), or `text` with non-empty text;
   - it was signed and arrived before expiry.
   
-  The first valid answer wins. A different later one is reported as a conflict.
+  The first valid answer wins. A different later one is reported as a conflict. A comment is reported with its choice (`"morgen", comment: "…"`), never dropped.
 - **Proofs.** A proof `{request, statement, signature}` passes an answer on, with the strings exact. A receiving client checks it against its own key files, the expiry and `actors`, and accepts each request id only once.
 - **The reference client** (`internal/approvals`) offers four tools:
   - `hub_approval_request`, `hub_approval_withdraw`, `hub_approvals` (state and proofs) and `hub_approval_verify`.

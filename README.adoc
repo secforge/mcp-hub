@@ -469,11 +469,13 @@ way. It never overwrites an existing file, and confirms receipt so the server
 deletes the file. It only fetches from hosts this client's connections use,
 unless the user says to trust another.
 
-|`hub_approval_request(connection, approver, text, expiresInMinutes?, actors?)`
+|`hub_approval_request(connection, approver, text, expiresInMinutes?, actors?, choices?)`
 |Where the server offers approvals: ask a person for a signed approval on their
 paired phone. Returns at once; the answer arrives later as a delivered notice.
 That happens only after this client has verified the phone's Ed25519 signature
 against the approver's key file in `~/.config/mcp-hub/approvers/<approver>.keys`.
+`choices` offers the agent's own answers as buttons (1 to 8, default yes and no);
+the person may add a comment to any of them, and it comes back with the answer.
 
 |`hub_approval_withdraw(connection, requestId)`
 |Take back an open approval request.

@@ -1524,18 +1524,15 @@ func TestRosterCompleteBecomesTrueOnceCaughtUp(t *testing.T) {
 	}
 	defer b.Close()
 
-	activity := make(chan struct{}, 8)
-	b.OnActivity(func() { activity <- struct{}{} })
-
-	if b.RosterComplete() {
-		t.Fatal("expected RosterComplete to be false before the roster catch-up event arrives")
-	}
-	// One activity, not two: a's roster entry is held and folded into the
-	// roster that ends the enumeration, so b is woken once.
-	waitForActivity(t, activity)
-
-	if !b.RosterComplete() {
-		t.Fatal("expected RosterComplete to be true after catching up on the existing roster")
+	// Waited for, not assumed to come after the dial: the roster can arrive
+	// before dialTest returns (the race detector's timing showed it), so a
+	// "still false" check and a wait for the next activity were both racy.
+	deadline := time.Now().Add(5 * time.Second)
+	for !b.RosterComplete() {
+		if time.Now().After(deadline) {
+			t.Fatal("expected RosterComplete to be true after catching up on the existing roster")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	formatted, connected := b.Drain()
 	if !connected {

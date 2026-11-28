@@ -61,6 +61,11 @@ func approvalRequestTool() mcp.Tool {
 		mcp.WithArray("actors", mcp.WithStringItems(), mcp.Description(
 			"Optional: the names of the agents allowed to act on this approval when it is passed on "+
 				"as a proof. Leave out for any agent that trusts the same approver")),
+		mcp.WithArray("choices", mcp.WithStringItems(), mcp.Description(
+			"Optional: the answers offered as buttons, 1 to 8 distinct, each at most 60 characters, "+
+				"never \"text\" — e.g. [\"today\", \"tomorrow\", \"next week\"]. Default: yes and no. The "+
+				"person can always write free text instead, and add a comment to any choice; a comment "+
+				"comes back with the answer")),
 	)
 }
 
@@ -134,6 +139,14 @@ func (h *Hub) handleApprovalRequest(ctx context.Context, req mcp.CallToolRequest
 		return mcp.NewToolResultError(fmt.Sprintf("expiresInMinutes must be between 1 and %d",
 			int(maxLifetime.Minutes()))), nil
 	}
+	// The agent's own quick answers (wire revision 3), else yes and no.
+	choices := req.GetStringSlice("choices", nil)
+	if choices == nil {
+		choices = approvals.Choices
+	}
+	if err := approvals.ValidateChoices(choices); err != nil {
+		return mcp.NewToolResultError("nothing was asked: " + err.Error()), nil
+	}
 	actors := req.GetStringSlice("actors", nil)
 	for _, a := range actors {
 		if strings.TrimSpace(a) == "" {
@@ -155,8 +168,10 @@ func (h *Hub) handleApprovalRequest(ctx context.Context, req mcp.CallToolRequest
 			return err
 		}
 		plain, err := approvals.Request{Actors: actors,
-			Asker:   approvals.Asker{AgeRecipient: identity.Recipient().String(), Name: approvalAskerName()},
-			Choices: approvals.Choices, CreatedAt: now.Format(time.RFC3339), ExpiresAt: expiresAt,
+			Asker: approvals.Asker{AgeRecipient: identity.Recipient().String(), Name: approvalAskerName()},
+			// Comments: this client reports a comment beside a choice (AnswerText),
+			// so the phone may attach one (revision 3).
+			Choices: choices, Comments: true, CreatedAt: now.Format(time.RFC3339), ExpiresAt: expiresAt,
 			RequestID: requestID, Text: text, V: 1}.Encode()
 		if err != nil {
 			return err
@@ -550,13 +565,21 @@ func answerArrived(st *approvals.State, a *hubconn.ApprovalFrame, now time.Time)
 		id, e.State, who, shout(stmt)), true
 }
 
-// shout is an answer for a notice: YES or NO in capitals, free text as
-// the person wrote it.
+// shout is an answer for a notice: YES or NO in capitals, an agent's own
+// choice quoted as offered, free text as the person wrote it -- and a comment
+// beside a choice always with it (wire revision 3), never dropped.
 func shout(st approvals.Statement) string {
 	if st.Answer == "text" {
 		return approvals.AnswerText(st)
 	}
-	return strings.ToUpper(st.Answer)
+	answer := fmt.Sprintf("%q", st.Answer)
+	if st.Answer == "yes" || st.Answer == "no" {
+		answer = strings.ToUpper(st.Answer)
+	}
+	if st.Text != "" {
+		return fmt.Sprintf("%s, comment: %q", answer, st.Text)
+	}
+	return answer
 }
 
 func clip(s string, n int) string {

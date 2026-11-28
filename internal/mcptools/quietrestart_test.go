@@ -230,9 +230,15 @@ func TestASecondRestartDoesNotRepeatTheFirstNotice(t *testing.T) {
 			Features: teamsTestFeatures(), Behind: &behind})
 		conn.WriteMessage(websocket.TextMessage, raw)
 		conn.WriteJSON(wire.Roster{Type: wire.TypeRoster, Members: []wire.RosterMember{{PeerID: self, Name: "t"}, {PeerID: other, Name: "other"}}})
+		// One writer at a time: the reply loop below and restart() share this
+		// socket, and gorilla/websocket allows a single concurrent writer (the
+		// race detector caught both writing at once).
+		var writing sync.Mutex
 		restart := func() {
+			writing.Lock()
 			conn.WriteJSON(wire.ServerStopping{Type: wire.TypeServerStopping, ReconnectAfter: 1})
 			conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "restarting"))
+			writing.Unlock()
 			time.Sleep(30 * time.Millisecond)
 		}
 		if n == 1 {
@@ -258,13 +264,17 @@ func TestASecondRestartDoesNotRepeatTheFirstNotice(t *testing.T) {
 					}
 				}
 				if next >= len(history) {
+					writing.Lock()
 					conn.WriteJSON(wire.NewNoMoreMessages(wire.Anchor{At: m.At, Cursor: m.Cursor}))
+					writing.Unlock()
 					continue
 				}
 				h := history[next]
 				h.Type, h.Cursor, h.TS, h.Historical = wire.TypeMsg, cursors[next], "2026-10-30T12:00:00Z", true
 				h.Answers = &wire.Anchor{At: m.At, Cursor: m.Cursor}
+				writing.Lock()
 				conn.WriteJSON(h)
+				writing.Unlock()
 			}
 		}()
 		if n == 2 {

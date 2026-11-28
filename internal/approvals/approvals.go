@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"filippo.io/age"
 	"filippo.io/age/armor"
@@ -35,8 +36,15 @@ const SigningPrefix = "chat-relay-approval v1\n"
 // keyLinePrefix starts every approver key line a phone shows.
 const keyLinePrefix = "chat-relay-approver"
 
-// Choices are the quick answers a request offers.
+// Choices are the quick answers a request offers when the agent names none.
 var Choices = []string{"yes", "no"}
+
+// Bounds on an agent's own choices (wire revision 3): the phone shows them as
+// buttons.
+const (
+	MaxChoices      = 8
+	MaxChoiceLength = 60
+)
 
 var b64 = base64.RawURLEncoding
 
@@ -94,14 +102,17 @@ type Asker struct {
 // Request is a request's plaintext. Fields are declared in key order, so
 // it encodes with its keys sorted.
 type Request struct {
-	Actors    []string `json:"actors,omitempty"`
-	Asker     Asker    `json:"asker"`
-	Choices   []string `json:"choices"`
-	CreatedAt string   `json:"createdAt"`
-	ExpiresAt string   `json:"expiresAt"`
-	RequestID string   `json:"requestId"`
-	Text      string   `json:"text"`
-	V         int      `json:"v"`
+	Actors  []string `json:"actors,omitempty"`
+	Asker   Asker    `json:"asker"`
+	Choices []string `json:"choices"`
+	// Comments says this client reads a comment beside a choice (wire
+	// revision 3); without it the phone attaches none.
+	Comments  bool   `json:"comments,omitempty"`
+	CreatedAt string `json:"createdAt"`
+	ExpiresAt string `json:"expiresAt"`
+	RequestID string `json:"requestId"`
+	Text      string `json:"text"`
+	V         int    `json:"v"`
 }
 
 // Approver is a statement's signer as the statement names it.
@@ -256,7 +267,7 @@ func Check(statement, signature string, request []byte, keys []Key) (Statement, 
 		return Statement{}, Key{}, WrongRequestHash
 	}
 	var rq Request
-	if err := strictUnmarshal(request, requestShape, &rq); err != nil || rq.V != 1 || !validChoices(rq.Choices) {
+	if err := strictUnmarshal(request, requestShape, &rq); err != nil || rq.V != 1 || ValidateChoices(rq.Choices) != nil {
 		return Statement{}, Key{}, MalformedRequest
 	}
 	if st.RequestID != rq.RequestID || st.ExpiresAt != rq.ExpiresAt {
@@ -271,6 +282,10 @@ func Check(statement, signature string, request []byte, keys []Key) (Statement, 
 		}
 	} else if !slices.Contains(rq.Choices, st.Answer) {
 		return Statement{}, Key{}, NotOffered
+	} else if st.Text != "" && !rq.Comments {
+		// A comment beside a choice only where this client said it reads one
+		// (revision 3); the empty string is how an absent one decodes.
+		return Statement{}, Key{}, NotOffered
 	}
 	signedAt, err1 := time.Parse(time.RFC3339, st.SignedAt)
 	expiresAt, err2 := time.Parse(time.RFC3339, st.ExpiresAt)
@@ -283,25 +298,39 @@ func Check(statement, signature string, request []byte, keys []Key) (Statement, 
 	return st, signer, ""
 }
 
-// validChoices: at least one, each a non-empty string, never "text",
-// which names a free-text answer.
-func validChoices(choices []string) bool {
-	if len(choices) == 0 {
-		return false
+// ValidateChoices: 1 to MaxChoices distinct strings of 1 to MaxChoiceLength
+// characters, never "text", which names a free-text answer (revision 3).
+func ValidateChoices(choices []string) error {
+	if len(choices) == 0 || len(choices) > MaxChoices {
+		return fmt.Errorf("offer 1 to %d choices", MaxChoices)
 	}
+	seen := map[string]bool{}
 	for _, c := range choices {
-		if c == "" || c == "text" {
-			return false
+		switch {
+		case c == "":
+			return fmt.Errorf("an empty choice")
+		case c == "text":
+			return fmt.Errorf(`"text" cannot be a choice: it names a free-text answer`)
+		case utf8.RuneCountInString(c) > MaxChoiceLength:
+			return fmt.Errorf("choice %q is longer than %d characters", c, MaxChoiceLength)
+		case seen[c]:
+			return fmt.Errorf("choice %q twice", c)
 		}
+		seen[c] = true
 	}
-	return true
+	return nil
 }
 
-// AnswerText is a verified answer as one phrase: "yes", "no", or the
-// person's free text in quotes.
+// AnswerText is a verified answer as one phrase: the choice ("yes", "no",
+// or the agent's own), with the person's comment beside it if they gave one,
+// or the person's free text in quotes.
 func AnswerText(st Statement) string {
 	if st.Answer == "text" {
 		return fmt.Sprintf("free text: %q", st.Text)
+	}
+	if st.Text != "" {
+		// A comment beside a choice (revision 3): reported with it, never dropped.
+		return fmt.Sprintf("%s, comment: %q", st.Answer, st.Text)
 	}
 	return st.Answer
 }
