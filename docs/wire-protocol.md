@@ -1236,7 +1236,7 @@ An agent asks a PERSON for approval. The person answers on a paired phone, and t
   - `approvalClosed {requestId, state}` reports a close the client did not cause: `withdrawn` or `expired`.
 - **Plaintexts.**
   - The request is `{actors?, asker: {ageRecipient, name}, choices, comments?, createdAt, expiresAt, requestId, text, v: 1}`, with its keys sorted.
-  - `choices` are the agent's own (revision 3, 2026-11-28): 1 to 8 distinct strings of 1 to 60 characters, never `text`, without control or invisible format characters (Cc/Cf); every answer but yes and no is reported quoted; yes and no when the agent names none. `comments: true` says this client reports a comment beside a choice; this client always sends it.
+  - `choices` are the agent's own (revision 3, 2026-11-28): 1 to 8 distinct strings of 1 to 60 characters, never `text`, made only of letters, marks, digits, punctuation, symbols and the plain space (`unicode.IsPrint`, an allow-list); every answer but yes and no is reported quoted; yes and no when the agent names none. `comments: true` says this client reports a comment beside a choice; this client always sends it.
   - The answer envelope holds `{signature, statement}`, where `statement` is the exact string the phone signed.
   - The signature is Ed25519 over `"chat-relay-approval v1\n" + statement`.
   - The statement holds `answer`, `approver {label, signKey}`, `asker`, `expiresAt`, `requestHash` (base64url SHA-256 of the exact request bytes), `requestId`, `signedAt`, `text?` and `v`. `text` is the free text when `answer` is `text`, and otherwise the person's comment beside the choice -- only where the request had `comments: true`.

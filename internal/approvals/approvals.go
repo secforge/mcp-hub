@@ -318,7 +318,7 @@ func ValidateChoices(choices []string) error {
 			// A choice is echoed into notices and proof checks other agents
 			// read: no line breaks, control or invisible format characters
 			// that could forge a line there (security review, 2026-11-28).
-			return fmt.Errorf("choice %q holds a control or invisible character", c)
+			return fmt.Errorf("choice %q holds a character other than letters, digits, punctuation, symbols or spaces", c)
 		case seen[c]:
 			return fmt.Errorf("choice %q twice", c)
 		}
@@ -347,10 +347,12 @@ func AnswerText(st Statement) string {
 	return answer
 }
 
-// unprintable: control characters (line breaks included) and invisible
-// format characters (zero-width, bidi overrides).
+// unprintable: anything but letters, marks, digits, punctuation, symbols and
+// the plain space -- an allow-list, so line and paragraph separators,
+// control, format, private-use and unassigned characters are all out
+// (security review, 2026-11-28).
 func unprintable(r rune) bool {
-	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+	return !unicode.IsPrint(r)
 }
 
 // ParseSigned reads an answer envelope's plaintext strictly.
