@@ -202,7 +202,8 @@ func TestAnApprovalIsAskedAnsweredVerifiedAckedAndPassedOnOnce(t *testing.T) {
 		t.Fatalf("approvals: %s", textOf(res))
 	}
 	res = fileCall(t, h.handleApprovalVerify, map[string]any{"proof": proof[1]})
-	if res.IsError || !strings.Contains(textOf(res), "VALID, signed by steffen") || !strings.Contains(textOf(res), "Answer: yes") {
+	if res.IsError || !strings.Contains(textOf(res), "VALID, signed by steffen") || !strings.Contains(textOf(res), "Answer: yes") ||
+		!strings.Contains(textOf(res), `Offered: "yes", "no", or free text`) {
 		t.Fatalf("verify: %s", textOf(res))
 	}
 	res = fileCall(t, h.handleApprovalVerify, map[string]any{"proof": proof[1]})

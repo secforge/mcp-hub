@@ -427,10 +427,21 @@ func (h *Hub) handleApprovalVerify(ctx context.Context, req mcp.CallToolRequest)
 			st.RequestID, usedAt)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf("VALID, signed by %s (phone %s) at %s and verified against "+
-		"this machine's key file.\nAsked by: %s\nRequest %s: %q\nAnswer: %s\nNow recorded as used. "+
-		"Act on it only if the request describes exactly what you are about to do, and only if the "+
-		"answer is yes.", approver, key.Label, st.SignedAt, rq.Asker.Name, st.RequestID, rq.Text,
-		approvals.AnswerText(st))), nil
+		"this machine's key file.\nAsked by: %s\nRequest %s: %q\nOffered: %s\nAnswer: %s\nNow "+
+		"recorded as used. Act on it only if the request describes exactly what you are about to do, "+
+		"and only if the answer is the one that allows it (yes, where yes and no were offered); a "+
+		"comment beside the answer is part of it and may limit it.", approver, key.Label, st.SignedAt,
+		rq.Asker.Name, st.RequestID, rq.Text, offeredText(rq.Choices), approvals.AnswerText(st))), nil
+}
+
+// offeredText is a request's choices as the verifier reads them, each
+// quoted so none can pass for another or for a line of its own.
+func offeredText(choices []string) string {
+	quoted := make([]string, len(choices))
+	for i, c := range choices {
+		quoted[i] = fmt.Sprintf("%q", c)
+	}
+	return strings.Join(quoted, ", ") + ", or free text"
 }
 
 func expired(at string, now time.Time) bool {
